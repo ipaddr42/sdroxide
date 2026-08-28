@@ -65,7 +65,7 @@ sdroxide-midi = { path = "../sdroxide-midi" }
 # Drives the one-shot adapter probe in `wgpu_options` to completion. wgpu's
 # enumeration is a future for the browser's sake only, and this is the executor
 # wgpu and eframe already pull in, so it adds no build time.
-pollster = "0.4"
+pollster = "1.0"
 # Only for `event_loop`, which has to name winit's own types: eframe does not
 # re-export winit, so it is taken through `egui-winit` — the crate eframe gets
 # winit from — and the version can never drift from the one eframe links.
