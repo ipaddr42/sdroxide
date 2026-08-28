@@ -104,7 +104,7 @@ jobs:
 
       # The embed-web feature bakes these files into the binary via rust-embed.
       - name: Fetch web client
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: web-dist
           path: crates/sdroxide-web/dist
