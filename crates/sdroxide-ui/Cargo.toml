@@ -69,7 +69,7 @@ pollster = "0.4"
 # Only for `event_loop`, which has to name winit's own types: eframe does not
 # re-export winit, so it is taken through `egui-winit` — the crate eframe gets
 # winit from — and the version can never drift from the one eframe links.
-egui-winit = { version = "0.35", default-features = false }
+egui-winit = { version = "0.36", default-features = false }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 wasm-bindgen = "0.2"
