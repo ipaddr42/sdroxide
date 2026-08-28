@@ -11,7 +11,7 @@ rustfft.workspace = true
 # wrapper over rustfft (already in the tree via rubato), so it adds no new
 # transitive dependency and stays wasm-clean.
 realfft = "3.5"
-rubato = "4.0.0"
+rubato = "5.0.0"
 # RNNoise neural speech denoiser (pure Rust, wasm-clean). Core library only —
 # the default features pull in a CLI binary (clap/hound/dasp).
 nnnoiseless = { version = "0.5.2", default-features = false }
