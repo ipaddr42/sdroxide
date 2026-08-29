@@ -3107,9 +3107,9 @@ dependencies = [
 
 [[package]]
 name = "mfsk-core"
-version = "0.8.0"
+version = "0.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1b3d17361e480238f3c4f76d4fb975da41a110c7ba3a3b738ecc5d28ef3953eb"
+checksum = "3da5d19a48de00a6c605167eb21c14b77406dcbcb23e98f460ec188eac4ae6d6"
 dependencies = [
  "crc",
  "num-complex",
