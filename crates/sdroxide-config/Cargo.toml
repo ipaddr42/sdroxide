@@ -9,9 +9,9 @@ sdroxide-types.workspace = true
 serde.workspace = true
 serde_json = "1.0.151"
 thiserror.workspace = true
-toml = "1.1.3"
+toml = "1.1.4"
 tracing.workspace = true
 # Downloads the seasonal broadcast schedule into the config directory. Same
 # version `sdroxide-solar` uses for its space-weather feeds, so it adds no build
 # time. Pure-Rust TLS.
-ureq = "3.3"
+ureq = "3.4"

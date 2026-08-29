@@ -18,8 +18,13 @@ const RATE: f64 = 8000.0;
 /// figures shift is stateful and nothing resets it between transmissions, so a
 /// spliced pair that never shifts is read in whichever case the decoder started
 /// in — and the clear would get the blame for the mojibake.
-fn rtty_audio(msg: &str) -> Vec<f32> {
-    let mut tx = RttyTx::new(RATE, 1000.0, 50.0, 450.0);
+///
+/// `center_hz` comes from the controller under test rather than a literal: RTTY
+/// sits on a *standard* tone pair, and when that centre moved to 2125/2295 Hz
+/// this generator was left transmitting 1.2 kHz below where the receiver was
+/// listening, which reads as "the clear broke the decoder" and is not.
+fn rtty_audio(center_hz: f64, msg: &str) -> Vec<f32> {
+    let mut tx = RttyTx::new(RATE, center_hz, 50.0, 450.0);
     tx.push_text(msg);
     let mut audio = Vec::new();
     let mut guard = 0;
@@ -40,7 +45,8 @@ fn rtty_controller() -> TextModemController {
 #[test]
 fn clearing_empties_the_window_and_copying_carries_on() {
     let mut ctl = rtty_controller();
-    for chunk in rtty_audio("CQ 599 DE DELTA DELTA ").chunks(960) {
+    let center = ctl.audio_hz() as f64;
+    for chunk in rtty_audio(center, "CQ 599 DE DELTA DELTA ").chunks(960) {
         ctl.on_rx_audio(chunk);
     }
     let copied = ctl.status().text_rx;
@@ -50,7 +56,7 @@ fn clearing_empties_the_window_and_copying_carries_on() {
     assert!(ctl.status().text_rx.is_empty(), "the window still holds {:?}", ctl.status().text_rx);
 
     // The receiver was not stood down, only the page torn off.
-    for chunk in rtty_audio("TEST 599 DE PAPA PAPA ").chunks(960) {
+    for chunk in rtty_audio(center, "TEST 599 DE PAPA PAPA ").chunks(960) {
         ctl.on_rx_audio(chunk);
     }
     let after = ctl.status().text_rx;

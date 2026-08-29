@@ -29,13 +29,16 @@ use mfsk_core::engine::llr::{
     sync_quality,
 };
 use mfsk_core::engine::pipeline::{DecodeResult, DecodeStrictness};
-use mfsk_core::engine::sync::{SyncCandidate, coarse_sync, fine_sync_power_per_block};
+use mfsk_core::engine::sync::{
+    AudioSource, RxGrid, SyncCandidate, coarse_sync, fine_sync_power_per_block,
+};
 use mfsk_core::engine::sync2d::{freq_shift_cd0, ft4_sync_search_window};
 use mfsk_core::engine::{FecCodec, FecOpts, FrameLayout, MessageCodec, ModulationParams, Protocol};
 use num_complex::Complex;
 use rayon::prelude::*;
 
 use super::Ft2;
+use crate::params::DECODE_RATE;
 
 /// 12 kHz → 1333.3 Hz baseband, wide enough for four tones 41.667 Hz apart
 /// plus headroom.
@@ -87,7 +90,15 @@ pub fn decode_slot(
     sync_min: f32,
     max_cand: usize,
 ) -> Vec<DecodeResult> {
-    let candidates = coarse_sync::<Ft2>(audio, freq_min, freq_max, sync_min, None, max_cand);
+    let candidates = coarse_sync::<Ft2>(
+        AudioSource::Real(audio),
+        freq_min,
+        freq_max,
+        sync_min,
+        None,
+        max_cand,
+        RxGrid::real(DECODE_RATE as f32),
+    );
     if candidates.is_empty() {
         return Vec::new();
     }
@@ -303,8 +314,10 @@ mod tests {
     #[test]
     fn round_trips_an_exchange_and_a_signal_report() {
         for (a, b, c, want) in [
-            // `unpack77` renders reports unpadded, so "-07" comes back "-7".
-            ("OE1ABC", "IU8LMC", "-07", "OE1ABC IU8LMC -7"),
+            // Two digits either side of the sign, WSJT-X's `i3.2`: what goes
+            // in comes back unchanged. (`unpack77` used to drop the padding
+            // on single-digit negatives — mfsk-core 0.10 fixed that.)
+            ("OE1ABC", "IU8LMC", "-07", "OE1ABC IU8LMC -07"),
             ("IU8LMC", "OE1ABC", "RR73", "IU8LMC OE1ABC RR73"),
         ] {
             let slot = slot_with(a, b, c, 1200.0, 20_000);

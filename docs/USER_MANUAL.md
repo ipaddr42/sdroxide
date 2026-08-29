@@ -7365,9 +7365,9 @@ reduction is a **reduction**, so a bigger number is less signal.
 
 A HackRF One or HackRF Pro — or a Jawbreaker or a rad1o — driven directly over
 USB by sdroxide's own pure-Rust driver. No SoapySDR, no libusb and no libhackrf,
-so this interface is in every build variant on every platform. 1 MHz to 6 GHz,
-2 to 20 Msps, wideband IQ in both directions; a Pro reaches lower at both ends,
-100 kHz and 250 ksps.
+so this interface is in every build variant on every platform. DC to 7.25 GHz,
+2 to 20 Msps, wideband IQ in both directions; a Pro takes narrower rates, down
+to 250 ksps.
 
 This is the only USB interface here that transmits, and the only one that is
 **half duplex**: receive stops for the length of every over, because the
@@ -7450,10 +7450,20 @@ does not send the request at all on that board rather than send one that would
 be accepted and ignored; if you have a filter pinned from another radio, the
 status line at open says so.
 
-**Tuning range.** Read off the board, not assumed. A HackRF One is 1 MHz to
-6 GHz, a Jawbreaker starts at 10 MHz, a rad1o is 50–4000 MHz, and a HackRF Pro
-reaches down to **100 kHz** — a decade below the One, which is most of the
-reason to have one for the low bands.
+**Tuning range.** **DC to 7.25 GHz**, the same on every board, because that is
+what the firmware accepts — it clamps a tuning request into 0–7250 MHz and has
+no per-board table. libhackrf documents the same span and SoapySDR publishes it,
+which is why a HackRF driven through SoapySDR has always tuned wider here than
+one driven natively.
+
+That is a wider span than any of these boards is *specified* for. A HackRF One
+is a 1 MHz – 6 GHz radio, a Pro is 100 kHz – 6 GHz, and outside those the
+receiver is heavily attenuated and the transmitter makes little or no power.
+But attenuated is not the same as absent: people listen to shortwave below
+1 MHz on a HackRF, and 5 GHz Wi-Fi is visible above 6, so sdroxide lets the dial
+go there and lets you judge what you hear rather than deciding in advance that
+you cannot. Expect a deaf radio at the edges, and do not expect to transmit
+usefully there.
 
 **IQ correction.** On by default. This is a zero-IF radio: its own oscillator
 leakage sits at the centre of the span, and the mixer's quadrature error puts a

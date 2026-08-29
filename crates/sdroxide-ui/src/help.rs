@@ -1957,7 +1957,7 @@ mod tests {
         ctx.begin_pass(egui::RawInput { events, ..Default::default() });
         help.grab_keys(&ctx);
         let left = ctx.input(|i| i.events.clone());
-        let _ = ctx.end_pass();
+        ctx.end_pass().drop_without_applying_deltas();
         left
     }
 
@@ -2196,7 +2196,7 @@ Nothing to see here.
                 ..Default::default()
             });
             help.ui(&ctx);
-            let _ = ctx.end_pass();
+            ctx.end_pass().drop_without_applying_deltas();
             ctx.memory(|m| m.area_rect(id)).expect("the manual is on screen")
         };
 

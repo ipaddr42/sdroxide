@@ -1100,31 +1100,29 @@ mod tests {
                 end: 7,
             };
             let (mut slot, mut row, mut header) = (0.0f32, 0.0f32, 0.0f32);
-            let _ = ctx.run_ui(
-                egui::RawInput { screen_rect: Some(screen), ..Default::default() },
-                |ui| {
-                    slot = row_height(ui);
-                    // The painted extent of each item, NOT the cursor advance:
-                    // the advance includes the item spacing egui puts between
-                    // widgets, which is the spacing `show_rows` adds for us.
-                    row = ui
-                        .scope(|ui| {
-                            SdroxideApp::log_qso_row(ui, &r, &[]);
-                        })
-                        .response
-                        .rect
-                        .height();
-                    // Laid out horizontally, which is how `log_list` builds the
-                    // header's child ui.
-                    header = ui
-                        .horizontal(|ui| {
-                            SdroxideApp::log_day_header(ui, &g, 7);
-                        })
-                        .response
-                        .rect
-                        .height();
-                },
-            );
+            ctx.run_ui(egui::RawInput { screen_rect: Some(screen), ..Default::default() }, |ui| {
+                slot = row_height(ui);
+                // The painted extent of each item, NOT the cursor advance:
+                // the advance includes the item spacing egui puts between
+                // widgets, which is the spacing `show_rows` adds for us.
+                row = ui
+                    .scope(|ui| {
+                        SdroxideApp::log_qso_row(ui, &r, &[]);
+                    })
+                    .response
+                    .rect
+                    .height();
+                // Laid out horizontally, which is how `log_list` builds the
+                // header's child ui.
+                header = ui
+                    .horizontal(|ui| {
+                        SdroxideApp::log_day_header(ui, &g, 7);
+                    })
+                    .response
+                    .rect
+                    .height();
+            })
+            .drop_without_applying_deltas();
             assert!(
                 (row + ROW_GAP - slot).abs() < 0.5,
                 "{tier:?}: a QSO row painted {row} points and the gap is {ROW_GAP}, \

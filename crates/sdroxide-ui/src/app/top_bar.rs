@@ -5650,7 +5650,7 @@ mod tests {
         };
         const LABELS: [&str; 5] = ["RX", "VFO", "TX", "DISP", "SYS"];
         let (mut tops, mut right, mut edge) = (Vec::new(), 0.0f32, 0.0f32);
-        let _ = ctx.run_ui(input, |ui| {
+        ctx.run_ui(input, |ui| {
             ui.spacing_mut().item_spacing = egui::vec2(8.0, 8.0);
             ui.with_layout(
                 egui::Layout::left_to_right(egui::Align::Min).with_main_wrap(true),
@@ -5702,7 +5702,8 @@ mod tests {
                     );
                 },
             );
-        });
+        })
+        .drop_without_applying_deltas();
         let top = tops[0];
         assert!(tops.iter().all(|t| (t - top).abs() < 0.5), "the buttons landed at {tops:?}");
         assert!(right <= edge + 0.5, "the last button reaches {right} past a {edge} pt edge");
@@ -5826,7 +5827,7 @@ mod tests {
     fn system_box_and_chips() -> (f32, Vec<(&'static str, f32)>) {
         let (ctx, input) = desktop_ctx();
         let mut out = None;
-        let _ = ctx.run_ui(input, |ui| {
+        ctx.run_ui(input, |ui| {
             let mut chips = Vec::new();
             let width = system_rows_w(ui);
             let room =
@@ -5853,7 +5854,8 @@ mod tests {
                     room
                 });
             out = Some((room, chips));
-        });
+        })
+        .drop_without_applying_deltas();
         out.expect("the box was drawn")
     }
 
@@ -5886,7 +5888,7 @@ mod tests {
     fn the_condensed_display_box_fits_its_chips() {
         for has_wide in [false, true] {
             let (ctx, input) = desktop_ctx();
-            let _ = ctx.run_ui(input, |ui| {
+            ctx.run_ui(input, |ui| {
                 let row1: &[&str] =
                     if has_wide { &DISPLAY_VIEW_CHIPS } else { &DISPLAY_VIEW_CHIPS[..2] };
                 let room = chip_row_w(ui, row1).max(chip_row_w(ui, &DISPLAY_TOOL_CHIPS));
@@ -5903,7 +5905,8 @@ mod tests {
                         );
                     });
                 }
-            });
+            })
+            .drop_without_applying_deltas();
         }
     }
 
@@ -5914,7 +5917,7 @@ mod tests {
     #[test]
     fn the_diversity_box_fits_its_rows() {
         let (ctx, input) = desktop_ctx();
-        let _ = ctx.run_ui(input, |ui| {
+        ctx.run_ui(input, |ui| {
             let room = div_rows_w(ui) - 2.0 * crate::chrome::MODULE_MARGIN_X;
             for label in DIV_MODE_LABELS {
                 ui.horizontal(|ui| {
@@ -5936,7 +5939,8 @@ mod tests {
                 let took = ui.min_rect().width();
                 assert!(took <= room + 0.5, "the adaptation row took {took} of {room}");
             });
-        });
+        })
+        .drop_without_applying_deltas();
     }
 
     /// Which of the two rails the transmit box offers, and why each answer is
@@ -5998,7 +6002,7 @@ mod tests {
     fn the_condensed_tx_box_fits_its_rows() {
         for keyer in [false, true] {
             let (ctx, input) = desktop_ctx();
-            let _ = ctx.run_ui(input, |ui| {
+            ctx.run_ui(input, |ui| {
                 ui.spacing_mut().item_spacing = egui::vec2(MODULE_ROW_SPACING, MODULE_ROW_SPACING);
                 let (fixed1, fixed2) = tx_rows_fixed_w(ui, keyer);
                 // Both rows are drawn at the rail the box reserves for them.
@@ -6102,7 +6106,8 @@ mod tests {
                     level_w <= TX_LEVEL_COL_W + 0.5,
                     "the transmit-audio column took {level_w} of {TX_LEVEL_COL_W}"
                 );
-            });
+            })
+            .drop_without_applying_deltas();
         }
     }
 
@@ -6309,7 +6314,7 @@ mod tests {
     #[test]
     fn the_desktop_strip_packs_a_cat_rig_into_two_rows() {
         let (ctx, input) = desktop_ctx();
-        let _ = ctx.run_ui(input, |ui| {
+        ctx.run_ui(input, |ui| {
             // `top_bar` sets the strip's own inter-box gap before it packs.
             let gap = 8.0;
             // 1400 pt is where `layout::tier_for` starts calling a window a
@@ -6327,7 +6332,8 @@ mod tests {
                     rows = rows_needed(avail, gap, &boxes),
                 );
             }
-        });
+        })
+        .drop_without_applying_deltas();
     }
 
     /// And the box the packer's slack lands on stays a control box rather than
@@ -6336,7 +6342,7 @@ mod tests {
     #[test]
     fn the_vfo_box_does_not_swallow_a_rows_slack() {
         let (ctx, input) = desktop_ctx();
-        let _ = ctx.run_ui(input, |ui| {
+        ctx.run_ui(input, |ui| {
             let boxes = cat_rig_strip_boxes(ui, Mode::Lsb);
             let plan = plan_top_strip(1364.0, 8.0, &boxes);
             let vfo = plan
@@ -6349,7 +6355,8 @@ mod tests {
                 "the VFO box came out {vfo} pt against a natural {}",
                 boxes[2].w,
             );
-        });
+        })
+        .drop_without_applying_deltas();
     }
 
     /// Lay the condensed VFO/RIT box's rows out with real chips and drag
@@ -6361,7 +6368,7 @@ mod tests {
     fn the_condensed_vfo_box_fits_its_rows() {
         for tx_capable in [false, true] {
             let (ctx, input) = desktop_ctx();
-            let _ = ctx.run_ui(input, |ui| {
+            ctx.run_ui(input, |ui| {
                 ui.spacing_mut().item_spacing = egui::vec2(MODULE_ROW_SPACING, MODULE_ROW_SPACING);
                 let chips = vfo_chip_labels(tx_capable);
                 let room = chip_row_w(ui, &chips).max(vfo_offsets_w(ui, tx_capable)) + 4.0;
@@ -6393,7 +6400,8 @@ mod tests {
                     .inner;
                 assert!(row1 <= room + 0.5, "tx={tx_capable}: row 1 took {row1} of {room}");
                 assert!(row2 <= room + 0.5, "tx={tx_capable}: row 2 took {row2} of {room}");
-            });
+            })
+            .drop_without_applying_deltas();
         }
     }
 
@@ -6454,12 +6462,13 @@ mod tests {
         };
         // The first pass gives the chip an id; then it is opened and laid out.
         let mut id = None;
-        let _ = ctx.run_ui(input(), |ui| id = Some(menu(ui)));
+        ctx.run_ui(input(), |ui| id = Some(menu(ui))).drop_without_applying_deltas();
         let id = id.expect("the chip was drawn");
         egui::Popup::open_id(&ctx, id);
-        let _ = ctx.run_ui(input(), |ui| {
+        ctx.run_ui(input(), |ui| {
             menu(ui);
-        });
+        })
+        .drop_without_applying_deltas();
         ctx.memory(|m| m.area_rect(id)).expect("the menu was shown")
     }
 
@@ -6517,7 +6526,7 @@ mod tests {
                 for agc_off in [false, true] {
                     for mode in [Mode::Usb, Mode::Nfm, Mode::Wfm, Mode::Drm] {
                         let (ctx, input) = desktop_ctx();
-                        let _ = ctx.run_ui(input, |ui| {
+                        ctx.run_ui(input, |ui| {
                             ui.spacing_mut().item_spacing =
                                 egui::vec2(MODULE_ROW_SPACING, MODULE_ROW_SPACING);
                             // The box draws its Vol and SQL rails at what it
@@ -6618,7 +6627,8 @@ mod tests {
                             let (room1, room2) = (rows.receive, rows.noise);
                             assert!(row1 <= room1 + 0.5, "{state}: row 1 took {row1} of {room1}");
                             assert!(row2 <= room2 + 0.5, "{state}: row 2 took {row2} of {room2}");
-                        });
+                        })
+                        .drop_without_applying_deltas();
                     }
                 }
             }

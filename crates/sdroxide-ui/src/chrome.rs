@@ -2127,13 +2127,14 @@ mod tests {
             ..Default::default()
         };
         let (mut took, mut left) = (false, 0);
-        let _ = ctx.run_ui(input, |ui| {
+        ctx.run_ui(input, |ui| {
             if focused {
                 ui.memory_mut(|m| m.request_focus(id));
             }
             took = take_return(ui, id);
             left = ui.input(|i| i.events.len());
-        });
+        })
+        .drop_without_applying_deltas();
         (took, left)
     }
 
@@ -2159,7 +2160,7 @@ mod tests {
     fn module_height(height: f32, flush: bool) -> (f32, f32) {
         let ctx = egui::Context::default();
         let (mut row, mut content) = (0.0, 0.0);
-        let _ = ctx.run_ui(Default::default(), |ui| {
+        ctx.run_ui(Default::default(), |ui| {
             ui.with_layout(egui::Layout::left_to_right(egui::Align::Min), |ui| {
                 let grab = |ui: &mut Ui| content = ui.available_size().y;
                 if flush {
@@ -2169,7 +2170,8 @@ mod tests {
                 }
                 row = ui.min_rect().height();
             });
-        });
+        })
+        .drop_without_applying_deltas();
         (row, content)
     }
 
@@ -2222,17 +2224,19 @@ mod tests {
         };
         // First pass to give the chip an id, then open its popup and lay it out.
         let mut id = None;
-        let _ = ctx.run_ui(input(), |ui| {
+        ctx.run_ui(input(), |ui| {
             let btn = chip(ui, false, "MENU");
             id = Some(egui::Popup::default_response_id(&btn));
             menu_popup(ui, &btn, a_long_menu);
-        });
+        })
+        .drop_without_applying_deltas();
         let id = id.expect("the chip was drawn");
         egui::Popup::open_id(&ctx, id);
-        let _ = ctx.run_ui(input(), |ui| {
+        ctx.run_ui(input(), |ui| {
             let btn = chip(ui, false, "MENU");
             menu_popup(ui, &btn, a_long_menu);
-        });
+        })
+        .drop_without_applying_deltas();
         ctx.memory(|m| m.area_rect(id)).expect("the popup was shown")
     }
 
@@ -2364,7 +2368,7 @@ mod tests {
         }
         let (mut tab, mut inner) = (Rect::NOTHING, Rect::NOTHING);
         let (mut tab_hit, mut chip_hit) = (false, false);
-        let _ = ctx.run_ui(input, |ui| {
+        ctx.run_ui(input, |ui| {
             tab_bar(ui, |ui, bar| {
                 let out = bar.tab_body(ui, true, |ui| {
                     ui.label("Radio 1");
@@ -2375,7 +2379,8 @@ mod tests {
                 tab = out.response.rect;
                 tab_hit = out.response.clicked();
             });
-        });
+        })
+        .drop_without_applying_deltas();
         (tab, inner, tab_hit, chip_hit)
     }
 
@@ -2420,7 +2425,7 @@ mod tests {
                 StrokeKind::Inside,
             );
             let ctx = egui::Context::default();
-            let _ = ctx.run_ui(Default::default(), |ui| {
+            ctx.run_ui(Default::default(), |ui| {
                 for style in ChromeStyle::ALL {
                     // The Terminal style frames a control with characters
                     // straddling its edge, so its *cells* reach a character
@@ -2441,7 +2446,8 @@ mod tests {
                         assert!(got.is_positive(), "{style:?} painted nothing at all");
                     }
                 }
-            });
+            })
+            .drop_without_applying_deltas();
         }
     }
 
@@ -2456,7 +2462,7 @@ mod tests {
     fn the_terminal_border_sits_on_the_edge_it_frames() {
         let rect = Rect::from_min_max(pos2(40.0, 60.0), pos2(340.0, 220.0));
         let ctx = egui::Context::default();
-        let _ = ctx.run_ui(Default::default(), |ui| {
+        ctx.run_ui(Default::default(), |ui| {
             let p = ui.painter();
             let size = terminal_size(p);
             let cell = cell_size(p, size);
@@ -2466,7 +2472,8 @@ mod tests {
             assert!(ink.min.x < rect.left() && ink.min.y < rect.top(), "{ink:?} vs {rect:?}");
             assert!(ink.max.x > rect.right() && ink.max.y > rect.bottom(), "{ink:?} vs {rect:?}");
             assert!(rect.expand2(cell).contains_rect(ink), "{ink:?} spills past {rect:?}");
-        });
+        })
+        .drop_without_applying_deltas();
     }
 
     /// Same for a slider's knob: it is drawn at the value's position, and a
@@ -2481,12 +2488,13 @@ mod tests {
         };
         let bounds = Rect::from_center_size(disc.center, egui::Vec2::splat(2.0 * disc.radius));
         let ctx = egui::Context::default();
-        let _ = ctx.run_ui(Default::default(), |ui| {
+        ctx.run_ui(Default::default(), |ui| {
             for style in ChromeStyle::ALL {
                 let got = styled_knob(ui, &disc, style).visual_bounding_rect();
                 assert!(bounds.expand(3.0).contains_rect(got), "{style:?} painted {got:?}");
             }
-        });
+        })
+        .drop_without_applying_deltas();
     }
 
     /// Lay one checkbox out in a fresh context and report the size it took and
@@ -2498,12 +2506,13 @@ mod tests {
         let (mut size, mut hit) = (egui::Vec2::ZERO, Pos2::ZERO);
         let mut input = egui::RawInput { screen_rect: Some(screen), ..Default::default() };
         for pass in 0..2 {
-            let _ = ctx.run_ui(input.clone(), |ui| {
+            ctx.run_ui(input.clone(), |ui| {
                 let r =
                     if stock { ui.checkbox(&mut on, label) } else { checkbox(ui, &mut on, label) };
                 size = r.rect.size();
                 hit = r.rect.center();
-            });
+            })
+            .drop_without_applying_deltas();
             if pass == 0 {
                 // egui hit-tests against the layout of the frame before, so the
                 // click can only be aimed once the box has been placed.
@@ -2547,7 +2556,7 @@ mod tests {
     #[test]
     fn a_chip_is_as_wide_as_it_was_measured() {
         let ctx = egui::Context::default();
-        let _ = ctx.run_ui(Default::default(), |ui| {
+        ctx.run_ui(Default::default(), |ui| {
             for label in ["LOG", "AWARDS", "\u{2699} SETTINGS", "20M \u{b7} USB"] {
                 for size in [None, Some(15.0)] {
                     let want = (chip_width(ui, label, size), chip_height(ui, size));
@@ -2562,7 +2571,8 @@ mod tests {
                     );
                 }
             }
-        });
+        })
+        .drop_without_applying_deltas();
     }
 
     /// The Angled chip outline is the app's signature shape and must never

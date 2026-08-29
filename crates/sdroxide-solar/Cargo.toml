@@ -30,6 +30,6 @@ roxmltree = "0.21.1"
 # Blocking HTTPS. Default features are rustls with the `ring` provider and
 # compiled-in Mozilla roots: no OpenSSL, no system certificate store, and no
 # async runtime — this crate owns exactly one worker thread.
-ureq = "3.3"
+ureq = "3.4"
 crossbeam-channel.workspace = true
 sdroxide-config = { path = "../sdroxide-config" }

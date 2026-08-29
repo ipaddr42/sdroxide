@@ -249,7 +249,14 @@ pub fn decode_slot(audio: &[f32], sample_rate: u32) -> Vec<WsprDecode> {
                 freq_hz: al.tone0_hz,
                 start_sample: (al.lag * 32).max(0) as usize,
                 dt_sec: 0.0,
+                // The drift the demodulation actually ran at — the same
+                // figure handed to `align_and_decode` above, not the raw
+                // coarse score.
+                drift_hz: reportable_drift(c.drift_hz),
                 info_bits: hit.info,
+                // Upstream takes this from the coarse candidate too; the
+                // reported figure is read back off `c` in `from_result`.
+                snr_db: c.snr_db,
             };
             // Does the message we are about to report actually explain the
             // tones that arrived? Every symbol the OSD fallback emits is a

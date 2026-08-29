@@ -34,7 +34,9 @@ use crate::handle::{
     Ctrl, DeviceInfo, HackRfHandle, Pending, RxStats, Shared, TxTransition, push_iq, rx_ring_for,
     tx_ring_for,
 };
-use crate::protocol::{BULK_IN, BULK_OUT, BULK_PACKET, BYTES_PER_SAMPLE, GainSetter};
+use crate::protocol::{
+    BULK_IN, BULK_OUT, BULK_PACKET, BYTES_PER_SAMPLE, GainSetter, TUNING_RANGE_HZ,
+};
 use crate::trace::{self, Trace};
 use crate::usb::UsbDev;
 
@@ -332,7 +334,7 @@ fn run(
         serial,
         sample_rate_hz: rate,
         filter_bw_hz: dev.filter_bw(),
-        freq_range: dev.kind().freq_range(),
+        freq_range: TUNING_RANGE_HZ,
         rate_range: dev.rate_range(),
         has_bias_tee: dev.has_bias_tee(),
         filter_is_automatic: dev.sets_own_filter(),

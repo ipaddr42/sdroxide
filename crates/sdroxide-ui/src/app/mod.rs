@@ -1759,10 +1759,10 @@ mod tests {
         };
 
         let mut at = egui::Pos2::ZERO;
-        let _ =
-            ctx.run_ui(egui::RawInput { screen_rect: Some(screen), ..Default::default() }, |ui| {
-                at = draw(ui).rect.center();
-            });
+        ctx.run_ui(egui::RawInput { screen_rect: Some(screen), ..Default::default() }, |ui| {
+            at = draw(ui).rect.center();
+        })
+        .drop_without_applying_deltas();
         let button = |pressed| egui::Event::PointerButton {
             pos: at,
             button: egui::PointerButton::Primary,
@@ -1772,7 +1772,7 @@ mod tests {
         let mut clicked = false;
         for events in [vec![egui::Event::PointerMoved(at), button(true)], vec![button(false)]] {
             let input = egui::RawInput { screen_rect: Some(screen), events, ..Default::default() };
-            let _ = ctx.run_ui(input, |ui| clicked |= draw(ui).clicked());
+            ctx.run_ui(input, |ui| clicked |= draw(ui).clicked()).drop_without_applying_deltas();
         }
         clicked
     }

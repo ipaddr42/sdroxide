@@ -121,6 +121,9 @@ mod tests {
         for _ in 0..4 {
             let out = ctx.run_ui(egui::RawInput::default(), |ui| ask(ui.ctx()));
             delay = out.viewport_output.get(&egui::ViewportId::ROOT).map(|v| v.repaint_delay);
+            // Nothing here paints, so the texture deltas go unapplied — and
+            // since egui 0.36 dropping them unhandled is a debug assertion.
+            out.drop_without_applying_deltas();
         }
         delay.expect("no root viewport output")
     }

@@ -17,4 +17,4 @@ thiserror.workspace = true
 tracing.workspace = true
 # The Winlink secure-login challenge is MD5 over a fixed salt. Used as a
 # checksum against a published algorithm, not to protect anything.
-md-5 = "0.10"
+md-5 = "0.11"

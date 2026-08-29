@@ -42,7 +42,15 @@ fn rtty_decodes_signal_present_from_first_block() {
         ..Default::default()
     };
 
-    let mut tx = RttyTx::new(RATE, 1000.0, 50.0, 450.0);
+    // tap_rate == the modem's internal rate, so no resampling is involved.
+    let mut ctl = TextModemController::new(Mode::Rtty, cfg, RATE);
+
+    // Transmit on the pair the receiver is actually listening to, read off the
+    // controller rather than written out here: RTTY's centre is a standard, and
+    // when it moved to 2125/2295 Hz a literal left this generator a kilohertz
+    // low — which decodes as nothing at all and reads as the squelch latching
+    // shut again, the very bug this test guards.
+    let mut tx = RttyTx::new(RATE, ctl.audio_hz() as f64, 50.0, 450.0);
     tx.push_text(msg);
     let mut audio = Vec::new();
     let mut guard = 0;
@@ -53,8 +61,6 @@ fn rtty_decodes_signal_present_from_first_block() {
         guard += 1;
     }
 
-    // tap_rate == the modem's internal rate, so no resampling is involved.
-    let mut ctl = TextModemController::new(Mode::Rtty, cfg, RATE);
     for chunk in audio.chunks(960) {
         ctl.on_rx_audio(chunk);
     }

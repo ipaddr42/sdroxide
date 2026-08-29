@@ -322,6 +322,12 @@ fn build(rs: &RenderState) -> SolarResources {
                      blend: Option<wgpu::BlendState>,
                      depth: Option<wgpu::DepthStencilState>,
                      samples: u32| {
+        // wgpu 30 made vertex buffer slots individually optional, so a pipeline
+        // can leave a gap in the slot numbering. Nothing here does — every slot
+        // this file declares is bound — so the layouts are wrapped once at the
+        // boundary rather than each call site carrying a `Some`.
+        let buffers: Vec<Option<wgpu::VertexBufferLayout>> =
+            buffers.iter().cloned().map(Some).collect();
         device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some(label),
             layout: Some(layout),
@@ -329,7 +335,7 @@ fn build(rs: &RenderState) -> SolarResources {
                 module: sh,
                 entry_point: Some("vs"),
                 compilation_options: Default::default(),
-                buffers,
+                buffers: &buffers,
             },
             fragment: Some(wgpu::FragmentState {
                 module: sh,

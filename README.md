@@ -521,7 +521,7 @@ starting sdroxide before the rig is fine:
 - **HackRF One / Pro (USB)** — a HackRF One or HackRF Pro (or a Jawbreaker or
   rad1o), driven directly over USB by a native pure-Rust driver. **No SoapySDR,
   no libusb and no libhackrf needed**, so it works in every build including the
-  standard `.msi` and `.dmg`. 1 MHz–6 GHz, 2–20 Msps, wideband IQ receive *and*
+  standard `.msi` and `.dmg`. DC–7.25 GHz, 2–20 Msps, wideband IQ receive *and*
   transmit. See "HackRF permissions" under Building for the Linux udev rule.
 
   **Half duplex**: receive stops for the length of an over, the way the hardware
@@ -536,18 +536,27 @@ starting sdroxide before the rig is fine:
   separate receive and transmit settings so you can run the preamp bypassed on
   receive and in circuit on transmit. sdroxide reprograms the whole front end on
   every change of direction, which is why that works here and does not through
-  SoapySDR. Bias tee, baseband filter and ppm correction are on the same tab;
-  the board's real tuning range is read off it, so a rad1o is honestly reported
-  as 50–4000 MHz rather than offered a HackRF One's span.
+  SoapySDR. Bias tee, baseband filter and ppm correction are on the same tab.
+
+  The tuning range is the **firmware's**, DC–7.25 GHz, the same on every board
+  and the same span libhackrf and SoapySDR publish. That is wider than any of
+  these radios is specified for — a HackRF One is a 1 MHz–6 GHz receiver — and
+  outside that it is heavily attenuated and makes little transmit power. It
+  does still tune there, though, which is what people listening to shortwave
+  below 1 MHz or watching 5 GHz Wi-Fi are relying on, so the dial goes where
+  the radio goes.
 
   A **HackRF Pro** is the same driver and the same protocol — it shares the
   HackRF One's USB id and every vendor request this driver sends — with three
-  differences sdroxide reads off the board rather than assuming: it tunes down
-  to **100 kHz** instead of 1 MHz, it accepts sample rates down to **250 ksps**
-  because it decimates in its FPGA rather than running the converter slowly, and
-  it **chooses its own baseband filter** (three quarters of the sample rate) and
-  ignores anything the host asks for, so that control is greyed out. sdroxide
-  decodes the Pro's standard 8-bit stream; its half-precision and
+  differences. It is specified down to **100 kHz** instead of 1 MHz, which is
+  most of the reason to have one for the low bands. It accepts sample rates
+  down to **250 ksps**, because it decimates in its FPGA rather than running
+  the converter slowly. And it **chooses its own baseband filter** (three
+  quarters of the sample rate) and ignores anything the host asks for, so that
+  control is greyed out. The last two sdroxide reads off the board rather than
+  assuming.
+
+  sdroxide decodes the Pro's standard 8-bit stream; its half-precision and
   extended-precision gateware modes are not driven, and a Pro left in one of
   them by `hackrf_debug -P` will need unplugging.
 

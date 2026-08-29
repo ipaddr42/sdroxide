@@ -15,5 +15,5 @@ sdroxide-dsp.workspace = true
 rustfft.workspace = true
 tracing.workspace = true
 crossbeam-channel.workspace = true
-rten = { version = "0.25", default-features = false, features = ["onnx_format"] }
-rten-tensor = "0.25"
+rten = { version = "0.26", default-features = false, features = ["onnx_format"] }
+rten-tensor = "0.26"

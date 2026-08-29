@@ -5294,15 +5294,14 @@ pub(in crate::app) fn settings_hackrf_tab(
 
     ui.add_space(4.0);
     ui.label(
-        RichText::new(if is_pro {
-            "100 kHz – 6 GHz, half duplex. No SoapySDR, no libusb and no libhackrf \
+        RichText::new(
+            "DC – 7.25 GHz, half duplex. No SoapySDR, no libusb and no libhackrf \
              needed. The radio and the sample rate take effect on Apply; \
-             everything else applies as you change it."
-        } else {
-            "1 MHz – 6 GHz, half duplex. No SoapySDR, no libusb and no libhackrf \
-             needed. The radio and the sample rate take effect on Apply; \
-             everything else applies as you change it."
-        })
+             everything else applies as you change it. The band edges are the \
+             firmware's: a HackRF is specified for 1 MHz – 6 GHz (100 kHz on a \
+             Pro) and is heavily attenuated outside that, but it does tune \
+             there.",
+        )
         .weak(),
     );
 }

@@ -999,7 +999,7 @@ fn probe_hackrf() {
             // the product id and product string are what enumeration gives away
             // for free, and between them they separate a HackRF One from a Pro,
             // a Jawbreaker or a rad1o — which matters, because the four do not
-            // tune the same range.
+            // take the same sample rates.
             println!("  {}: {}", i, d.label());
         }
     }
@@ -1960,9 +1960,11 @@ fn open_hackrf_source(
 /// over, and claiming otherwise would let the engine keep a receive chain
 /// running against a stream that has been torn down.
 ///
-/// The frequency range comes off the radio rather than a constant — a rad1o is
-/// 50–4000 MHz and a Jawbreaker starts at 10 MHz, and telling one of those
-/// owners they can work 6 GHz would be worse than saying nothing.
+/// The frequency range is the firmware's, not the board's specified coverage:
+/// DC – 7.25 GHz on every HackRF, matching libhackrf and SoapyHackRF. A HackRF
+/// is deaf below 1 MHz and above 6 GHz, but it does tune there and people do
+/// use it there, so the range that reaches the dial is the one the radio will
+/// accept. See `sdroxide_hackrf::protocol::TUNING_RANGE_HZ`.
 ///
 /// Three real gain elements, LNA first: `gains[0]` is what the main window's
 /// Gain slider reaches, and the LNA is the stage that actually changes

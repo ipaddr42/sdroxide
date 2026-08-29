@@ -22,8 +22,8 @@ thiserror.workspace = true
 # `random` is not optional in practice: VITS samples noise in its stochastic
 # duration predictor (RandomNormalLike), and without it the model refuses to
 # load. `mmap` keeps the 60 MB of weights out of the resident set.
-rten = { version = "0.25", optional = true, features = ["mmap", "random"] }
-rten-tensor = { version = "0.25", optional = true }
+rten = { version = "0.26", optional = true, features = ["mmap", "random"] }
+rten-tensor = { version = "0.26", optional = true }
 # The voice's .onnx.json: phoneme_id_map, sample rate, inference scales.
 serde_json = { version = "1", optional = true }
 # Grapheme-to-phoneme. eSpeak-free (CMUdict + ARPAbet -> IPA) and pure Rust, so

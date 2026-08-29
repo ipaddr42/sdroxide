@@ -21,11 +21,10 @@
 /// USB vendor id, shared by every board.
 pub const VID: u16 = 0x1d50;
 
-/// Product ids. All of them are driven identically; they differ only in the
-/// frequency range they will actually tune ([`BoardKind::freq_range`]), the
-/// sample rates they accept ([`BoardKind::rate_range`]), whether a bias tee
-/// exists, and whether the baseband filter can be set from the host
-/// ([`BoardKind::sets_own_filter`]).
+/// Product ids. All of them are driven identically, and all of them tune the
+/// same [`TUNING_RANGE_HZ`]; they differ only in the sample rates they accept
+/// ([`BoardKind::rate_range`]), whether a bias tee exists, and whether the
+/// baseband filter can be set from the host ([`BoardKind::sets_own_filter`]).
 ///
 /// **`0x6089` is not one board.** The HackRF Pro ships the same id as the
 /// HackRF One — GSG's firmware shares one device descriptor between them
@@ -67,6 +66,31 @@ pub const CTRL_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(1
 
 /// Bytes per complex sample on the wire: one signed byte each for I and Q.
 pub const BYTES_PER_SAMPLE: usize = 2;
+
+/// What a HackRF will tune, in Hz. **The same for every board.**
+///
+/// This is the firmware's limit rather than a board's specification.
+/// `firmware/common/tuning.c` clamps a tuning request into 0 Hz – 7250 MHz
+/// (`restrict_rf`, against `MAX_HP_FREQ`) with no per-board table anywhere in
+/// it; libhackrf documents the same span in as many words — "should be in range
+/// 1-6000MHz, but 0-7250MHz is possible" — and SoapyHackRF publishes a flat
+/// `Range(0, 7250000000)`, which is why the same radio has always tuned wider
+/// through SoapySDR than it did through this driver.
+///
+/// This driver used to publish a per-board table instead — 1 MHz – 6 GHz for a
+/// HackRF One, 100 kHz – 6 GHz for a Pro, 50–4000 MHz for a rad1o — taken from
+/// each board's *specified* coverage. That was the wrong figure to publish.
+/// Specified coverage is where the radio performs; outside it a HackRF is
+/// heavily attenuated on receive and makes little or no transmit power, but it
+/// still tunes, and both shortwave under 1 MHz and 5 GHz Wi-Fi are usable in
+/// practice (issue #226; Great Scott Gadgets say the same in
+/// greatscottgadgets/hackrf#1435). Publishing the narrow figure turned "poor
+/// reception" into a dial that would not go there at all.
+///
+/// A board that genuinely stops short of the edges is still worse there than a
+/// HackRF One — that is a matter of sensitivity, which the operator can hear
+/// and judge, not of a limit this driver gets to impose on their behalf.
+pub const TUNING_RANGE_HZ: (f64, f64) = (0.0, 7.25e9);
 
 /// What the hardware will accept. Not the same thing as what the settings combo
 /// offers, which is `HackRfConfig::SAMPLE_RATES` over in `sdroxide-types` —
@@ -262,22 +286,6 @@ impl BoardKind {
             BoardKind::Rad1o => "rad1o",
             BoardKind::HackRfPro => "HackRF Pro",
             BoardKind::Unknown(_) => "HackRF",
-        }
-    }
-
-    /// What this board will actually tune, in Hz.
-    ///
-    /// These differ per board and getting them from the radio rather than
-    /// assuming a HackRF One is the difference between a rad1o owner seeing an
-    /// honest 50–4000 MHz and being told they can work 6 GHz. The Pro reaches a
-    /// decade lower than the One at the bottom — 100 kHz against 1 MHz — which
-    /// is most of the reason to own one for HF.
-    pub fn freq_range(self) -> (f64, f64) {
-        match self {
-            BoardKind::Jawbreaker => (10.0e6, 6.0e9),
-            BoardKind::Rad1o => (50.0e6, 4.0e9),
-            BoardKind::HackRfPro => (100.0e3, 6.0e9),
-            _ => (1.0e6, 6.0e9),
         }
     }
 
@@ -919,18 +927,25 @@ mod tests {
         assert!(serial_matches("", None));
     }
 
-    /// The product id names the radio in a list without opening it; the board
-    /// id refines that once it is open. A rad1o must never be offered 6 GHz.
+    /// The tuning range is the firmware's clamp, not a per-board figure: 0 Hz
+    /// to 7250 MHz, the same span libhackrf documents and SoapyHackRF
+    /// publishes. Narrowing it to a board's specified coverage is what issue
+    /// #226 was about — a HackRF is deaf below 1 MHz and above 6 GHz, but deaf
+    /// is not the same as untunable.
     #[test]
-    fn each_board_states_its_own_limits() {
+    fn the_tuning_range_is_the_firmwares_and_is_board_independent() {
+        assert_eq!(TUNING_RANGE_HZ, (0.0, 7.25e9));
+    }
+
+    /// The product id names the radio in a list without opening it; the board
+    /// id refines that once it is open. What the two decide is the sample rate
+    /// list, the bias tee and who owns the baseband filter — no longer the
+    /// tuning range, which is the same on all of them.
+    #[test]
+    fn each_board_is_named_by_its_product_id_and_refined_by_its_board_id() {
         assert_eq!(BoardKind::from_pid(PID_RAD1O), BoardKind::Rad1o);
         assert_eq!(BoardKind::from_pid(PID_JAWBREAKER), BoardKind::Jawbreaker);
         assert_eq!(BoardKind::from_pid(PID_HACKRF_ONE), BoardKind::HackRfOne);
-
-        assert_eq!(BoardKind::Rad1o.freq_range(), (50.0e6, 4.0e9));
-        assert_eq!(BoardKind::Jawbreaker.freq_range(), (10.0e6, 6.0e9));
-        assert_eq!(BoardKind::HackRfOne.freq_range(), (1.0e6, 6.0e9));
-        assert_eq!(BoardKind::HackRfPro.freq_range(), (100.0e3, 6.0e9));
 
         // Rev 9 and pre-rev-9 are both a HackRF One as far as this driver is
         // concerned; only the name would differ and it does not.

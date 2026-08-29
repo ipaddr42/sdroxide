@@ -34,7 +34,7 @@
 use mfsk_core::engine::dsp::downsample::{build_fft_cache, downsample_cached};
 use mfsk_core::engine::llr::{compute_llr, symbol_spectra, sync_quality};
 use mfsk_core::engine::protocol::FecOpts;
-use mfsk_core::engine::sync::{SyncCandidate, coarse_sync, refine_candidate};
+use mfsk_core::engine::sync::{AudioSource, RxGrid, SyncCandidate, coarse_sync, refine_candidate};
 use mfsk_core::engine::{FrameLayout, ModulationParams};
 use num_complex::Complex;
 use sdroxide_types::Js8Speed;
@@ -188,7 +188,15 @@ pub fn decode_slot<P: Js8Proto>(audio: &[i16], depth: Js8Depth) -> Vec<Js8Decode
         return Vec::new();
     }
 
-    let candidates = coarse_sync::<P>(audio, AUDIO_MIN_HZ, AUDIO_MAX_HZ, SYNC_MIN, None, MAX_CAND);
+    let candidates = coarse_sync::<P>(
+        AudioSource::Real(audio),
+        AUDIO_MIN_HZ,
+        AUDIO_MAX_HZ,
+        SYNC_MIN,
+        None,
+        MAX_CAND,
+        RxGrid::real(DECODE_RATE as f32),
+    );
     if candidates.is_empty() {
         return Vec::new();
     }

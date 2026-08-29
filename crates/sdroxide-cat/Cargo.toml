@@ -11,7 +11,7 @@ sdroxide-types.workspace = true
 # libudev-sys (no libudev-dev needed to build). Port enumeration falls back to
 # scanning /sys/class/tty, which still lists /dev/ttyACM* — we only need the
 # path, not USB vendor/product metadata.
-serialport = { version = "4.7", default-features = false }
+serialport = { version = "4.10", default-features = false }
 crossbeam-channel.workspace = true
 thiserror.workspace = true
 tracing.workspace = true

@@ -130,14 +130,14 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 postcard = { version = "1", features = ["use-std"] }
 crossbeam-channel = "0.5"
-rtrb = "0.3"
+rtrb = "0.4"
 # Pure-Rust USB — the RTL-SDR backend's only dependency. No libusb, so it needs
 # no system library on any target and ships in every build variant.
-nusb = "0.2.5"
+nusb = "0.2.7"
 # Runtime dlopen, for the SDRplay backend's closed vendor library. Nothing is
 # linked at build time, so this too ships in every build variant and simply
 # reports "not installed" where the vendor API is absent.
-libloading = "0.8"
+libloading = "0.9"
 
 [package]
 name = "sdroxide"
@@ -177,7 +177,7 @@ sdroxide-ui = { workspace = true, features = ["remote"] }
 # silently switched it back off: without it the whole widget tree is
 # invisible to NVDA, Orca and VoiceOver. It is native-only (it maps to
 # egui-winit), so it costs the browser build nothing.
-eframe = { version = "0.35.0", default-features = false, features = [
+eframe = { version = "0.36.1", default-features = false, features = [
     "accesskit",
     "default_fonts",
     "wgpu",

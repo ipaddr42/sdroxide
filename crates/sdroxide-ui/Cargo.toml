@@ -19,7 +19,7 @@ serde.workspace = true
 # silently switched it back off: without it the whole widget tree is
 # invisible to NVDA, Orca and VoiceOver. It is native-only (it maps to
 # egui-winit), so it costs the browser build nothing.
-eframe = { version = "0.35.0", default-features = false, features = [
+eframe = { version = "0.36.1", default-features = false, features = [
     "accesskit",
     "default_fonts",
     "wgpu",
@@ -65,11 +65,11 @@ sdroxide-midi = { path = "../sdroxide-midi" }
 # Drives the one-shot adapter probe in `wgpu_options` to completion. wgpu's
 # enumeration is a future for the browser's sake only, and this is the executor
 # wgpu and eframe already pull in, so it adds no build time.
-pollster = "0.4"
+pollster = "1.0"
 # Only for `event_loop`, which has to name winit's own types: eframe does not
 # re-export winit, so it is taken through `egui-winit` — the crate eframe gets
 # winit from — and the version can never drift from the one eframe links.
-egui-winit = { version = "0.35", default-features = false }
+egui-winit = { version = "0.36", default-features = false }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 wasm-bindgen = "0.2"
@@ -82,7 +82,7 @@ web-sys = { version = "0.3", features = ["Blob", "BlobPropertyBag", "Url", "Docu
 # Compiles and validates the WGSL in src/shaders/ as a unit test, so a shader
 # error is a test failure rather than a blank window at runtime. Same version
 # wgpu already uses, so it adds no build time.
-naga = { version = "30.0.0", features = ["wgsl-in"] }
+naga = { version = "30.0.1", features = ["wgsl-in"] }
 # The format eframe's storage uses, so the persisted-state tests can read a blob
 # written by an older version exactly as the app would. Already in the tree via
 # eframe, so it adds no build time either.

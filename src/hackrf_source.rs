@@ -119,10 +119,10 @@ impl HackRfSource {
         })
     }
 
-    /// What this board will actually tune. A rad1o is 50–4000 MHz, a
-    /// Jawbreaker starts at 10 MHz and a Pro reaches down to 100 kHz, so this
-    /// is read off the radio rather than assumed to be a HackRF One's
-    /// 1 MHz – 6 GHz.
+    /// What this radio will tune: DC – 7.25 GHz, the firmware's own clamp and
+    /// the same span libhackrf and SoapyHackRF publish. Not a per-board figure
+    /// — see `sdroxide_hackrf::protocol::TUNING_RANGE_HZ` for why a board's
+    /// *specified* coverage is the wrong thing to put in front of the dial.
     pub fn freq_range(&self) -> (f64, f64) {
         self.handle.freq_range
     }

@@ -20,7 +20,7 @@ edition.workspace = true
 sdroxide-types.workspace = true
 # `default-features = false` for the same reason `sdroxide-cat` does it: drop
 # the `libudev` feature so libudev-sys is not linked. We only need the path.
-serialport = { version = "4.7", default-features = false }
+serialport = { version = "4.10", default-features = false }
 crossbeam-channel.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
