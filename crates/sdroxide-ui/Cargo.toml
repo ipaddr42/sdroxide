@@ -19,7 +19,7 @@ serde.workspace = true
 # silently switched it back off: without it the whole widget tree is
 # invisible to NVDA, Orca and VoiceOver. It is native-only (it maps to
 # egui-winit), so it costs the browser build nothing.
-eframe = { version = "0.35.0", default-features = false, features = [
+eframe = { version = "0.36.1", default-features = false, features = [
     "accesskit",
     "default_fonts",
     "wgpu",
