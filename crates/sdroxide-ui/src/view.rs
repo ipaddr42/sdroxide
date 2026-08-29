@@ -35,6 +35,25 @@ pub struct ViewState {
     pub spectrum_fraction: f32,
     /// Draw a decaying peak-hold trace over the spectrum.
     pub peak_hold: bool,
+    /// Draw the spectrum strip as a receding 3D surface instead of a flat
+    /// line: the newest spectrum across the front, the ones before it flowing
+    /// away from the viewer. See [`crate::widgets::spectrum3d`].
+    ///
+    /// Off by default — the flat line is the display everything else in the
+    /// panadapter is measured against, and the surface costs the strip's whole
+    /// height to say the same thing with time in it.
+    #[serde(default)]
+    pub spectrum_3d: bool,
+    /// How that surface is drawn: `true` fills it and colours it by the
+    /// waterfall palette, `false` draws each remembered spectrum as a trace
+    /// over an opaque fill.
+    ///
+    /// Solid by default: it is the rendering that puts the level in the colour
+    /// as well as in the shape, and it reuses the palette the operator has
+    /// already picked for the waterfall, so the two halves of the panadapter
+    /// agree about what a strong signal looks like.
+    #[serde(default = "spectrum_3d_solid_default")]
+    pub spectrum_3d_solid: bool,
     /// Keep the tuned frequency in the middle of the panadapter: every time
     /// the dial moves, the window slides under it so the marker stays put
     /// (issue #174).
@@ -477,6 +496,8 @@ impl Default for ViewState {
             fft_size: 4096,
             spectrum_fraction: 0.35,
             peak_hold: false,
+            spectrum_3d: false,
+            spectrum_3d_solid: spectrum_3d_solid_default(),
             center_on_vfo: false,
             spectrum_collapsed: false,
             waterfall_collapsed: false,
@@ -587,6 +608,12 @@ fn wide_waterfall_default() -> bool {
     true
 }
 
+/// Default for [`ViewState::spectrum_3d_solid`] — the filled, palette-coloured
+/// surface, which is what the 3D chip should show the first time it is clicked.
+fn spectrum_3d_solid_default() -> bool {
+    true
+}
+
 /// Default for [`ViewState::auto_fit`] — on, so the waterfall reads on the
 /// first band it is pointed at without anyone having to click FIT.
 fn auto_fit_default() -> bool {
@@ -679,6 +706,11 @@ mod tests {
         // The layer the SPEC popup added: a blob from before it must come back
         // with the waterfall shown, not hidden.
         assert!(v.waterfall_visible(), "upgrading hid the waterfall");
+        // The same for the 3D surface behind that popup's 3D chip: an upgrade
+        // must land on the flat trace, with the solid rendering waiting behind
+        // the chip rather than the wireframe a bare `default` would give.
+        assert!(!v.spectrum_3d, "upgrading switched the 3D surface on by itself");
+        assert!(v.spectrum_3d_solid, "the 3D surface would have come up as a wireframe");
     }
 
     /// The other direction of the same trap: a blob written by a build that

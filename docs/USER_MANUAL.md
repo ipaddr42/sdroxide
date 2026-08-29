@@ -647,12 +647,20 @@ sdroxide brings the receiver back up where you left it rather than on defaults.
     waterfall.
   - **PEAK HOLD** — trace the highest level each column has reached over the
     live line, decaying back down.
+  - **3D** — draw the spectrum as a receding surface instead of a flat line,
+    with the newest spectrum across the front. See
+    [The 3D spectrum](#the-3d-spectrum) below.
+  - **surface** — how that surface is drawn: **LINES** or **SOLID**. Greyed
+    until 3D is switched on.
+  - **flow** — how fast it flows away from you, and so how much time the
+    surface holds. Greyed until 3D is switched on.
   - **reaction** — how quickly the line follows the band: **Slow**, **Medium**
     or **Fast**. Slower averages more frames into each other, which steadies
     the line and holds a weak carrier still long enough to read. The waterfall
-    is not touched by it — those rows get every frame either way.
+    is not touched by it — those rows get every frame either way. It steadies
+    the 3D surface by the same amount, which is built from the same numbers.
   - **detail** — how many columns the panadapter *and its waterfall* are drawn
-    with; the width in force is named beside the chips. See
+    with; the width in force is named beside the button. See
     [Panadapter detail](#panadapter-detail) below.
 
   In the **Waterfall** box:
@@ -677,6 +685,8 @@ sdroxide brings the receiver back up where you left it rather than on defaults.
   Detail and the two speeds are this screen's own preference rather than the
   radio's: a remote client picks its own, and neither the station nor another
   client is touched. They are remembered between sessions.
+
+  ![The SPEC popup](images/spec-popup.png)
 - **WIDE** — show or hide the **full-band strip**: a shallow second waterfall
   above the panadapter covering everything the receiver can see at once, with a
   blue outline around the slice the panadapter is receiving and an amber line on
@@ -793,7 +803,7 @@ everyone should leave it on: it reads this machine's graphics — the largest
 texture it will hold, whether it is drawing on a real GPU or in software, which
 renderer is in use, whether the radio is across a network — together with how
 wide the panadapter actually is *in pixels*, and picks the most the machine can
-carry. The number it settled on is shown beside the chips.
+carry. The number it settled on is shown beside the buttons.
 
 The steps are **2048**, **4096** and **8192** columns. 2048 is what every
 sdroxide before this one drew, and about what a 1080p panadapter can show; 4096
@@ -815,14 +825,62 @@ Detail costs memory on the graphics card: 8 MB per radio tab at 2048, 16 at
 4096, 32 at 8192. Changing it restarts the waterfall's history from black,
 once.
 
-**Zooming in does not cost the receiver anything.** It used to: the resolution
-for a zoomed window came from a bigger transform over *everything the front end
-streams*, and on a wide SDR that could be most of the processor — enough, on a
-small machine, to start the driver dropping samples the moment somebody zoomed
-in ([issue #195](https://github.com/dividebysandwich/sdroxide/issues/195)). The
-window on screen is now mixed down and analysed at its own width instead, which
-resolves the same picture for a fraction of the work, and the full-rate
-transform stays the size the **detail** setting asks for. Nothing to set.
+#### The 3D spectrum
+
+The **3D** button in the SPEC popup swaps the flat spectrum line for a receding
+surface: the newest spectrum lies across the front at full width, and the ones
+before it flow away from you, narrowing towards a vanishing point. The last few
+seconds of the band are on screen at once as a landscape — how many is the
+**flow** row below — so a carrier that comes and goes reads as a ridge with a
+length to it rather than as a line that twitches, and a signal a couple of dB
+out of the noise is a bump you can follow backwards in time. The waterfall says the same thing in colour;
+this says it in shape.
+
+![The 3D spectrum: the solid surface above, the line rendering below](images/spectrum-3d.png)
+
+The **surface** row picks between the two renderings:
+
+- **SOLID** fills the surface and colours it by the same palette the waterfall
+  uses, so the level is in the colour as well as in the height and the two
+  halves of the panadapter agree about what a strong signal looks like. Change
+  the palette in Settings › Display.
+- **LINES** draws one trace per remembered spectrum in the flat line's own
+  colour: the shape without the levels. It strokes a line over the same surface
+  SOLID fills, so a column costs it more — and because both renderings are held
+  to the same drawing budget, it is given fewer of them. That makes it the
+  coarser of the two across the band, and the cheaper of the two to draw.
+
+The **flow** row sets how fast the surface travels: **Slow** (6 rows a second),
+**Medium** (12), **Fast** (24) or **Faster** (48). The surface is a fixed 48
+rows deep, so this is also how much band it holds — eight seconds at Slow, one
+at Faster — and the two ends of the row are two different instruments. Slow is
+a memory: a signal that came up once in the last few seconds is still on screen
+to be looked at. Faster is a motion display: the surface moves visibly, which is
+what makes a fade or a keying pattern something you watch rather than something
+you infer. The rate is in rows a *second* and not rows a frame, so the picture
+is the same on a browser client at 30 fps as on a desktop at 60; past the frame
+rate the extra rows are copies, which is why the buttons stop where they do. The
+waterfall keeps its own **scroll** rate, and neither touches the other.
+
+Both hide what is behind them, which is what makes the picture read as depth: a
+strong signal in front stands over the band it is covering, and a flat stretch
+in front lets the rows behind it show over the top. The dB scale down the left
+edge belongs to the front row — the newest spectrum — and so does everything
+else drawn *on* the spectrum: the passband wash, the filter edge grips and the
+tuning lines are kept to the front of the surface rather than cut through rows
+the filter was never set on. The flat grid and the **PEAK HOLD** trace both
+describe a single line and are not drawn at all while the surface is; the
+surface brings its own floor and its own amplitude axis instead.
+
+
+This is drawn on the client — the browser client has it too, on the same buttons
+— and it is off by default. It is not free, and it is the one display here that
+can double the client's own processor load: measured against the flat line on
+the same band, at 60 frames a second and a 1696-point-wide panadapter, 35% of a
+core for the flat line, 70% for the solid surface and 52% for the line one.
+Nothing reaches the radio, though — no extra work is asked of the engine, and
+nothing more goes over the link to a remote station, so a client that is
+struggling cannot slow the station down.
 
 #### Waterfall scroll speed
 
@@ -849,16 +907,6 @@ setting. Two costs worth knowing: the waterfall keeps a fixed number of
 lines, so history shortens as the rate rises (73 seconds at Medium, 9 at
 Fastest), and to a *remote* client every line is a byte per column on the
 link.
-
-The peak that makes each line "the strongest thing in its slice of time" is
-held only on the lane actually drawing the waterfall. It costs a comparison and
-a store per bin on every transform, over an array as long as the transform, and
-until v1.5.5 every analyser in the receiver paid it — including the full-rate
-one sitting behind a zoom lane, drawing nothing. On an RTL-SDR at 2.4 Msps that
-alone was most of the panadapter's share of the DSP thread, and dropping it
-halved that share
-([issue #216](https://github.com/dividebysandwich/sdroxide/issues/216)).
-
 
 ### 2.9 The S-meter
 
@@ -2011,7 +2059,7 @@ same way.
 
 When a station's codec cannot be decoded, the DRM window says so in place of
 guesswork: the codec is named, followed by *not decodable*, and the panel tells
-you which library is missing. The **DRM** chip in the top bar stays dark in that
+you which library is missing. The **DRM** button in the top bar stays dark in that
 state, because nothing is being heard.
 
 **What is not here.** Transmit: DRM is a broadcast system and there is no
@@ -2031,7 +2079,7 @@ may run:
 - **I/Q WAV** — the raw spectrum the receiver is delivering, described under
   [Recording the spectrum](#recording-the-spectrum) below.
 
-The chip lights while either is running and hovering it names the files. It has
+The button lights while either is running and hovering it names the files. It has
 no keyboard shortcut by default, but
 **Record on/off** is in the bindable action list, so it can be put on a key, a
 mouse button or a MIDI pad ([6.4](#64-controls-keyboard-mouse-and-midi)).
@@ -2113,9 +2161,8 @@ closed properly, so there is never a half-written file to repair.
 **I/Q WAV**, the second row of the REC picker, records the whole span the
 receiver is delivering rather than the audio of one signal in it: a band you can
 replay afterwards and tune around inside, decode differently, or hand to someone
-else ([issue #217](https://github.com/dividebysandwich/sdroxide/issues/217)).
-Beside the chip is what it costs at the current sample rate before you start it,
-and the megabytes and minutes written once it is running.
+else. Beside the button is what it costs at the current sample rate before you
+start it, and the megabytes and minutes written once it is running.
 
 The file is a stereo 32-bit float WAV — I in the left channel, Q in the right —
 at the receiver's own sample rate, which is what **SDR#**, **SDRuno**,
@@ -2138,10 +2185,10 @@ half minutes at that rate — so a capture that outgrows one is written as
 is an ordinary WAV until it needs not to be.
 
 A radio that hands over demodulated audio rather than I/Q — a transceiver on a
-sound card — has no spectrum to record, and the chip says so instead of being
-missing. Started from a remote or browser client the capture is written on the
-machine the receiver is plugged into, for the same reason the MP3 is, and rather
-more urgently: a gigabyte a minute is not something to send over a link.
+sound card — has no spectrum to record. Started from a remote or browser client
+the capture is written on the machine the receiver is plugged into, for the
+same reason the MP3 is, and rather more urgently: a gigabyte a minute is not
+something to send over a link.
 
 This is the same data `--record-iq` ([12](#12-command-line-reference)) writes,
 in a container other programs can open — `--record-iq` writes the bare samples
@@ -2875,8 +2922,7 @@ transmit. A label already in that mode leaves your own offset alone.
 **On VHF and UHF, use RTTY-FM instead.** Some national societies still send
 their weekly bulletin as RTTY on a 2 m FM channel, and that is not the same
 signal as RTTY on a sideband — the tone pair modulates an FM carrier rather than
-riding on one edge of a passband. **RTTY-FM** is on the DIGITAL row beside RTTY
-([issue #214](https://github.com/dividebysandwich/sdroxide/issues/214)).
+riding on one edge of a passband. **RTTY-FM** is on the DIGITAL row beside RTTY.
 
 Everything about the modem is the same: the same Baudot alphabet, the same
 2125/2295 Hz tone pair, the same shift, baud and **Reverse** controls and the
@@ -3959,7 +4005,7 @@ when it was registered, unique worldwide and unchanging.
 | KM | Range from your station. Shown once **My grid** is filled in ([§3.1](#31-general-considerations)). |
 | AGE | How long since anything at all was heard from it. |
 
-The chips above the list sort it; clicking the one already selected reverses the
+The buttons above the list sort it; clicking the one already selected reverses the
 order. Clicking a row opens the full card below it — everything the table has no
 room for, including geometric altitude, turn rate, signal level and the last
 frame as hex — and selects the aircraft on the map. **CENTER** in the card puts
@@ -4089,10 +4135,8 @@ capture is 10 dB above it, no decoder will find anything in it.
 ### 3.14 NAVTEX
 
 Choose **NAVTEX** from the DIGITAL row. It is the maritime safety broadcast
-every coast station in the world sends — navigational and meteorological
-warnings, search-and-rescue bulletins, ice reports, pilot notices — and one of
-the few utility services still worth leaving a receiver on
-([issue #212](https://github.com/dividebysandwich/sdroxide/issues/212)).
+every coast station in the world sends: navigational and meteorological
+warnings, search-and-rescue bulletins, ice reports, pilot notices.
 
 **Receive only, and deliberately.** The service belongs to coast stations and
 sits next to distress traffic; an amateur transmitting on it would be putting
@@ -7940,7 +7984,7 @@ than a continuous control).
 > whose own default is 19200, so a configuration in which you have never touched
 > **Baud** starts out at a rate the radio has no setting for. sdroxide falls back
 > to 38400 in that case and says so on screen, but the honest fix is to set this
-> to whatever menu 70 says ([issue #146](https://github.com/dividebysandwich/sdroxide/issues/146)).
+> to whatever menu 70 says.
 
 Leave the port **empty** and an FDM-DUO is still usable on its receive cable
 alone: the driver tunes, changes mode and keys through the CAT gateway on the
@@ -7980,20 +8024,6 @@ number you have typed into it, so set the band on the radio and type its dial
 frequency here to line the two up. That is also how an FDM-S1 or FDM-S2 works,
 having no VFO at all.
 
-> Earlier versions parked the VFO on the panadapter **centre** and moved the dial
-> inside the window in software. The radio's display then never agreed with
-> sdroxide's, its own audio was demodulating the centre rather than the station
-> you were listening to, an over keyed at the radio went out on the centre, and a
-> tuning step smaller than half the window commanded nothing at all — so the dial
-> and the mouse wheel simply did not move the radio
-> ([issue #146](https://github.com/dividebysandwich/sdroxide/issues/146)).
->
-> Before that, the VFO was held on the transmit frequency while receiving, which
-> dragged the window along underneath a panadapter that did not know it had
-> moved: a click on a signal moved that signal across the screen by the same
-> distance instead of tuning it
-> ([issue #111](https://github.com/dividebysandwich/sdroxide/issues/111)).
-
 **CW is keyed by the radio's own key or paddle.** The FDM-DUO has no command
 that accepts text — its `SW` command plays one of the ten messages stored *in
 the radio* — so the CW panel cannot key it over CAT. Menu 37 `CW IN` set to
@@ -8008,8 +8038,7 @@ own receiver the 700 Hz down, so the radio's display reads the frequency you are
 working (the same figure the CW panel shows beside the pitch, and the one to
 log) while sdroxide's readout stays the zero-beat it has always been. Nothing on
 the waterfall moves. Without it the paddle answered every station a whole
-sidetone low and nobody came back
-([issue #170](https://github.com/dividebysandwich/sdroxide/issues/170)).
+sidetone low and nobody came back.
 
 > **Not verified against hardware.** The whole of this backend — the USB
 > protocol, the tuning arithmetic, the calibration map and the CAT dialect — is
@@ -8495,11 +8524,10 @@ spoken announcements below them under `[speech]`:
   shows.
 
   **Small screen** is Tablet with everything pulled in — the single-row strip
-  and its compact readout, and the operating panels' chips and row spacing
+  and its compact readout, and the operating panels' buttons and row spacing
   tightened. It is for a screen like **1366×768**, which is wide enough for the
   roomy layout and short enough that a decode list and a waterfall are fighting
-  over about six hundred points
-  ([issue #211](https://github.com/dividebysandwich/sdroxide/issues/211)).
+  over about six hundred points.
   **Auto** already tightens the panels on any window under about 820 points
   tall, so a small laptop gets most of this without being told; the setting is
   for the rest of it, and for anyone who wants the tighter panels in a window
@@ -9180,9 +9208,7 @@ A few things worth knowing:
   header carries a channel count, and WSJT-X leaves it uninitialised — a
   different random number in every packet. Taken at face value that collapses
   each 10 ms packet to a single sample, which is what made a 15 s FT8 slot go
-  out as a few seconds of chopped signal
-  ([issue #202](https://github.com/dividebysandwich/sdroxide/issues/202)). The
-  payload is read instead where the field is not a channel count.
+  out as a few seconds of chopped signal.
 
 #### 6.8.3 WSJT-X UDP broadcast
 
@@ -11527,8 +11553,7 @@ a carrier and FT8 is a synthesised burst, so neither goes anywhere near the
 microphone — a voice mode is the only thing that does, and if the microphone is
 not the card you are speaking into there is nothing to modulate. The drive
 slider, the power register and the meters all read correctly throughout, which
-is what makes it look like a power bug
-([#215](https://github.com/dividebysandwich/sdroxide/issues/215)).
+is what makes it look like a power bug.
 
 An over that goes out with nothing on the microphone now says so when you
 unkey — "That over went out with no audio". Pick the input under **Settings →
@@ -11541,8 +11566,7 @@ another panic naming `wgpu`, after running for a while.**
 The graphics driver refused an allocation and the renderer has no way to carry
 on without one. It is the driver's failure rather than sdroxide's — reported on
 an Intel HD Graphics 530 under Mesa, an hour into a session, with a wgpu
-validation error a moment before it
-([#219](https://github.com/dividebysandwich/sdroxide/issues/219)) — and nothing
+validation error a moment before it — and nothing
 in the program can prevent it. What it can do is not walk into it twice: a panic
 that came from the graphics driver leaves a note in
 `renderer-fallback.txt` in the configuration directory
@@ -11569,9 +11593,7 @@ on such a card that can take several seconds; the window's real size, arriving
 while that is still going, used to make sdroxide wait for the card to catch up.
 OpenGL gives that kind of wait 2.147 seconds and not a moment more, after which
 the window counted as broken and the process died — twice over, the second time
-inside its own cleanup, which is where the backtrace came from. It was reported
-on an Intel HD Graphics 4000 running its 2013 OpenGL driver
-([#148](https://github.com/dividebysandwich/sdroxide/issues/148)).
+inside its own cleanup, which is where the backtrace came from.
 
 sdroxide no longer asks to be kept waiting by an OpenGL driver, so a slow card
 is now merely slow. The wait bought nothing here in any case — nothing in

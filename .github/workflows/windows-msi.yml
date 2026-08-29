@@ -24,7 +24,7 @@ jobs:
     name: web client (wasm)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: wasm32-unknown-unknown
@@ -40,7 +40,7 @@ jobs:
       - name: Build web client
         working-directory: crates/sdroxide-web
         run: trunk build --release
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: web-dist
           path: crates/sdroxide-web/dist
@@ -56,7 +56,7 @@ jobs:
     steps:
       # `submodules` pulls vendor/rade_c (the RADE codec), vendor/faad2 (the AAC
       # decoder the DRM receiver is built with) and vendor/rtl_433.
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           submodules: recursive
 
@@ -104,7 +104,7 @@ jobs:
 
       # The embed-web feature bakes these files into the binary via rust-embed.
       - name: Fetch web client
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: web-dist
           path: crates/sdroxide-web/dist
@@ -144,7 +144,7 @@ jobs:
             -d Version="$CARGO_VERSION" -d BinDir="$BIN_DIR" \
             -o "out/$PKG.msi"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: ${{ env.PKG }}-msi
           path: out/*.msi

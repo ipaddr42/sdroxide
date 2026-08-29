@@ -253,6 +253,12 @@ pub struct WfTuning {
     pub spectrum_alpha: f32,
     /// Waterfall colour-palette index (from `UiSettings`).
     pub palette: usize,
+    /// Rows a second the 3D spectrum flows away from the viewer, from the SPEC
+    /// popup's **flow** row. Zero while the stream is stalled, which is what
+    /// holds the surface still — the same rule that stops the waterfall
+    /// scrolling rather than filling it with rows of a spectrum nobody is
+    /// measuring any more.
+    pub surface_rows_per_sec: f32,
     /// Optional vertical gradient `(top, bottom)` filling the spectrum area,
     /// `None` when disabled in the UI settings.
     pub gradient: Option<(Color32, Color32)>,
@@ -1020,6 +1026,11 @@ pub fn show_ext(
     peaks: &mut PeakHold,
     smooth: &mut SpectrumSmooth,
     trace: &mut TraceCache,
+    // The remembered spectra behind the 3D surface, when the SPEC popup's 3D
+    // chip is lit. Kept by the app rather than here for the same reason the
+    // smoothing and the peak hold are: it is history, and a widget redrawn
+    // from scratch every frame has nowhere to keep any.
+    surface: &mut crate::widgets::spectrum3d::Surface,
     cursor: Option<AudioCursor>,
     // FT8 DXpedition role. Anything but `Normal` shades the two halves of the
     // passband the pile-up divides itself into, with the half we operate in
@@ -1118,6 +1129,23 @@ pub fn show_ext(
     let spec_rect = Rect::from_min_size(rect.min, vec2(rect.width(), spec_h));
     let scale_rect =
         Rect::from_min_size(pos2(rect.left(), spec_rect.bottom()), vec2(rect.width(), scale_h()));
+    // What the marks that annotate the *current* spectrum are drawn across —
+    // the passband wash, the filter edge grips, the tuning lines. The whole
+    // strip for the flat trace, and only its front plane for the 3D surface:
+    // there the newest spectrum is the bottom of the picture and everything
+    // above it is time already gone, so a line drawn the full height would cut
+    // through rows the filter was never set on. See `spectrum3d::front_plane_h`.
+    let spec_marks = if view.spectrum_3d {
+        Rect::from_min_max(
+            pos2(
+                spec_rect.left(),
+                spec_rect.bottom() - crate::widgets::spectrum3d::front_plane_h(spec_h),
+            ),
+            spec_rect.max,
+        )
+    } else {
+        spec_rect
+    };
     let wf_rect = Rect::from_min_max(pos2(rect.left(), scale_rect.bottom()), rect.max);
 
     // Where the spot lanes and their ticks go. Normally the waterfall, since
@@ -1857,28 +1885,55 @@ pub fn show_ext(
             mesh.indices.extend_from_slice(&[0, 1, 2, 0, 2, 3]);
             painter.add(Shape::mesh(mesh));
         }
-        draw_grid(&painter, view, &spec_rect);
-        if view.peak_hold {
-            peaks.update(f);
-            let key = trace_key(f, peaks.generation, view, &spec_rect, wf.row_scale);
-            let pts = trace.hold.points_for(key, || {
-                compute_trace(view, f, Some(&peaks.bins), &spec_rect, wf.row_scale)
-            });
-            painter.add(Shape::line(
-                pts,
-                Stroke::new(1.0, Color32::from_rgba_unmultiplied(255, 220, 90, 170)),
-            ));
-        } else {
-            peaks.clear();
-        }
-        // Live trace: UI-smoothed (per the spectrum-speed setting) so the line's
-        // reaction speed is independent of the un-averaged waterfall detail.
+        // UI-smoothed (per the spectrum-speed setting) so the line's reaction
+        // speed is independent of the un-averaged waterfall detail. Folded in
+        // before either display is drawn: the 3D surface remembers these same
+        // bins, so the reaction setting steadies it exactly as it steadies the
+        // flat trace.
         smooth.update(f, wf.spectrum_alpha);
-        let key = trace_key(f, smooth.generation, view, &spec_rect, wf.row_scale);
-        let pts = trace.live.points_for(key, || {
-            compute_trace(view, f, Some(&smooth.bins), &spec_rect, wf.row_scale)
-        });
-        painter.add(Shape::line(pts, Stroke::new(1.0, Color32::from_rgb(120, 220, 255))));
+        if view.spectrum_3d {
+            // Time has the depth axis instead of being thrown away. The flat
+            // grid and the peak hold are both statements about a single line
+            // and have nothing to say about a surface, so neither is drawn —
+            // the surface brings its own floor and its own amplitude axis.
+            peaks.clear();
+            surface.push(
+                f.center_hz,
+                f.span_hz,
+                &smooth.bins,
+                wf.now_unix,
+                wf.surface_rows_per_sec,
+            );
+            crate::widgets::spectrum3d::draw(
+                &painter,
+                &spec_rect,
+                view,
+                surface,
+                view.spectrum_3d_solid,
+                wf.palette,
+            );
+        } else {
+            surface.clear();
+            draw_grid(&painter, view, &spec_rect);
+            if view.peak_hold {
+                peaks.update(f);
+                let key = trace_key(f, peaks.generation, view, &spec_rect, wf.row_scale);
+                let pts = trace.hold.points_for(key, || {
+                    compute_trace(view, f, Some(&peaks.bins), &spec_rect, wf.row_scale)
+                });
+                painter.add(Shape::line(
+                    pts,
+                    Stroke::new(1.0, Color32::from_rgba_unmultiplied(255, 220, 90, 170)),
+                ));
+            } else {
+                peaks.clear();
+            }
+            let key = trace_key(f, smooth.generation, view, &spec_rect, wf.row_scale);
+            let pts = trace.live.points_for(key, || {
+                compute_trace(view, f, Some(&smooth.bins), &spec_rect, wf.row_scale)
+            });
+            painter.add(Shape::line(pts, Stroke::new(1.0, Color32::from_rgb(120, 220, 255))));
+        }
     }
     draw_scale(&painter, view, &scale_rect);
 
@@ -1939,7 +1994,7 @@ pub fn show_ext(
         // waterfall, so the filter width stays visible when collapsed.
         if spec_h > 1.0 {
             painter.rect_filled(
-                Rect::from_min_max(pos2(x0c, spec_rect.top()), pos2(x1c, spec_rect.bottom())),
+                Rect::from_min_max(pos2(x0c, spec_marks.top()), pos2(x1c, spec_marks.bottom())),
                 0.0,
                 Color32::from_rgba_unmultiplied(255, 90, 90, 26),
             );
@@ -1962,7 +2017,7 @@ pub fn show_ext(
                 } else {
                     crate::theme::scope_gray(90)
                 };
-                painter.vline(x, spec_rect.y_range(), Stroke::new(w, color));
+                painter.vline(x, spec_marks.y_range(), Stroke::new(w, color));
             }
             let wf_color = if hot {
                 Color32::from_rgba_unmultiplied(255, 170, 90, 200)
@@ -1975,7 +2030,7 @@ pub fn show_ext(
 
     if in_view(vfo_hz) {
         let x = view.freq_to_x(vfo_hz, &rect);
-        painter.vline(x, spec_rect.y_range(), Stroke::new(1.0, Color32::from_rgb(255, 60, 60)));
+        painter.vline(x, spec_marks.y_range(), Stroke::new(1.0, Color32::from_rgb(255, 60, 60)));
         painter.vline(
             x,
             wf_rect.y_range(),
@@ -1994,7 +2049,10 @@ pub fn show_ext(
         if sx1c > sx0c {
             if spec_h > 1.0 {
                 painter.rect_filled(
-                    Rect::from_min_max(pos2(sx0c, spec_rect.top()), pos2(sx1c, spec_rect.bottom())),
+                    Rect::from_min_max(
+                        pos2(sx0c, spec_marks.top()),
+                        pos2(sx1c, spec_marks.bottom()),
+                    ),
                     0.0,
                     Color32::from_rgba_unmultiplied(c_r, c_g, c_b, 30),
                 );
@@ -2015,7 +2073,7 @@ pub fn show_ext(
                     } else {
                         Color32::from_rgba_unmultiplied(c_r, c_g, c_b, 110)
                     };
-                    painter.vline(x, spec_rect.y_range(), Stroke::new(w, color));
+                    painter.vline(x, spec_marks.y_range(), Stroke::new(w, color));
                 }
                 painter.vline(
                     x,
@@ -2032,7 +2090,7 @@ pub fn show_ext(
             // The tuning line thickens under the pointer so the operator can
             // see they have hold of it before they start dragging.
             let w = if hover_sub || sub_drag { 2.5 } else { 1.5 };
-            painter.vline(x, spec_rect.y_range(), Stroke::new(w, SUB_COLOR));
+            painter.vline(x, spec_marks.y_range(), Stroke::new(w, SUB_COLOR));
             painter.vline(
                 x,
                 wf_rect.y_range(),
@@ -2119,7 +2177,7 @@ pub fn show_ext(
         let hz = state.rx_freq_hz() + a as f64;
         if in_view(hz) {
             let x = view.freq_to_x(hz, &rect);
-            painter.vline(x, spec_rect.y_range(), Stroke::new(1.5, crate::theme::scope().accent));
+            painter.vline(x, spec_marks.y_range(), Stroke::new(1.5, crate::theme::scope().accent));
             painter.vline(
                 x,
                 wf_rect.y_range(),
@@ -2133,7 +2191,7 @@ pub fn show_ext(
         if in_view(hz) {
             let x = view.freq_to_x(hz, &rect);
             let c = Color32::from_rgb(255, 190, 90);
-            painter.vline(x, spec_rect.y_range(), Stroke::new(1.0, c));
+            painter.vline(x, spec_marks.y_range(), Stroke::new(1.0, c));
             painter.vline(
                 x,
                 wf_rect.y_range(),
@@ -2152,7 +2210,7 @@ pub fn show_ext(
     if in_view(inactive_hz) {
         let x = view.freq_to_x(inactive_hz, &rect);
         let color = Color32::from_rgba_unmultiplied(255, 170, 40, 90);
-        painter.vline(x, spec_rect.y_range(), Stroke::new(1.0, color));
+        painter.vline(x, spec_marks.y_range(), Stroke::new(1.0, color));
         painter.vline(
             x,
             wf_rect.y_range(),
@@ -2441,6 +2499,9 @@ pub fn show_ext(
             // Item 6: crosshair + click-tune frequency readout.
             let line = Color32::from_rgba_unmultiplied(185, 205, 225, 70);
             if spec_h > 1.0 {
+                // The whole strip, not `spec_marks`: this one follows the
+                // pointer, and a crosshair that stopped short of wherever the
+                // pointer actually is would read as a broken one.
                 painter.vline(p.x, spec_rect.y_range(), Stroke::new(1.0, line));
             }
             painter.vline(p.x, wf_rect.y_range(), Stroke::new(1.0, line));

@@ -455,6 +455,14 @@ impl SdroxideApp {
             // The operator's own rate, unscaled: the gridlines are spaced in
             // points and derive the rest from `row_scale` themselves.
             rows_per_sec: self.ui_settings.waterfall_rows_per_sec(),
+            // Gated on `live` for the reason the waterfall's rows are: a
+            // stalled stream must freeze the picture, not fill it with copies
+            // of the last spectrum it managed to send.
+            surface_rows_per_sec: if live {
+                self.ui_settings.spectrum_3d_rows_per_sec()
+            } else {
+                0.0
+            },
             row_scale: row_scale.max(1.0),
             tex_w: self.panadapter_bins(),
             now_unix: self.wf_now_pin,

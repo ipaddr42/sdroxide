@@ -550,6 +550,7 @@ impl eframe::App for SdroxideApp {
                         &mut self.peaks,
                         &mut self.spec_smooth,
                         &mut self.trace_cache,
+                        &mut self.spec3d,
                         // A click sets the tone offset in the modes that park
                         // on an agreed dial and pick a signal inside the
                         // sub-band. Not in RTTY: its tone pair is a standard
@@ -740,6 +741,7 @@ impl eframe::App for SdroxideApp {
                         &mut self.peaks,
                         &mut self.spec_smooth,
                         &mut self.trace_cache,
+                        &mut self.spec3d,
                         cw_pitch,
                         sdroxide_types::DxpedMode::Normal,
                         false,

@@ -216,6 +216,9 @@ pub struct SdroxideApp {
     wf_now_pin: f64,
     /// Cached spectrum polylines (recomputed only when frame/view/rect change).
     trace_cache: spectrum_view::TraceCache,
+    /// The spectra behind the 3D surface, when the SPEC popup's 3D chip is lit
+    /// — the panadapter's only piece of history that is not the waterfall's.
+    spec3d: crate::widgets::spectrum3d::Surface,
     /// Switchable sound devices, queried once each time the settings dialog
     /// opens (cpal enumeration is too slow for per-frame).
     audio_devices: Option<AudioDevices>,
@@ -1051,6 +1054,7 @@ impl SdroxideApp {
             wf_row_accum: 0.0,
             wf_now_pin: 0.0,
             trace_cache: spectrum_view::TraceCache::default(),
+            spec3d: Default::default(),
             audio_devices: None,
             audio_devices_queried: false,
             // Asked for when the settings dialog opens, along with everything

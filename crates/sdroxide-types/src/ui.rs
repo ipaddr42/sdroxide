@@ -32,6 +32,12 @@ impl Speed {
     pub const WATERFALL: [Speed; 5] =
         [Speed::Slow, Speed::Medium, Speed::Fast, Speed::Faster, Speed::Fastest];
 
+    /// The four the 3D spectrum's flow offers. No `Fastest`: the surface is
+    /// advanced by the client from the frames it is sent, so its ceiling is the
+    /// frame rate — 60 by default — and a fifth step above `Faster` would only
+    /// repeat rows.
+    pub const SURFACE: [Speed; 4] = [Speed::Slow, Speed::Medium, Speed::Fast, Speed::Faster];
+
     pub fn label(self) -> &'static str {
         match self {
             Speed::Slow => "Slow",
@@ -441,6 +447,14 @@ pub struct UiSettings {
     pub waterfall_speed: Speed,
     /// How fast the spectrum line reacts (averaging; slower = smoother).
     pub spectrum_speed: Speed,
+    /// How fast the 3D spectrum flows away from the viewer.
+    ///
+    /// Its own setting rather than the waterfall's, even though both are time
+    /// axes, because the two are read at different lengths: the waterfall is
+    /// minutes of band and this is the last few seconds of it, and the rate
+    /// that makes a CW trace legible on one buries the other's whole depth in a
+    /// fifth of a second. See [`UiSettings::spectrum_3d_rows_per_sec`].
+    pub spectrum_3d_speed: Speed,
     /// Waterfall colour palette, as an index into the client's palette list.
     pub waterfall_palette: usize,
     /// How many columns the panadapter and its waterfall are drawn with.
@@ -585,6 +599,7 @@ impl Default for UiSettings {
             frame_rate_fps: 60,
             waterfall_speed: Speed::Medium,
             spectrum_speed: Speed::Medium,
+            spectrum_3d_speed: Speed::Medium,
             waterfall_palette: 0,
             spectrum_detail: SpectrumDetail::Auto,
             spectrum_gradient: true,
@@ -657,6 +672,28 @@ impl UiSettings {
             Speed::Fast => 56.0,
             Speed::Faster => 112.0,
             Speed::Fastest => 224.0,
+        }
+    }
+
+    /// Rows a second the 3D spectrum flows away from the viewer.
+    ///
+    /// The surface remembers a fixed number of spectra, so this is also how
+    /// much time its depth covers — at 48 rows deep, eight seconds at `Slow`
+    /// down to one at `Faster`. Slower is a longer memory and a surface that
+    /// crawls; faster is a shorter one that moves, which is what makes a signal
+    /// that is only there for a moment show up as a shape rather than a blip.
+    ///
+    /// Nothing above the frame rate buys anything: the client advances the
+    /// surface from the spectra it is sent, so a rate past them repeats rows —
+    /// which is why the chips stop at `Faster` and why `Fastest` is answered
+    /// here anyway, for a hand-edited config.
+    pub fn spectrum_3d_rows_per_sec(self) -> f32 {
+        match self.spectrum_3d_speed {
+            Speed::Slow => 6.0,
+            Speed::Medium => 12.0,
+            Speed::Fast => 24.0,
+            Speed::Faster => 48.0,
+            Speed::Fastest => 96.0,
         }
     }
 
