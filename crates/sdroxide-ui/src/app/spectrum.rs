@@ -350,8 +350,19 @@ impl SdroxideApp {
         // resolution finer than the span is exactly what somebody zoomed in is
         // asking for, and the seconds it costs are then a price they chose.
         let base = base_fft_for_rate(self.view.fft_size, full_span);
+        // …and never past the point where the engine's own zoom lane would
+        // switch off. Growing this analyser is a transform over everything the
+        // front end streams; the lane resolves the same window off a decimated
+        // copy for a fraction of it, and asking for more than this stops it
+        // being built at all — which is what made zooming in on a 2 Msps
+        // HackRF start dropping samples (issue #195).
+        let ceiling = viewport
+            .and_then(|(lo, hi)| {
+                sdroxide_types::panadapter_fft_ceiling(full_span, hi - lo, self.panadapter_bins())
+            })
+            .unwrap_or(MAX_FFT);
         let mut fft = base;
-        while (fft as f64) < base as f64 * zoom.min(8.0) && fft < MAX_FFT {
+        while (fft as f64) < base as f64 * zoom.min(8.0) && fft < MAX_FFT && fft * 2 <= ceiling {
             fft *= 2;
         }
         SpectrumConfig {

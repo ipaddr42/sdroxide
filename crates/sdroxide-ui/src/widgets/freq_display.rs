@@ -10,6 +10,16 @@ use sdroxide_types::WheelSettings;
 /// The readout's design size, and the largest it is ever drawn at. Narrower
 /// layouts fit smaller digits into the room they have — see `freq_module`.
 pub const DIGIT_SIZE: f32 = 40.0;
+/// Digit columns the readout normally carries: enough for 9.999999999 GHz,
+/// which is every band this program reaches without a converter in front of
+/// the radio.
+pub const DIGITS: u32 = 10;
+/// One more than [`DIGITS`] — for a station whose LNB/converter puts real
+/// frequencies at or past 10 GHz, a QO-100 downlink chief among them. Callers
+/// decide which a radio needs; see `SdroxideApp::readout_digits`. Kept
+/// conditional rather than paid by every radio: the extra column costs the
+/// top strip a full digit's width, and the packer already runs tight.
+pub const DIGITS_EXT: u32 = 11;
 /// The lit digits' amber, shared by both readouts and the type-in field.
 ///
 /// The readout is the one number an operator reads from across the shack, so
@@ -23,7 +33,9 @@ fn digit_ink() -> Color32 {
     }
 }
 
-/// Shows `hz` as a 10-digit tunable readout. Returns `Some(new_hz)` on change.
+/// Shows `hz` as a `digits`-column tunable readout — [`DIGITS`] on every radio
+/// this program reaches without a converter, [`DIGITS_EXT`] on one whose
+/// LNB/converter offset puts it past 10 GHz. Returns `Some(new_hz)` on change.
 ///
 /// `wheel` supplies the operator's pointer preferences: `digit_wheel` turns the
 /// per-digit scroll stepping off for anyone who would rather scroll the page,
@@ -43,6 +55,7 @@ pub fn show(
     wheel: WheelSettings,
     size: f32,
     ink: Option<Color32>,
+    digits: u32,
 ) -> Option<f64> {
     let lit = ink.unwrap_or_else(digit_ink);
     let mut freq = hz.round().max(0.0) as i64;
@@ -50,8 +63,8 @@ pub fn show(
 
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 1.0;
-        for p in (0..10u32).rev() {
-            if p < 9 && (p + 1) % 3 == 0 {
+        for p in (0..digits).rev() {
+            if p < digits - 1 && (p + 1) % 3 == 0 {
                 ui.add(Label::new(
                     RichText::new(".").monospace().size(size).color(crate::theme::gray(110)),
                 ));
@@ -126,20 +139,21 @@ fn zero_from_digit(freq: i64, step: i64) -> i64 {
 /// Losing the per-digit targets is also what lets the compact boxes shrink
 /// the digits below comfortable clicking size.
 ///
-/// Returns `Some(new_hz)` when a typed frequency is committed. `ink` is
-/// [`show`]'s.
+/// Returns `Some(new_hz)` when a typed frequency is committed. `ink` and
+/// `digits` are [`show`]'s.
 pub fn show_typed(
     ui: &mut Ui,
     id: egui::Id,
     hz: f64,
     size: f32,
     ink: Option<Color32>,
+    digits: u32,
 ) -> Option<f64> {
     let edit_id = id.with("edit");
     match ui.data(|d| d.get_temp::<String>(edit_id)) {
-        Some(text) => edit_field(ui, id, edit_id, text, size),
+        Some(text) => edit_field(ui, id, edit_id, text, size, digits),
         None => {
-            show_dial(ui, id, edit_id, hz, size, ink);
+            show_dial(ui, id, edit_id, hz, size, ink, digits);
             None
         }
     }
@@ -154,14 +168,15 @@ fn show_dial(
     hz: f64,
     size: f32,
     ink: Option<Color32>,
+    digits: u32,
 ) {
     let lit = ink.unwrap_or_else(digit_ink);
     let freq = hz.round().max(0.0) as i64;
     let row = ui
         .horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 1.0;
-            for p in (0..10u32).rev() {
-                if p < 9 && (p + 1) % 3 == 0 {
+            for p in (0..digits).rev() {
+                if p < digits - 1 && (p + 1) % 3 == 0 {
                     ui.add(Label::new(
                         RichText::new(".").monospace().size(size).color(crate::theme::gray(110)),
                     ));
@@ -197,6 +212,21 @@ fn show_dial(
     }
 }
 
+/// The digit-and-dot template a `digits`-column readout spans — "0.000.000.000"
+/// at [`DIGITS`], one more leading zero at [`DIGITS_EXT`]. Grouped the same way
+/// [`show`] draws it, so the template is always as wide as the dial it stands
+/// in for.
+fn digit_template(digits: u32) -> String {
+    let mut s = String::with_capacity(digits as usize + 3);
+    for p in (0..digits).rev() {
+        if p < digits - 1 && (p + 1) % 3 == 0 {
+            s.push('.');
+        }
+        s.push('0');
+    }
+    s
+}
+
 /// The type-in field the dial turns into, in the dial's own font and ink.
 fn edit_field(
     ui: &mut Ui,
@@ -204,20 +234,17 @@ fn edit_field(
     edit_id: egui::Id,
     mut text: String,
     size: f32,
+    digits: u32,
 ) -> Option<f64> {
     let field_id = id.with("field");
     let mut out = None;
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 1.0;
         // Sized so the box the dial sits in does not move when it turns into
-        // the editor: the field spans what the ten digits spanned.
+        // the editor: the field spans what the digits spanned.
         let digits_w = ui
             .painter()
-            .layout_no_wrap(
-                "0.000.000.000".to_owned(),
-                egui::FontId::monospace(size),
-                Color32::WHITE,
-            )
+            .layout_no_wrap(digit_template(digits), egui::FontId::monospace(size), Color32::WHITE)
             .size()
             .x;
         let resp = crate::chrome::field(
@@ -246,7 +273,7 @@ fn edit_field(
         // editor; only Enter carrying a parsable number tunes anything.
         let done = resp.lost_focus();
         if done && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-            out = parse_mhz(&text);
+            out = parse_mhz(&text, digits);
         }
         if done {
             ui.data_mut(|d| d.remove_temp::<String>(edit_id));
@@ -266,11 +293,19 @@ fn format_mhz(hz: f64) -> String {
 }
 
 /// A typed MHz value as Hz. Accepts the decimal comma half the world types.
-/// `None` — nothing to tune to — for anything unparsable or out of all range.
-fn parse_mhz(s: &str) -> Option<f64> {
+/// `None` — nothing to tune to — for anything unparsable or out of range for
+/// `digits` columns (`1e`*`digits`* Hz and up — [`DIGITS`] refuses 10 GHz and
+/// past it, [`DIGITS_EXT`] refuses 100 GHz and past it).
+///
+/// Gated by `digits` rather than a single generous ceiling: accepting a
+/// number the *resting* dial cannot hold would just have `show_dial` truncate
+/// it silently right back to a wrong-looking readout the moment focus left
+/// the field — the same corruption naming `digits` here exists to prevent.
+fn parse_mhz(s: &str, digits: u32) -> Option<f64> {
     let mhz: f64 = s.trim().replace(',', ".").parse().ok()?;
     let hz = (mhz * 1e6).round();
-    (hz.is_finite() && (0.0..1e10).contains(&hz)).then_some(hz)
+    let max = 10f64.powi(digits as i32);
+    (hz.is_finite() && (0.0..max).contains(&hz)).then_some(hz)
 }
 
 #[cfg(test)]
@@ -279,13 +314,23 @@ mod tests {
 
     #[test]
     fn typed_frequencies_parse_as_mhz() {
-        assert_eq!(parse_mhz("14.074"), Some(14_074_000.0));
-        assert_eq!(parse_mhz(" 7,1 "), Some(7_100_000.0), "decimal comma");
-        assert_eq!(parse_mhz("0.4776"), Some(477_600.0));
-        assert_eq!(parse_mhz(""), None);
-        assert_eq!(parse_mhz("ten"), None);
-        assert_eq!(parse_mhz("-7.1"), None, "a negative frequency is a typo");
-        assert_eq!(parse_mhz("1e7"), None, "10 THz is out of every range");
+        assert_eq!(parse_mhz("14.074", DIGITS), Some(14_074_000.0));
+        assert_eq!(parse_mhz(" 7,1 ", DIGITS), Some(7_100_000.0), "decimal comma");
+        assert_eq!(parse_mhz("0.4776", DIGITS), Some(477_600.0));
+        assert_eq!(parse_mhz("", DIGITS), None);
+        assert_eq!(parse_mhz("ten", DIGITS), None);
+        assert_eq!(parse_mhz("-7.1", DIGITS), None, "a negative frequency is a typo");
+        assert_eq!(parse_mhz("1e7", DIGITS), None, "10 THz is out of every range");
+    }
+
+    /// The QO-100 beacon (10489.75 MHz) is exactly the case [`DIGITS_EXT`]
+    /// exists for: refused at the normal digit count, where the resting dial
+    /// could not show it without silently dropping its leading digit, and
+    /// accepted once the radio's own converter has earned it the extra column.
+    #[test]
+    fn a_ten_gigahertz_frequency_needs_the_extended_digit_count() {
+        assert_eq!(parse_mhz("10489.75", DIGITS), None, "10 GHz+ needs DIGITS_EXT");
+        assert_eq!(parse_mhz("10489.75", DIGITS_EXT), Some(10_489_750_000.0));
     }
 
     #[test]
@@ -295,8 +340,22 @@ mod tests {
         assert_eq!(format_mhz(477_612.0), "0.477612");
         assert_eq!(format_mhz(0.0), "0");
         for hz in [14_074_000.0, 7_000_000.0, 477_612.0] {
-            assert_eq!(parse_mhz(&format_mhz(hz)), Some(hz), "prefill for {hz} did not round-trip");
+            assert_eq!(
+                parse_mhz(&format_mhz(hz), DIGITS),
+                Some(hz),
+                "prefill for {hz} did not round-trip"
+            );
         }
+    }
+
+    /// [`digit_template`] has to measure exactly as wide as what [`show`]
+    /// draws for the same `digits`, or the type-in field jumps sideways when
+    /// the dial turns into it — the whole reason it exists rather than a
+    /// literal.
+    #[test]
+    fn the_digit_template_groups_the_same_way_the_dial_does() {
+        assert_eq!(digit_template(DIGITS), "0.000.000.000");
+        assert_eq!(digit_template(DIGITS_EXT), "00.000.000.000");
     }
 
     #[test]

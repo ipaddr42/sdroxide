@@ -708,8 +708,10 @@ starting sdroxide before the rig is fine:
 
   The AD9361's four AGC modes, receive gain, transmit attenuation and both RF
   ports are on the Radio tab. Tuning limits are read off the device, so a stock
-  AD9363 board (325 MHz–3.8 GHz) and one unlocked to AD9364 (70 MHz–6 GHz) are
-  both reported correctly without a setting. Half duplex by default: receive
+  AD9363 board (325 MHz–3.8 GHz), one unlocked to AD9364 (70 MHz–6 GHz) and one
+  running F5OEO's [tezuka](https://github.com/F5OEO/tezuka_fw) firmware
+  (47.5 MHz–6 GHz, which puts 6 m and 4 m in reach) are all reported correctly
+  without a setting. Half duplex by default: receive
   stops for the length of an over, because a USB 2.0 gadget will not carry a
   megasample-per-second stream both ways at once. On a board with real Ethernet
   behind it — a LibreSDR, or a Pluto on a gigabit adapter — tick **Full duplex**

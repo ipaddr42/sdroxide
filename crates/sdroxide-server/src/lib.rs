@@ -974,6 +974,10 @@ fn handle_event(shared: &Shared, ev: RadioEvent) {
                 latest.adsb_status = Some(st.clone());
                 Some(ServerMsg::AdsbStatus(st))
             }
+            // Native-only for now: every station this shipped for runs its
+            // own hardware locally, so there is no `ServerMsg` variant for
+            // this yet — see `RadioEvent::Qo100Status`'s own doc.
+            RadioEvent::Qo100Status(_) => None,
             RadioEvent::SstvLine { image_id, y, rgb } => {
                 Some(ServerMsg::SstvLine { image_id, y, rgb })
             }

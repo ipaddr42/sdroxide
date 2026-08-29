@@ -25,13 +25,19 @@ pub struct MemoryChannel {
     /// that goes out under the voice, and whether the over opens on a 1750 Hz
     /// burst.
     ///
-    /// `None` only for a `memories.json` written before this existed, which
-    /// recalls onto whatever the repeater controls are already set to. Every
-    /// memory stored since carries an explicit setup, including a plainly
-    /// simplex one — a channel that says "simplex, no tone" has to be able to
-    /// take the radio *out* of the shift the last recall put it in, or working
-    /// down a list of repeater memories would leave the shift standing on the
-    /// simplex channel at the end of it.
+    /// `None` only for a `memories.json` written before this existed, and a
+    /// recall reads that as plain simplex with no tone — the same as an
+    /// explicit `Some(RepeaterState::default())`. It has to: nothing in the UI
+    /// can draw the difference, so a channel with no stored setup looks exactly
+    /// like a simplex one, and the operator who recalls it off a list that says
+    /// "145.500 NFM" must not end up transmitting 600 kHz down with the last
+    /// repeater's tone still going out (issue #204).
+    ///
+    /// Every memory stored since this existed carries an explicit setup,
+    /// including a plainly simplex one — a channel that says "simplex, no tone"
+    /// has to be able to take the radio *out* of the shift the last recall put
+    /// it in, or working down a list of repeater memories would leave the shift
+    /// standing on the simplex channel at the end of it.
     #[serde(default)]
     pub repeater: Option<crate::RepeaterState>,
 }

@@ -1,0 +1,23 @@
+[package]
+name = "sdroxide-qo100"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# Native-only: the QO-100 beacon decoder runs server-side in the engine, off
+# the raw IQ, like the skimmers and the ISM decoder. Not linked by the wasm
+# client.
+#
+# The BPSK-400/AO-40-uncoded framing implemented here is written from public
+# protocol facts (sync word, frame length, CRC variant, encoding order) — not
+# ported from any existing decoder's code — cross-checked against the open
+# reference implementation in Daniel Estévez's gr-satellites project
+# (GPL-3.0-or-later, https://github.com/daniestevez/gr-satellites,
+# python/components/deframers/ao40_uncoded_deframer.py and
+# python/satyaml/QO-100.yml). See `bpsk.rs` for the citations inline.
+
+[dependencies]
+sdroxide-types.workspace = true
+sdroxide-dsp.workspace = true
+crossbeam-channel.workspace = true
+tracing.workspace = true

@@ -791,4 +791,11 @@ pub enum Command {
     ///
     /// Appended for the usual reason — postcard numbers variants by position.
     SetAdsbConfig(crate::AdsbSettings),
+
+    /// Whether the QO-100 beacon decoder runs, and how wide it searches
+    /// around [`crate::QO100_BEACON_HZ`]. The engine persists this and
+    /// echoes it back in [`crate::RadioState`], so there is no apply step —
+    /// the same convention [`Command::SetIsmConfig`] follows. Appended for
+    /// the usual reason: postcard numbers variants by position.
+    SetQo100Config(crate::Qo100Settings),
 }

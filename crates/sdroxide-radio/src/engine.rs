@@ -27,6 +27,7 @@ use sdroxide_dsp::{
     make_modulator,
 };
 use sdroxide_ism::{IsmAction, IsmController};
+use sdroxide_qo100::Qo100Controller;
 use sdroxide_rigctld::{RigState, RigctldController};
 use sdroxide_skimmer::{SkimmerAction, SkimmerController};
 use sdroxide_tci::server::{ServerRequest, TciServerController, TciStateSnapshot};
@@ -62,24 +63,30 @@ const MAX_BATCH_ROWS: usize = 64;
 /// The main panadapter's width is [`sdroxide_types::SpectrumConfig::bins`].
 pub const WIDE_BINS: usize = 2048;
 
-/// How much wider than the viewport the zoom lane's output has to be, so the
-/// decimator's transition band stays off the edge of the display.
-const ZOOM_LANE_MARGIN: f64 = 1.4;
-
 /// The zoom lane's FFT size for a display `display_bins` columns wide.
 ///
-/// The decimation ladder is powers of two, so the lane's output lands between
-/// [`ZOOM_LANE_MARGIN`] and twice that times the viewport — which means the
-/// bins that fall *inside* the viewport are between a 2.8th and a 1.4th of
-/// these. Twice the columns therefore puts about one bin per column inside it
-/// even at the narrow end of the ladder, which is the property the old fixed
-/// 4096 had back when every display was 2048 columns wide.
+/// Two dilutions sit between a transform and a column, and both have to be paid
+/// for. The decimation ladder is powers of two, so the lane's output lands
+/// between [`sdroxide_types::ZOOM_LANE_MARGIN`] and twice that times the
+/// viewport — the bins inside the viewport are between a 2.8th and a 1.4th of
+/// these. And the viewport is itself about twice the window actually on screen,
+/// the client asking for slack so that panning inside it needs no
+/// reconfiguration. So a column gets between a 5.6th and a 2.8th of the
+/// transform, and eight times the columns is what puts at least one bin under
+/// every one of them at the wide end of the ladder.
 ///
-/// Floored at that same 4096 so a 2048-column display is unchanged, and capped
-/// at 32768: past there a single transform covers more signal than the lane's
-/// hop can hide (see [`MAX_HOP_DIV`]).
+/// It used to be twice the columns, which counted only the first dilution and
+/// left about half a bin per column on screen. That was invisible while the
+/// client answered a zoom by growing the *device-wide* FFT instead — but that
+/// transform runs at the front end's whole rate and is several times the price
+/// of this one, which is what made zooming in on a 2 Msps HackRF start dropping
+/// samples (issue #195). This lane now resolves the window on its own, so it
+/// has to resolve it properly.
+///
+/// Floored at 4096 and capped at 32768: past there a single transform covers
+/// more signal than the lane's hop can hide (see [`MAX_HOP_DIV`]).
 fn zoom_lane_fft(display_bins: usize) -> usize {
-    (display_bins * 2).next_power_of_two().clamp(4096, 32_768)
+    (display_bins * 8).next_power_of_two().clamp(4096, 32_768)
 }
 
 /// How many transforms a waterfall row is built from, when there are enough to
@@ -1291,10 +1298,109 @@ struct TxChain {
 
 /// 10 ms of TX audio per iteration.
 const TX_AUDIO_BLOCK: usize = 480;
-/// Standing depth (40 ms) the TCI TX queue is paced towards. Each block asks
-/// the client, via a `TxChrono`, for exactly what would restore this — so a
-/// client that honours chronos tracks our real consumption instead of guessing.
+/// Standing depth (40 ms) the TCI TX queue starts out paced towards. Each block
+/// asks the client, via a `TxChrono`, for exactly what would restore this *and
+/// has not already been asked for* — so a client that honours chronos tracks
+/// our real consumption instead of guessing.
+///
+/// The floor rather than the figure: see [`TCI_TX_MAX_TARGET`].
 const TCI_TX_TARGET: usize = TX_AUDIO_BLOCK * 4;
+/// The deepest the TCI TX queue is ever paced towards (250 ms).
+///
+/// 40 ms of standing depth assumes a client that answers a chrono about as
+/// promptly as this loop issues them. WSJT-X does not: its transmit audio comes
+/// off a GUI timer, so a run of chronos is answered in one go a couple of
+/// hundred milliseconds later, and a queue paced at 40 ms is empty for most of
+/// that. Padding the gap with silence chops the over — a quarter of an FT8
+/// burst is a decode nobody gets (issue #202).
+///
+/// So the depth is *learned*: every block that underruns deepens it by one
+/// block, which lands it at about the longest gap the client has shown, and it
+/// stops at this ceiling. It is not wound back down, because a client's cadence
+/// does not improve on its own and re-learning it would cost another chopped
+/// over; the price is transmit latency, and a quarter of a second of it is
+/// still less than the half-second cushion `TCI_TX_FIFO_CAP` already allows.
+const TCI_TX_MAX_TARGET: usize = TX_AUDIO_BLOCK * 25;
+/// Blocks (500 ms) of silence from a keyed TCI client before what it was asked
+/// for is written off and asked for again.
+///
+/// The outstanding count is what keeps this loop from asking twice for the same
+/// audio, so a chrono the client simply dropped would otherwise suppress every
+/// further request and leave the rest of the over silent. Twice the deepest
+/// queue, so a client that is merely slow is never written off while its answer
+/// is still on the way, and well inside [`TCI_TX_STARVE_LIMIT`], so a client
+/// that really has died is still unkeyed rather than asked forever.
+const TCI_TX_ASK_TIMEOUT_BLOCKS: u32 = 50;
+
+/// How a keying TCI client is asked for transmit audio: the standing queue
+/// depth it is paced towards, what it has already been asked for, and how long
+/// it has been quiet.
+///
+/// A `TxChrono` is a request with no acknowledgement, so the loop that issues
+/// them has to do its own bookkeeping or it asks for the same missing audio on
+/// every one of the blocks a slow client takes to answer the first request.
+/// What comes back is then several times what the queue can hold, and the
+/// overflow is not a lost buffer of microphone — it is the client's *waveform*
+/// jumping forward, which is how a 15 s FT8 slot went out as a few seconds of
+/// signal (issue #202).
+///
+/// Its own type so the rules can be exercised without a socket, a rig or an
+/// engine: they are three interacting counters, and every case worth checking
+/// is a sequence of blocks.
+#[derive(Debug, Clone, Copy)]
+struct TciTxPace {
+    /// Frames asked for that have not arrived yet.
+    asked: usize,
+    /// Consecutive blocks the client has sent nothing at all.
+    quiet: u32,
+    /// The standing depth being paced towards, `TCI_TX_TARGET..=TCI_TX_MAX_TARGET`.
+    target: usize,
+}
+
+impl Default for TciTxPace {
+    fn default() -> Self {
+        TciTxPace { asked: 0, quiet: 0, target: TCI_TX_TARGET }
+    }
+}
+
+impl TciTxPace {
+    /// One block: `queued` frames are in hand and `got` arrived since the last
+    /// call. Returns the frame count to chrono for, or `None` when enough is
+    /// already in hand or already on its way.
+    fn request(&mut self, queued: usize, got: usize) -> Option<u32> {
+        self.asked = self.asked.saturating_sub(got);
+        // A client that has gone quiet for longer than any answer could take is
+        // not going to send what it still owes; write it off so the next block
+        // asks again rather than waiting forever on it.
+        self.quiet = if got > 0 { 0 } else { self.quiet + 1 };
+        if self.quiet >= TCI_TX_ASK_TIMEOUT_BLOCKS {
+            self.quiet = 0;
+            self.asked = 0;
+        }
+        let deficit = self.target.saturating_sub(queued + self.asked);
+        if deficit < TX_AUDIO_BLOCK {
+            return None;
+        }
+        self.asked += deficit;
+        Some(deficit as u32)
+    }
+
+    /// A block went out padded with silence: the standing depth was too shallow
+    /// for this client's cadence. One block per underrunning block lands it at
+    /// about the length of the gap, which is exactly the buffer that would have
+    /// covered it.
+    fn underran(&mut self) {
+        self.target = (self.target + TX_AUDIO_BLOCK).min(TCI_TX_MAX_TARGET);
+    }
+
+    /// A new over: nothing from the last one is owed to this one. The learned
+    /// depth is deliberately kept — the client's cadence is the same client's
+    /// cadence, and re-learning it would chop this over too.
+    fn rekey(&mut self) {
+        self.asked = 0;
+        self.quiet = 0;
+    }
+}
 /// Consecutive short TX blocks (1.5 s) before we conclude a keyed TCI client
 /// has died and unkey. A brief gap is normal on a WebSocket and must not chop
 /// the over — half a transmitted FT8 burst decodes nowhere.
@@ -1962,6 +2068,24 @@ struct Engine {
     /// panel that connected while the lane was down would sit on "starting the
     /// decoder" forever.
     adsb_idle_sent: Option<Option<String>>,
+    /// QO-100 beacon decoder: a fixed downconversion onto
+    /// [`sdroxide_types::QO100_BEACON_HZ`] plus a worker-thread demodulator,
+    /// present only while the decoder is enabled. Simpler than the ISM
+    /// window: the target frequency never moves, so retuning it is always
+    /// just re-seating the mixer — see `sync_qo100_window`.
+    qo100_ddc: Option<Ddc>,
+    qo100: Option<Qo100Controller>,
+    qo100_buf: Vec<Complex32>,
+    /// The stream rate `qo100_ddc` was built to decimate — the same reason
+    /// `ism_in_rate` exists.
+    qo100_in_rate: f64,
+    /// The last QO-100 setting the operator chose, held in step with
+    /// `state.qo100` for symmetry with `ism_cfg` and `skim_cfg`. Nothing
+    /// reads it back yet: like the ISM decoder, a source swap into audio mode
+    /// turns the decoder off and a swap back leaves it off until the operator
+    /// turns it on again. Not persisted to disk — there is nothing here worth
+    /// surviving a restart.
+    qo100_cfg: sdroxide_types::Qo100Settings,
     /// Open capture file for `--record-iq`, and the interleaving scratch it is
     /// written from.
     iq_rec: Option<std::io::BufWriter<std::fs::File>>,
@@ -2054,6 +2178,9 @@ struct Engine {
     tci_tx: bool,
     /// Consecutive short TX blocks this over, for the dead-client unkey.
     tci_tx_starved: u32,
+    /// How the keying TCI client is being asked for transmit audio — see
+    /// [`TciTxPace`].
+    tci_pace: TciTxPace,
     /// What we last published to TCI clients, so unchanged ticks cost nothing.
     tci_last_snap: Option<TciStateSnapshot>,
     /// Demod-audio (CAT-rig) mode: the source delivers already-demodulated real
@@ -2171,6 +2298,17 @@ struct Engine {
     /// not offer are held rather than dropped, so swapping back to the front
     /// end they belong to brings them back.
     want_gains: (GainSet, GainSet),
+    /// How far the operator wants the raw IQ decimated, held for the same
+    /// reason [`Self::want_gains`] is and re-asked of every front end that is
+    /// opened.
+    ///
+    /// Separate from [`RadioState::decimation`], which is what the *current*
+    /// device can actually carry. The two differ exactly when the front end has
+    /// no span to throw away — a rig on a sound card, and the 48 kHz stand-in a
+    /// radio switched off runs on — and keeping only the effective figure is
+    /// what used to make switching a radio off and on again forget the
+    /// decimation outright, session file included (issue #209).
+    want_decimation: u32,
     /// Where this engine's radio-scoped files live. See [`EngineConfig::store`].
     store: sdroxide_config::Store,
     /// This engine's radio id. See [`EngineConfig::instance`].
@@ -2286,6 +2424,19 @@ fn skim_center_for(
     if holds { cur } else { want }
 }
 
+/// The QO-100 beacon decoder's down-converter output rate for a search
+/// half-width of `half_width_hz`: about 2.5× the search so the requested span
+/// fits under Nyquist with margin — see `sdroxide_qo100::bpsk` for why the
+/// decoder wants that oversampling — and floored at 16 kHz so the default
+/// (±5 kHz) and any narrower width still land on a sane, cheap rate. Widening
+/// the search really does widen the capture the decoder is handed; the
+/// demodulator inside it always runs at a fixed rate regardless
+/// (`sdroxide_qo100`'s `DEMOD_RATE_HZ`), which is what keeps the search cost
+/// from growing with the square of the width.
+fn qo100_capture_rate_for(half_width_hz: f64) -> f64 {
+    (half_width_hz * 2.5).max(16_000.0)
+}
+
 /// How soon after noticing a disconnected front-end the first reconnect attempt
 /// runs, and the ceiling the spacing doubles up to while attempts keep failing.
 const RETRY_FIRST: Duration = Duration::from_secs(1);
@@ -2335,7 +2486,20 @@ fn decimation_for(want: u32, device_rate_hz: f64, audio_mode: bool) -> u32 {
     if audio_mode || want < 2 {
         return 1;
     }
-    (1u32 << want.ilog2()).min(sdroxide_types::max_decimation(device_rate_hz))
+    wanted_decimation(want).min(sdroxide_types::max_decimation(device_rate_hz))
+}
+
+/// What the operator asked for, as a figure worth *remembering*: rounded down
+/// to a power of two and capped at [`sdroxide_types::MAX_DECIMATION`], but with
+/// no device rate involved.
+///
+/// The counterpart to [`decimation_for`], which answers the other half of the
+/// question — what this particular front end can carry. Kept apart because the
+/// answer to the second one is worthless as a memory: a radio switched off is
+/// on a 48 kHz stand-in that can carry nothing, and letting that overwrite the
+/// operator's choice is what issue #209 was.
+fn wanted_decimation(want: u32) -> u32 {
+    if want < 2 { 1 } else { (1u32 << want.ilog2()).min(sdroxide_types::MAX_DECIMATION) }
 }
 
 /// Drop the commands at the end of a drained batch that a later one in the same
@@ -2521,8 +2685,11 @@ fn engine_thread(
     // and the receiver chain are built at, and building them at the device rate
     // first would mean tearing them down again before the first block.
     let session = engine_cfg.remember_session.then(|| engine_cfg.store.load_session());
-    state.decimation =
-        decimation_for(session.as_ref().map_or(1, |s| s.decimation), radio_fs, audio_mode);
+    // Held separately from what this front end can carry: a start on a stand-in
+    // (a radio switched off, a rig that isn't there yet) must not be the thing
+    // that forgets it — see `Engine::want_decimation`.
+    let want_decimation = wanted_decimation(session.as_ref().map_or(1, |s| s.decimation));
+    state.decimation = decimation_for(want_decimation, radio_fs, audio_mode);
     let decim = (state.decimation > 1).then(|| Decimator::new(state.decimation));
     state.sample_rate = radio_fs / state.decimation as f64;
 
@@ -2750,6 +2917,13 @@ fn engine_thread(
         adsb_cfg,
         adsb_home: None,
         adsb_idle_sent: None,
+        qo100_ddc: None,
+        qo100: None,
+        qo100_buf: Vec::new(),
+        qo100_in_rate: 0.0,
+        // Session-scoped only, unlike `skim_cfg`/`ism_cfg` — see
+        // `sync_qo100`'s doc for why this one is not read back from disk.
+        qo100_cfg: sdroxide_types::Qo100Settings::default(),
         iq_rec,
         iq_rec_buf: Vec::new(),
         scan_cfg,
@@ -2786,6 +2960,7 @@ fn engine_thread(
         main_play_r_rec: Vec::new(),
         tci_tx: false,
         tci_tx_starved: 0,
+        tci_pace: TciTxPace::default(),
         tci_last_snap: None,
         audio_mode,
         radio_fs,
@@ -2820,6 +2995,7 @@ fn engine_thread(
         session,
         want_antenna,
         want_gains,
+        want_decimation,
         store: engine_cfg.store,
         instance: engine_cfg.instance,
         primary: engine_cfg.primary,
@@ -2856,6 +3032,7 @@ fn engine_thread(
         engine.sync_ism(); // likewise, from ism.json
         engine.sync_adsb_home();
         engine.sync_adsb(); // and the aircraft lane, if the mode is already ADS-B
+        engine.sync_qo100(); // a no-op today: `qo100_cfg` starts disabled and is never loaded
     }
     // Start any enabled network spot feeds from the persisted config. The
     // operator identity comes from the digi config — one identity for the whole
@@ -3034,6 +3211,7 @@ fn engine_thread(
         engine.poll_skimmer();
         engine.poll_ism();
         engine.poll_adsb();
+        engine.poll_qo100();
         engine.poll_scanner();
         engine.poll_tci_server();
         engine.poll_rigctld();
@@ -3744,6 +3922,15 @@ impl Engine {
                 d.on_rx_iq(&self.adsb_buf);
             }
         }
+        // ...and the QO-100 beacon decoder from its own fixed downconversion
+        // onto the beacon frequency.
+        if let Some(ddc) = self.qo100_ddc.as_mut() {
+            self.qo100_buf.clear();
+            ddc.process(iq, &mut self.qo100_buf);
+            if let Some(c) = self.qo100.as_ref() {
+                c.on_rx_iq(&self.qo100_buf);
+            }
+        }
         // Feed TCI clients: the same clean tap the digital decoders use (so
         // muting or turning down sdroxide can't silence somebody's decoder),
         // resampled to the 48 kHz TCI mandates.
@@ -3813,12 +4000,10 @@ impl Engine {
             return None;
         }
         // The narrowest output on the ladder that still spans the viewport with
-        // room for the decimator's skirt.
-        let want = span * ZOOM_LANE_MARGIN;
-        let mut decim = 1u32;
-        while decim < 1 << 14 && full / f64::from(decim * 2) >= want {
-            decim *= 2;
-        }
+        // room for the decimator's skirt. Shared with the client, which works
+        // out the same answer to decide how large a device-wide FFT is worth
+        // asking for — see `sdroxide_types::panadapter_fft_ceiling`.
+        let decim = sdroxide_types::zoom_lane_decimation(full, span);
         (decim > 1).then_some(((lo + hi) / 2.0, decim))
     }
 
@@ -4116,6 +4301,26 @@ impl Engine {
                 // knob moves the dial and leaves the receiver exactly where it
                 // was, and something has to bring it along.
                 self.keep_vfo_in_span();
+                // And then put the receiver on the new dial, which is the part
+                // neither of the two calls above necessarily does. On a
+                // panadapter pairing — a transceiver on CAT beside an SDR that
+                // supplies the spectrum — the window deliberately does *not*
+                // follow the rig's knob, so `adopt_source_center` finds nothing
+                // to adopt, and a move inside the span gives
+                // `keep_vfo_in_span` nothing to do either. Without this the
+                // readout and the passband marker follow the rig while the DDC
+                // stays on the frequency before the move: flrig retunes from
+                // WSJT-X, the picture agrees and the audio does not (issue
+                // #206). Every operator-initiated tune already pairs
+                // `follow_dial` with this; the rig-initiated one was the odd
+                // path out.
+                //
+                // Not in audio mode, where there is no DDC and the rig's own
+                // dial is the tuning: `update_tuning` would command the
+                // frequency straight back at the radio that just reported it.
+                if !self.audio_mode {
+                    self.update_tuning();
+                }
                 self.update_display_center();
                 let _ = self.event_tx.send(RadioEvent::State(self.state.clone()));
             }
@@ -4161,6 +4366,7 @@ impl Engine {
                 self.sync_skim_window();
                 self.sync_ism_window();
                 self.sync_adsb_window();
+                self.sync_qo100_window();
                 self.update_tuning();
                 let _ = self.event_tx.send(RadioEvent::State(self.state.clone()));
             }
@@ -4367,6 +4573,10 @@ impl Engine {
         // target rather than a plan of them: 1090 MHz is where it has to be, and
         // the only question is whether the new span still reaches it.
         self.sync_adsb_window();
+        // The QO-100 window, unlike the ISM one, *does* follow the hardware
+        // centre — its one target frequency never moves, so re-seating the
+        // mixer is all a retune ever needs.
+        self.sync_qo100_window();
         // Re-seat the DDCs on the new centre. Without this the main receiver
         // keeps the offset it had against the old one, which is exactly how a
         // rig-initiated retune ends up demodulating somewhere the readout does
@@ -6044,8 +6254,9 @@ impl Engine {
                     rtty,
                     // Always captured, even plainly simplex with no tone: a
                     // repeater memory recalled after this one has to be able to
-                    // take the shift back off, and a channel that stored no
-                    // opinion could not.
+                    // take the shift back off. `None` survives only in channels
+                    // stored before this field existed, and a recall reads that
+                    // as simplex too — see `RecallMemory` below.
                     repeater: Some(self.state.repeater),
                 });
                 self.save_memories();
@@ -6071,9 +6282,17 @@ impl Engine {
                     // on resolves its shift against the frequency it is being
                     // recalled onto, and asking the band plan about the dial we
                     // are leaving would answer for the wrong band.
-                    if let Some(r) = m.repeater {
-                        self.set_repeater(r.clamped());
-                    }
+                    //
+                    // A channel stored before the field existed carries no
+                    // setup at all, and that is read as plain simplex rather
+                    // than as "leave whatever is set alone" (issue #204).
+                    // Nothing in the UI can express "no opinion" — the list
+                    // draws such a channel exactly like a simplex one — so
+                    // treating it as one is what the operator is being shown.
+                    // The alternative is the dangerous reading: recalling
+                    // 145.500 off a list that says 145.500 and transmitting
+                    // 600 kHz down with the last repeater's tone still on.
+                    self.set_repeater(m.repeater.unwrap_or_default().clamped());
                     if m.rtty.is_some() {
                         // Already in RTTY when recalled: the mode didn't change,
                         // so no rebuild happened and the live modem still holds
@@ -6504,6 +6723,18 @@ impl Engine {
                 self.sync_adsb();
                 if let Some(d) = self.adsb.as_ref() {
                     d.set_config(cfg);
+                }
+            }
+
+            SetQo100Config(cfg) => {
+                self.state.qo100 = cfg;
+                // Held in step with the live setting for symmetry with the
+                // ISM and skimmer configs; see `qo100_cfg`'s own doc for why
+                // nothing reads it back and why it is not saved to disk.
+                self.qo100_cfg = cfg;
+                self.sync_qo100();
+                if let Some(c) = self.qo100.as_ref() {
+                    c.set_config(cfg);
                 }
             }
 
@@ -7300,6 +7531,98 @@ impl Engine {
         }
     }
 
+    /// The QO-100 beacon decoder's downconverter output rate for a given
+    /// search width: comfortably oversampled against the 800 chip/s the
+    /// beacon transmits at — see `sdroxide_qo100::bpsk`'s module doc for why
+    /// the decoder wants that margin — and wide enough that the requested
+    /// search actually fits under Nyquist with room to spare, so widening the
+    /// window in the UI really does widen what the receiver hands the
+    /// decoder rather than asking it to search past the edge of what it can
+    /// see. Floored at 16 kHz, and still far short of what the ISM plan or
+    /// the skimmer ask for, so it costs the engine almost nothing at the
+    /// default width.
+    fn qo100_target_rate_hz(&self) -> f64 {
+        qo100_capture_rate_for(self.state.qo100.search_half_width_hz)
+    }
+
+    /// Construct or tear down the QO-100 beacon decoder, mirroring
+    /// [`Self::sync_ism`]'s shape. Simpler than the ISM window in one way —
+    /// the target frequency ([`sdroxide_types::QO100_BEACON_HZ`]) never moves
+    /// with the band — but not in another: the operator's search-width
+    /// buttons change how wide a downconversion the decoder needs, the same
+    /// reason ISM's own window resizes when the band plan does.
+    fn sync_qo100(&mut self) {
+        // Wideband-only, for the same reason as the skimmers and ISM: a CAT
+        // rig on a sound card hands over demodulated audio, not IQ to mix a
+        // downconverter from.
+        if self.audio_mode {
+            self.state.qo100.enabled = false;
+        }
+        match (self.state.qo100.enabled, self.qo100.is_some()) {
+            (true, false) => {
+                let mut ddc = Ddc::new(self.state.sample_rate, self.qo100_target_rate_hz());
+                ddc.set_offset_hz(sdroxide_types::QO100_BEACON_HZ - self.state.center_hz);
+                let out_rate = ddc.out_rate();
+                self.qo100 = Some(Qo100Controller::new(out_rate, self.state.qo100));
+                self.qo100_ddc = Some(ddc);
+                self.qo100_in_rate = self.state.sample_rate;
+                info!(rate = out_rate, "QO-100 beacon decoder started");
+            }
+            (false, true) => {
+                self.qo100 = None;
+                self.qo100_ddc = None;
+                self.qo100_buf.clear();
+                info!("QO-100 beacon decoder stopped");
+            }
+            (true, true) => self.sync_qo100_window(),
+            _ => {}
+        }
+    }
+
+    /// Re-seat the downconverter's mixer after a retune, and rebuild it
+    /// outright if the sample rate feeding it has changed or the operator has
+    /// asked for a different search width — a `Ddc` bakes its input rate and
+    /// its decimation chain in at construction and neither can be changed in
+    /// place, the same reason `sync_ism_window` rebuilds on a rate change.
+    fn sync_qo100_window(&mut self) {
+        if self.qo100_ddc.is_none() {
+            return;
+        }
+        let want_rate = self.qo100_target_rate_hz();
+        let have_rate = self.qo100_ddc.as_ref().map(|d| d.out_rate()).unwrap_or(0.0);
+        // `Ddc` settles for the nearest *achievable* rate, so this compares
+        // against what a fresh chain would actually land on rather than the
+        // bare request — a request unchanged in effect must not rebuild the
+        // chain (and so drop whatever the decoder had buffered) every tick.
+        let rebuild = (self.state.sample_rate - self.qo100_in_rate).abs() >= 1.0
+            || (Ddc::rate_for(self.state.sample_rate, want_rate) - have_rate).abs() >= 1.0;
+        if rebuild {
+            let mut ddc = Ddc::new(self.state.sample_rate, want_rate);
+            ddc.set_offset_hz(sdroxide_types::QO100_BEACON_HZ - self.state.center_hz);
+            let out_rate = ddc.out_rate();
+            self.qo100_ddc = Some(ddc);
+            self.qo100_in_rate = self.state.sample_rate;
+            // The controller bakes its sample rate into the worker's rolling
+            // buffer sizing and every `bpsk::acquire` call, so a rate change
+            // rebuilds it too rather than trying to reconfigure it in place —
+            // simple, and cheap: switching search width is a deliberate,
+            // infrequent click, not a hot path.
+            self.qo100 = Some(Qo100Controller::new(out_rate, self.state.qo100));
+            info!(rate = out_rate, "QO-100 window rebuilt");
+            return;
+        }
+        let Some(ddc) = self.qo100_ddc.as_mut() else { return };
+        ddc.set_offset_hz(sdroxide_types::QO100_BEACON_HZ - self.state.center_hz);
+    }
+
+    /// Drain the QO-100 beacon decoder's latest status and forward it.
+    fn poll_qo100(&mut self) {
+        let Some(c) = self.qo100.as_ref() else { return };
+        if let Some(status) = c.poll() {
+            let _ = self.event_tx.send(RadioEvent::Qo100Status(status));
+        }
+    }
+
     /// Drain the ISM decoder's device table and status and forward them.
     fn poll_ism(&mut self) {
         let Some(d) = self.ism.as_ref() else { return };
@@ -7937,6 +8260,10 @@ impl Engine {
         if self.state.tx.ptt {
             self.tci_tx = true;
             self.tci_tx_starved = 0;
+            // Nothing from the last over is owed to this one. The learned
+            // depth is not reset with it: the client's cadence is the same
+            // client's cadence, and re-learning it would chop this over too.
+            self.tci_pace.rekey();
             // Start from an empty ring so a previous over's tail can't play.
             if let Some(s) = self.tci_srv.as_mut() {
                 s.drain_tx_audio();
@@ -7956,6 +8283,7 @@ impl Engine {
         }
         self.tci_tx = false;
         self.tci_tx_starved = 0;
+        self.tci_pace.rekey();
         self.mic_fifo.clear();
         if let Some(s) = self.tci_srv.as_mut() {
             s.drain_tx_audio();
@@ -9581,7 +9909,10 @@ impl Engine {
             tx_eq: self.state.tx.eq,
             squelch_db: self.state.rx[0].squelch_db,
             noise_reduction: self.state.rx[0].noise_reduction,
-            decimation: self.state.decimation,
+            // The standing choice again, not what the front end of the moment
+            // could do with it: a session written while the radio was switched
+            // off would otherwise put 1 on disk and lose it for good.
+            decimation: self.want_decimation,
             repeater: self.state.repeater,
             // What the operator asked for rather than what the device currently
             // reports, for the antennas' reason again: a front end with no gain
@@ -9784,6 +10115,10 @@ impl Engine {
     /// factor that works, so the state the operator is shown is always the one
     /// the receiver is actually running.
     fn set_decimation(&mut self, factor: u32) {
+        // Noted before the clamp, and whether or not anything moves: this is
+        // the operator's standing choice, and it outlives the front end that
+        // happens to be open when they make it.
+        self.want_decimation = wanted_decimation(factor);
         let factor = decimation_for(factor, self.radio_fs, self.audio_mode);
         if factor == self.state.decimation {
             return;
@@ -9837,6 +10172,7 @@ impl Engine {
         self.sync_skimmer();
         self.sync_ism();
         self.sync_adsb();
+        self.sync_qo100();
         self.sync_audio_tap();
         self.sync_tci_iq();
         info!(factor, rate = self.state.sample_rate, "front-end decimation");
@@ -10035,7 +10371,7 @@ impl Engine {
         // The decimation is the operator's, so it carries across the swap — but
         // re-asked of the new front end, which may not have the bandwidth to
         // spare for it (or, in audio mode, any IQ to decimate at all).
-        let decimation = decimation_for(self.state.decimation, self.radio_fs, self.audio_mode);
+        let decimation = decimation_for(self.want_decimation, self.radio_fs, self.audio_mode);
         self.decim = (decimation > 1).then(|| Decimator::new(decimation));
 
         // A swap changes the front end, not the operating position. The mode,
@@ -10199,6 +10535,7 @@ impl Engine {
             self.sync_skimmer();
             self.sync_ism();
             self.sync_adsb();
+            self.sync_qo100();
         }
         // Re-derive the TCI streams at the new device rate and push a fresh
         // state burst, so connected clients follow the swap.
@@ -11167,20 +11504,28 @@ impl Engine {
         }
         if let Some(srv) = self.tci_srv.as_mut() {
             let mut block = [0.0f32; TX_AUDIO_BLOCK];
+            let mut got = 0usize;
             loop {
                 let n = srv.read_tx_audio(&mut block);
                 self.mic_fifo.extend_from_slice(&block[..n]);
+                got += n;
                 if n < TX_AUDIO_BLOCK {
                     break;
                 }
             }
             // Closed-loop pacing: ask for exactly what would restore the target
-            // depth. A client that honours chronos then follows our real
-            // consumption; one that self-paces (as sdroxide's own client does
-            // when a rig never chronos) simply ignores them and still works.
-            let deficit = TCI_TX_TARGET.saturating_sub(self.mic_fifo.len());
-            if deficit >= TX_AUDIO_BLOCK {
-                srv.request_chrono(deficit as u32);
+            // depth *and is not already on its way*. A client that honours
+            // chronos then follows our real consumption; one that self-paces
+            // (as sdroxide's own client does when a rig never chronos) simply
+            // ignores them and still works.
+            //
+            // Counting what is outstanding is the whole of the loop being
+            // closed. Without it, a client that answers a run of chronos in one
+            // go is asked for the same missing audio once per block for as long
+            // as its answer takes to arrive, and hands back several times what
+            // the queue can hold — see `Engine::tci_tx_asked`.
+            if let Some(frames) = self.tci_pace.request(self.mic_fifo.len(), got) {
+                srv.request_chrono(frames);
             }
         }
         if self.mic_fifo.len() > TCI_TX_FIFO_CAP {
@@ -11195,6 +11540,7 @@ impl Engine {
         // chop the over, but count it so a dead client is eventually unkeyed.
         if self.mic_fifo.len() < TX_AUDIO_BLOCK {
             self.tci_tx_starved += 1;
+            self.tci_pace.underran();
         } else {
             self.tci_tx_starved = 0;
         }
@@ -11786,6 +12132,7 @@ impl Engine {
                 self.sync_skim_window();
                 self.sync_ism_window();
                 self.sync_adsb_window();
+                self.sync_qo100_window();
                 true
             }
             Err(e) => {
@@ -12662,23 +13009,65 @@ mod skim_window_tests {
 }
 
 #[cfg(test)]
+mod qo100_rate_tests {
+    use super::qo100_capture_rate_for;
+
+    /// The engine default (±5 kHz) and anything narrower sit on the 16 kHz
+    /// floor — ×2.5 does not reach it until ±6.4 kHz.
+    #[test]
+    fn the_default_and_narrow_widths_sit_on_the_16_khz_floor() {
+        assert_eq!(qo100_capture_rate_for(5_000.0), 16_000.0);
+        assert_eq!(qo100_capture_rate_for(0.0), 16_000.0);
+        assert_eq!(qo100_capture_rate_for(6_400.0), 16_000.0);
+    }
+
+    /// Past the knee the capture tracks the search width, so widening the
+    /// window in the UI really does hand the decoder a wider span.
+    #[test]
+    fn a_wider_search_asks_for_a_proportionally_wider_capture() {
+        assert_eq!(qo100_capture_rate_for(10_000.0), 25_000.0);
+        assert_eq!(qo100_capture_rate_for(25_000.0), 62_500.0);
+        // ±50 kHz is the UI's MAX_HALF_WIDTH_HZ.
+        assert_eq!(qo100_capture_rate_for(50_000.0), 125_000.0);
+    }
+
+    #[test]
+    fn the_capture_rate_is_monotonic_and_never_below_the_floor() {
+        let mut prev = 0.0;
+        for hw in [0.0, 2_500.0, 5_000.0, 10_000.0, 20_000.0, 50_000.0] {
+            let r = qo100_capture_rate_for(hw);
+            assert!(r >= prev, "rate dropped at half-width {hw}");
+            assert!(r >= 16_000.0, "below the floor at half-width {hw}");
+            prev = r;
+        }
+    }
+}
+
+#[cfg(test)]
 mod zoom_lane_fft_tests {
     use super::zoom_lane_fft;
 
-    /// A client on the historic 2048-column panadapter gets the lane it always
-    /// had. The whole change has to be invisible to it.
+    /// Enough transform to put a bin under every column *on screen*, which is
+    /// eight times the columns: the lane's output is up to 2.8 times the
+    /// viewport, and the viewport is about twice the window actually being
+    /// looked at. Two dilutions, both paid for.
     #[test]
-    fn the_old_width_gets_the_old_lane() {
-        assert_eq!(zoom_lane_fft(2048), 4096);
+    fn a_column_on_screen_gets_a_bin_of_its_own() {
+        assert_eq!(zoom_lane_fft(2048), 16_384);
+        // It used to be twice the columns, which counted only the first
+        // dilution and left this lane resolving half a bin per column — fine
+        // while the client answered a zoom by growing the device-wide FFT
+        // instead, and not fine now that this lane is what draws the window
+        // (issue #195).
+        assert_ne!(zoom_lane_fft(2048), 4096);
     }
 
-    /// Twice the columns, twice the transform — so the bins that land inside
-    /// the viewport still outnumber the columns drawing them at every rung of
-    /// the decimation ladder.
+    /// A wider panadapter asks for more, until the ceiling: past there a single
+    /// transform covers more signal than the lane's hop can hide.
     #[test]
     fn a_wider_panadapter_gets_a_wider_transform() {
-        assert_eq!(zoom_lane_fft(4096), 8192);
-        assert_eq!(zoom_lane_fft(8192), 16_384);
+        assert_eq!(zoom_lane_fft(4096), 32_768);
+        assert_eq!(zoom_lane_fft(8192), 32_768);
     }
 
     /// Held at both ends: nothing below the lane's own floor, and nothing past
@@ -13098,5 +13487,95 @@ mod collapse_tests {
             collapse(vec![Command::SetPtt(true), Command::SetCenter(1.0)]),
             ["SetPtt(true)", "C1"]
         );
+    }
+}
+
+#[cfg(test)]
+mod tci_pace_tests {
+    use super::{
+        TCI_TX_ASK_TIMEOUT_BLOCKS, TCI_TX_MAX_TARGET, TCI_TX_TARGET, TX_AUDIO_BLOCK, TciTxPace,
+    };
+
+    /// A client that answers every chrono at once is asked for exactly what it
+    /// consumed, and never twice for the same audio.
+    #[test]
+    fn a_prompt_client_is_asked_for_what_it_consumed() {
+        let mut p = TciTxPace::default();
+        // Key-down on an empty queue: the whole standing depth, once.
+        assert_eq!(p.request(0, 0), Some(TCI_TX_TARGET as u32));
+        // The next block, with nothing yet arrived, must ask for nothing: the
+        // first request covers it and is still on its way.
+        assert_eq!(p.request(0, 0), None);
+        // It lands and one block of it is played, so the queue is one block
+        // short of the standing depth — which is exactly what is asked for.
+        assert_eq!(
+            p.request(TCI_TX_TARGET - TX_AUDIO_BLOCK, TCI_TX_TARGET),
+            Some(TX_AUDIO_BLOCK as u32),
+            "one block consumed, one block asked for"
+        );
+    }
+
+    /// The bug behind issue #202: a client that takes several blocks to answer
+    /// must not be asked again on every one of them. Whatever it is asked for
+    /// in total may never exceed the standing depth, because that is all the
+    /// queue can hold — anything past it is the client's waveform thrown away.
+    #[test]
+    fn a_slow_client_is_never_asked_for_more_than_the_queue_holds() {
+        let mut p = TciTxPace::default();
+        let mut asked = 0u32;
+        // Twenty-five blocks — a quarter of a second — with the client silent
+        // and the queue empty, which is exactly a GUI application answering on
+        // its own timer.
+        for _ in 0..25 {
+            asked += p.request(0, 0).unwrap_or(0);
+        }
+        assert_eq!(
+            asked, TCI_TX_TARGET as u32,
+            "asking once per block would have asked for {}× the queue",
+            25
+        );
+    }
+
+    /// …but a chrono the client simply dropped must not silence the rest of the
+    /// over: after a spell of complete silence the outstanding request is
+    /// written off and asked for again.
+    #[test]
+    fn an_unanswered_chrono_is_eventually_asked_for_again() {
+        let mut p = TciTxPace::default();
+        assert_eq!(p.request(0, 0), Some(TCI_TX_TARGET as u32));
+        // Nothing arrived on the block that made the request either, so that
+        // one counts towards the silence as well.
+        let mut quiet_blocks = 1;
+        let again = loop {
+            quiet_blocks += 1;
+            assert!(quiet_blocks < 500, "the outstanding request was never written off");
+            if let Some(frames) = p.request(0, 0) {
+                break frames;
+            }
+        };
+        assert_eq!(again, TCI_TX_TARGET as u32);
+        assert_eq!(
+            quiet_blocks, TCI_TX_ASK_TIMEOUT_BLOCKS,
+            "a client that has said nothing at all is asked again, but only after \
+             longer than any answer could take"
+        );
+    }
+
+    /// The standing depth follows the gaps the client leaves, so the next over
+    /// is buffered for the cadence this one showed — and stops at the ceiling.
+    #[test]
+    fn the_standing_depth_learns_the_clients_cadence_and_stops_at_the_ceiling() {
+        let mut p = TciTxPace::default();
+        p.underran();
+        assert_eq!(p.request(0, 0), Some((TCI_TX_TARGET + TX_AUDIO_BLOCK) as u32));
+
+        let mut p = TciTxPace::default();
+        for _ in 0..1000 {
+            p.underran();
+        }
+        assert_eq!(p.request(0, 0), Some(TCI_TX_MAX_TARGET as u32));
+        // A new over keeps what was learned but owes nothing.
+        p.rekey();
+        assert_eq!(p.request(0, 0), Some(TCI_TX_MAX_TARGET as u32));
     }
 }

@@ -15,6 +15,7 @@ or connects to a remote sdroxide server.
 
 1. [Feature overview](#1-feature-overview)
 2. [Basic operation](#2-basic-operation)
+    - [2.21 QO-100 beacon calibration](#221-qo-100-beacon-calibration)
 3. [Digital modes (FT8, FT4, FT2, PSK31, RTTY, Olivia, THOR, FSQ, Hellschreiber, SSTV, RIFP, weather fax, JS8, RF Paint, WSPR, packet, APRS, ADS-B)](#3-digital-modes)
 4. [Skimmers (CW, PSK, RTTY)](#4-skimmers)
 5. [ISM band decoder (315 / 345 / 433 / 868 / 915 MHz devices)](#5-ism-band-decoder)
@@ -112,6 +113,9 @@ or connects to a remote sdroxide server.
 - **ISM band decoder** — reads the unattended 868 MHz traffic around you and
   lists each device with its readings in real units. See
   [ISM band decoder](#5-ism-band-decoder).
+- **QO-100 beacon calibration** — decodes the 10489.750 MHz narrowband beacon,
+  measures how far your LNB has drifted, and writes the converter offset for
+  you. See [§2.21](#221-qo-100-beacon-calibration).
 - **Many radio backends:** SoapySDR devices, OpenHPSDR (Hermes/Metis) Ethernet
   SDRs, a TCI server (ExpertSDR3/Thetis), a SmartSDR radio (FlexRadio
   FLEX-6000/8000), RTL-SDR, RX-888, Airspy HF+ and SDRplay RSP receivers over
@@ -784,6 +788,15 @@ Detail costs memory on the graphics card: 8 MB per radio tab at 2048, 16 at
 4096, 32 at 8192. Changing it restarts the waterfall's history from black,
 once.
 
+**Zooming in does not cost the receiver anything.** It used to: the resolution
+for a zoomed window came from a bigger transform over *everything the front end
+streams*, and on a wide SDR that could be most of the processor — enough, on a
+small machine, to start the driver dropping samples the moment somebody zoomed
+in ([issue #195](https://github.com/dividebysandwich/sdroxide/issues/195)). The
+window on screen is now mixed down and analysed at its own width instead, which
+resolves the same picture for a fraction of the work, and the full-rate
+transform stays the size the **detail** setting asks for. Nothing to set.
+
 #### Waterfall scroll speed
 
 How fast the waterfall scrolls, in lines a second, on the **scroll** row of the
@@ -1118,9 +1131,12 @@ to transmit, and whether every over opens on the 1750 Hz burst. A channel that
 already has one comes up with the section open. Storing a memory captures
 whatever the DUPLEX and TONE controls are set to at the time — including plainly
 simplex with no tone, which is what lets the next recall take a shift back
-*off* rather than leaving the last repeater's on a simplex channel. The list
-shows what is stored beside the mode, so two memories on one dial read as the
-different channels they are. See
+*off* rather than leaving the last repeater's on a simplex channel. **Every
+recall sets DUPLEX and TONE**, including a channel from a `memories.json`
+written before this existed and one whose RPT section was never opened: those
+are read as plain simplex with no tone, because that is what the list is
+showing you. The list shows what is stored beside the mode, so two memories on
+one dial read as the different channels they are. See
 [2.18 Repeater operation](#218-repeater-operation-duplex-and-tone).
 
 The **Sort** row above the list says what order it is drawn in — **Stored** (as
@@ -2039,6 +2055,91 @@ This is not `--record-iq` ([12](#12-command-line-reference)), which writes the
 raw IQ of the whole span — tens of megabytes a second — so that a band can be
 replayed offline. This records what came out of the receiver, at a size you can
 send to someone.
+
+### 2.21 QO-100 beacon calibration
+
+The QO-100 (Es'hail-2) narrowband transponder carries a beacon on its lower
+edge, at **10489.750 MHz**, that transmits AO-40 telemetry as 400 baud
+Manchester BPSK. Every ground station receives that beacon through an LNB, whose
+local oscillator is only roughly on frequency and drifts with temperature — so
+the dial and the signal disagree by a few kHz, and by different amounts on a
+cold morning and a warm afternoon. The **QO100** button in the System module
+opens a window that decodes the beacon, measures exactly how far it is from
+10489.750 MHz, and offers to write that figure into the converter/LNB offset in
+one click.
+
+**In brief.** With an LNB or converter offset set up in the receiver for the
+QO-100 (Es'hail-2) geostationary satellite, the decoder searches a few kHz
+either side of 10489.750 MHz, locks onto the beacon there, and decodes its
+AO-40 telemetry. Having tuned itself onto the signal to get a clean decode, it
+then works out from the frequency it actually found the beacon on how far the
+LNB or receiver offset is in error, and **APPLY CORRECTION** writes the
+corrected figure back. This is the same task the QO-100 beacon plugin performs
+in SDR Console.
+
+> **Note:** like the skimmers and the ISM decoder, this is a wideband feature.
+> It needs a true IQ source and is unavailable when a CAT radio is feeding
+> demodulated audio.
+
+#### What the window shows
+
+- **ON / OFF** starts the decoder. It reads the raw IQ straight from the
+  hardware, so it works regardless of where the main dial is pointed, as long as
+  the beacon is inside the span the receiver is delivering — turning it on also
+  tunes VFO A to 10489.750 MHz as a convenience, nothing more. Like SCAN and
+  SAT, the button stays lit whenever the decoder is running, window open or not.
+  It is greyed out only if the receiver's own configuration says 10489.750 MHz
+  is unreachable — the usual cause is that no converter/LNB offset has been set
+  up yet (**Settings ▸ Radio ▸ Converter**).
+- **width ± / −** sets how far either side of 10489.750 MHz the search looks, in
+  5 kHz steps from ±5 to ±50 kHz. Start at the default ±5 kHz; widen it only if
+  the beacon is not found, which means the LNB is further off than usual. A
+  wider search asks the receiver for a wider capture and takes longer to sweep,
+  so it is not free. The demodulator itself always runs at a fixed rate whatever
+  the capture, which keeps that in hand up to a point: the default ±5 kHz sweeps
+  in a fraction of a second and ±25 kHz in a few seconds, both comfortably
+  inside the window they are searching. ±50 kHz takes longer than the window
+  does to fill, so at the widest setting the decoder runs a core flat out and
+  gets through fewer windows than it receives. Widen it to find the beacon, then
+  bring it back down.
+- The **mini waterfall** draws the slice of spectrum being searched, with the
+  measured beacon frequency marked once the decoder locks. It is only a picture:
+  if the receiver is parked on another band the strip is blank and the window
+  says so, but the decoder keeps working.
+- **RECEIVER / TARGET / MEASURED / DRIFT** are the dial frequency now, the
+  10489.750 MHz target, the frequency the beacon was actually found on, and the
+  difference. DRIFT is green within ±200 Hz, amber to ±3 kHz.
+- **TELEMETRY** shows the beacon's own decoded status text. It is there for its
+  own sake and as an independent check: a lock with a valid CRC but garbled text
+  is a warning that no number above would catch.
+- The status line under the strip is the honest measure, the same
+  "attempted vs. succeeded" idea as the ISM decoder's bursts/decoded line: the
+  first search window fills after about 24 seconds, then repeats, and a search
+  that is running but has not found the beacon reads differently from one that
+  never started.
+
+#### Applying the correction
+
+**APPLY CORRECTION** writes the corrected converter offset and reopens the
+receiver — the same brief interruption **Settings ▸ Radio ▸ Apply** makes, so a
+bad reading can never disturb a running receiver for more than that. The button
+stays disabled until the decoder has locked **twice** and the latest of those
+frames carried telemetry text: a 32-bit sync word matched within three bit
+errors and then a 16-bit CRC will pass by pure chance roughly once every couple
+of hours of searching, and one lock is not enough to change a setting on. The
+figure written is the one from that most recent lock. After it is applied, the
+window shows what changed and when.
+
+Because the coded frames the beacon alternates with are not decoded, a lock
+lands roughly every 20 seconds rather than every 10 — which is normal and not a
+sign the beacon has gone away.
+
+#### Remote and browser clients
+
+The decoder runs on the machine the radio is on. Its readout is not sent to
+remote or browser clients yet, so on those the window opens, the strip draws
+from the shared spectrum, and the status line says the readout is local to the
+receiving station rather than sitting on "starting…".
 
 ---
 
@@ -6154,6 +6255,29 @@ radio you actually own. Press **Test connection** to see which it reported. (If
 a firmware publishes no limits at all, sdroxide says so rather than quoting the
 fallback figures as fact.)
 
+**70 MHz is not the floor any more.** The two figures above are the ones
+Analog Devices' own firmware publishes. The community firmware that most of the
+current AD936x work happens in — [**tezuka**](https://github.com/F5OEO/tezuka_fw),
+by F5OEO — takes the same silicon down to **47.5 MHz**, which is what puts
+**6 m and 4 m** inside a Pluto's range instead of just outside it. It also adds
+an 8-bit complex sample mode (about 14 MHz of span over USB, 45 MHz over
+gigabit Ethernet), RX1/RX2 and TX1/TX2 switching, and — the part worth having
+on its own — **SD-card boot**, so a firmware that does not suit you is undone
+by taking the card out rather than by unbricking a board. It builds for about
+ten boards: the original Pluto, PlutoPlus, ANTSDR E200/E310, Fishball/PlutoSky,
+SignalSDR Pro, LibreSDR/ZynqSDR, Pluto Nano and the PCIe and Mini
+OpenSDRLab boards.
+
+Nothing has to be configured in sdroxide to use it. The tuning range, the
+sample rate and the on-the-wire sample format are all read off the device as it
+connects rather than assumed, so a board running tezuka reports its own limits
+and its own format and sdroxide follows them. What that means in practice is
+that the band buttons open up as far as the firmware says and no further. This
+is read from what the firmware publishes rather than measured here — no
+tezuka board has been on this bench — so treat the 47.5 MHz figure as the
+firmware's claim, and press **Test connection** to see what your own board
+actually answers.
+
 **Full duplex** — the checkbox above the port boxes, off by default. With it
 off, receive stops for the length of an over and the whole link goes to
 transmit, exactly as the HPSDR backend does. The reason is the link, not the
@@ -8793,6 +8917,17 @@ A few things worth knowing:
   IQ stream.
 - **Receive pauses while you transmit**, unless the radio is full-duplex — the
   same as any other TCI rig.
+- **Transmit audio is paced by the server, not the client.** TCI has the radio
+  ask for each buffer of transmit audio as it needs it (a *chrono*), and the
+  client answers one packet per request. sdroxide asks for exactly what is
+  missing from the queue and no more, so a client that answers a run of
+  requests in one go — which is what an application whose audio comes off a GUI
+  timer does — is never handed back more than the queue can hold. The queue
+  itself deepens on its own, up to a quarter of a second, to whatever gaps the
+  client actually leaves. Nothing to set: it settles in the first over and stays
+  there. (Earlier versions asked once per 10 ms block regardless of what was
+  already on its way, and an FT8 slot could go out as a few seconds of signal —
+  [issue #202](https://github.com/dividebysandwich/sdroxide/issues/202).)
 
 #### 6.8.3 WSJT-X UDP broadcast
 
@@ -11550,7 +11685,10 @@ All in [§6.2.7](#627-plutosdr-adalm-pluto):
   `192.168.2.1`, your computer `192.168.2.10`; the tab wants an address, not
   a serial. **Test connection** reports model, firmware, and the tuning range
   this particular board has (stock AD9363: 325 MHz–3.8 GHz; the well-known
-  AD9364 firmware change: 70 MHz–6 GHz).
+  AD9364 firmware change: 70 MHz–6 GHz; F5OEO's
+  [tezuka](https://github.com/F5OEO/tezuka_fw) firmware: 47.5 MHz–6 GHz, which
+  brings 6 m and 4 m into range). The limits are read off the board, so none of
+  this is a setting.
 - A stock Pluto cannot go below about **2.084 Msps**; leave the analog filter
   on `auto`; the RX gain slider only works in **Manual** AGC (the AD9361 owns
   the register otherwise). TX gain is attenuation — 0 dB is full output — and

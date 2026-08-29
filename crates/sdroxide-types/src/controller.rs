@@ -297,6 +297,17 @@ pub enum RadioEvent {
     /// this enum, and an enum is as big as its largest variant everywhere it is
     /// held.
     AdsbStatus(Box<crate::AdsbStatus>),
+    /// What the QO-100 beacon decoder has made of the 10489.750 MHz downlink:
+    /// lock state, the measured frequency offset, and the last decoded
+    /// telemetry text. Sent whenever it changes, the same convention
+    /// [`RadioEvent::IsmStatus`] follows — settings travel separately, in
+    /// [`crate::RadioState::qo100`].
+    ///
+    /// Native-engine only for now: bridging this to a remote/WASM client
+    /// would mean a matching variant in `sdroxide_proto::ServerMsg`, the way
+    /// `IsmStatus` has one — not done yet, since every station this shipped
+    /// for runs its own hardware locally.
+    Qo100Status(crate::Qo100Status),
 }
 
 /// Snapshot of the frontend's switchable sound devices (native clients).

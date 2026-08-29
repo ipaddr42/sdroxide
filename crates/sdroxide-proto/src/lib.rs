@@ -827,7 +827,26 @@ use sdroxide_types::{
 /// Appended at the end of the struct; postcard numbers fields by position, so a
 /// v99 peer desynchronises on the tail of every `AdsbStatus` and the
 /// handshake's equality test is what stops it trying.
-pub const PROTO_VERSION: u16 = 100;
+///
+/// **101** — the QO-100 beacon calibration decoder.
+///
+/// [`sdroxide_types::RadioState`] gained `qo100`
+/// ([`sdroxide_types::Qo100Settings`]) holding whether the decoder runs and how
+/// wide it searches, and [`sdroxide_types::Command`] gained `SetQo100Config` to
+/// move it — the ISM decoder's shape, no apply step, the engine echoes the
+/// setting back in the state. Both are appended at the tail of their type, so
+/// every field and variant already on the wire keeps its number; a v100 peer
+/// desynchronises on the tail of every `RadioState` regardless, and the
+/// handshake's equality test is what stops it trying.
+///
+/// The live side — [`sdroxide_types::Qo100Status`] (lock, measured offset,
+/// decoded telemetry text) — is a native-engine `RadioEvent` only and never
+/// reaches the wire: `sdroxide-server` maps it to no `ServerMsg`, the same as
+/// the spectrum lanes that travel their own way. So there is no new `ServerMsg`
+/// here, and a remote client's window shows that the reading is local-only
+/// rather than sitting on "starting…". If it is bridged later that is its own
+/// append and its own bump.
+pub const PROTO_VERSION: u16 = 101;
 const VERSION_BYTE: u8 = 0x12;
 
 #[derive(Debug, thiserror::Error)]

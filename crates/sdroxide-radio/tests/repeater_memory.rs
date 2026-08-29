@@ -154,6 +154,29 @@ fn a_memory_carries_its_repeater_setup_both_ways() {
     assert_eq!(s.repeater, RepeaterState::default(), "the shift outlived the channel it was for");
     assert_eq!(s.tx_freq_hz(), SIMPLEX_HZ);
 
+    // ---- A channel from before the field existed is simplex too ----
+    // `memories.json` files written before repeater support carry no setup at
+    // all, and the list draws them exactly like a simplex channel. Recalling
+    // one has to leave the radio simplex with no tone rather than on whatever
+    // the last repeater recall set (issue #204) — the operator is reading
+    // "145.500 NFM" off the list, not "and keep the −600 kHz shift".
+    send(Command::RecallMemory(rpt_id));
+    state_where(&h.event_rx, |s| s.repeater.shift == Shift::Minus);
+    send(Command::EditMemory {
+        id: simplex_id,
+        name: "S20".into(),
+        freq_hz: SIMPLEX_HZ,
+        mode: Mode::Nfm,
+        repeater: None,
+    });
+    memories(&h.event_rx, |m| m[1].repeater.is_none());
+    send(Command::RecallMemory(simplex_id));
+    let s = state_where(&h.event_rx, |s| {
+        s.active_freq_hz() == SIMPLEX_HZ && s.repeater.shift == Shift::Simplex
+    });
+    assert_eq!(s.repeater.tx_tone(), None, "an unset channel must not keep the last tone");
+    assert_eq!(s.tx_freq_hz(), SIMPLEX_HZ);
+
     // ---- An edit rewrites the setup in place ----
     let edited = RepeaterState { tone: ToneMode::Dcs, dcs_code: 754, ..rpt };
     send(Command::EditMemory {
@@ -172,7 +195,9 @@ fn a_memory_carries_its_repeater_setup_both_ways() {
     let saved = sdroxide_config::load_memories();
     assert_eq!(saved.len(), 2);
     assert_eq!(saved[0].repeater, Some(edited));
-    assert_eq!(saved[1].repeater, Some(RepeaterState::default()));
+    // Left as the edit above put it: an unset channel stays unset on disk, and
+    // it is the *recall* that reads it as simplex.
+    assert_eq!(saved[1].repeater, None);
 
     unsafe { std::env::remove_var("SDROXIDE_CONFIG_DIR") };
     let _ = std::fs::remove_dir_all(&root);

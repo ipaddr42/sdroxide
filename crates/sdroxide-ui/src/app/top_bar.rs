@@ -192,22 +192,27 @@ const STRIP_PTT_TEXT: f32 = 17.0;
 
 /// What a digit size costs the frequency readout, and what size fits a width.
 ///
-/// The readout is ten fixed-width digits, three group separators and a " Hz"
-/// tail, spaced 1 pt apart — so its width is linear in the digit size, and one
-/// measurement of the live fonts gives the slope. Inverting that is what lets
-/// one formula serve a 360 pt phone and a 2560 pt desktop.
+/// The readout is `digits` fixed-width digits ([`freq_display::DIGITS`]
+/// normally, [`freq_display::DIGITS_EXT`] on a radio whose converter reaches
+/// past 10 GHz — see [`SdroxideApp::readout_digits`]), three group separators
+/// and a " Hz" tail, spaced 1 pt apart — so its width is linear in the digit
+/// size, and one measurement of the live fonts gives the slope. Inverting
+/// that is what lets one formula serve a 360 pt phone and a 2560 pt desktop.
 struct ReadoutFit {
     /// Width per point of digit size.
     per_pt: f32,
     /// Height per point of digit size.
     h_per_pt: f32,
+    /// The 1 pt gaps between the readout's pieces — `digits` digits, 3 dots
+    /// and the " Hz" tail — added once rather than per point of size.
+    gaps: f32,
 }
 
 impl ReadoutFit {
     /// Everything up to the group separators scales with the digit size, and
     /// `freq_display` draws " Hz" at 0.3x it, so one reference measurement of
     /// each glyph is enough.
-    fn measure(ui: &egui::Ui) -> Self {
+    fn measure(ui: &egui::Ui, digits: u32) -> Self {
         const REF: f32 = 40.0;
         let w = |s: &str, f: egui::FontId| {
             ui.painter().layout_no_wrap(s.to_owned(), f, Color32::WHITE).size()
@@ -215,13 +220,17 @@ impl ReadoutFit {
         let digit = w("0", egui::FontId::monospace(REF));
         let dot = w(".", egui::FontId::monospace(REF)).x;
         let hz = w(" Hz", egui::FontId::proportional(REF)).x;
-        Self { per_pt: (10.0 * digit.x + 3.0 * dot + 0.3 * hz) / REF, h_per_pt: digit.y / REF }
+        Self {
+            per_pt: (digits as f32 * digit.x + 3.0 * dot + 0.3 * hz) / REF,
+            h_per_pt: digit.y / REF,
+            gaps: (digits + 3) as f32,
+        }
     }
 
     /// Width of the readout at `size`, including `freq_display`'s 1 pt spacing
-    /// between its fourteen pieces.
+    /// between its pieces.
     fn width(&self, size: f32) -> f32 {
-        size * self.per_pt + 13.0
+        size * self.per_pt + self.gaps
     }
 
     fn height(&self, size: f32) -> f32 {
@@ -231,7 +240,7 @@ impl ReadoutFit {
     /// The largest digit size whose readout fits `budget`. Uncapped and
     /// unfloored — callers clamp to their own limits.
     fn fit(&self, budget: f32) -> f32 {
-        (budget - 13.0) / self.per_pt
+        (budget - self.gaps) / self.per_pt
     }
 }
 
@@ -684,7 +693,7 @@ impl SdroxideApp {
         // strip against its own pane.
         let avail = ui.available_width();
         let gap = ui.spacing().item_spacing.x;
-        let fit = ReadoutFit::measure(ui);
+        let fit = ReadoutFit::measure(ui, self.readout_digits());
         // The readout keeps its design size wherever the row can hold it, and
         // shrinks against the full row where it cannot (a forced Desktop
         // layout on a narrow pane) — a box the packer cannot break up any
@@ -868,7 +877,7 @@ impl SdroxideApp {
         let div = self.has_diversity();
         let gap = ui.spacing().item_spacing.x;
         let chip_h = crate::chrome::chip_height(ui, None);
-        let fit = ReadoutFit::measure(ui);
+        let fit = ReadoutFit::measure(ui, self.readout_digits());
 
         let active = self.state.active_vfo;
         let tag = match active {
@@ -932,6 +941,7 @@ impl SdroxideApp {
                         shown,
                         plan.digit,
                         ink,
+                        self.readout_digits(),
                     ) {
                         cmds.push(Command::SetVfo { vfo: active, hz: hz - offset });
                     }
@@ -1268,6 +1278,33 @@ impl SdroxideApp {
         }
     }
 
+    /// How many digit columns the frequency readout needs: [`freq_display::DIGITS`]
+    /// on every radio this program reaches on its own, one more
+    /// ([`freq_display::DIGITS_EXT`]) once its published receive range —
+    /// already shifted by whatever converter/LNB offset is configured, see
+    /// `shift_caps` — reaches 10 GHz or past it. A QO-100 station is the case
+    /// this exists for: without it, the dial reading 10489.750 MHz has no
+    /// column for the leading "1" and silently shows "0489.750.000" instead.
+    ///
+    /// Read from the live capabilities rather than the offset alone, so a
+    /// receiver that reaches 10 GHz on its own hardware (a wideband direct
+    /// sampler, a paired panadapter) gets the same extra column without
+    /// needing a converter to ask for it.
+    ///
+    /// The published range is not the only tell, though: a SoapySDR driver
+    /// that never implemented `getFrequencyRange` publishes an empty list, so
+    /// a 3-cm LNB station driven through one would still truncate its
+    /// 10489.750 MHz dial. So the configured converter offset and the dial
+    /// itself each earn the column on their own — the offset so the column is
+    /// there *before* the operator tunes up rather than appearing mid-digit.
+    fn readout_digits(&self) -> u32 {
+        let range_reaches_10ghz =
+            self.caps.as_ref().is_some_and(|c| c.freq_ranges_rx.iter().any(|&(_, hi)| hi >= 1e10));
+        let converter_offset_hz =
+            self.radio_cfg.as_ref().map(|c| c.converter_offset_hz).unwrap_or(0.0);
+        readout_digit_count(range_reaches_10ghz, converter_offset_hz, self.state.active_freq_hz())
+    }
+
     /// The VFO frequency controls (A/B select + big readout + the inactive
     /// VFO's frequency) in a label-less box, always the first module.
     ///
@@ -1282,7 +1319,7 @@ impl SdroxideApp {
         cmds: &mut Vec<Command>,
         tier: crate::layout::Tier,
     ) -> bool {
-        let fit = ReadoutFit::measure(ui);
+        let fit = ReadoutFit::measure(ui, self.readout_digits());
         if tier == crate::layout::Tier::Phone {
             return self.freq_module_compact(ui, cmds, &fit);
         }
@@ -1399,6 +1436,7 @@ impl SdroxideApp {
                         self.input.cfg.wheel,
                         size,
                         ink,
+                        self.readout_digits(),
                     );
                 },
             );
@@ -1568,6 +1606,7 @@ impl SdroxideApp {
                 shown,
                 size,
                 ink,
+                self.readout_digits(),
             );
             if let Some(hz) = new_hz {
                 cmds.push(Command::SetVfo { vfo: active, hz: hz - offset });
@@ -4019,7 +4058,7 @@ impl SdroxideApp {
     /// The first five window chips — the condensed System box's top row.
     /// `extra` stretches each chip past its label; the popup passes 0.
     fn system_chips_top(&mut self, ui: &mut egui::Ui, extra: f32) {
-        let [log, spots, awards, bands, sat_label, ism, ..] = SYSTEM_CHIPS;
+        let [log, spots, awards, bands, sat_label, qo100_label, ism, ..] = SYSTEM_CHIPS;
         if chip_stretched(ui, self.show_logbook, log, extra)
             .on_hover_text("Logbook — all QSOs (digital + manual)")
             .clicked()
@@ -4070,6 +4109,29 @@ impl SdroxideApp {
             .clicked()
         {
             self.show_sat = !self.show_sat;
+        }
+        // Accented while the beacon hunt is running, like the satellite lock:
+        // it is worth knowing at a glance even with the window closed.
+        let qo100_chip = if self.state.qo100.enabled {
+            accent_chip_stretched(
+                ui,
+                true,
+                qo100_label,
+                crate::theme::GREEN(),
+                crate::theme::INK_ON_BRIGHT(),
+                extra,
+            )
+        } else {
+            chip_stretched(ui, self.show_qo100, qo100_label, extra)
+        };
+        if qo100_chip
+            .on_hover_text(
+                "QO-100 beacon — calibrate the LNB/converter offset against the 10489.750 MHz \
+                 beacon",
+            )
+            .clicked()
+        {
+            self.show_qo100 = !self.show_qo100;
         }
         // Accented while the decoder is actually running, like the scanner and
         // the satellite lock: it is spending CPU on four downconverters whether
@@ -4278,12 +4340,13 @@ impl PttPress {
 /// whatever crosses the window edge is lost. That is how SCAN, SETTINGS and
 /// HELP came to vanish on the layouts where the strip put this box near the
 /// end of a row.
-const SYSTEM_CHIPS: [&str; 11] = [
+const SYSTEM_CHIPS: [&str; 12] = [
     "LOG",
     "SPOTS",
     "AWARDS",
     "BANDS",
     "SAT",
+    "QO100",
     "ISM",
     "MAIL",
     "MEM",
@@ -4296,7 +4359,7 @@ const SYSTEM_CHIPS: [&str; 11] = [
 /// agree with the destructuring patterns in `system_chips_top` / `_bottom` —
 /// the array length pins both, so a chip added to the list forces all three
 /// to be revisited together.
-const SYSTEM_SPLIT: usize = 6;
+const SYSTEM_SPLIT: usize = 7;
 
 /// The Display box's top row: the solar view, then the chips that choose what
 /// the panadapter draws — the last of those only on a front end with a
@@ -4954,6 +5017,35 @@ fn sub_mode_picker(ui: &mut egui::Ui, cur: Mode, narrow: bool) -> Option<Mode> {
     picked
 }
 
+/// How many digit columns the frequency readout needs: [`freq_display::DIGITS`]
+/// normally, [`freq_display::DIGITS_EXT`] once anything puts a real digit in the
+/// ten-GHz column. Three independent tells, any one of them enough:
+///
+/// * `range_reaches_10ghz` — the receiver's published receive range (already
+///   shifted by the configured converter/LNB offset) reaches 10 GHz or past it.
+/// * `converter_offset_hz` — a 3-cm / 10 GHz converter is configured (LNB LO
+///   9750–10600 MHz, i.e. `|offset|` of about 9.75 GHz and up — a QO-100
+///   station's is 9.75 GHz exactly, well short of 10 GHz), so the column is
+///   there *before* the operator tunes up rather than appearing mid-digit. A
+///   driver that publishes no ranges at all (SoapySDR makes that optional)
+///   leaves the first tell blind, and this is what still earns that station
+///   its column. The `9e9` cut clears every 3-cm converter and stays above
+///   the next transverter down (13 cm, ~2.3 GHz).
+/// * `active_freq_hz` — the dial is already up there, converter or not (a
+///   wideband direct sampler, a paired panadapter).
+///
+/// Without the extra column the dial reading 10489.750 MHz has nowhere to put
+/// its leading "1" and is silently shown as "0489.750.000".
+fn readout_digit_count(
+    range_reaches_10ghz: bool,
+    converter_offset_hz: f64,
+    active_freq_hz: f64,
+) -> u32 {
+    let earns_extra =
+        range_reaches_10ghz || converter_offset_hz.abs() >= 9e9 || active_freq_hz >= 1e10;
+    if earns_extra { freq_display::DIGITS_EXT } else { freq_display::DIGITS }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5053,7 +5145,7 @@ mod tests {
     /// the shipped fonts; the assertions below are what that buys at each of
     /// the viewport widths the tiers were drawn for.
     fn shipped() -> ReadoutFit {
-        ReadoutFit { per_pt: 10.0 * 0.540 + 3.0 * 0.540 + 0.3 * 1.392, h_per_pt: 1.0 }
+        ReadoutFit { per_pt: 10.0 * 0.540 + 3.0 * 0.540 + 0.3 * 1.392, h_per_pt: 1.0, gaps: 13.0 }
     }
 
     #[test]
@@ -5936,7 +6028,7 @@ mod tests {
     /// that need an app to measure (the frequency readout's side columns) are
     /// priced at their design figures, which is what a desktop gets.
     fn cat_rig_strip_boxes(ui: &egui::Ui, mode: Mode) -> Vec<StripBox> {
-        let fit = ReadoutFit::measure(ui);
+        let fit = ReadoutFit::measure(ui, freq_display::DIGITS);
         let freq_w = 8.0
             + AB_W
             + 10.0
@@ -6304,5 +6396,47 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn the_readout_stays_at_ten_columns_for_an_ordinary_station() {
+        // No range past 10 GHz, no converter, dial on HF / VHF / 23 cm.
+        assert_eq!(readout_digit_count(false, 0.0, 14_074_000.0), freq_display::DIGITS);
+        assert_eq!(readout_digit_count(false, 0.0, 1_296_000_000.0), freq_display::DIGITS);
+        // A 13 cm transverter (~2.256 GHz offset) is the nearest converter
+        // below a 3 cm one and must not trip the extra column.
+        assert_eq!(
+            readout_digit_count(false, -2_256_000_000.0, 144_000_000.0),
+            freq_display::DIGITS
+        );
+    }
+
+    #[test]
+    fn a_qo100_converter_offset_earns_the_eleventh_column_before_the_dial_moves() {
+        // A QO-100 LNB down-converts by 9.75 GHz — short of 10 GHz, which is
+        // why the cut is 9e9 — while the dial is still parked on HF and the
+        // driver may publish no ranges at all. The column has to be there
+        // already, or it appears mid-digit the moment the operator tunes up.
+        assert_eq!(
+            readout_digit_count(false, -9_750_000_000.0, 14_074_000.0),
+            freq_display::DIGITS_EXT
+        );
+        // A 10 GHz-LO LNB (some 3 cm setups) too.
+        assert_eq!(
+            readout_digit_count(false, -10_000_000_000.0, 14_074_000.0),
+            freq_display::DIGITS_EXT
+        );
+    }
+
+    #[test]
+    fn a_dial_at_the_beacon_earns_the_column_on_its_own() {
+        // A wideband front end tuned straight to 10489.750 MHz, no converter —
+        // the exact reading the extra column exists to keep from truncating.
+        assert_eq!(readout_digit_count(false, 0.0, 10_489_750_000.0), freq_display::DIGITS_EXT);
+    }
+
+    #[test]
+    fn a_published_range_reaching_10_ghz_is_enough_by_itself() {
+        assert_eq!(readout_digit_count(true, 0.0, 14_074_000.0), freq_display::DIGITS_EXT);
     }
 }

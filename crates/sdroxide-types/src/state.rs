@@ -272,6 +272,70 @@ pub fn max_decimation(device_rate_hz: f64) -> u32 {
     factor
 }
 
+/// How much wider than the viewport the panadapter's zoom lane runs, so the
+/// decimator's transition band stays off the edge of the display.
+///
+/// Here rather than in the engine because the client has to work out the same
+/// answer: see [`panadapter_fft_ceiling`].
+pub const ZOOM_LANE_MARGIN: f64 = 1.4;
+
+/// The power-of-two decimation a panadapter zoom lane would run at to cover a
+/// `view_span_hz` window out of a `full_span_hz` stream, or `1` when the window
+/// is too wide for a lane to be any narrower than the stream itself.
+pub fn zoom_lane_decimation(full_span_hz: f64, view_span_hz: f64) -> u32 {
+    if !(full_span_hz.is_finite() && view_span_hz.is_finite())
+        || full_span_hz <= 0.0
+        || view_span_hz <= 0.0
+    {
+        return 1;
+    }
+    let want = view_span_hz * ZOOM_LANE_MARGIN;
+    let mut decim = 1u32;
+    while decim < 1 << 14 && full_span_hz / f64::from(decim * 2) >= want {
+        decim *= 2;
+    }
+    decim
+}
+
+/// The largest device-wide FFT worth asking for while looking at a
+/// `view_span_hz` window of a `full_span_hz` stream on a `display_bins`-wide
+/// panadapter — or `None` where there is no zoom lane to defer to and the
+/// device-wide analyser is the only thing that can resolve the window.
+///
+/// Zooming used to be answered by making the device-wide FFT bigger, and that
+/// is a transform over *everything the front end streams*: on a 2 Msps HackRF,
+/// going from 4096 points to 32768 costs about two thirds of the whole receive
+/// path's throughput, which on a small machine is a receiver that starts
+/// dropping samples the moment somebody zooms in (issue #195).
+///
+/// Since the zoom lane exists there is a much cheaper answer: the window mixed
+/// down and decimated to its own width, and analysed there. The engine builds
+/// one exactly while the device-wide analyser has fewer than one bin per column
+/// inside the window — so growing that analyser past this ceiling does not
+/// merely cost more, it *switches the cheap lane off* and pays several times
+/// over for a picture the lane had already drawn.
+pub fn panadapter_fft_ceiling(
+    full_span_hz: f64,
+    view_span_hz: f64,
+    display_bins: u32,
+) -> Option<u32> {
+    if zoom_lane_decimation(full_span_hz, view_span_hz) < 2 || display_bins == 0 {
+        return None;
+    }
+    // The engine's own test, rearranged: a lane is wanted while
+    // `fft * view / full < display_bins`.
+    let limit = f64::from(display_bins) * full_span_hz / view_span_hz;
+    if !limit.is_finite() || limit < 2.0 {
+        return None;
+    }
+    // The largest power of two strictly under it.
+    let mut fft = 1u32;
+    while f64::from(fft * 2) < limit && fft < 1 << 20 {
+        fft *= 2;
+    }
+    Some(fft)
+}
+
 /// Complete radio state snapshot. Kept small (~300 bytes serialized) so full
 /// snapshots — never deltas — travel on every change, latest-wins.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -391,6 +455,13 @@ pub struct RadioState {
     /// panel learns that. Appended last: postcard numbers fields by position.
     #[serde(default)]
     pub adsb: crate::AdsbSettings,
+    /// The QO-100 beacon decoder: whether it runs, and how wide a search it
+    /// makes around [`crate::QO100_BEACON_HZ`]. Live status (lock, offset,
+    /// decoded text) is [`crate::Qo100Status`], sent separately like
+    /// [`crate::IsmStatus`] — this struct is settings, sent whole on every
+    /// change like [`Self::ism`].
+    #[serde(default)]
+    pub qo100: crate::Qo100Settings,
 }
 
 impl Default for RadioState {
@@ -430,6 +501,7 @@ impl Default for RadioState {
             // Open, until the radio says otherwise: the level is adopted from
             // the rig, and until one has answered there is nothing to claim.
             rig_squelch: 0.0,
+            qo100: crate::Qo100Settings::default(),
         }
     }
 }
@@ -463,5 +535,44 @@ impl RadioState {
         // different places for different reasons, and a radio that silently
         // dropped one of them would transmit where neither control says.
         base + self.repeater.shift_hz() + self.xit.effective_hz()
+    }
+}
+
+#[cfg(test)]
+mod zoom_lane_tests {
+    use super::{panadapter_fft_ceiling, zoom_lane_decimation};
+
+    /// The ladder the engine's zoom lane walks: the narrowest output that still
+    /// spans the window with room for the decimator's skirt.
+    #[test]
+    fn the_ladder_keeps_the_decimators_skirt_off_the_display() {
+        // A window a shade under half the stream: halving it once would leave
+        // the skirt inside the picture, so there is no lane to build.
+        assert_eq!(zoom_lane_decimation(2_000_000.0, 800_000.0), 1);
+        // A quarter of the stream: one step down still covers it with margin.
+        assert_eq!(zoom_lane_decimation(2_000_000.0, 500_000.0), 2);
+        assert_eq!(zoom_lane_decimation(2_000_000.0, 250_000.0), 4);
+        assert_eq!(zoom_lane_decimation(2_000_000.0, 31_250.0), 32);
+        // Nonsense in, no lane out.
+        assert_eq!(zoom_lane_decimation(0.0, 1.0), 1);
+        assert_eq!(zoom_lane_decimation(f64::NAN, 1.0), 1);
+    }
+
+    /// The ceiling a client must not ask past, and the reason it exists: the
+    /// engine builds its zoom lane exactly while the device-wide analyser has
+    /// fewer than one bin per column inside the window.
+    #[test]
+    fn the_ceiling_is_the_largest_fft_that_still_leaves_the_lane_in_charge() {
+        // 2 Msps, a 500 kHz window on a 2048-column panadapter: the analyser
+        // has one bin per column at 8192 points, so 4096 is the most that still
+        // leaves the lane to draw it.
+        assert_eq!(panadapter_fft_ceiling(2_000_000.0, 500_000.0, 2048), Some(4096));
+        // Deeper in, the ceiling rises with the zoom — the analyser needs more
+        // points to reach the same one-bin-per-column there.
+        assert_eq!(panadapter_fft_ceiling(2_000_000.0, 62_500.0, 2048), Some(32_768));
+        // A window too wide for a lane has no ceiling: the device-wide analyser
+        // is the only thing that can resolve it, so let the client have it.
+        assert_eq!(panadapter_fft_ceiling(2_000_000.0, 800_000.0, 2048), None);
+        assert_eq!(panadapter_fft_ceiling(2_000_000.0, 500_000.0, 0), None);
     }
 }
