@@ -619,7 +619,9 @@ impl PacketController {
             return;
         }
         let Some(me) = self.mycall() else {
-            self.term_note("*** set a station callsign in the packet settings first".into());
+            self.term_note(
+                "*** set a station callsign first — the SETUP button above the monitor pane".into(),
+            );
             return;
         };
         let peer = match Addr::new(call.trim()) {
@@ -961,6 +963,7 @@ impl PacketController {
             fsq_messages: Vec::new(),
             rade: None,
             packet: Some(self.packet_status()),
+            navtex: None,
             aprs: None,
             js8: None,
             fox_queue: Vec::new(),

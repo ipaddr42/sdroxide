@@ -563,7 +563,7 @@ impl SdroxideApp {
     /// PSK has no parameters, so nothing is drawn.
     fn text_modem_params_row(&mut self, ui: &mut egui::Ui, cmds: &mut Vec<Command>) {
         let mode = self.state.rx[0].mode;
-        if !matches!(mode, Mode::Rtty | Mode::Olivia | Mode::Thor) {
+        if !matches!(mode, Mode::Rtty | Mode::RttyFm | Mode::Olivia | Mode::Thor) {
             return; // PSK (and anything else) has no per-mode settings
         }
         fn cap(ui: &mut egui::Ui, text: &str) {
@@ -575,7 +575,7 @@ impl SdroxideApp {
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 3.0;
             match mode {
-                Mode::Rtty => {
+                Mode::Rtty | Mode::RttyFm => {
                     // 450 is what the Deutscher Wetterdienst broadcasts use and
                     // is far enough from 425 to matter; the nudge covers the
                     // rest, since commercial shifts are not a short list.

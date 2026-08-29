@@ -798,4 +798,37 @@ pub enum Command {
     /// the same convention [`Command::SetIsmConfig`] follows. Appended for
     /// the usual reason: postcard numbers variants by position.
     SetQo100Config(crate::Qo100Settings),
+
+    /// Start (`true`) or stop (`false`) recording the receiver's raw I/Q to a
+    /// WAV file (issue #217).
+    ///
+    /// Independent of [`Command::SetRecording`]: one writes what the operator
+    /// *hears*, the other what the receiver *received*, and an operator
+    /// capturing a band for later analysis wants the second whether or not the
+    /// first is running. Both may run at once.
+    ///
+    /// The engine names the file — date, time, centre frequency and sample rate
+    /// — and puts it beside the audio recordings. Refused on a demod-audio
+    /// front end, which has no I/Q to capture.
+    ///
+    /// Appended for the usual reason — postcard numbers variants by position.
+    SetIqRecording(bool),
+
+    /// Set the serial number the next contest exchange will carry (issue #223).
+    ///
+    /// Its own command rather than a whole [`DigiConfig`](crate::DigiConfig)
+    /// through `SetDigiConfig` for the same reason
+    /// [`Command::SetDigiTxLevel`] is: the *engine* advances this number, once
+    /// per logged contact, so every client's copy of the configuration is stale
+    /// the moment a contact completes and sending one back would put the count
+    /// where it was an hour ago. That makes `contest_serial` a field with a
+    /// write route outside `SetDigiConfig`, which is what puts it in the
+    /// engine's `keep_engine_owned` — and this is the route.
+    ///
+    /// Clamped to `1..=`[`crate::CONTEST_SERIAL_MAX`] engine-side: the layout's
+    /// field is eleven bits, and a number outside it is not a message the far
+    /// end can read.
+    ///
+    /// Appended for the usual reason — postcard numbers variants by position.
+    SetContestSerial(u32),
 }

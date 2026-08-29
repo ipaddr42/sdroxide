@@ -58,6 +58,7 @@ pub fn mode_to_civ(m: Mode) -> u8 {
         | Mode::Rtty
         | Mode::Sstv
         | Mode::Wefax
+        | Mode::Navtex
         | Mode::Olivia
         | Mode::Thor
         | Mode::Fsq
@@ -80,6 +81,7 @@ pub fn mode_to_civ(m: Mode) -> u8 {
         | Mode::Packet
         | Mode::Aprs
         | Mode::SstvFm
+        | Mode::RttyFm
         | Mode::Adsb => 0x05,
         Mode::Spec => 0x01,
     }

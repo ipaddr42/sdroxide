@@ -410,7 +410,7 @@ impl Transport for UsbDev {
                     None,
                     &format!("FAILED: {source}"),
                 );
-                Err(Error::Transfer { op: "control read", source })
+                Err(Error::Transfer { op: format!("control read {req:?}"), source })
             }
         }
     }
@@ -453,7 +453,10 @@ impl Transport for UsbDev {
                     None,
                     &format!("FAILED: {source}"),
                 );
-                Err(Error::Transfer { op: "control write", source })
+                Err(Error::Transfer {
+                    op: format!("control write {req:?} (value {value:#06x}, index {index:#06x})"),
+                    source,
+                })
             }
         }
     }
@@ -501,6 +504,9 @@ pub(crate) mod fake {
         /// Canned replies per request code; anything absent answers with a
         /// single `1`, which is what the gain setters read as "accepted".
         replies: Mutex<Vec<(u8, Vec<u8>)>>,
+        /// Request codes this radio refuses, as a real one stalls a request its
+        /// board does not have.
+        stalls: Mutex<Vec<u8>>,
         api: u16,
         trace: Trace,
     }
@@ -516,6 +522,7 @@ pub(crate) mod fake {
             FakeTransport {
                 calls: Mutex::new(Vec::new()),
                 replies: Mutex::new(Vec::new()),
+                stalls: Mutex::new(Vec::new()),
                 // Newest API, so nothing is skipped as too old unless a test
                 // asks for that explicitly.
                 api: 0x0109,
@@ -531,6 +538,17 @@ pub(crate) mod fake {
         pub fn reply(self, req: Request, bytes: &[u8]) -> FakeTransport {
             self.replies.lock().unwrap().push((req.code(), bytes.to_vec()));
             self
+        }
+
+        /// Refuse `req` the way a radio whose board does not have it does: a
+        /// stalled control transfer.
+        pub fn stalling(self, req: Request) -> FakeTransport {
+            self.stalls.lock().unwrap().push(req.code());
+            self
+        }
+
+        fn stalls(&self, req: Request) -> bool {
+            self.stalls.lock().unwrap().contains(&req.code())
         }
 
         pub fn calls(&self) -> Vec<Call> {
@@ -577,6 +595,12 @@ pub(crate) mod fake {
 
         fn control_out(&self, req: Request, value: u16, index: u16, data: &[u8]) -> Result<()> {
             self.record(req, value, index, data);
+            if self.stalls(req) {
+                return Err(Error::Transfer {
+                    op: format!("control write {req:?}"),
+                    source: nusb::transfer::TransferError::Stall,
+                });
+            }
             Ok(())
         }
 

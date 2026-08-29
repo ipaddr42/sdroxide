@@ -144,6 +144,7 @@ impl HellController {
             fsq_messages: Vec::new(),
             rade: None,
             packet: None,
+            navtex: None,
             aprs: None,
             js8: None,
             fox_queue: Vec::new(),

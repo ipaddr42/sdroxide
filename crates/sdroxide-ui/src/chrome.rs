@@ -1368,6 +1368,14 @@ pub fn chip(ui: &mut Ui, selected: bool, text: impl Into<RichText>) -> Response 
     chip_impl(ui, selected, text.into(), None, Sense::click(), None)
 }
 
+/// [`chip`], but the pointer may also drag it: the settings roster's radio
+/// chips, which are rearranged by dragging (issue #224). A drag that never
+/// travels far enough to be one is still delivered as a click, so nothing is
+/// lost by making a chip draggable.
+pub fn chip_draggable(ui: &mut Ui, selected: bool, text: impl Into<RichText>) -> Response {
+    chip_impl(ui, selected, text.into(), None, Sense::click_and_drag(), None)
+}
+
 /// What sdroxide's own power switch does, in the one place all three of its
 /// homes read it from: the frequency box, the tab strip and the settings
 /// roster.

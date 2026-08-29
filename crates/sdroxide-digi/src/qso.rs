@@ -4,7 +4,8 @@
 //! through the standard exchange.
 
 use sdroxide_types::{
-    Decode, DigiConfig, DigiStatus, DxpedMode, Mode, QsoRecord, QsoStep, QueuedCall, TranscriptLine,
+    ContestMode, Decode, DigiConfig, DigiStatus, DxpedMode, Mode, QsoRecord, QsoStep, QueuedCall,
+    TranscriptLine,
 };
 
 use crate::fox::{Fox, slot_spacing_hz};
@@ -28,12 +29,60 @@ pub(crate) enum Payload {
     Rrr,
     Rr73,
     B73,
+    /// A contest exchange: a two-digit RS glued to a serial number, and a
+    /// six-character locator (issue #223). `rogered` is the leading `R`, which
+    /// carries exactly what it carries in the everyday exchange — "I have yours"
+    /// — and so is what decides whether the answer is another exchange or an
+    /// RR73.
+    Exchange {
+        rs: u8,
+        serial: u32,
+        grid6: String,
+        rogered: bool,
+    },
     Other,
+}
+
+/// Split a contest exchange token — `590003` — into `(59, 3)`.
+///
+/// The RS is bounded because the layout's field is: three bits read back as
+/// `52 + n`, so `51` or `60` is not a message anyone can have sent.
+fn parse_exchange(tok: &str) -> Option<(u8, u32)> {
+    if tok.len() != 6 || !tok.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let rs: u8 = tok[..2].parse().ok()?;
+    let serial: u32 = tok[2..].parse().ok()?;
+    (52..=59).contains(&rs).then_some((rs, serial))
+}
+
+/// A six-character locator in the alphabet the contest layout allows (the
+/// sub-square letters run A..X).
+fn is_grid6(t: &str) -> bool {
+    let b = t.as_bytes();
+    b.len() == 6
+        && (b'A'..=b'R').contains(&b[0])
+        && (b'A'..=b'R').contains(&b[1])
+        && b[2].is_ascii_digit()
+        && b[3].is_ascii_digit()
+        && (b'A'..=b'X').contains(&b[4])
+        && (b'A'..=b'X').contains(&b[5])
 }
 
 pub(crate) fn classify_payload(text: &str) -> Payload {
     let toks: Vec<&str> = text.split_whitespace().collect();
     let Some(p) = toks.get(2) else { return Payload::Other };
+    // A contest exchange is two tokens, and the `R` in front of it is a third —
+    // so it is read before the single-token payloads below, which would see
+    // only its first half.
+    let rogered = *p == "R";
+    let rest = &toks[if rogered { 3 } else { 2 }..];
+    if let [exch, grid6] = rest
+        && let Some((rs, serial)) = parse_exchange(exch)
+        && is_grid6(grid6)
+    {
+        return Payload::Exchange { rs, serial, grid6: (*grid6).to_string(), rogered };
+    }
     match *p {
         "RR73" => Payload::Rr73,
         "RRR" => Payload::Rrr,
@@ -60,6 +109,10 @@ fn reply_step(payload: &Payload) -> Option<QsoStep> {
         Payload::Grid(_) | Payload::Other => Some(QsoStep::TxReport),
         Payload::Report(_) => Some(QsoStep::TxRReport),
         Payload::RReport(_) => Some(QsoStep::TxRr73),
+        // A contest exchange answers exactly as a report does: theirs bare asks
+        // for ours rogered, theirs rogered says the exchange is complete.
+        Payload::Exchange { rogered: false, .. } => Some(QsoStep::TxRReport),
+        Payload::Exchange { rogered: true, .. } => Some(QsoStep::TxRr73),
         Payload::Rrr | Payload::Rr73 => Some(QsoStep::Tx73),
         Payload::B73 => None,
     }
@@ -99,6 +152,15 @@ struct Dx {
     grid: Option<String>,
     rpt_sent: Option<i16>, // report we sent them (their SNR at us)
     rpt_rcvd: Option<i16>, // report they sent us
+    /// The contest exchange they sent us — `(RS, serial, locator)` — kept
+    /// whole because all three of them go in the log, and the serial is the
+    /// only part of a contest QSO that cannot be worked out again afterwards.
+    exch_rcvd: Option<(u8, u32, String)>,
+    /// The serial we sent them. Read off `DigiConfig::contest_serial` when the
+    /// exchange first goes out rather than at log time, so a contact that
+    /// straddles the engine advancing the counter is logged with the number
+    /// that actually went on the air.
+    serial_sent: Option<u32>,
     started_utc: i64,
     last_utc: i64,
 }
@@ -392,11 +454,19 @@ impl QsoMachine {
             Some(Payload::Report(r) | Payload::RReport(r)) => Some(r),
             _ => None,
         };
+        let exch_rcvd = match &heard {
+            Some(Payload::Exchange { rs, serial, grid6, .. }) => {
+                Some((*rs, *serial, grid6.clone()))
+            }
+            _ => None,
+        };
         self.dx = Some(Dx {
             call: from,
             grid,
             rpt_sent: Some(snr),
             rpt_rcvd,
+            exch_rcvd,
+            serial_sent: None,
             started_utc: now_utc,
             last_utc: now_utc,
         });
@@ -596,6 +666,7 @@ impl QsoMachine {
                     if let Payload::Report(r) | Payload::RReport(r) = payload {
                         self.set_rcvd(r);
                     }
+                    self.set_exch_rcvd(&payload);
                     // They are on the air and free: that is the thing we were
                     // waiting for, so the calls we made before they went quiet
                     // must not count against the ones we are about to make.
@@ -666,6 +737,8 @@ impl QsoMachine {
                     grid,
                     rpt_sent: Some(d.snr_db),
                     rpt_rcvd: None,
+                    exch_rcvd: None,
+                    serial_sent: None,
                     started_utc: now_utc,
                     last_utc: now_utc,
                 });
@@ -780,6 +853,7 @@ impl QsoMachine {
         if let Payload::Report(r) | Payload::RReport(r) = payload {
             self.set_rcvd(*r);
         }
+        self.set_exch_rcvd(payload);
         let prev = self.step;
         match payload {
             // Free text, a bare call, anything the packer mangled: it says
@@ -825,6 +899,20 @@ impl QsoMachine {
         }
     }
 
+    /// Keep the contest exchange they sent, and the locator with it.
+    ///
+    /// The locator lands in `grid` as well as in the exchange: the map, the
+    /// distance and the awards all read that field, and a six-character one is
+    /// simply a better answer to the same question than the four-character grid
+    /// the opening messages carried.
+    fn set_exch_rcvd(&mut self, payload: &Payload) {
+        let Payload::Exchange { rs, serial, grid6, .. } = payload else { return };
+        if let Some(dx) = self.dx.as_mut() {
+            dx.exch_rcvd = Some((*rs, *serial, grid6.clone()));
+            dx.grid = Some(grid6.clone());
+        }
+    }
+
     /// Log the QSO and enter [`QsoStep::Confirming`], keeping the DX so we can
     /// re-send our final message for a few minutes if they didn't hear it.
     ///
@@ -838,11 +926,33 @@ impl QsoMachine {
             if let Some(e) = sdroxide_types::entity_name(&dx.call) {
                 self.worked_entities.insert(e.to_string());
             }
+            // A contest contact logs what was actually exchanged (issue #223).
+            // The reports become the two digits of the RS each side sent — the
+            // way every contest log reads, and the way WSJT-X writes them —
+            // rather than the signal-to-noise ratio, which is not what went
+            // over. `SRX`/`STX` carry the serial numbers and the `_STRING`
+            // fields the exchange whole, which is what a checker wants to see.
+            let (mut rst_sent, mut rst_rcvd) = (dx.rpt_sent, dx.rpt_rcvd);
+            let (mut srx, mut stx) = (None, None);
+            let (mut srx_string, mut stx_string) = (String::new(), String::new());
+            if self.contest() == ContestMode::EuVhf {
+                let rs_sent = sdroxide_types::eu_vhf_rs(dx.rpt_sent.unwrap_or(0));
+                let serial = self.serial_for_this_qso();
+                rst_sent = Some(i16::from(rs_sent));
+                stx = Some(serial);
+                stx_string =
+                    format!("{rs_sent:02}{serial:04} {}", self.cfg.my_grid.to_ascii_uppercase());
+                if let Some((rs, ser, grid6)) = &dx.exch_rcvd {
+                    rst_rcvd = Some(i16::from(*rs));
+                    srx = Some(*ser);
+                    srx_string = format!("{rs:02}{ser:04} {grid6}");
+                }
+            }
             self.completed.push_back(QsoRecord {
                 call: dx.call.clone(),
                 grid: dx.grid.clone(),
-                rst_sent: dx.rpt_sent,
-                rst_rcvd: dx.rpt_rcvd,
+                rst_sent,
+                rst_rcvd,
                 freq_hz: 0.0, // filled by the controller (needs dial freq)
                 mode: self.mode.label().to_string(),
                 band: String::new(), // filled by the controller
@@ -850,6 +960,10 @@ impl QsoMachine {
                 end_utc: now_utc,
                 my_call: self.cfg.my_call.clone(),
                 my_grid: self.cfg.my_grid.clone(),
+                srx,
+                stx,
+                srx_string,
+                stx_string,
                 ..Default::default() // id assigned by the logbook, no comment
             });
             // Say so in the transcript. The exchange stays on screen for the
@@ -919,6 +1033,9 @@ impl QsoMachine {
         // "JN78ve" is truncated to "JN78" for the transmitted message.
         let mg: String = self.cfg.my_grid.chars().take(4).collect();
         let rpt_sent = dx.and_then(|d| d.rpt_sent);
+        if self.contest() == ContestMode::EuVhf {
+            return self.plan_eu_vhf(dx_call, &mg, rpt_sent);
+        }
         let fill = |tmpl: &str, rpt: Option<i16>| DigiConfig::fill(tmpl, mc, &mg, dx_call, rpt);
         match self.step {
             QsoStep::CallingCq => Some(fill(&self.cfg.msg_cq, None)),
@@ -931,6 +1048,73 @@ impl QsoMachine {
             QsoStep::Confirming => self.resend.then(|| self.final_msg.clone()).flatten(),
             QsoStep::Idle | QsoStep::WaitCq => None,
         }
+    }
+
+    /// The special operating activity in force, or `None` where it cannot
+    /// apply.
+    ///
+    /// Two things put it out of reach, and both of them silently: a mode with
+    /// no 77-bit layout to carry the exchange, and a station whose locator is
+    /// only four characters — the whole point of the EU VHF layout is the
+    /// six-character one, and there is no honest message to send without it.
+    /// The setup panel says so where the activity is chosen; here the ordinary
+    /// exchange simply goes out, which is the one behaviour that is never
+    /// wrong on the air.
+    pub(crate) fn contest(&self) -> ContestMode {
+        match self.cfg.contest {
+            ContestMode::EuVhf
+                if matches!(self.mode, Mode::Ft8 | Mode::Ft4 | Mode::Ft2)
+                    && is_grid6(&self.cfg.my_grid.to_ascii_uppercase()) =>
+            {
+                ContestMode::EuVhf
+            }
+            _ => ContestMode::None,
+        }
+    }
+
+    /// This slot's message in an EU VHF contest (issue #223).
+    ///
+    /// The first two and the last two of the six are ordinary messages — the
+    /// exchange has to be preceded by messages that spell both callsigns out,
+    /// because the exchange itself carries only their hashes. The two in the
+    /// middle are the `i3 = 5` layout: a signal report as the two digits of an
+    /// RS, a serial number, and the six-character locator.
+    fn plan_eu_vhf(&self, dx_call: &str, grid4: &str, rpt_sent: Option<i16>) -> Option<String> {
+        let mc = self.cfg.my_call.trim();
+        let grid6 = self.cfg.my_grid.to_ascii_uppercase();
+        let serial = self.serial_for_this_qso();
+        // The report is theirs at us, mapped onto the RS the field can carry.
+        // With nobody worked yet there is nothing measured, so the exchange
+        // opens at 59 rather than inventing a signal.
+        let rs = sdroxide_types::eu_vhf_rs(rpt_sent.unwrap_or(0));
+        let exch = format!("{rs:02}{serial:04}");
+        match self.step {
+            QsoStep::CallingCq => Some(format!("CQ TEST {mc} {grid4}")),
+            QsoStep::TxGrid => Some(format!("{dx_call} {mc} {grid4}")),
+            QsoStep::TxReport => Some(format!("<{dx_call}> <{mc}> {exch} {grid6}")),
+            QsoStep::TxRReport => Some(format!("<{dx_call}> <{mc}> R {exch} {grid6}")),
+            QsoStep::TxRr73 => Some(format!("{dx_call} {mc} RR73")),
+            QsoStep::Tx73 => Some(format!("{dx_call} {mc} 73")),
+            QsoStep::Confirming => self.resend.then(|| self.final_msg.clone()).flatten(),
+            QsoStep::Idle | QsoStep::WaitCq => None,
+        }
+    }
+
+    /// The serial this contact is sending: the one already committed to it, or
+    /// the station's next unused number.
+    ///
+    /// Committed on the first exchange that goes out and held for the rest of
+    /// the contact, so a contact still in progress when the engine advances the
+    /// counter — which it does the instant the *previous* one is logged — does
+    /// not change its serial halfway through. That is the fault this exists to
+    /// prevent: the far end logs the number in the message it heard, and two
+    /// different numbers for one contact is a scoring error on both sides.
+    fn serial_for_this_qso(&self) -> u32 {
+        self.dx
+            .as_ref()
+            .and_then(|d| d.serial_sent)
+            .unwrap_or(self.cfg.contest_serial)
+            .clamp(1, sdroxide_types::CONTEST_SERIAL_MAX)
     }
 
     /// The controller calls this after each burst finishes. When the final
@@ -955,6 +1139,16 @@ impl QsoMachine {
             return;
         }
         self.tx_since_progress += 1;
+        // The serial belongs to this contact from the first exchange that goes
+        // out on the air. See [`Self::serial_for_this_qso`].
+        if self.contest() == ContestMode::EuVhf
+            && matches!(self.step, QsoStep::TxReport | QsoStep::TxRReport)
+        {
+            let serial = self.serial_for_this_qso();
+            if let Some(dx) = self.dx.as_mut() {
+                dx.serial_sent.get_or_insert(serial);
+            }
+        }
         // Calling one station that never comes back: give up rather than call
         // into the void all afternoon. (Repeating a CQ is exempt — that *is*
         // the operation; the watchdog above bounds it instead.)
@@ -1006,6 +1200,7 @@ impl QsoMachine {
             fsq_messages: Vec::new(),
             rade: None,
             packet: None,
+            navtex: None,
             aprs: None,
             js8: None,
             fox_queue: self.fox.as_ref().map(Fox::status).unwrap_or_default(),
@@ -1031,27 +1226,123 @@ mod tests {
     }
 
     fn decode(msg: &str) -> Decode {
+        // The angle brackets a hashed callsign is written with are the
+        // *rendering* of the hash, not part of the call — the real parser
+        // strips them (`modem::call_of`), so this stand-in has to as well or a
+        // contest exchange never looks addressed to anybody.
+        let call = |t: &str| {
+            t.strip_prefix('<').and_then(|x| x.strip_suffix('>')).unwrap_or(t).to_string()
+        };
         Decode {
             slot_utc: 0,
             snr_db: -10,
             dt: 0.1,
             audio_hz: 1500.0,
             message: msg.to_string(),
-            to: msg.split_whitespace().next().filter(|t| *t != "CQ").map(|s| s.to_string()),
-            from: {
-                let t: Vec<&str> = msg.split_whitespace().collect();
-                if t.first() == Some(&"CQ") {
-                    t.get(1).map(|s| s.to_string())
-                } else {
-                    t.get(1).map(|s| s.to_string())
-                }
-            },
+            to: msg.split_whitespace().next().filter(|t| *t != "CQ").map(call),
+            from: msg.split_whitespace().nth(1).map(call),
             grid: None,
             is_cq: msg.starts_with("CQ"),
             cq_to: msg.split_whitespace().nth(1).filter(|t| *t == "DX").map(str::to_string),
             free_text: false,
             rr73_to: None,
         }
+    }
+
+    /// A station set up for a European VHF contest: the six-character locator
+    /// the layout requires, and a serial to start from.
+    fn eu_cfg() -> DigiConfig {
+        DigiConfig {
+            my_call: "G4ABC/P".into(),
+            my_grid: "IO91NP".into(),
+            contest: ContestMode::EuVhf,
+            contest_serial: 3,
+            ..Default::default()
+        }
+    }
+
+    /// The exchange from WSJT-X's own `messages.txt`, run through the
+    /// sequencer from both sides (issue #223).
+    #[test]
+    fn a_eu_vhf_contest_runs_the_reference_exchange() {
+        let mut q = QsoMachine::new(Mode::Ft8, eu_cfg());
+        q.call_cq();
+        assert_eq!(q.plan_tx().as_deref(), Some("CQ TEST G4ABC/P IO91"));
+
+        // PA9XYZ answers with a grid; we come back with the exchange. The RS
+        // is their signal at us: -10 dB is (−10+36)/6 = 4, so 54.
+        assert!(q.on_rx(&[decode("G4ABC/P PA9XYZ JO22")], 115));
+        assert_eq!(q.step(), QsoStep::TxReport);
+        assert_eq!(q.plan_tx().as_deref(), Some("<PA9XYZ> <G4ABC/P> 540003 IO91NP"));
+
+        // Their exchange comes back rogered → the contact is complete and we
+        // send RR73, exactly as a rogered report would have us do.
+        q.note_tx_sent(130);
+        assert!(q.on_rx(&[decode("<G4ABC/P> <PA9XYZ> R 570007 JO22DB")], 145));
+        assert_eq!(q.step(), QsoStep::TxRr73);
+        assert_eq!(q.plan_tx().as_deref(), Some("PA9XYZ G4ABC/P RR73"));
+
+        q.note_tx_sent(160);
+        let rec = q.take_completed().expect("logged");
+        assert_eq!(rec.call, "PA9XYZ");
+        // The reports logged are the two RS values that went over the air, not
+        // the signal-to-noise ratios behind them.
+        assert_eq!(rec.rst_sent, Some(54));
+        assert_eq!(rec.rst_rcvd, Some(57));
+        assert_eq!(rec.stx, Some(3));
+        assert_eq!(rec.srx, Some(7));
+        assert_eq!(rec.stx_string, "540003 IO91NP");
+        assert_eq!(rec.srx_string, "570007 JO22DB");
+        // Their six-character locator is the one the log keeps.
+        assert_eq!(rec.grid.as_deref(), Some("JO22DB"));
+    }
+
+    /// Answering somebody else's contest CQ: their exchange arrives bare, ours
+    /// goes back rogered.
+    #[test]
+    fn answering_a_contest_cq_rogers_the_exchange() {
+        let mut q = QsoMachine::new(Mode::Ft8, eu_cfg());
+        q.start_qso("PA9XYZ".into(), Some("JO22".into()), -10, false, 100);
+        assert_eq!(q.plan_tx().as_deref(), Some("PA9XYZ G4ABC/P IO91"));
+        assert!(q.on_rx(&[decode("<G4ABC/P> <PA9XYZ> 590003 JO22DB")], 115));
+        assert_eq!(q.step(), QsoStep::TxRReport);
+        assert_eq!(q.plan_tx().as_deref(), Some("<PA9XYZ> <G4ABC/P> R 540003 IO91NP"));
+    }
+
+    /// The serial is fixed when the first exchange goes on the air and does
+    /// not move under the contact afterwards — the engine advances the
+    /// station's counter the instant the *previous* contact is logged, and two
+    /// different numbers for one contact is a scoring error at both ends.
+    #[test]
+    fn a_contact_keeps_the_serial_it_first_sent() {
+        let mut q = QsoMachine::new(Mode::Ft8, eu_cfg());
+        q.start_qso("PA9XYZ".into(), Some("JO22".into()), -10, false, 100);
+        assert!(q.on_rx(&[decode("<G4ABC/P> <PA9XYZ> 590003 JO22DB")], 115));
+        assert_eq!(q.plan_tx().as_deref(), Some("<PA9XYZ> <G4ABC/P> R 540003 IO91NP"));
+        q.note_tx_sent(130);
+        // The station's counter moves on under us.
+        q.set_config(DigiConfig { contest_serial: 9, ..eu_cfg() });
+        assert_eq!(q.plan_tx().as_deref(), Some("<PA9XYZ> <G4ABC/P> R 540003 IO91NP"));
+    }
+
+    /// Without a six-character locator there is no honest contest message to
+    /// send, so the ordinary exchange goes out instead — the one behaviour
+    /// that is never wrong on the air. The setup panel is where the operator
+    /// is told.
+    #[test]
+    fn a_four_character_grid_falls_back_to_the_ordinary_exchange() {
+        let cfg = DigiConfig { my_grid: "IO91".into(), ..eu_cfg() };
+        let mut q = QsoMachine::new(Mode::Ft8, cfg);
+        q.call_cq();
+        assert_eq!(q.plan_tx().as_deref(), Some("CQ G4ABC/P IO91"));
+    }
+
+    /// And neither is there in a mode with no 77-bit layout to carry it.
+    #[test]
+    fn a_mode_without_the_layout_falls_back_too() {
+        let mut q = QsoMachine::new(Mode::Psk, eu_cfg());
+        q.call_cq();
+        assert_eq!(q.plan_tx().as_deref(), Some("CQ G4ABC/P IO91"));
     }
 
     #[test]

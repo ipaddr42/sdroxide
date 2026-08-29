@@ -9,6 +9,23 @@ use sdroxide_types::Command;
 
 use crate::app::SdroxideApp;
 
+/// A six-character Maidenhead locator, in the alphabet the EU VHF contest
+/// layout allows — the sub-square letters run A..X, not A..Y.
+///
+/// The same test the engine applies before it will send a contest exchange
+/// (`sdroxide_digi::qso`), so the warning here and the behaviour there cannot
+/// disagree.
+fn is_grid6(g: &str) -> bool {
+    let b = g.trim().to_ascii_uppercase().into_bytes();
+    b.len() == 6
+        && (b'A'..=b'R').contains(&b[0])
+        && (b'A'..=b'R').contains(&b[1])
+        && b[2].is_ascii_digit()
+        && b[3].is_ascii_digit()
+        && (b'A'..=b'X').contains(&b[4])
+        && (b'A'..=b'X').contains(&b[5])
+}
+
 impl SdroxideApp {
     /// Own-call / grid / message-template editor (and RTTY parameters).
     pub(in crate::app) fn digi_settings_window(
@@ -744,6 +761,74 @@ impl SdroxideApp {
                             )
                             .changed();
                         ui.end_row();
+                        // Special operating activity (issue #223). Above the
+                        // DXpedition roles because it changes what every
+                        // message in the exchange says, where those change who
+                        // sends them.
+                        ui.label("Contest");
+                        ui.horizontal(|ui| {
+                            for m in sdroxide_types::ContestMode::ALL {
+                                changed |= ui
+                                    .selectable_value(&mut cfg.contest, m, m.label())
+                                    .on_hover_text(match m {
+                                        sdroxide_types::ContestMode::None => {
+                                            "The everyday exchange: grid, report, RR73."
+                                        }
+                                        sdroxide_types::ContestMode::EuVhf => {
+                                            "European VHF contests: send a signal report, a \
+                                             serial number and your SIX-character locator, in \
+                                             the message layout WSJT-X calls EU VHF Contest. \
+                                             CQ goes out as CQ TEST."
+                                        }
+                                    })
+                                    .changed();
+                            }
+                        });
+                        ui.end_row();
+                        if cfg.contest == sdroxide_types::ContestMode::EuVhf {
+                            ui.label("Serial");
+                            ui.horizontal(|ui| {
+                                // Straight out as its own command, never
+                                // through this window's `changed` flag: the
+                                // engine advances this number as each contact is
+                                // logged and keeps it against a stale client
+                                // copy (`keep_engine_owned`), so a
+                                // `SetDigiConfig` carrying it would be ignored.
+                                let n = ui
+                                    .add(
+                                        egui::DragValue::new(&mut cfg.contest_serial)
+                                            .range(1..=sdroxide_types::CONTEST_SERIAL_MAX),
+                                    )
+                                    .on_hover_text(
+                                        "The serial number the next exchange will carry. It \
+                                         advances by itself as each contact is logged and is \
+                                         remembered between sessions — set it by hand only to \
+                                         start a contest, or to pick up where a paper log got \
+                                         to.",
+                                    );
+                                if n.changed() {
+                                    cmds.push(Command::SetContestSerial(cfg.contest_serial));
+                                }
+                                // The layout has no room for a four-character
+                                // locator, so this is a refusal and not a
+                                // preference: say so where it is set rather than
+                                // letting the ordinary exchange go out and
+                                // leaving the operator to wonder.
+                                if !is_grid6(&cfg.my_grid) {
+                                    ui.label(
+                                        RichText::new("⚠ needs a 6-character grid")
+                                            .size(11.0)
+                                            .color(crate::theme::ALERT()),
+                                    )
+                                    .on_hover_text(
+                                        "EU VHF Contest messages carry a six-character locator \
+                                         (JN88DD, not JN88). Until My grid has one, the ordinary \
+                                         exchange is sent instead.",
+                                    );
+                                }
+                            });
+                            ui.end_row();
+                        }
                         ui.label("DXpedition");
                         ui.horizontal(|ui| {
                             for m in sdroxide_types::DxpedMode::ALL {

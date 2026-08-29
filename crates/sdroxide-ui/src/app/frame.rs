@@ -112,6 +112,19 @@ impl eframe::App for SdroxideApp {
         // two are the same rect.
         let tier = crate::layout::tier_for(ui.max_rect().size(), self.ui_settings.layout);
         crate::layout::set_tier(&ctx, tier);
+        // …and the two questions the tier does not answer, published the same
+        // way and for the same reason — the operator's override lives in
+        // settings the context cannot see. `Small screen` asked for on a tall
+        // display would otherwise be measured back to "roomy" at the places
+        // that draw (issue #211).
+        crate::layout::set_tight(
+            &ctx,
+            crate::layout::tight_for(ui.max_rect().size(), self.ui_settings.layout),
+        );
+        crate::layout::set_short_tablet(
+            &ctx,
+            crate::layout::short_tablet_for(ui.max_rect().size(), self.ui_settings.layout),
+        );
         if self.tier != tier {
             self.tier = tier;
             crate::theme::apply_metrics(&ctx, tier);
@@ -604,6 +617,9 @@ impl eframe::App for SdroxideApp {
             }
             if show_panel {
                 ui.allocate_ui(egui::vec2(width, panel_h), |ui| {
+                    // The operating panels, pulled in on a small screen — one
+                    // call for all of them, see `layout::tighten`.
+                    crate::layout::tighten(ui);
                     egui::Frame::new()
                         .fill(crate::theme::BG_DEEP())
                         .inner_margin(egui::Margin { left: 0, right: 0, top: 6, bottom: 0 })
@@ -613,6 +629,8 @@ impl eframe::App for SdroxideApp {
                                     self.rade_panel(ui, &mut cmds, panel_h);
                                 } else if mode.is_wefax() {
                                     self.wefax_panel(ui, &mut cmds, panel_h);
+                                } else if mode == Mode::Navtex {
+                                    self.navtex_panel(ui, &mut cmds, panel_h);
                                 } else if mode.is_image() {
                                     self.image_panel(ui, &mut cmds, mode);
                                 } else if mode.is_rf_paint() {
@@ -760,6 +778,9 @@ impl eframe::App for SdroxideApp {
                     }
                 }
                 ui.allocate_ui(egui::vec2(width, panel_h), |ui| {
+                    // The operating panels, pulled in on a small screen — one
+                    // call for all of them, see `layout::tighten`.
+                    crate::layout::tighten(ui);
                     egui::Frame::new()
                         .fill(crate::theme::BG_DEEP())
                         .inner_margin(egui::Margin { left: 0, right: 0, top: 6, bottom: 0 })

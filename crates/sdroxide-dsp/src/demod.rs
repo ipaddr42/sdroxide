@@ -135,6 +135,7 @@ pub fn make_demod(mode: Mode, channel_rate: f64) -> Option<Box<dyn Demodulator>>
         | Mode::Rtty
         | Mode::Sstv
         | Mode::Wefax
+        | Mode::Navtex
         | Mode::Olivia
         | Mode::Thor
         | Mode::Fsq
@@ -161,7 +162,9 @@ pub fn make_demod(mode: Mode, channel_rate: f64) -> Option<Box<dyn Demodulator>>
         // and the ±5 kHz scaling the transmitter below uses. Its video
         // subcarrier runs 1200–2300 Hz, which is inside that chain with room
         // to spare either side.
-        Mode::Nfm | Mode::SstvFm => Some(Box::new(FmDemod::new(channel_rate, lo, hi))),
+        Mode::Nfm | Mode::SstvFm | Mode::RttyFm => {
+            Some(Box::new(FmDemod::new(channel_rate, lo, hi)))
+        }
         Mode::Wfm => Some(Box::new(WfmDemod::new(channel_rate))),
         // DRM's decoder is a vendored C++ receiver, which cannot be linked from
         // this crate — see `Demodulator::take_drm`. The engine builds

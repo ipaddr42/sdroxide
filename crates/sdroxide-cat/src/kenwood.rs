@@ -351,7 +351,7 @@ fn mode_digit(m: Mode) -> (char, bool) {
         Mode::Nfm | Mode::Wfm | Mode::Adsb => ('4', false),
         // RIFP keys the carrier itself and VHF packet frequency-modulates it:
         // data over FM, not over a sideband.
-        Mode::Rifp | Mode::Packet | Mode::Aprs | Mode::SstvFm => ('4', true),
+        Mode::Rifp | Mode::Packet | Mode::Aprs | Mode::SstvFm | Mode::RttyFm => ('4', true),
         Mode::Am | Mode::Sam | Mode::Dsb | Mode::Drm => ('5', false),
         Mode::Digl => ('1', true),
         Mode::Digu
@@ -368,7 +368,9 @@ fn mode_digit(m: Mode) -> (char, bool) {
         | Mode::Hell
         | Mode::PacketHf
         | Mode::Rade => ('2', true),
-        Mode::Usb | Mode::Spec | Mode::Sstv | Mode::Wefax | Mode::RfPaint => ('2', false),
+        Mode::Usb | Mode::Spec | Mode::Sstv | Mode::Wefax | Mode::Navtex | Mode::RfPaint => {
+            ('2', false)
+        }
     }
 }
 

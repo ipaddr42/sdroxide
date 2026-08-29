@@ -239,17 +239,32 @@ pub enum LayoutMode {
     Desktop,
     Tablet,
     Phone,
+    /// A small desktop screen: the tablet tier's menus, always on the
+    /// single-row strip, with the operating panels' chips and spacing pulled
+    /// in. For 1366×768 and the like, where the tablet layout fits but spends
+    /// more of a short screen on chrome than it has to spare (issue #211).
+    ///
+    /// Appended rather than slotted in beside `Tablet`, because this is
+    /// serialised into `config.toml` and inserting a variant would rename
+    /// everyone else's.
+    Small,
 }
 
 impl LayoutMode {
-    pub const ALL: [LayoutMode; 4] =
-        [LayoutMode::Auto, LayoutMode::Desktop, LayoutMode::Tablet, LayoutMode::Phone];
+    pub const ALL: [LayoutMode; 5] = [
+        LayoutMode::Auto,
+        LayoutMode::Desktop,
+        LayoutMode::Tablet,
+        LayoutMode::Small,
+        LayoutMode::Phone,
+    ];
 
     pub fn label(self) -> &'static str {
         match self {
             LayoutMode::Auto => "Auto",
             LayoutMode::Desktop => "Desktop",
             LayoutMode::Tablet => "Tablet",
+            LayoutMode::Small => "Small screen",
             LayoutMode::Phone => "Phone",
         }
     }

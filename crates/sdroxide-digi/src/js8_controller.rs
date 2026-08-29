@@ -997,6 +997,7 @@ impl DigiEngine for Js8Controller {
             fsq_messages: Vec::new(),
             rade: None,
             packet: None,
+            navtex: None,
             aprs: None,
             js8: Some(Js8Status {
                 speed: self.speed,

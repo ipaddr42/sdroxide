@@ -634,6 +634,7 @@ impl AprsController {
             fsq_messages: Vec::new(),
             rade: None,
             packet: None,
+            navtex: None,
             aprs: Some(Box::new(self.aprs_status())),
             js8: None,
             fox_queue: Vec::new(),

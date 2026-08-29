@@ -168,12 +168,44 @@ fn decode_tx_audio(msg: &[u8], scratch: &mut Vec<f32>) -> Option<Vec<f32>> {
     }
     scratch.clear();
     p::decode_f32_payload(msg, &h, scratch);
-    // `channels` is what the sender says the interleave is; a server that
-    // leaves it zero (some do) is treated as mono rather than dropped.
-    Some(match h.channels {
-        0 | 1 => scratch.clone(),
-        n => scratch.chunks(n as usize).map(|f| f.iter().sum::<f32>() / f.len() as f32).collect(),
+    Some(match interleave_of(h.channels, scratch) {
+        1 => scratch.clone(),
+        n => scratch.chunks(n).map(|f| f.iter().sum::<f32>() / f.len() as f32).collect(),
     })
+}
+
+/// How many floats of the payload make one frame.
+///
+/// **The header field cannot be trusted.** WSJT-X leaves `channels`
+/// uninitialised on the transmit audio it sends, so it arrives as a *different*
+/// large random number in every packet — 2 771 387 240, then 613 045 248, then
+/// 0. Taken at face value, `chunks(n)` over one of those collapses a whole
+/// 10 ms packet into a single averaged sample, and what reaches the air is a
+/// few hundred scattered samples of the client's waveform: a 15 s FT8 slot
+/// going out as a few seconds of chopped signal, which is issue #202.
+///
+/// So only 1 and 2 are read as channel counts. Anything else is decided from
+/// the payload, which says so plainly: transmit audio is mono content, and a
+/// client that interleaves it duplicates each sample, so a stereo packet is
+/// pairs of identical floats. WSJT-X's are, exactly — `[0.778, 0.778, 0.913,
+/// 0.913, …]` — and a genuinely mono packet from a sender that also left the
+/// field unset is not halved.
+fn interleave_of(channels: u32, payload: &[f32]) -> usize {
+    match channels {
+        1 => 1,
+        2 => 2,
+        _ => {
+            let pairs = payload.len() / 2;
+            // Every pair, not most of them: a duplicated stream is duplicated
+            // exactly, and "nearly all" would also be true of a real stereo
+            // recording of a quiet room. An empty or odd payload is not paired
+            // at all and stays mono.
+            let duplicated = pairs > 0
+                && payload.len() % 2 == 0
+                && payload.chunks_exact(2).all(|c| c[0] == c[1]);
+            if duplicated { 2 } else { 1 }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -187,7 +219,12 @@ mod tests {
         let mut scratch = Vec::new();
         assert_eq!(decode_tx_audio(&pkt, &mut scratch), Some(vec![0.5, 0.5]));
 
-        // A sender that left `channels` unset is taken at face value as mono.
+        // A sender that left `channels` unset but duplicated its samples is
+        // stereo whatever the field says.
+        let pkt = p::build_binary(p::DataType::TxAudio, 0, 48_000, 0, &[0.25, 0.25, -0.5, -0.5]);
+        assert_eq!(decode_tx_audio(&pkt, &mut scratch), Some(vec![0.25, -0.5]));
+
+        // …and one that left it unset and really is mono is not halved.
         let pkt = p::build_binary(p::DataType::TxAudio, 0, 48_000, 0, &[0.25, -0.25]);
         assert_eq!(decode_tx_audio(&pkt, &mut scratch), Some(vec![0.25, -0.25]));
 
@@ -195,5 +232,28 @@ mod tests {
         let pkt = p::build_iq(96_000, 0, &[1.0, 1.0]);
         assert_eq!(decode_tx_audio(&pkt, &mut scratch), None);
         assert_eq!(decode_tx_audio(&[0u8; 8], &mut scratch), None);
+    }
+
+    /// Issue #202, in the form it actually arrived in: WSJT-X sends
+    /// duplicated-stereo transmit audio with the `channels` field left as
+    /// whatever was on the stack, a different value in every packet. Trusting
+    /// it collapsed each 10 ms packet to a single sample.
+    #[test]
+    fn a_garbage_channel_count_does_not_destroy_the_packet() {
+        let mut scratch = Vec::new();
+        // 480 duplicated frames — one 10 ms packet, exactly as WSJT-X sends it.
+        let mono: Vec<f32> = (0..480).map(|i| (i as f32 / 480.0) - 0.5).collect();
+        let stereo: Vec<f32> = mono.iter().flat_map(|&s| [s, s]).collect();
+        for channels in [2_771_387_240u32, 613_045_248, 0, 3_331_189_240, u32::MAX] {
+            let pkt = p::build_binary(p::DataType::TxAudio, 0, 48_000, channels, &stereo);
+            let got = decode_tx_audio(&pkt, &mut scratch).expect("TX audio");
+            assert_eq!(
+                got.len(),
+                mono.len(),
+                "channels={channels} turned a 480-frame packet into {} frame(s)",
+                got.len()
+            );
+            assert_eq!(got, mono, "channels={channels} changed the waveform");
+        }
     }
 }

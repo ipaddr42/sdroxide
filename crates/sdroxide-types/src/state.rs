@@ -420,6 +420,15 @@ pub struct RadioState {
     /// recording.
     #[serde(default)]
     pub recording_mono: bool,
+    /// Whether the raw I/Q capture is running — see
+    /// [`crate::Command::SetIqRecording`]. Separate from
+    /// [`Self::recording`]: the two record different things and either may run
+    /// without the other.
+    pub iq_recording: bool,
+    /// Filename of the active I/Q capture (basename only), for display, and the
+    /// megabytes written so far. `None` when nothing is being captured.
+    pub iq_recording_file: Option<String>,
+    pub iq_recording_mb: u32,
     /// The engine will key outside the amateur bands.
     ///
     /// Set by the `--oob-tx` command-line flag, never by anything in the UI:
@@ -497,6 +506,9 @@ impl Default for RadioState {
             recording: false,
             recording_file: None,
             recording_mono: false,
+            iq_recording: false,
+            iq_recording_file: None,
+            iq_recording_mb: 0,
             oob_tx: false,
             // Open, until the radio says otherwise: the level is adopted from
             // the rig, and until one has answered there is nothing to claim.

@@ -41,6 +41,9 @@ pub struct SpectrumAnalyzer {
     /// [`Self::avg_power`]. Set for the length of one row build — see
     /// [`Self::set_read_hold`].
     read_hold: bool,
+    /// Whether the last [`Self::make_frame`] was a row build — see
+    /// [`Self::took_row`].
+    hold_read: bool,
     alpha: f32,
     primed: bool,
     peak_abs: f32,
@@ -104,6 +107,7 @@ impl SpectrumAnalyzer {
             avg_power: vec![0.0; fft_size],
             hold: Vec::new(),
             read_hold: false,
+            hold_read: false,
             alpha: 1.0,
             primed: false,
             peak_abs: 0.0,
@@ -165,8 +169,26 @@ impl SpectrumAnalyzer {
     /// viewport — two copies of that arithmetic would drift apart on the first
     /// change to either. Set it, build the row, clear it; see
     /// `Engine::make_row`.
+    ///
+    /// Armed even where no peaks are being held yet: such a frame reads the
+    /// running average, exactly as every build before the row clock did, and
+    /// [`Self::took_row`] then reports that this lane is the one drawing rows
+    /// so its caller can switch the hold on. That is how a lane pays for the
+    /// hold only while it is the lane somebody is looking at.
     pub fn set_read_hold(&mut self, on: bool) {
-        self.read_hold = on && !self.hold.is_empty();
+        self.read_hold = on;
+    }
+
+    /// Whether the last [`Self::make_frame`] was built as a waterfall row, and
+    /// clear the flag.
+    ///
+    /// The caller sets [`Self::set_read_hold`] on every lane that *could* draw
+    /// and then asks each of them this, rather than working out in advance
+    /// which one will: the choice of lane is a dozen conditions deep in the
+    /// engine's frame builder, and a second copy of it here would go wrong the
+    /// first time either changed.
+    pub fn took_row(&mut self) -> bool {
+        std::mem::take(&mut self.hold_read)
     }
 
     /// Begin a fresh row: the peak starts again from where the spectrum is now,
@@ -307,8 +329,13 @@ impl SpectrumAnalyzer {
         };
 
         // Held peaks for a waterfall row, or the running average for the
-        // trace — see [`Self::set_read_hold`]. Same pooling either way.
-        let power: &[f32] = if self.read_hold { &self.hold } else { &self.avg_power };
+        // trace — see [`Self::set_read_hold`]. Same pooling either way. A lane
+        // asked for a row before its hold was switched on answers from the
+        // average, which is the current spectrum and so a correct row; the
+        // hold starts on the next one.
+        self.hold_read = self.read_hold;
+        let power: &[f32] =
+            if self.read_hold && !self.hold.is_empty() { &self.hold } else { &self.avg_power };
 
         // DC spike suppression (hardware LO leakage): read the ±2 bins
         // around DC as the average of their neighbors. Patch at read time so
@@ -388,6 +415,48 @@ impl SpectrumAnalyzer {
 mod tests {
     use super::*;
     use std::f32::consts::TAU;
+
+    /// A lane asked for a row before its hold exists answers from the running
+    /// average and says it drew, so the caller knows to switch the hold on.
+    ///
+    /// That is what lets a hold cost anything only on the lane somebody is
+    /// actually pooling rows from: a device-wide analyser sitting behind a zoom
+    /// lane pays a compare and a store per bin on every transform for a picture
+    /// nobody is looking at, which on a 2.4 Msps front end through a
+    /// 131072-point window is half a megabyte of write traffic per transform
+    /// (issue #216).
+    #[test]
+    fn a_lane_asked_for_a_row_says_so_before_it_holds_anything() {
+        let fs = 1_000_000.0;
+        let n = 1024;
+        let mut an = SpectrumAnalyzer::new(n, fs, 0.0);
+        an.set_dc_suppress(false);
+        assert!(!an.row_hold(), "nothing is held until somebody asks");
+
+        let tone: Vec<Complex32> = (0..n * 2)
+            .map(|i| {
+                let ph = TAU * 250_000.0 * i as f32 / fs as f32;
+                Complex32::new(ph.cos(), ph.sin())
+            })
+            .collect();
+        an.process(&tone);
+
+        // A row from a lane with no hold: the current spectrum, which is what
+        // every build before the row clock drew, and not a frame of zeros.
+        an.set_read_hold(true);
+        let row = an.make_frame(0.0, fs, -120.0, 0.0, n, None);
+        an.set_read_hold(false);
+        assert!(an.took_row(), "the lane that drew the row has to say so");
+        assert!(!an.took_row(), "…once");
+        assert!(row.bins.iter().any(|&b| b > 40), "the row is empty: {:?}", row.bins.len());
+
+        // A lane that was armed but did not draw says nothing, so its caller
+        // can give the hold up.
+        let mut idle = SpectrumAnalyzer::new(n, fs, 0.0);
+        idle.set_read_hold(true);
+        idle.set_read_hold(false);
+        assert!(!idle.took_row(), "a lane nobody pooled from must not claim the row");
+    }
 
     /// A tone that came and went between two waterfall rows still shows up in
     /// the row it happened in.

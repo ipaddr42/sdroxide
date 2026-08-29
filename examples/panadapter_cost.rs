@@ -64,10 +64,14 @@ fn caps(rate: f64) -> DeviceCaps {
 /// is the fully zoomed-out view. `fft` is what the client asks the device-wide
 /// analyser for, which is what grows with zoom today.
 fn cfg(span_hz: Option<f64>, fft: u32) -> Command {
+    cfg_rows(span_hz, fft, 100)
+}
+
+fn cfg_rows(span_hz: Option<f64>, fft: u32, rows: u16) -> Command {
     Command::SetSpectrumCfg(SpectrumConfig {
         fft_size: fft,
         display_bins: 2048,
-        rows_per_sec: 100,
+        rows_per_sec: rows,
         db_floor: -140.0,
         db_ceil: 0.0,
         viewport: span_hz.map(|s| (CENTER - s / 2.0, CENTER + s / 2.0)),
@@ -98,6 +102,20 @@ fn measure(rate: f64, secs: f64, label: &str, command: Command) {
 }
 
 fn main() {
+    if let Ok(only) = std::env::var("PANA_ONLY") {
+        // One case, for a profiler: the sweep's other settings would be in the
+        // same profile and there would be no telling them apart.
+        let mut it = only.split(',');
+        let rate = it.next().and_then(|s| s.parse::<f64>().ok()).unwrap_or(2.4) * 1e6;
+        let secs = it.next().and_then(|s| s.parse::<f64>().ok()).unwrap_or(10.0);
+        let fft = it.next().and_then(|s| s.parse::<u32>().ok()).unwrap_or(4096);
+        let rows = it.next().and_then(|s| s.parse::<u16>().ok()).unwrap_or(224);
+        let zoom = it.next().and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0);
+        let _ = tracing_subscriber::fmt().with_env_filter("warn").try_init();
+        let span = (zoom > 0.0).then(|| rate / zoom);
+        measure(rate, secs, &format!("fft {fft}, {rows} rows/s"), cfg_rows(span, fft, rows));
+        return;
+    }
     let mut args = std::env::args().skip(1);
     let rate = args.next().and_then(|s| s.parse::<f64>().ok()).unwrap_or(2.0) * 1e6;
     let secs = args.next().and_then(|s| s.parse::<f64>().ok()).unwrap_or(5.0);
@@ -109,4 +127,16 @@ fn main() {
     measure(rate, secs, "64× zoom, 32768", cfg(Some(rate / 64.0), 32_768));
     measure(rate, secs, "64× zoom, 4096", cfg(Some(rate / 64.0), 4096));
     measure(rate, secs, "2× zoom, 8192", cfg(Some(rate / 2.0), 8192));
+    println!();
+    for rows in [1u16, 28, 56, 112, 224] {
+        measure(rate, secs, &format!("zoomed out 4096, {rows} rows/s"), cfg_rows(None, 4096, rows));
+    }
+    for rows in [1u16, 28, 100] {
+        measure(
+            rate,
+            secs,
+            &format!("8x zoom 32768, {rows} rows/s"),
+            cfg_rows(Some(rate / 8.0), 32_768, rows),
+        );
+    }
 }

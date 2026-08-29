@@ -31,6 +31,8 @@ enum MsgKind {
     RttyRu,
     /// One non-standard (compound / long) callsign plus one hashed one.
     NonStandard,
+    /// EU VHF contest: `<to> <from> [R] RSNNNN GRID6`, both calls hashed.
+    EuVhf,
     /// A layout this build doesn't model.
     Other,
 }
@@ -47,6 +49,7 @@ fn msg_kind(bits77: &[u8; 77]) -> MsgKind {
         (1 | 2, _) => MsgKind::Standard,
         (3, _) => MsgKind::RttyRu,
         (4, _) => MsgKind::NonStandard,
+        (5, _) => MsgKind::EuVhf,
         _ => MsgKind::Other,
     }
 }
@@ -119,11 +122,14 @@ pub struct Ft8Modem {
     /// Callsigns heard this session, so the `<...>` placeholders in
     /// non-standard-callsign and DXpedition messages resolve to real calls.
     hashes: CallsignHashTable,
+    /// The same callsigns again, hashed the way the EU VHF contest layout
+    /// needs them — see [`eu_vhf::Hashes`].
+    eu_hashes: eu_vhf::Hashes,
 }
 
 impl Ft8Modem {
     pub fn new(mode: Mode) -> Self {
-        Ft8Modem { mode, hashes: CallsignHashTable::new() }
+        Ft8Modem { mode, hashes: CallsignHashTable::new(), eu_hashes: eu_vhf::Hashes::default() }
     }
 
     pub fn mode(&self) -> Mode {
@@ -136,6 +142,7 @@ impl Ft8Modem {
     pub fn seed_hashes(&mut self, calls: &[String]) {
         for c in calls.iter().filter(|c| !c.is_empty()) {
             self.hashes.insert(c);
+            self.eu_hashes.insert(c);
         }
     }
 
@@ -163,6 +170,7 @@ impl Ft8Modem {
     ) -> Vec<Decode> {
         let mode = self.mode;
         let ht = &self.hashes;
+        let eu = &self.eu_hashes;
         let mut decodes: Vec<Decode> = match mode {
             Mode::Ft4 => DecodeRequest::<mfsk_core::Ft4>::new(
                 audio_12k,
@@ -177,7 +185,7 @@ impl Ft8Modem {
             .into_iter()
             .filter_map(|r| {
                 let bits: [u8; 77] = r.message77().try_into().ok()?;
-                build_decode(&bits, r.snr_db, r.dt_sec, r.freq_hz, slot_utc, ht)
+                build_decode(&bits, r.snr_db, r.dt_sec, r.freq_hz, slot_utc, ht, eu)
             })
             .collect(),
             // FT2 is FT4 at double the symbol rate, but mfsk-core ships no FT2
@@ -195,7 +203,7 @@ impl Ft8Modem {
             .into_iter()
             .filter_map(|r| {
                 let bits: [u8; 77] = r.message77().try_into().ok()?;
-                build_decode(&bits, r.snr_db, r.dt_sec, r.freq_hz, slot_utc, ht)
+                build_decode(&bits, r.snr_db, r.dt_sec, r.freq_hz, slot_utc, ht, eu)
             })
             .collect(),
             _ => {
@@ -220,7 +228,7 @@ impl Ft8Modem {
                     .into_iter()
                     .filter_map(|r| {
                         let bits: [u8; 77] = r.message77().try_into().ok()?;
-                        build_decode(&bits, r.snr_db, r.dt_sec, r.freq_hz, slot_utc, ht)
+                        build_decode(&bits, r.snr_db, r.dt_sec, r.freq_hz, slot_utc, ht, eu)
                     })
                     .collect()
             }
@@ -245,7 +253,7 @@ impl Ft8Modem {
                         .into_iter()
                         .filter_map(|r| {
                             let bits: [u8; 77] = r.message77().try_into().ok()?;
-                            build_decode(&bits, r.snr_db, r.dt_sec, r.freq_hz, slot_utc, ht)
+                            build_decode(&bits, r.snr_db, r.dt_sec, r.freq_hz, slot_utc, ht, eu)
                         })
                         .filter(|d| !decodes.iter().any(|o| same_signal(o, d)))
                         .collect::<Vec<_>>();
@@ -256,6 +264,7 @@ impl Ft8Modem {
         for d in &decodes {
             for call in [d.to.as_deref(), d.from.as_deref()].into_iter().flatten() {
                 self.hashes.insert(call);
+                self.eu_hashes.insert(call);
             }
         }
         decodes
@@ -295,9 +304,10 @@ impl Ft8Modem {
 /// carry, and report the message as the far end will read it.
 ///
 /// The ladder is: the DXpedition (Fox) layout when the text is written as one,
-/// then a directed CQ, then the standard exchange, then the
-/// non-standard-callsign layout (which can only carry `RRR` / `RR73` / `73`, so
-/// a grid or report is dropped), then 13 characters of free text.
+/// then the EU VHF contest exchange, then a directed CQ, then the standard
+/// exchange, then the non-standard-callsign layout (which can only carry
+/// `RRR` / `RR73` / `73`, so a grid or report is dropped), then 13 characters
+/// of free text.
 fn pack_message(text: &str) -> Option<([u8; 77], String)> {
     let text = text.trim().to_ascii_uppercase();
     let toks: Vec<&str> = text.split_whitespace().collect();
@@ -316,7 +326,25 @@ fn pack_message(text: &str) -> Option<([u8; 77], String)> {
         }
     }
 
-    // 1. A directed CQ: "CQ EU AB1CD FN42". The modifier is not a fourth field
+    // 1. The EU VHF contest exchange (issue #223):
+    //    "<TO> <FROM> [R] 590003 JO22DB". Ahead of everything below it because
+    //    it is the only layout that will carry a six-character locator, and
+    //    nothing else here would recognise the exchange at all — it would go
+    //    out as thirteen characters of free text.
+    if matches!(toks.len(), 4 | 5) && c1.starts_with('<') && c2.starts_with('<') {
+        let rogered = toks[2] == "R";
+        let rest = &toks[if rogered { 3 } else { 2 }..];
+        if let ([exch, grid6], Some((rs, serial))) =
+            (rest, rest.first().and_then(|t| eu_vhf::parse_exchange(t)))
+            && let Some(m) =
+                eu_vhf::pack(eu_vhf::bare(c1), eu_vhf::bare(c2), rogered, rs, serial, grid6)
+        {
+            let r = if rogered { "R " } else { "" };
+            return Some((m, format!("{c1} {c2} {r}{exch} {grid6}")));
+        }
+    }
+
+    // 2. A directed CQ: "CQ EU AB1CD FN42". The modifier is not a fourth field
     //    — "CQ EU" packs as one token — so the message is still the everyday
     //    three, with the first of them two words long.
     if c1 == "CQ" && toks.len() == 4 && !c2.is_empty() {
@@ -326,14 +354,14 @@ fn pack_message(text: &str) -> Option<([u8; 77], String)> {
         }
     }
 
-    // 2. The everyday message, when both calls are standard.
+    // 3. The everyday message, when both calls are standard.
     if toks.len() <= 3 {
         if let Some(m) = wsjt77::pack77(c1, c2, payload) {
             return Some((m, join3(c1, c2, payload)));
         }
     }
 
-    // 3. One compound / non-standard callsign, the other one hashed. Only a
+    // 4. One compound / non-standard callsign, the other one hashed. Only a
     //    bare RRR / RR73 / 73 fits alongside it — a grid or report is lost, so
     //    the returned text says so.
     let rpt = match payload {
@@ -364,7 +392,7 @@ fn pack_message(text: &str) -> Option<([u8; 77], String)> {
         }
     }
 
-    // 4. Free text: 13 characters, from a restricted alphabet.
+    // 5. Free text: 13 characters, from a restricted alphabet.
     let free: String = text.chars().take(13).collect();
     let m = wsjt77::pack77_free_text(free.trim_end())?;
     Some((m, free.trim_end().to_string()))
@@ -409,6 +437,214 @@ fn pack77_fox(
     Some((msg, sdroxide_types::fmt_report(2 * n5 as i16 - 30)))
 }
 
+/// The EU VHF contest layout, `i3 = 5` (issue #223):
+/// `[h12 to][h22 from][r1 rogered][s3 report][s11 serial][g25 grid6]`, then
+/// `i3`. Both callsigns travel as *hashes* — twelve bits for the addressee,
+/// twenty-two for the sender — which is what buys the room for a six-character
+/// locator and a serial number in the same 77 bits.
+///
+/// mfsk-core carries neither half of this layout, so both are written here
+/// against WSJT-X's `packjt77.f90` (`pack77_5` / the `i3.eq.5` arm of
+/// `unpack77`). The hash function itself is mfsk-core's, the one it already
+/// resolves type-4 messages with, so the two cannot come to disagree about what
+/// a callsign hashes to.
+///
+/// A hash is not reversible: the far end reads `<...>` for any station it has
+/// not heard spell its callsign out in an earlier message. That is the layout's
+/// own bargain and not something to work around — it is why a contest exchange
+/// is preceded by two ordinary messages that carry the calls in full.
+mod eu_vhf {
+    use std::collections::VecDeque;
+
+    use mfsk_core::msg::hash_table::ihashcall;
+
+    /// Strip the angle brackets a hashed callsign is written with.
+    pub fn bare(tok: &str) -> &str {
+        tok.strip_prefix('<').and_then(|t| t.strip_suffix('>')).unwrap_or(tok)
+    }
+
+    /// How many callsigns to keep, matching WSJT-X's own `MAXHASH`.
+    const MAX_CALLS: usize = 1000;
+
+    /// The callsigns heard, for resolving the hashes this layout travels as.
+    ///
+    /// Its own table rather than mfsk-core's `CallsignHashTable`, over a
+    /// divergence that bites hardest in exactly this mode: that one strips a
+    /// `/R` or `/P` suffix before hashing, where WSJT-X hashes the callsign
+    /// whole (`packjt77.f90`, `save_hash_call`). A `/P` station is the typical
+    /// entrant in a European VHF contest, so hashing the base call would put
+    /// every one of them on a number no other program computes — and neither
+    /// side would ever resolve the other's exchange.
+    ///
+    /// A ring of the calls themselves rather than a map of hashes: two widths
+    /// are needed (12 bits for the addressee, 22 for the sender), the hash is
+    /// cheap, and a thousand entries is what the reference implementation
+    /// keeps. Newest first, so the most recently heard station wins a
+    /// collision — which is the rule WSJT-X's own table follows.
+    #[derive(Debug, Default, Clone)]
+    pub struct Hashes {
+        calls: VecDeque<String>,
+    }
+
+    impl Hashes {
+        /// Remember a callsign, brackets and all if it has them. A placeholder
+        /// nobody resolved, a token too short to be a call, and `CQ` are not
+        /// callsigns and are dropped.
+        pub fn insert(&mut self, call: &str) {
+            let call = bare(call.trim()).to_ascii_uppercase();
+            if call.len() < 3 || call == "..." || call.starts_with("CQ") {
+                return;
+            }
+            if let Some(i) = self.calls.iter().position(|c| *c == call) {
+                self.calls.remove(i);
+            }
+            self.calls.push_front(call);
+            self.calls.truncate(MAX_CALLS);
+        }
+
+        /// The callsign whose `bits`-wide hash is `n`, if one has been heard.
+        pub fn lookup(&self, n: u32, bits: u32) -> Option<&str> {
+            self.calls.iter().find(|c| ihashcall(c, bits) == n).map(String::as_str)
+        }
+    }
+
+    /// Serial numbers past this do not fit the eleven-bit field.
+    pub const MAX_SERIAL: u32 = 2047;
+
+    /// The exchange as it appears in a message: an RS of `5x` glued to a
+    /// four-digit serial, e.g. `590003`.
+    pub fn exchange(rs: u8, serial: u32) -> String {
+        format!("{rs:02}{:04}", serial.min(MAX_SERIAL))
+    }
+
+    /// Split `590003` back into `(59, 3)`. `None` for anything that is not six
+    /// digits with an RS the three-bit field can carry.
+    pub fn parse_exchange(tok: &str) -> Option<(u8, u32)> {
+        if tok.len() != 6 || !tok.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        let rs: u8 = tok[..2].parse().ok()?;
+        let serial: u32 = tok[2..].parse().ok()?;
+        (52..=59).contains(&rs).then_some((rs, serial))
+    }
+
+    /// A six-character locator, in the narrower alphabet this layout allows:
+    /// the sub-square letters run A..X, not A..Y as a bare Maidenhead locator
+    /// would. Twenty-five bits hold exactly 18·18·10·10·24·24 of them.
+    pub fn is_grid6(g: &str) -> bool {
+        let b = g.as_bytes();
+        b.len() == 6
+            && (b'A'..=b'R').contains(&b[0])
+            && (b'A'..=b'R').contains(&b[1])
+            && b[2].is_ascii_digit()
+            && b[3].is_ascii_digit()
+            && (b'A'..=b'X').contains(&b[4])
+            && (b'A'..=b'X').contains(&b[5])
+    }
+
+    /// Pack a locator into the 25-bit field.
+    pub fn pack_grid6(g: &str) -> Option<u32> {
+        if !is_grid6(g) {
+            return None;
+        }
+        let b = g.as_bytes();
+        let d = |i: usize, base: u8| u32::from(b[i] - base);
+        Some(
+            d(0, b'A') * 18 * 10 * 10 * 24 * 24
+                + d(1, b'A') * 10 * 10 * 24 * 24
+                + d(2, b'0') * 10 * 24 * 24
+                + d(3, b'0') * 24 * 24
+                + d(4, b'A') * 24
+                + d(5, b'A'),
+        )
+    }
+
+    /// The inverse of [`pack_grid6`]. `None` for a value outside the field's
+    /// 18·18·10·10·24·24 range, which is a message that did not come from a
+    /// packer following the standard.
+    pub fn unpack_grid6(n: u32) -> Option<String> {
+        let mut n = n;
+        let mut take = |m: u32| {
+            let v = n / m;
+            n %= m;
+            v
+        };
+        let j1 = take(18 * 10 * 10 * 24 * 24);
+        let j2 = take(10 * 10 * 24 * 24);
+        let j3 = take(10 * 24 * 24);
+        let j4 = take(24 * 24);
+        let j5 = take(24);
+        let j6 = n;
+        if j1 > 17 || j2 > 17 || j3 > 9 || j4 > 9 || j5 > 23 || j6 > 23 {
+            return None;
+        }
+        Some(
+            [
+                (b'A' + j1 as u8) as char,
+                (b'A' + j2 as u8) as char,
+                (b'0' + j3 as u8) as char,
+                (b'0' + j4 as u8) as char,
+                (b'A' + j5 as u8) as char,
+                (b'A' + j6 as u8) as char,
+            ]
+            .iter()
+            .collect(),
+        )
+    }
+
+    /// Pack `<to> <from> [R] RSNNNN GRID6` into 77 bits.
+    ///
+    /// The callsigns are taken bare: the angle brackets the message is written
+    /// with are the *rendering* of a hash, not part of the callsign.
+    pub fn pack(
+        to: &str,
+        from: &str,
+        rogered: bool,
+        rs: u8,
+        serial: u32,
+        grid6: &str,
+    ) -> Option<[u8; 77]> {
+        if !(52..=59).contains(&rs) {
+            return None;
+        }
+        let igrid = pack_grid6(grid6)?;
+        let mut msg = [0u8; 77];
+        let mut write = |start: usize, len: usize, val: u32| {
+            for i in 0..len {
+                msg[start + i] = ((val >> (len - 1 - i)) & 1) as u8;
+            }
+        };
+        write(0, 12, ihashcall(to, 12));
+        write(12, 22, ihashcall(from, 22));
+        write(34, 1, u32::from(rogered));
+        write(35, 3, u32::from(rs - 52));
+        write(38, 11, serial.min(MAX_SERIAL));
+        write(49, 25, igrid);
+        write(74, 3, 5); // i3 = 5
+        Some(msg)
+    }
+
+    /// Read an `i3 = 5` message back, resolving both hashes where the table
+    /// knows them. Returns the text exactly as WSJT-X renders it, so a decode
+    /// list is comparable line for line with one from any other program.
+    pub fn unpack(bits: &[u8; 77], hashes: &Hashes) -> Option<String> {
+        let read = |start: usize, len: usize| -> u32 {
+            (0..len).fold(0u32, |acc, i| acc << 1 | u32::from(bits[start + i] & 1))
+        };
+        let n12 = read(0, 12);
+        let n22 = read(12, 22);
+        let rogered = read(34, 1) == 1;
+        let rs = 52 + read(35, 3) as u8;
+        let serial = read(38, 11);
+        let grid6 = unpack_grid6(read(49, 25))?;
+        let name = |c: Option<&str>| format!("<{}>", c.unwrap_or("..."));
+        let to = name(hashes.lookup(n12, 12));
+        let from = name(hashes.lookup(n22, 22));
+        let r = if rogered { "R " } else { "" };
+        Some(format!("{to} {from} {r}{} {grid6}", exchange(rs, serial)))
+    }
+}
+
 /// True when two decodes are the same transmission seen by two passes: same
 /// text from the same place in the passband. The tolerance is a few Hz, so two
 /// stations sending identical text at different offsets stay distinct.
@@ -422,7 +658,9 @@ fn join3(a: &str, b: &str, c: &str) -> String {
 }
 
 /// Unpack 77 message bits and build a [`Decode`], or `None` if unpacking fails.
-/// `hashes` resolves the `<...>` placeholders of hashed callsigns.
+/// `hashes` resolves the `<...>` placeholders of hashed callsigns, and
+/// `eu_hashes` the ones the EU VHF contest layout uses — see [`eu_vhf::Hashes`]
+/// for why those are not the same table.
 fn build_decode(
     bits77: &[u8; 77],
     snr_db: f32,
@@ -430,9 +668,16 @@ fn build_decode(
     freq_hz: f32,
     slot_utc: i64,
     hashes: &CallsignHashTable,
+    eu_hashes: &eu_vhf::Hashes,
 ) -> Option<Decode> {
-    let text = wsjt77::unpack77_with_hash(bits77, hashes)?;
-    let p = parse_message(&text, msg_kind(bits77));
+    let kind = msg_kind(bits77);
+    // mfsk-core does not carry `i3 = 5`, and answers `None` for it rather than
+    // wrongly: without this the whole EU VHF exchange is silently invisible.
+    let text = match kind {
+        MsgKind::EuVhf => eu_vhf::unpack(bits77, eu_hashes)?,
+        _ => wsjt77::unpack77_with_hash(bits77, hashes)?,
+    };
+    let p = parse_message(&text, kind);
     Some(Decode {
         slot_utc,
         snr_db: snr_db.round() as i16,
@@ -507,6 +752,20 @@ fn parse_message(text: &str, kind: MsgKind) -> Parsed {
         };
     }
 
+    // The EU VHF contest exchange: "<TO> <FROM> [R] 590003 JO22DB". Addressed
+    // like the rest, but its locator is the *six*-character one and sits at the
+    // end rather than in the payload slot — which is the whole point of the
+    // layout, so it is read out here rather than left behind as a report the
+    // generic tail does not recognise.
+    if kind == MsgKind::EuVhf {
+        return Parsed {
+            to: toks.first().and_then(|t| call_of(t)),
+            from: toks.get(1).and_then(|t| call_of(t)),
+            grid: toks.last().filter(|t| eu_vhf::is_grid6(t)).map(|s| s.to_string()),
+            ..Default::default()
+        };
+    }
+
     // Standard, RTTY Roundup, Field Day and non-standard-callsign layouts all
     // put the addressee first and the sender second.
     Parsed {
@@ -552,6 +811,107 @@ fn is_callish(t: &str) -> bool {
         && t.chars().any(|c| c.is_ascii_digit())
         && t.chars().any(|c| c.is_ascii_alphabetic())
         && t.chars().all(|c| c.is_ascii_alphanumeric() || c == '/')
+}
+
+#[cfg(test)]
+mod eu_vhf_tests {
+    use super::*;
+
+    /// The worked example from WSJT-X's own `messages.txt`, both ways.
+    ///
+    /// The bit layout is written here rather than taken from a library, so the
+    /// check that matters is against the reference *text* — a packer and an
+    /// unpacker that agree with each other prove nothing at all.
+    #[test]
+    fn the_reference_exchange_survives_a_round_trip() {
+        let mut ht = eu_vhf::Hashes::default();
+        ht.insert("G4ABC/P");
+        ht.insert("PA9XYZ");
+        let bits = eu_vhf::pack("G4ABC/P", "PA9XYZ", true, 57, 7, "JO22DB").expect("packs");
+        // i3 = 5, and nothing else in the type field.
+        assert_eq!(&bits[74..77], &[1, 0, 1]);
+        assert_eq!(msg_kind(&bits), MsgKind::EuVhf);
+        assert_eq!(
+            eu_vhf::unpack(&bits, &ht).as_deref(),
+            Some("<G4ABC/P> <PA9XYZ> R 570007 JO22DB"),
+        );
+    }
+
+    /// The other half of the same exchange: bare, not rogered.
+    #[test]
+    fn an_unrogered_exchange_reads_back_without_the_r() {
+        let mut ht = eu_vhf::Hashes::default();
+        ht.insert("PA9XYZ");
+        ht.insert("G4ABC/P");
+        let bits = eu_vhf::pack("PA9XYZ", "G4ABC/P", false, 59, 3, "IO91NP").expect("packs");
+        assert_eq!(eu_vhf::unpack(&bits, &ht).as_deref(), Some("<PA9XYZ> <G4ABC/P> 590003 IO91NP"),);
+    }
+
+    /// A station nobody has heard spell its call out comes back as `<...>`,
+    /// which is the layout's own bargain: the callsigns travel as hashes.
+    #[test]
+    fn an_unknown_hash_reads_as_a_placeholder() {
+        let bits = eu_vhf::pack("PA9XYZ", "G4ABC/P", false, 59, 3, "IO91NP").expect("packs");
+        assert_eq!(
+            eu_vhf::unpack(&bits, &eu_vhf::Hashes::default()).as_deref(),
+            Some("<...> <...> 590003 IO91NP"),
+        );
+    }
+
+    /// Every locator the field can hold survives the trip, and the boundaries
+    /// of the alphabet are in the set — the sub-square letters stop at X, and a
+    /// packer that allowed Y would write a number the field cannot hold.
+    #[test]
+    fn every_locator_the_field_holds_round_trips() {
+        for g in ["AA00AA", "RR99XX", "JN88DD", "IO91NP", "JO22DB"] {
+            let n = eu_vhf::pack_grid6(g).unwrap_or_else(|| panic!("{g} did not pack"));
+            assert!(n < 18 * 18 * 10 * 10 * 24 * 24, "{g} packed out of range: {n}");
+            assert_eq!(eu_vhf::unpack_grid6(n).as_deref(), Some(g));
+        }
+        assert_eq!(eu_vhf::pack_grid6("JN88DY"), None, "Y is outside the field's alphabet");
+        assert_eq!(eu_vhf::pack_grid6("JN88"), None, "a four-character grid is not one");
+    }
+
+    /// The exchange is a two-digit RS glued to a four-digit serial, and the RS
+    /// is bounded by the three bits the field gives it.
+    #[test]
+    fn the_exchange_is_an_rs_and_a_serial() {
+        assert_eq!(eu_vhf::parse_exchange("590003"), Some((59, 3)));
+        assert_eq!(eu_vhf::parse_exchange("520001"), Some((52, 1)));
+        assert_eq!(eu_vhf::parse_exchange("512047"), None, "RS 51 is below the field");
+        assert_eq!(eu_vhf::parse_exchange("602047"), None, "RS 60 is above it");
+        assert_eq!(eu_vhf::parse_exchange("59003"), None, "five digits is not an exchange");
+        assert_eq!(eu_vhf::exchange(59, 3), "590003");
+    }
+
+    /// The message packer has to recognise the exchange for what it is. Before
+    /// it did, the whole thing went out as thirteen characters of free text —
+    /// which is a valid transmission and completely useless.
+    #[test]
+    fn the_packer_picks_the_contest_layout() {
+        let (bits, sent) =
+            pack_message("<PA9XYZ> <G4ABC/P> R 570007 JO22DB").expect("packs as a contest message");
+        assert_eq!(msg_kind(&bits), MsgKind::EuVhf);
+        assert_eq!(sent, "<PA9XYZ> <G4ABC/P> R 570007 JO22DB");
+        let (bits, _) = pack_message("<PA9XYZ> <G4ABC/P> 590003 IO91NP").expect("packs");
+        assert_eq!(msg_kind(&bits), MsgKind::EuVhf);
+    }
+
+    /// And a decode of one is addressed, with the six-character locator read
+    /// out of it — the whole reason the layout exists.
+    #[test]
+    fn a_contest_decode_is_addressed_and_carries_its_locator() {
+        let mut eu = eu_vhf::Hashes::default();
+        eu.insert("PA9XYZ");
+        eu.insert("G4ABC/P");
+        let (bits, _) = pack_message("<PA9XYZ> <G4ABC/P> R 570007 JO22DB").expect("packs");
+        let d = build_decode(&bits, -5.0, 0.2, 1200.0, 0, &CallsignHashTable::new(), &eu)
+            .expect("decodes");
+        assert_eq!(d.to.as_deref(), Some("PA9XYZ"));
+        assert_eq!(d.from.as_deref(), Some("G4ABC/P"));
+        assert_eq!(d.grid.as_deref(), Some("JO22DB"));
+        assert!(!d.is_cq && !d.free_text);
+    }
 }
 
 #[cfg(test)]

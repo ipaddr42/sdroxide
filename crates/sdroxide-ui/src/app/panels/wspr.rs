@@ -217,6 +217,10 @@ impl SdroxideApp {
                     .size(10.5)
                     .color(crate::theme::CYAN_DIM()),
             );
+            // WSPR has one agreed dial per band and thirteen bands, and a
+            // beacon operator moves between them by hand — so the list is
+            // exactly the thing that was otherwise looked up (issue #210).
+            self.digi_freq_chip(ui, cmds);
             crate::chrome::row_tail(ui, |ui| {
                 // What is left of the slot, at the end of the row where the eye
                 // comes back to it. It is the one figure here that means

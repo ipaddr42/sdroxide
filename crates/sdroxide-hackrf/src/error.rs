@@ -23,8 +23,13 @@ pub enum Error {
     Access(String),
 
     /// A USB transfer failed.
+    ///
+    /// `op` names the request as well as the direction — "control write
+    /// SET_FREQ", not "control write". A stall is the radio refusing *that*
+    /// request, and a message that does not say which one is a report nobody
+    /// can act on without a second round trip to the operator (issue #220).
     #[error("USB {op} failed: {source}")]
-    Transfer { op: &'static str, source: nusb::transfer::TransferError },
+    Transfer { op: String, source: nusb::transfer::TransferError },
 
     /// A control transfer returned fewer bytes than the caller needed.
     #[error("short control read on request {request}: wanted {want} bytes, got {got}")]

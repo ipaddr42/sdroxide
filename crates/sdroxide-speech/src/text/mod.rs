@@ -136,6 +136,7 @@ impl<'a> Speaker<'a> {
             // so it is said rather than spelt at: "S S T V F M" run together
             // is a fifth and sixth letter of the mode's name.
             Mode::SstvFm => "S S T V on F M",
+            Mode::RttyFm => "ritty on F M",
             Mode::Olivia => "olivia",
             Mode::Thor => "thor",
             Mode::Fsq => "F S Q",
@@ -147,6 +148,7 @@ impl<'a> Speaker<'a> {
             // A word, not four letters: nobody says "A P R S" out loud.
             Mode::Aprs => "aprs",
             Mode::Wefax => "wefax",
+            Mode::Navtex => "nav tex",
             Mode::Js8 => "J S eight",
             // Pronounced "whisper" — the joke the name is built on.
             Mode::Wspr => "whisper",

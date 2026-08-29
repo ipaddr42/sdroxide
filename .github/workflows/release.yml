@@ -106,7 +106,8 @@ jobs:
           # Dream, faad2 and the FFT are all built from source in-tree.
           DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
             git ca-certificates curl wget zstd build-essential \
-            libasound2-dev pkg-config cmake autoconf automake libtool libclang-dev
+            libasound2-dev pkg-config cmake autoconf automake libtool libclang-dev \
+            file desktop-file-utils
           if [[ "${{ matrix.variant }}" == "soapy" ]]; then
             apt-get install -y --no-install-recommends libsoapysdr-dev
           fi
@@ -369,6 +370,82 @@ jobs:
             cargo deb --no-build -p sdroxide --variant soapysdr -o "out/$PKG.deb"
           else
             cargo deb --no-build -p sdroxide -o "out/$PKG.deb"
+          fi
+
+      - name: Package AppImage (Linux)
+        # Issue #208: one file to download and run, with no install step and no
+        # package manager.
+        #
+        # Built from the **-compat** job and from the standard variant only,
+        # and both halves of that are deliberate:
+        #
+        # * -compat, because an AppImage is a promise that the file runs on the
+        #   machine it lands on, and that promise is glibc's to keep. The
+        #   regular Linux build needs glibc 2.39; this one links 2.35 and so
+        #   covers the stable distributions as well as the current ones.
+        # * standard (no SoapySDR), because a SoapySDR AppImage would have to
+        #   carry libSoapySDR *and* the driver modules it goes looking for at
+        #   run time, in a directory laid out the way that library expects. That
+        #   is the half-working bundle AppImages are notorious for, and this
+        #   build needs none of it: the native drivers — RTL-SDR, RX-888,
+        #   HackRF, Airspy, AirspyHF+, SDRplay, LimeSDR, PlutoSDR, HPSDR, TCI,
+        #   CAT — are all compiled in.
+        #
+        # Nothing is bundled beside the binary. ALSA, X11, Wayland, GLIBC and
+        # the GL stack are on AppImage's own exclude list precisely because they
+        # have to be the host's — a bundled libasound cannot see the host's
+        # sound configuration, and a bundled GL stack cannot see its driver. So
+        # this AppImage is exactly as portable as the -compat tarball beside it,
+        # and is a single runnable file with a menu entry instead of a directory
+        # to unpack.
+        if: runner.os == 'Linux' && matrix.variant == 'cat' && contains(matrix.label, 'compat')
+        run: |
+          case "${{ matrix.label }}" in
+            *aarch64*) export ARCH=aarch64 ;;
+            *)         export ARCH=x86_64 ;;
+          esac
+          # The AppDir. `voices/` sits beside the executable because that is
+          # where the program looks for it (`speech::synth::voice_dirs` reads
+          # `current_exe()`), which inside a mounted AppImage is
+          # /tmp/.mount_XXXX/usr/bin.
+          rm -rf AppDir
+          mkdir -p AppDir/usr/bin AppDir/usr/share/applications \
+                   AppDir/usr/share/icons/hicolor/scalable/apps \
+                   AppDir/usr/share/doc/sdroxide
+          cp target/release/sdroxide AppDir/usr/bin/
+          cp -r stage/sdroxide/voices AppDir/usr/bin/
+          cp stage/sdroxide/*.txt stage/sdroxide/LICENSE stage/sdroxide/*.rules \
+             AppDir/usr/share/doc/sdroxide/
+          cp packaging/linux/sdroxide.desktop AppDir/usr/share/applications/
+          cp packaging/icons/sdroxide.svg AppDir/usr/share/icons/hicolor/scalable/apps/
+          # appimagetool wants the desktop entry and the icon at the AppDir root
+          # as well, and `.DirIcon` is what a file manager shows.
+          cp packaging/linux/sdroxide.desktop AppDir/
+          cp packaging/icons/sdroxide.svg AppDir/
+          cp packaging/icons/sdroxide.svg AppDir/.DirIcon
+          # AppRun rather than a symlink to the binary: `exec` keeps the process
+          # id, so a desktop that started the AppImage still owns the window,
+          # and "$@" passes the command line through — `--server`, `--probe` and
+          # the rest work exactly as they do on the tarball.
+          cat > AppDir/AppRun <<'EOF'
+          #!/bin/sh
+          HERE="$(dirname "$(readlink -f "$0")")"
+          exec "$HERE/usr/bin/sdroxide" "$@"
+          EOF
+          chmod +x AppDir/AppRun
+          # `--appimage-extract-and-run`: appimagetool is itself an AppImage and
+          # mounting one needs FUSE, which a container has no business having.
+          TOOL_URL=https://github.com/AppImage/appimagetool/releases/download/1.9.1/appimagetool-$ARCH.AppImage
+          curl -sSfL "$TOOL_URL" -o appimagetool
+          chmod +x appimagetool
+          APPIMAGE_EXTRACT_AND_RUN=1 ./appimagetool AppDir "out/$PKG.AppImage"
+          # A file that cannot be run is not what this feature promised, so
+          # prove it can — on x86_64, where the runner is the target. The
+          # AppImage runtime needs FUSE and the runner has none, so this is the
+          # extract-and-run path, which is also the escape hatch a user without
+          # FUSE has.
+          if [[ "$ARCH" == "x86_64" ]]; then
+            APPIMAGE_EXTRACT_AND_RUN=1 "out/$PKG.AppImage" --version
           fi
 
       - name: Package (Windows)
@@ -679,6 +756,28 @@ jobs:
           Debian 12 and Raspberry Pi OS (bookworm). The regular Linux builds
           need glibc 2.39 or newer (Ubuntu 24.04 / Mint 22 / Debian 13); the
           `-compat` builds and `.deb`s work on both old and new distributions.
+
+          ### Just want to try it? Take the AppImage
+
+          `sdroxide-<version>-linux-x86_64-compat.AppImage` (and the `aarch64`
+          one for a Raspberry Pi or other ARM board) is one file: download it,
+          `chmod +x` it, and run it. Nothing is installed, nothing is unpacked,
+          and there is no package manager involved.
+
+          It is the **Standard** build, so no SoapySDR is needed — and none of
+          the native drivers go through it anyway: RTL-SDR, RX-888, HackRF,
+          Airspy, Airspy HF+, SDRplay, LimeSDR, PlutoSDR, HPSDR, TCI, SpyServer
+          and a CAT rig on a sound card are all compiled in. It is built against
+          glibc 2.35, so it runs on old and new distributions alike.
+
+          Two things it cannot do for you, because no single file can:
+
+          - **USB receivers still need the udev rule.** The rule lives in
+            `usr/share/doc/sdroxide` inside the AppImage; the tarball or the
+            `.deb` beside it carries the same files if that is easier.
+          - **It needs FUSE to mount itself**, which every desktop distribution
+            has (`fuse3`). Where it is missing —  a minimal container, say — run
+            it as `APPIMAGE_EXTRACT_AND_RUN=1 ./sdroxide-….AppImage` instead.
 
           ### Requirements (SoapySDR builds)
 

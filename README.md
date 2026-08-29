@@ -854,6 +854,23 @@ It has been developed against a **HackRF One** (half-duplex TX) and a
 - Hardware-free sources for testing: `--siggen` (built-in signal generator) and
   `--file <raw CF32 IQ>`.
 
+## Installing
+
+Every release carries, for Linux:
+
+- an **AppImage** — one file, no install: download
+  `sdroxide-<version>-linux-x86_64-compat.AppImage` (or the `aarch64` one for a
+  Raspberry Pi or other ARM board), `chmod +x` it, and run it. Built against
+  glibc 2.35, so it runs on old and new distributions alike, and it needs no
+  SoapySDR: every native driver is compiled in. USB receivers still need the
+  udev rule (see below); the rules travel inside the AppImage under
+  `usr/share/doc/sdroxide`.
+- a **`.deb`**, which installs the udev rules and the menu entry for you, and
+  declares its dependencies.
+- a **portable tarball**, for anything else.
+
+Windows gets an `.msi`, macOS a `.dmg`. Or build it yourself:
+
 ## Building
 
 ### Toolchain

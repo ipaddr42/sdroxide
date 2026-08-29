@@ -54,7 +54,7 @@ use tracing::debug;
 fn mode_name(m: Mode) -> &'static str {
     match m {
         Mode::Lsb => "LSB",
-        Mode::Usb | Mode::Spec | Mode::Sstv | Mode::Wefax | Mode::RfPaint => "USB",
+        Mode::Usb | Mode::Spec | Mode::Sstv | Mode::Wefax | Mode::Navtex | Mode::RfPaint => "USB",
         Mode::Cw => "CW",
         Mode::Am | Mode::Sam | Mode::Drm => "AM",
         Mode::Dsb => "DSB",
@@ -65,7 +65,7 @@ fn mode_name(m: Mode) -> &'static str {
         Mode::Wfm | Mode::Adsb => "WFM",
         // Data over FM rather than over a sideband: the carrier is the signal's
         // centre, not one edge of it.
-        Mode::Rifp | Mode::Packet | Mode::Aprs | Mode::SstvFm => "PKTFM",
+        Mode::Rifp | Mode::Packet | Mode::Aprs | Mode::SstvFm | Mode::RttyFm => "PKTFM",
         Mode::Digl => "PKTLSB",
         Mode::Digu
         | Mode::Ft8

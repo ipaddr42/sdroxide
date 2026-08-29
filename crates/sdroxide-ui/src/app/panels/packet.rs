@@ -87,6 +87,25 @@ impl SdroxideApp {
             }
             crate::chrome::row_tail(ui, |ui| {
                 self.clear_rx_chip(ui, cmds);
+                // The only route to the packet settings there is. Everything
+                // this mode needs before it can transmit at all — the station
+                // callsign above all — lives in that window, and until this
+                // chip existed nothing anywhere opened it: an operator told to
+                // "set a station callsign in the packet settings first" had
+                // nowhere to go and look (issue #159).
+                if crate::chrome::chip(
+                    ui,
+                    self.show_digi_settings,
+                    RichText::new("⚙ SETUP").size(9.5),
+                )
+                .on_hover_text(
+                    "Station callsign, speed, TX delay, the digipeater path, the beacon and the \
+                     KISS server",
+                )
+                .clicked()
+                {
+                    self.show_digi_settings = !self.show_digi_settings;
+                }
             });
         });
 
@@ -202,6 +221,11 @@ impl SdroxideApp {
 
         // ── connect bar ───────────────────────────────────────────────────
         let mut connect = false;
+        // Nothing transmits without a station callsign, and the refusal used to
+        // arrive only after CONNECT was pressed. Saying so on the button is the
+        // difference between a setting to go and find and a mode that looks
+        // broken (issue #159).
+        let have_call = !self.digi_cfg_edit.packet_mycall.trim().is_empty();
         ui.horizontal(|ui| {
             let can_edit = !connected && !working;
             ui.add_enabled_ui(can_edit, |ui| {
@@ -251,7 +275,7 @@ impl SdroxideApp {
                 {
                     cmds.push(Command::PacketDisconnect);
                 }
-            } else if tx_gated(ui, tx_ok && ready && !busy, |ui| {
+            } else if tx_gated(ui, tx_ok && ready && have_call && !busy, |ui| {
                 crate::chrome::chip_accent(
                     ui,
                     false,
@@ -261,6 +285,9 @@ impl SdroxideApp {
                 )
                 .on_hover_text(if busy {
                     "The MAIL window has the link. Finish or stop that session first."
+                } else if !have_call {
+                    "This station has no callsign yet — set one under SETUP, above the monitor \
+                     pane. Nothing transmits until it is set."
                 } else if ready {
                     "Call this station in connected mode — a node, a BBS, or another operator."
                 } else {
@@ -285,7 +312,13 @@ impl SdroxideApp {
             });
         });
 
-        if connect && tx_ok && !connected && !working && !self.packet_target.trim().is_empty() {
+        if connect
+            && tx_ok
+            && have_call
+            && !connected
+            && !working
+            && !self.packet_target.trim().is_empty()
+        {
             cmds.push(Command::PacketConnect {
                 call: self.packet_target.trim().to_string(),
                 via: self.packet_via.trim().to_string(),

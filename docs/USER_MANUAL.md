@@ -16,7 +16,7 @@ or connects to a remote sdroxide server.
 1. [Feature overview](#1-feature-overview)
 2. [Basic operation](#2-basic-operation)
     - [2.21 QO-100 beacon calibration](#221-qo-100-beacon-calibration)
-3. [Digital modes (FT8, FT4, FT2, PSK31, RTTY, Olivia, THOR, FSQ, Hellschreiber, SSTV, RIFP, weather fax, JS8, RF Paint, WSPR, packet, APRS, ADS-B)](#3-digital-modes)
+3. [Digital modes (FT8, FT4, FT2, PSK31, RTTY, Olivia, THOR, FSQ, Hellschreiber, SSTV, RIFP, weather fax, JS8, RF Paint, WSPR, packet, APRS, ADS-B, NAVTEX)](#3-digital-modes)
 4. [Skimmers (CW, PSK, RTTY)](#4-skimmers)
 5. [ISM band decoder (315 / 345 / 433 / 868 / 915 MHz devices)](#5-ism-band-decoder)
 6. [Settings](#6-settings)
@@ -292,7 +292,7 @@ popup with three rows:
   has a standard calling frequency carry a cyan underline; see
   [§3.1](#31-general-considerations).
 - **MODE:** `LSB USB CW AM SAM NFM WFM DRM DIGU DIGL DSB SPEC`.
-- **DIGITAL:** `FT8 FT4 PSK RTTY OLIVIA THOR FSQ HELL SSTV SSTV-FM RIFP RFPAINT RADE` (see
+- **DIGITAL:** `FT8 FT4 PSK RTTY RTTY-FM OLIVIA THOR FSQ HELL SSTV SSTV-FM NAVTEX RIFP RFPAINT RADE` (see
   [Digital modes](#3-digital-modes)).
 
 ![The band and mode selector popup](images/04-band-mode-popup.jpg)
@@ -434,9 +434,9 @@ mode. What is in the box never changes; only where the two rows are cut does.
   refusing it. The sub receiver still has to live inside the span, so if it was
   parked outside the new one it is moved back in.
 - **MUTE** — mute the receiver (keyboard shortcut **M**).
-- **REC** / **MONO** — record what you hear and what you send
+- **REC** — record what you hear and what you send, or the raw spectrum
   to an MP3 file, and choose whether it is written in two channels or one. See
-  [2.20](#220-recording-the-audio).
+  [2.20](#220-recording-the-audio-and-the-spectrum).
 - **SQL** — squelch; below the open threshold it reads
   `off`.
 
@@ -701,6 +701,22 @@ sdroxide brings the receiver back up where you left it rather than on defaults.
   which is also how to ask for a one-off fit: click it off and on again.
   Switching it off leaves the levels wherever you set them (the floor and
   ceiling in the FFT popup are yours to keep only while FIT is off).
+- **CTR** — keep the tuned frequency in the **middle** of the panadapter. Lit,
+  the window slides under the dial every time you tune, so the marker stays put
+  and the band scrolls past it. With it off — the way it has always worked — the
+  window holds still and the marker travels across it until the dial leaves the
+  span, at which point the picture jumps a whole window at once.
+
+  Zoomed in this costs nothing: the window is a viewport onto a wider captured
+  span, and the receiver is never disturbed. Zoomed all the way out there is
+  nowhere left to slide, so the receiver's own centre follows the dial instead —
+  the same thing a drag that reaches the edge of the picture already does. A
+  radio whose centre *is* its dial (a transceiver on a sound card, an Icom
+  sending its 12 kHz I.F.) is centred to begin with and has nothing to do.
+
+  Switching CTR **on** centres at once, which is also how to ask for a one-off
+  "put me back in the middle": click it on, and off again if you would rather
+  pan and zoom where you like.
 - **SKIM** — opens the skimmer popup (per-skimmer on/off and squelch); lit while
   any skimmer runs. See [Skimmers](#4-skimmers).
 - **SCAN** — opens the scanner window; lit while a scan is running, green while
@@ -746,15 +762,26 @@ sdroxide brings the receiver back up where you left it rather than on defaults.
 The **waterfall colour scheme** and the **spectrum background gradient** are set
 on the **UI** tab of the Settings window (see
 [§6.3](#63-ui-display-preferences-and-voice-announcements)). The colour scheme is one of
-`Classic`, `Viridis`, `Gray`, `Icom`, `Neon`, `Synthwave`, `Matrix`, or `Tron`;
+`Classic`, `Viridis`, `Gray`, `Icom`, `Neon`, `Synthwave`, `Matrix`, `Tron`,
+`Amber`, or `Rainbow`;
 the gradient fills the spectrum area from a top colour down to a bottom colour
 (default dark red → black) and can be turned off. The same tab also themes the
 UI itself — colour theme, button shape and window shape — independently of the
 waterfall's palette; the screenshots in this manual show the **Default** theme.
 
-You can also resize the split between the spectrum line and the waterfall by
-dragging the frequency-scale strip between them, and hide either or both of
-them altogether from the **SPEC** popup in the Display module.
+The **frequency-scale strip** between the spectrum line and the waterfall is
+both a divider and an axis, and a drag on it picks one the moment it has a
+direction: **up and down** resizes the split between the two layers, **sideways**
+slides the band along under the picture. The sideways drag moves the *window*
+and never the dial — it is how to look somewhere else without leaving the
+frequency you are listening to — and once the view is the whole span it takes
+the receiver's own centre with it, so it keeps going rather than stopping at the
+edge. Either layer can also be hidden altogether from the **SPEC** popup in the
+Display module.
+
+The scale carries a labelled frequency every hundred points or so with
+unlabelled ticks between them, so a wide panadapter gets more markers to read
+against than a narrow one rather than the same handful stretched across it.
 
 ![Waterfall colour schemes](images/05-colormaps.png)
 
@@ -822,6 +849,15 @@ setting. Two costs worth knowing: the waterfall keeps a fixed number of
 lines, so history shortens as the rate rises (73 seconds at Medium, 9 at
 Fastest), and to a *remote* client every line is a byte per column on the
 link.
+
+The peak that makes each line "the strongest thing in its slice of time" is
+held only on the lane actually drawing the waterfall. It costs a comparison and
+a store per bin on every transform, over an array as long as the transform, and
+until v1.5.5 every analyser in the receiver paid it — including the full-rate
+one sitting behind a zoom lane, drawing nothing. On an RTL-SDR at 2.4 Msps that
+alone was most of the panadapter's share of the DSP thread, and dropping it
+halved that share
+([issue #216](https://github.com/dividebysandwich/sdroxide/issues/216)).
 
 
 ### 2.9 The S-meter
@@ -1257,7 +1293,7 @@ is audible.
   dial plus that pitch — and it is what to log and what to give on the air. The
   big readout at the top of the window is the dial, which sits a sidetone-pitch
   *below* the signal, so with a 700 Hz pitch it reads 700 Hz low. The logbook's
-  **+ NEW ENTRY** ([3.2.6](#326-logging-and-the-logbook)) fills itself in from
+  **+ NEW ENTRY** ([3.2.7](#327-logging-and-the-logbook)) fills itself in from
   the same figure, not from the dial.
 - **On a transceiver that keys its own transmitter, that same figure is what
   the radio's VFO reads.** It has to be: the rig makes the carrier itself, on
@@ -1518,6 +1554,19 @@ no hardware of its own — it names the station and asks first. Creating a radio
 is not something to do to somebody else's machine by accident: it opens a
 configuration there and starts an engine, and everyone else connected to that
 station gets a tab for it.
+
+**Rearranging the strip.** The buttons in Settings → Radio can be **dragged**
+into any order you like: pick one up, and a cyan caret shows where it will land.
+The main window's tab strip follows the same order, and it is remembered between
+sessions. A short drag that never really moves is still a click, so switching
+radios costs exactly what it did before.
+
+What the order does *not* change is which radio is the station's first. That one
+holds the shared network services, takes the command line's settings and the
+configuration paths every earlier version used, and is the one radio that cannot
+be closed — wherever on the strip you put it. Connections to other stations can
+be dragged about too, but they are in no roster here, so they come back at the
+end of the strip next time.
 
 **Adding somebody else's station.** A radio in a tab does not have to be
 attached to this machine. **Settings → Remote** takes the address of an sdroxide
@@ -1971,11 +2020,19 @@ guide are carried by the standard but not shown. The CELP and HVXC speech
 codecs of the original standard were withdrawn from it and nothing transmits
 them.
 
-### 2.20 Recording the audio
+### 2.20 Recording the audio and the spectrum
 
-**REC**, in the receiver box beside MUTE, records the session to an MP3
-file: press it to start, press it again to stop. While it runs, hovering it
-names the file being written. It has no keyboard shortcut by default, but
+**REC**, in the receiver box beside MUTE, opens a small picker with the two
+things that can be recorded — and they are different things, so either or both
+may run:
+
+- **MP3** — what you hear and what you send, described in the rest of this
+  section.
+- **I/Q WAV** — the raw spectrum the receiver is delivering, described under
+  [Recording the spectrum](#recording-the-spectrum) below.
+
+The chip lights while either is running and hovering it names the files. It has
+no keyboard shortcut by default, but
 **Record on/off** is in the bindable action list, so it can be put on a key, a
 mouse button or a MIDI pad ([6.4](#64-controls-keyboard-mouse-and-midi)).
 
@@ -2016,12 +2073,12 @@ them apart:
   nothing to keep apart, so both what you receive and what you send are written
   to both channels and the file plays centred instead of out of one ear.
 
-**MONO**, the button that follows REC, writes a single channel instead, with receive and
-transmit taking turns on it: a smaller file, and the honest format for a
-recording that is going to be played back in mono anyway.
+**MONO**, beside MP3 in the picker, writes a single channel instead, with
+receive and transmit taking turns on it: a smaller file, and the honest format
+for a recording that is going to be played back in mono anyway.
 
 Either way the layout is settled when the recording starts — which is why MONO
-is greyed out while REC is lit. A file already being written keeps the channel
+is greyed out while a recording runs. A file already being written keeps the channel
 count it began with, so switching the sub receiver on, or a broadcast's stereo
 pilot coming and going, cannot change it halfway through.
 
@@ -2051,10 +2108,44 @@ configured it says so rather than recording silence. It stops by itself if the
 audio output device is changed under it, and one still running when you quit is
 closed properly, so there is never a half-written file to repair.
 
-This is not `--record-iq` ([12](#12-command-line-reference)), which writes the
-raw IQ of the whole span — tens of megabytes a second — so that a band can be
-replayed offline. This records what came out of the receiver, at a size you can
-send to someone.
+#### Recording the spectrum
+
+**I/Q WAV**, the second row of the REC picker, records the whole span the
+receiver is delivering rather than the audio of one signal in it: a band you can
+replay afterwards and tune around inside, decode differently, or hand to someone
+else ([issue #217](https://github.com/dividebysandwich/sdroxide/issues/217)).
+Beside the chip is what it costs at the current sample rate before you start it,
+and the megabytes and minutes written once it is running.
+
+The file is a stereo 32-bit float WAV — I in the left channel, Q in the right —
+at the receiver's own sample rate, which is what **SDR#**, **SDRuno**,
+**HDSDR**, **SDRangel** and GNU Radio all read. The centre frequency travels
+both in the name and in the file's `auxi` chunk, because those are the two
+places those programs look, so a capture opens tuned to where it was made:
+
+```
+SDRoxide_20260829_134507Z_14074000Hz_2400000sps_IQ.wav
+```
+
+It also plays back here, with nothing to type — `sdroxide --file <capture>`
+takes the rate and the frequency out of the header. `--rate` and `--freq` still
+win if you give them.
+
+**It is large: eight bytes a sample.** At 2.4 Msps that is 19 MB a second, a
+gigabyte a minute. A WAV's sizes are 32-bit and so stop at 4 GB — three and a
+half minutes at that rate — so a capture that outgrows one is written as
+**RF64** instead, which every program above opens. Nothing to choose: the file
+is an ordinary WAV until it needs not to be.
+
+A radio that hands over demodulated audio rather than I/Q — a transceiver on a
+sound card — has no spectrum to record, and the chip says so instead of being
+missing. Started from a remote or browser client the capture is written on the
+machine the receiver is plugged into, for the same reason the MP3 is, and rather
+more urgently: a gigabyte a minute is not something to send over a link.
+
+This is the same data `--record-iq` ([12](#12-command-line-reference)) writes,
+in a container other programs can open — `--record-iq` writes the bare samples
+and starts with the program, which is what a headless capture wants.
 
 ### 2.21 QO-100 beacon calibration
 
@@ -2210,11 +2301,16 @@ FM for VHF packet, APRS and RIFP, where the same control is the deviation
 instead. All of it lives in `digi.json`
 ([13](#13-configuration-files)).
 
-#### Bands with more than one agreed frequency
+#### The agreed frequencies for a mode
 
-Most modes have one agreed frequency per band, and the band buttons above are all
-you need. Some have several — and where they do, a **⇵** button appears in that
-mode's operating panel listing them:
+Every mode with a convention of its own carries a **⇵** button in its operating
+panel — FT8, FT4, FT2, JS8, WSPR, PSK, RTTY, FSQ, SSTV (analog and FM), RIFP and
+APRS. It lists **every band's** agreed frequency for that mode, grouped by band
+with the band you are already in at the top, so changing band is one click rather
+than a band button and then a number you had to remember.
+
+Several bands have more than one entry, and that is where the list earns its
+place twice over:
 
 | Mode | Where it happens |
 | --- | --- |
@@ -2226,6 +2322,10 @@ The button's face is the frequency you are on when the dial is already sitting o
 one of them, and reads **⇵ FREQ** when it is not. Clicking a frequency moves the
 **dial**; where you sit inside the audio passband is a separate control and is
 left alone.
+
+WEFAX has its own **STATIONS** button instead ([3.8](#38-weather-fax-wefax--radiofax)): its
+transmitters are not on any band plan, so they are listed by station rather than
+by band.
 
 The frequencies that differ by region — PSK31 and RTTY on 40 m, SSTV on 80 m and
 40 m — are not offered as a choice, because the **IARU region** setting
@@ -2284,6 +2384,9 @@ Click **SETUP** in the QSO area to open the **FT8 / FT4 / FT2 Setup** window:
 - **TX watchdog / Give up after** — how long unattended transmitting may
   continue with no progress, and how many unanswered calls to one station are
   worth making. Both 0 to disable.
+- **Contest** — the special operating activity, if any: **None** or
+  **EU VHF Contest** (see [Contest operation](#325-contest-operation-eu-vhf)).
+  **Serial** is the number the next exchange will carry.
 - **DXpedition** — which side of an FT8 or FT2 pile-up you are on: **Normal**,
   **Hound**, or **Fox** (see [DXpedition mode](#324-dxpedition-mode-hound-and-fox)).
   **Fox signals** sets how many stations a Fox works at once. FT4 has no
@@ -2359,8 +2462,8 @@ The panel has two halves:
   **CLEAR RX** empties the list by hand, for when the band has gone quiet and
   what is on screen is a list of stations that *were* there. Nothing on the air
   stops, and the next slot starts filling it again.
-- **QSO** (right) — a **⇵** frequency button when the band has more than one
-  agreed frequency for the mode ([3.1](#31-general-considerations)), a world map
+- **QSO** (right) — a **⇵** frequency button listing every band's agreed FT8/FT4
+  frequency ([3.1](#31-general-considerations)), a world map
   (your location, the station you are working, and
   a transmit indicator — see [the world map](#the-world-map) below), a station card showing the current step
   (`Idle`, `Wait CQ`, `Calling CQ`, `Tx Grid`, `Tx Report`, `Tx R+Report`,
@@ -2371,8 +2474,8 @@ Beyond the everyday exchange, the decode list understands the other FT8 message
 layouts: **compound and non-standard callsigns** (`DL/W1AW`, `W1AW/P`), **hashed
 callsigns** (shown as `<W1AW>` once that station has been heard, and as `<...>`
 until then), **free text** (13 characters, listed as `TEXT` since it names no
-sender), **contest exchanges** (ARRL RTTY Roundup, Field Day) and **DXpedition**
-messages. Transmitting works the same way round: a message that the standard
+sender), **contest exchanges** (EU VHF, ARRL RTTY Roundup, Field Day) and
+**DXpedition** messages. Transmitting works the same way round: a message that the standard
 layout can't carry is sent in the layout that can, and the transcript records
 what actually went on the air — addressing a compound call sends your own
 callsign hashed (`DL/W1AW <AB1CD> RR73`), which drops the signal report, and
@@ -2577,7 +2680,61 @@ sharing the transmitter's power, so more signals means each one is weaker.
 Contacts are logged as their `RR73` goes out; where a caller is waiting, that
 `RR73` shares its signal with the report opening the next contact.
 
-#### 3.2.5 Reporting what you hear
+#### 3.2.5 Contest operation (EU VHF)
+
+European VHF contests do not exchange a grid and a signal report — they exchange
+a **signal report, a serial number and a six-character locator**. That does not
+fit the everyday FT8 message, so the mode has one of its own, and both ends have
+to be in it for the exchange to be read at all.
+
+Set **Contest** to **EU VHF Contest** in the FT8 setup window and put a
+six-character locator in **My grid** (`JN88DD`, not `JN88`). Without one there
+is no honest message to send, so sdroxide sends the ordinary exchange instead
+and the setup window says so beside the serial number. The activity applies to
+FT8, FT4 and FT2; every other mode ignores it.
+
+The exchange then runs:
+
+```
+CQ TEST G4ABC/P IO91
+                             G4ABC/P PA9XYZ JO22
+<PA9XYZ> <G4ABC/P> 590003 IO91NP
+                             <G4ABC/P> <PA9XYZ> R 570007 JO22DB
+PA9XYZ G4ABC/P RR73
+```
+
+The first two messages and the last are ordinary ones, carrying both callsigns
+in full. The two in the middle are the contest layout: the callsigns travel as
+**hashes** — which is what buys the room for the locator and the serial — and are
+shown in angle brackets. A station whose callsign you have not yet heard spelled
+out appears as `<...>`; that is the layout's own bargain and not a fault. It is
+also why the exchange is preceded by the two ordinary messages.
+
+The number in the middle is the exchange itself: `59` is the signal report, as
+the two digits of an RS, and `0003` is the serial number. sdroxide derives the
+report from the measured signal exactly as WSJT-X does, so it is a real report
+and not a formality.
+
+**The serial number** advances by itself as each contact is logged, and is
+remembered between sessions — a contest runs over a weekend and across restarts.
+Set it by hand only to start a contest, or to pick up where a paper log got to.
+A contact keeps whatever serial it first sent, so a number that advances while
+an exchange is still in progress cannot change halfway through. It wraps back to
+1 past 2047, which is as far as the layout's field reaches.
+
+**In the log**, a contest contact keeps what was actually exchanged: the reports
+are the two RS values that went over the air rather than the signal-to-noise
+ratios behind them, the serial numbers land in ADIF's `STX` and `SRX`, and the
+exchanges whole in `STX_STRING` and `SRX_STRING`. The six-character locator
+becomes the station's grid, so the map and the distance get the better answer.
+
+> Only EU VHF is implemented. WSJT-X offers five other special operating
+> activities — ARRL Field Day, the RTTY Roundup, NA VHF, WW Digi and ARRL Digi —
+> each with its own message layout and its own exchange. sdroxide *decodes* the
+> Field Day and RTTY Roundup layouts when it hears them; it does not transmit
+> them.
+
+#### 3.2.6 Reporting what you hear
 
 Enable **Upload my FT8/FT4/FT2 decodes** on the Network settings tab to report every
 station you decode to [pskreporter.info](https://pskreporter.info), where your
@@ -2590,7 +2747,7 @@ line is shown on your station's page. The **Collector** host and port are there
 for testing: port 14739 is the project's test collector, which accepts reports
 without publishing them.
 
-#### 3.2.6 Logging and the logbook
+#### 3.2.7 Logging and the logbook
 
 Completed FT8/FT4/FT2 QSOs are logged automatically. Open the full logbook with the
 **LOG** button (System module).
@@ -2714,6 +2871,30 @@ signals across each band's PSK/RTTY calling sub-bands. Clicking a label from any
 mode switches to PSK or RTTY, tunes onto the signal, and opens this panel — onto
 the standard tone pair in RTTY, so the offset you land on is the one you will
 transmit. A label already in that mode leaves your own offset alone.
+
+**On VHF and UHF, use RTTY-FM instead.** Some national societies still send
+their weekly bulletin as RTTY on a 2 m FM channel, and that is not the same
+signal as RTTY on a sideband — the tone pair modulates an FM carrier rather than
+riding on one edge of a passband. **RTTY-FM** is on the DIGITAL row beside RTTY
+([issue #214](https://github.com/dividebysandwich/sdroxide/issues/214)).
+
+Everything about the modem is the same: the same Baudot alphabet, the same
+2125/2295 Hz tone pair, the same shift, baud and **Reverse** controls and the
+same panel. What differs is the radio and the frequency:
+
+- A CAT-controlled rig is put in **FM data** (PKTFM / FM-D) rather than in USB.
+- The **dial is the channel**, not the foot of a passband, so nothing is offset
+  from it — a contact is logged on the frequency you tuned, where an HF RTTY
+  contact is logged 2.2 kHz above it.
+- The passband is an FM channel's, ±8 kHz, selectable 8k / 16k.
+- The transmit level is **deviation** and comes from the FM half of the digital
+  transmit level ([2.10](#210-transmit)), which is the same rail VHF
+  packet and APRS use.
+
+Its band buttons are the FM **calling** channels — 50.150, 145.500 and 433.500 —
+because RTTY on FM has no worldwide convention at all: where it is still used the
+frequency comes from the society running the bulletin. Tune the real one and
+store it in a memory.
 
 ### 3.4 Olivia, THOR and FSQ
 
@@ -3713,9 +3894,9 @@ hundredths of an inch the protocol carries.
 
 ### 3.13 ADS-B (aircraft on 1090 MHz)
 
-Choose **ADS-B** from the mode row — beside DRM, with the demodulators rather
-than under DIGITAL, because it is something to point the radio at rather than
-something to work. Every civil aircraft in the sky transmits its identity,
+Choose **ADS-B** from the end of the **DIGITAL** row. It sits apart from the
+rest of that row all the same: there is no QSO to work and no transmitter, only
+a signal to point the radio at. Every civil aircraft in the sky transmits its identity,
 altitude, velocity and position on 1090 MHz, twice a second, in clear and with a
 checksum. The panel is a target list on the left and a radar picture on the
 right.
@@ -3904,6 +4085,61 @@ strong aircraft 30 dB or more above the noise floor; if the loudest thing in the
 capture is 10 dB above it, no decoder will find anything in it.
 
 ---
+
+### 3.14 NAVTEX
+
+Choose **NAVTEX** from the DIGITAL row. It is the maritime safety broadcast
+every coast station in the world sends — navigational and meteorological
+warnings, search-and-rescue bulletins, ice reports, pilot notices — and one of
+the few utility services still worth leaving a receiver on
+([issue #212](https://github.com/dividebysandwich/sdroxide/issues/212)).
+
+**Receive only, and deliberately.** The service belongs to coast stations and
+sits next to distress traffic; an amateur transmitting on it would be putting
+out safety information nobody may act on. There is no transmit half of this
+panel and no callsign to set.
+
+**The channels.** The band buttons are the three services: **518 kHz**
+(international, always English), **490 kHz** (national language, so whatever
+your nearest coast station broadcasts in) and **4209.5 kHz** (tropical). What
+they tune is 1.7 kHz *below* the channel, because the quoted frequency is the
+assigned one — the centre of the two tones — and a receiver in upper sideband
+has to sit below it to put them at 1615 and 1785 Hz. That arithmetic is done
+for you, and the readout still says where the signal is.
+
+**What you see.** Two panes:
+
+- **MESSAGES** — one entry per message, newest first, headed by the four
+  characters the service identifies it with: the transmitter (a letter the
+  NAVAREA co-ordinator allocated), the subject, and a serial number.
+  Navigational warnings, meteorological warnings and search-and-rescue
+  bulletins are shown in red — a ship's receiver is not allowed to filter those
+  three out, and sdroxide does not offer to either. A message that was cut
+  short, or that lost characters, says so under its heading.
+- **READING** — the message selected, or the one arriving. Monospaced and
+  unwrapped, because a NAVTEX message is laid out in columns by the station
+  that sent it and reflowing it destroys the only formatting it has. With
+  nothing selected and nothing arriving it shows everything decoded, message or
+  not, which is the honest view when a header has been missed.
+
+**A station repeats itself, and that is the point.** Each transmitter has a ten
+minute slot every four hours, and it sends the same messages again on the next
+one. sdroxide keeps *one* entry per message — a repeat replaces the copy already
+held when it is better, meaning it reached its `NNNN` where the first did not, or
+lost fewer characters. So a warning that faded halfway through fills itself in
+over the next few hours instead of appearing four times half-copied.
+
+**The two numbers beside SYNC** are what the mode's error correction actually
+did. NAVTEX has no checksum: every character is sent twice, five character times
+apart, in an alphabet where exactly four of seven bits are marks — so a single
+bit error makes a code that cannot exist, and the repeat is what replaces it.
+*Repaired* counts the characters taken from the repeat and *lost* the ones where
+both copies were bad; a lost character stands in the text as `*`, marked rather
+than hidden, because half a gale warning has to look like half a gale warning.
+
+**REV** swaps the mark and space tones, for a signal received on the other
+sideband. Off is upper sideband on the channel, which is what every published
+tuning instruction for the service says.
 
 ## 4. Skimmers
 
@@ -7184,7 +7420,10 @@ a DSP one.
 **Bias tee.** About 3 V at 50 mA on the antenna port, for an active antenna or a
 preamp. A HackRF One or Pro only — the Jawbreaker and the rad1o have no such
 circuit, and on those sdroxide does not send the command at all and says so
-rather than leaving a switch that quietly does nothing.
+rather than leaving a switch that quietly does nothing. A board that refuses the
+command anyway — the firmware answers it with a stall on anything that is not a
+One, an r9 or a Pro, and some boards do not identify themselves as any of those
+— is a radio with no antenna-port power, not a radio that will not open.
 
 ##### Transmit
 
@@ -8249,10 +8488,22 @@ The **UI** tab holds display preferences, stored in `config.toml` under `[ui]`, 
 spoken announcements below them under `[speech]`:
 
 - **Layout** — which control strip the window wears. **Auto** picks one from the
-  window size and is what you want; **Desktop**, **Tablet** and **Phone** force
-  it, to see how the compact strips look without a phone to hand, or to keep the
-  menus in a small desktop window rather than a strip wrapped over three rows.
-  See [9.4](#94-phones-and-tablets) for what each one shows.
+  window size and is what you want; **Desktop**, **Tablet**, **Small screen**
+  and **Phone** force it, to see how the compact strips look without a phone to
+  hand, or to keep the menus in a small desktop window rather than a strip
+  wrapped over three rows. See [9.4](#94-phones-and-tablets) for what each one
+  shows.
+
+  **Small screen** is Tablet with everything pulled in — the single-row strip
+  and its compact readout, and the operating panels' chips and row spacing
+  tightened. It is for a screen like **1366×768**, which is wide enough for the
+  roomy layout and short enough that a decode list and a waterfall are fighting
+  over about six hundred points
+  ([issue #211](https://github.com/dividebysandwich/sdroxide/issues/211)).
+  **Auto** already tightens the panels on any window under about 820 points
+  tall, so a small laptop gets most of this without being told; the setting is
+  for the rest of it, and for anyone who wants the tighter panels in a window
+  on a large screen.
 - **Theme** — the colour scheme for the whole UI: **Default** (the navy, cyan
   and hot pink every screenshot in this manual shows), **Light** (white panels
   and near-black text, for a bright shack or a screen read in daylight),
@@ -8919,15 +9170,19 @@ A few things worth knowing:
   same as any other TCI rig.
 - **Transmit audio is paced by the server, not the client.** TCI has the radio
   ask for each buffer of transmit audio as it needs it (a *chrono*), and the
-  client answers one packet per request. sdroxide asks for exactly what is
-  missing from the queue and no more, so a client that answers a run of
-  requests in one go — which is what an application whose audio comes off a GUI
-  timer does — is never handed back more than the queue can hold. The queue
-  itself deepens on its own, up to a quarter of a second, to whatever gaps the
-  client actually leaves. Nothing to set: it settles in the first over and stays
-  there. (Earlier versions asked once per 10 ms block regardless of what was
-  already on its way, and an FT8 slot could go out as a few seconds of signal —
-  [issue #202](https://github.com/dividebysandwich/sdroxide/issues/202).)
+  client answers one packet per request. sdroxide asks for everything the
+  transmitter has consumed plus a quarter of a second of lead, so a client that
+  falls behind is asked for *more* rather than for whatever it managed to send,
+  and one that runs ahead is not asked at all. When the client unkeys, the
+  audio it has already handed over is played out before the transmitter stops,
+  so the tail of a timed burst is not cut off. Nothing to set.
+- **A client that mislabels its transmit audio is still understood.** The TCI
+  header carries a channel count, and WSJT-X leaves it uninitialised — a
+  different random number in every packet. Taken at face value that collapses
+  each 10 ms packet to a single sample, which is what made a 15 s FT8 slot go
+  out as a few seconds of chopped signal
+  ([issue #202](https://github.com/dividebysandwich/sdroxide/issues/202)). The
+  payload is read instead where the field is not a channel count.
 
 #### 6.8.3 WSJT-X UDP broadcast
 
@@ -10177,7 +10432,7 @@ row of menu buttons:
 | **VFO** | A↔B, A→B, SPLIT, SUB, and the RIT/XIT offsets |
 | **SUB** | The second receiver's frequency, mode, filter and level (only while it is running) |
 | **TX** | TUNE, the voice keyer, and the drive, tune and mic levels |
-| **DISP** | ☀ 3D, WIDE, FIT, the panadapter boxes (the spectrum and waterfall switches, peak hold, their speeds and the detail), the skimmers, and the spectrum floor/ceiling and FFT size |
+| **DISP** | ☀ 3D, WIDE, FIT, CTR, the panadapter boxes (the spectrum and waterfall switches, peak hold, their speeds and the detail), the skimmers, and the spectrum floor/ceiling and FFT size |
 | **SYS** | LOG, SPOTS, AWARDS, BANDS, MEM, SETTINGS, HELP |
 
 A menu stays open until you tap outside it or tap its button again — the top-bar
@@ -10688,6 +10943,12 @@ Clicking the callsigns on a monitor line puts that station in the terminal's
 connect bar, path and all. That is how you find out who is reachable: by
 watching the channel, not by typing callsigns from memory.
 
+**SETUP** opens the packet settings — the station callsign above all, plus the
+speed, the TX delay, the packet length and window, the default digipeater path,
+the connect text, the beacon and the KISS server. It is the only route to them,
+and until a station callsign is set there **CONNECT** stays greyed out and
+nothing transmits: an unidentified signal is illegal everywhere.
+
 **TERMINAL** is the connected session — see below.
 
 ### Connecting to a node or a BBS
@@ -10878,6 +11139,7 @@ sdroxide stores its settings under the per-user config directory:
 | `rigctld.json` | JSON | Built-in Hamlib rigctld server: enabled, bind address, port, reported rig name, whether clients may transmit, and the client limit. |
 | `wsjtx.json` | JSON | WSJT-X UDP broadcast: enabled, destination host and port, and the name clients see. |
 | `scanner.json` | JSON | The scanner: memories or a range, the range and channel step, the level that counts as busy, the dwell, how it resumes, and which memories to skip. |
+| `renderer-fallback.txt` | text | Written only when a panic came from the graphics driver: the next start renders through OpenGL and says so. Delete it to go back to the default renderer ([14](#14-troubleshooting)). |
 | `skimmer.json` | JSON | Skimmers: which of CW / PSK / RTTY run, and each one's spot squelch in dB. Restored at startup; a narrowband (audio-mode) radio still forces them off without disturbing what you picked. |
 | `adsb.json` | JSON | ADS-B decoder ([§3.13](#313-ads-b-aircraft-on-1090-mhz)): the two timeouts, how many history dots to keep, how far ahead the speed vectors reach, and the ceiling on the aircraft table. Restored at startup, and — like `ism.json` — a receiver that cannot feed the decoder forces it off without disturbing what you picked. |
 | `ism.json` | JSON | ISM decoder: whether it runs, which device families it listens for, the burst threshold in dB, and whether the rtl_433 decoders are on, which band they watch and how wide a window they get. Restored at startup, and — like `skimmer.json` — a narrowband (audio-mode) radio forces it off without disturbing what you picked. |
@@ -10999,7 +11261,7 @@ remembered frequency is the first thing to check.
 
 Two things are kept outside the config directory, because they are things you
 will want to open in an ordinary file manager rather than program state:
-audio recordings go to `<Music>/sdroxide/` ([2.20](#220-recording-the-audio)),
+audio recordings go to `<Music>/sdroxide/` ([2.20](#220-recording-the-audio-and-the-spectrum)),
 and received weather-fax charts to
 `<Pictures>/sdroxide/wefax/`. Where the platform exposes no such folder, both
 fall back to the config directory.
@@ -11257,6 +11519,46 @@ WGPU_BACKEND=vulkan sdroxide
 `WGPU_BACKEND` (`vulkan`, `gl`, `metal`, `dx12`) pins the renderer on any
 machine, and pinning it also turns the check above off — so `WGPU_BACKEND=gl`
 is how to force the steady path on a GPU sdroxide does not know about.
+
+**TUNE makes full power and FT8 makes full power, but speaking into the
+microphone makes milliwatts.**
+The transmitter is doing exactly what it is told: it was handed silence. TUNE is
+a carrier and FT8 is a synthesised burst, so neither goes anywhere near the
+microphone — a voice mode is the only thing that does, and if the microphone is
+not the card you are speaking into there is nothing to modulate. The drive
+slider, the power register and the meters all read correctly throughout, which
+is what makes it look like a power bug
+([#215](https://github.com/dividebysandwich/sdroxide/issues/215)).
+
+An over that goes out with nothing on the microphone now says so when you
+unkey — "That over went out with no audio". Pick the input under **Settings →
+General**; on a headset this is usually a separate device from the speaker, and
+"System Default" is whatever the desktop's sound settings point at rather than
+whatever is plugged in.
+
+**sdroxide died with `Failed to create staging buffer for index data`, or
+another panic naming `wgpu`, after running for a while.**
+The graphics driver refused an allocation and the renderer has no way to carry
+on without one. It is the driver's failure rather than sdroxide's — reported on
+an Intel HD Graphics 530 under Mesa, an hour into a session, with a wgpu
+validation error a moment before it
+([#219](https://github.com/dividebysandwich/sdroxide/issues/219)) — and nothing
+in the program can prevent it. What it can do is not walk into it twice: a panic
+that came from the graphics driver leaves a note in
+`renderer-fallback.txt` in the configuration directory
+([13](#13-configuration-files)), and the next start renders through **OpenGL**
+instead and says so:
+
+```
+sdroxide: the last session ended inside the graphics driver, so this window
+renders through OpenGL instead.
+```
+
+The note stays until you delete it — a driver that has crashed once will crash
+again, and re-learning that costs another lost session. Delete the file to go
+back to the default renderer, or set `WGPU_BACKEND` to pick one yourself, which
+turns the check off in both directions. A panic anywhere else in sdroxide leaves
+no note and changes no renderer.
 
 **A blank window appears for a moment, sdroxide exits, and the console says
 `Failed to wait for GPU to come idle before reconfiguring the Surface`.**
@@ -11884,7 +12186,9 @@ using. Bind them under **Speech** on the Controls tab:
 | JS8 | JS8 — conversational messaging on FT8's waveform. Four speeds (Normal 15 s / Fast 10 s / Turbo 6 s / Slow 30 s); directed queries, heartbeats and multi-frame free text. |
 | WSPR | Weak Signal Propagation Reporter — a two-minute beacon carrying a callsign, grid and power. Not a QSO mode: it measures paths, uploads them to WSPRnet, and feeds the propagation heat map. See [3.11](#311-wspr-weak-signal-propagation-reporter). |
 | PSK | PSK31 keyboard mode (BPSK31 / varicode). |
-| RTTY | RTTY keyboard mode (Baudot; selectable shift and baud). |
+| RTTY | RTTY keyboard mode (Baudot; selectable shift and baud), on a sideband. |
+| RTTY-FM | The same modem on an FM carrier, the way a club bulletin is still sent on VHF. |
+| NAVTEX | The maritime safety broadcast on 518, 490 and 4209.5 kHz: navigational and meteorological warnings, search-and-rescue bulletins and ice reports, framed into messages. Receive only. |
 | OLIVIA | Robust MFSK keyboard mode (selectable tones/bandwidth). |
 | THOR | DominoEX-family IFK keyboard mode with FEC (THOR4…THOR32). |
 | FSQ | Fast Simple QSO — 33-tone IFK with directed (FSQCALL) messaging and images. |
@@ -11909,5 +12213,7 @@ have are not offered.
 ### Waterfall colour schemes
 
 `Classic` (PowerSDR-style), `Viridis`, `Gray`, `Icom` (Icom-style palette,
-peaking at red with no white blow-out), `Neon`, `Synthwave`, `Matrix`, and
-`Tron`. Chosen on the **UI** tab of the Settings window ([6.3](#63-ui-display-preferences-and-voice-announcements)).
+peaking at red with no white blow-out), `Neon`, `Synthwave`, `Matrix`, `Tron`,
+`Amber` (one warm phosphor family, to wear with the **Amber Phosphor** UI
+theme) and `Rainbow` (the full spectrum in order, to wear with the **Rainbow**
+UI theme). Chosen on the **UI** tab of the Settings window ([6.3](#63-ui-display-preferences-and-voice-announcements)).

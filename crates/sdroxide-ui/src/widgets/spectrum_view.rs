@@ -42,6 +42,12 @@ const MARKER_GRAB_PX: f32 = 5.0;
 /// about twice as long — which is how a weighted VFO knob behaves and what
 /// makes the gesture predictable.
 const FLING_FRICTION: f32 = 1400.0;
+/// How far a drag on the frequency-scale strip has to travel before it is
+/// claimed as a resize or as a sideways pan. Far enough that the pointer's
+/// direction means something, short enough that neither gesture feels like it
+/// took a moment to start.
+const SCALE_AXIS_LOCK: f32 = 4.0;
+
 /// Viscous drag, per second, on top of the friction. Stops a very hard flick
 /// from crossing half a band without making a gentle one feel sticky: an
 /// ordinary flick coasts under a second and about half a panadapter width, a
@@ -189,6 +195,29 @@ fn pan_center(
     *dev_center = hz;
     state.center_hz = hz;
     cmds.push(Command::SetCenter(hz));
+}
+
+/// Slide the window so `vfo` sits in the middle of it, and report what the
+/// captured span could not absorb — the amount the front end's own centre has
+/// to move for the dial to be centred, which is nothing at all while the view
+/// is still a viewport onto a wider window.
+///
+/// Below one display column the overshoot is reported as zero: a retune costs
+/// a waterfall remap and, on some front ends, a skimmer restart, and a slide
+/// narrower than a pixel is not visible to anyone. The view is still moved by
+/// it, so the sub-pixel remainders accumulate rather than being lost and the
+/// front end is asked once the total is worth asking for.
+fn center_on_dial(
+    view: &mut ViewState,
+    vfo: f64,
+    dev_center: f64,
+    dev_span: f64,
+    width_px: f32,
+) -> f64 {
+    let dhz = vfo - (view.view_lo_hz + view.view_hi_hz) / 2.0;
+    let over = pan_view(view, dhz, dev_center, dev_span);
+    let column = if width_px > 1.0 { dev_span / width_px as f64 } else { 0.0 };
+    if over.abs() >= column { over } else { 0.0 }
 }
 
 /// The sub receiver's colour, on the panadapter and on its control module.
@@ -1177,10 +1206,19 @@ pub fn show_ext(
     let mut sub_drag: bool = ui.data(|d| d.get_temp(sub_drag_id)).unwrap_or(false);
     let hover_sub = resp.hover_pos().map(sub_grab_at).unwrap_or(false) && hover_edge.is_none();
 
-    // The frequency-scale strip doubles as the spectrum/waterfall resize grip:
-    // a vertical drag there changes the spectrum height.
+    // The frequency-scale strip doubles as the spectrum/waterfall resize grip
+    // and as the frequency axis: a vertical drag there changes the spectrum
+    // height, a sideways one slides the band along under the picture
+    // (issue #174).
     let resize_id = ui.id().with("spec-resize");
     let mut resizing: bool = ui.data(|d| d.get_temp(resize_id)).unwrap_or(false);
+    // Which of the two a strip drag turned out to be — `None` until it has
+    // travelled far enough to have a direction, then `Some(true)` for the
+    // sideways pan and `Some(false)` for the resize, and it keeps that for the
+    // rest of the gesture. Without the lock a resize would shift the band every
+    // time the pointer wandered and a pan would quietly rewrite the split.
+    let scale_axis_id = ui.id().with("scale-axis");
+    let mut scale_axis: Option<bool> = ui.data(|d| d.get_temp(scale_axis_id)).unwrap_or(None);
     let hover_resize =
         !waterfall_only && resp.hover_pos().map(|p| scale_rect.contains(p)).unwrap_or(false);
 
@@ -1241,6 +1279,7 @@ pub fn show_ext(
             sub_drag = false;
             resizing = false;
             bw_fade = None;
+            scale_axis = None;
         } else {
             edge = origin.and_then(edge_at);
             sub_drag = edge.is_none() && origin.map(sub_grab_at).unwrap_or(false);
@@ -1252,11 +1291,13 @@ pub fn show_ext(
                 && !sub_drag
                 && origin.map(|p| scale_rect.contains(p)).unwrap_or(false);
             measuring = None;
+            scale_axis = None;
         }
         ui.data_mut(|d| {
             d.insert_temp(edge_id, edge);
             d.insert_temp(sub_drag_id, sub_drag);
             d.insert_temp(resize_id, resizing);
+            d.insert_temp(scale_axis_id, scale_axis);
             d.insert_temp(measure_id, measuring);
             d.insert_temp(fade_id, bw_fade);
         });
@@ -1308,6 +1349,8 @@ pub fn show_ext(
         ui.ctx().set_cursor_icon(CursorIcon::Grabbing);
     } else if hover_sub {
         ui.ctx().set_cursor_icon(CursorIcon::Grab);
+    } else if scale_axis == Some(true) {
+        ui.ctx().set_cursor_icon(CursorIcon::ResizeHorizontal);
     } else if hover_resize || resizing {
         ui.ctx().set_cursor_icon(CursorIcon::ResizeVertical);
     }
@@ -1363,15 +1406,46 @@ pub fn show_ext(
         // Bandwidth measurement — no tuning or panning; drawn in the overlay
         // pass at the end.
     } else if resizing && resp.dragged_by(egui::PointerButton::Primary) {
-        // Spectrum/waterfall resize — set the spectrum height from the pointer.
-        if let Some(p) = resp.interact_pointer_pos() {
-            let usable = (rect.height() - scale_h()).max(1.0);
-            view.spectrum_fraction = ((p.y - rect.top()) / usable).clamp(0.10, 0.85);
-            // Dragging the divider asks for a split, so whichever layer was
-            // switched off comes back — this is the way out of either
-            // one-layer view without going back to the SPEC popup.
-            view.spectrum_collapsed = false;
-            view.waterfall_collapsed = false;
+        // A strip drag is one gesture or the other, decided once it has gone
+        // far enough to mean something and held for the rest of the drag.
+        // Below that it does nothing at all: the resize reads the pointer's
+        // absolute height, so a gesture that turns out to be one catches up in
+        // the frame it is claimed and nothing is lost by waiting.
+        if scale_axis.is_none() {
+            let origin = ui.input(|i| i.pointer.press_origin());
+            if let (Some(p), Some(o)) = (resp.interact_pointer_pos(), origin) {
+                let travel = p - o;
+                if travel.length() >= SCALE_AXIS_LOCK {
+                    scale_axis = Some(travel.x.abs() > travel.y.abs());
+                }
+            }
+        }
+        match scale_axis {
+            // Sideways: slide the band under the picture, and only the band —
+            // the axis says where the window is, not where the dial is, so
+            // this never turns the VFO. What the captured span cannot absorb
+            // moves the front end's own centre, which is the only way the axis
+            // can keep going once the view is the whole window.
+            Some(true) => {
+                let dhz = -resp.drag_delta().x as f64 * view.span() / rect.width() as f64;
+                let over = pan_view(view, dhz, dev_center, dev_span);
+                pan_center(&mut dev_center, state, over, pan, cmds);
+            }
+            // Spectrum/waterfall resize — set the spectrum height from the
+            // pointer.
+            Some(false) => {
+                if let Some(p) = resp.interact_pointer_pos() {
+                    let usable = (rect.height() - scale_h()).max(1.0);
+                    view.spectrum_fraction = ((p.y - rect.top()) / usable).clamp(0.10, 0.85);
+                    // Dragging the divider asks for a split, so whichever layer
+                    // was switched off comes back — this is the way out of
+                    // either one-layer view without going back to the SPEC
+                    // popup.
+                    view.spectrum_collapsed = false;
+                    view.waterfall_collapsed = false;
+                }
+            }
+            None => {}
         }
     } else if let (Some((rx, is_hi)), true) = (edge, resp.dragged_by(egui::PointerButton::Primary))
     {
@@ -1697,7 +1771,37 @@ pub fn show_ext(
         d.insert_temp(fling_id, fling);
         d.insert_temp(stop_click_id, stop_click);
         d.insert_temp(gesture_dial_id, gesture_dial);
+        d.insert_temp(scale_axis_id, scale_axis);
     });
+
+    // Centre tuning (issue #174): keep the dial in the middle of the window.
+    //
+    // Edge-triggered on the dial *moving*, not held every frame, so a pan or a
+    // zoom-about-the-cursor still goes where it was put and only the next tune
+    // brings the marker home. The memo is dropped while the mode is off, which
+    // is what makes switching it on centre at once — that click is also the
+    // "centre the display now" button the issue asked for.
+    //
+    // Zoomed in this costs nothing: the window slides inside the captured span
+    // and the hardware never hears about it. Zoomed right out `pan_view` has no
+    // room to give and hands the whole move on, and the front end's own centre
+    // follows the dial — the same path a drag at the edge takes. Below a
+    // column's worth of movement the front end is left alone: a retune costs a
+    // waterfall remap and, on some front ends, a skimmer restart, and nobody
+    // can see a sub-pixel slide.
+    let centring_id = ui.id().with("centre-on-vfo");
+    let centred_at: Option<f64> = ui.data(|d| d.get_temp(centring_id)).unwrap_or(None);
+    if view.center_on_vfo {
+        let vfo = state.active_freq_hz();
+        if centred_at.is_none_or(|was| (was - vfo).abs() > 0.5) {
+            let over = center_on_dial(view, vfo, dev_center, dev_span, rect.width());
+            pan_center(&mut dev_center, state, over, pan, cmds);
+        }
+        ui.data_mut(|d| d.insert_temp(centring_id, Some(vfo)));
+    } else if centred_at.is_some() {
+        ui.data_mut(|d| d.insert_temp(centring_id, None::<f64>));
+    }
+
     let view_log_id = ui.id().with("view-log");
 
     // The panadapter's whole zoom/pan story in one line, and only when it
@@ -2707,7 +2811,8 @@ fn draw_grid(painter: &egui::Painter, view: &ViewState, rect: &Rect) {
             db += 20.0;
         }
     }
-    for hz in freq_gridlines(view.view_lo_hz, view.view_hi_hz) {
+    let step = freq_grid_step_for_width(view.view_lo_hz, view.view_hi_hz, rect.width());
+    for hz in gridlines_at(view.view_lo_hz, view.view_hi_hz, step) {
         let x = view.freq_to_x(hz, rect);
         painter.vline(x, rect.y_range(), grid);
     }
@@ -2715,7 +2820,20 @@ fn draw_grid(painter: &egui::Painter, view: &ViewState, rect: &Rect) {
 
 fn draw_scale(painter: &egui::Painter, view: &ViewState, rect: &Rect) {
     painter.rect_filled(*rect, 0.0, Color32::from_gray(20));
-    for hz in freq_gridlines(view.view_lo_hz, view.view_hi_hz) {
+    let step = freq_grid_step_for_width(view.view_lo_hz, view.view_hi_hz, rect.width());
+    // Unlabelled ticks between the labelled ones, the way the full-band strip
+    // above already draws its scale. A label every hundred points is as many
+    // numbers as the strip can hold, but placing a signal against the axis by
+    // eye wants marks in between — that is the other half of what issue #174
+    // asked for, and a tick costs no width at all.
+    for hz in gridlines_at(view.view_lo_hz, view.view_hi_hz, minor_grid_step(step)) {
+        painter.vline(
+            view.freq_to_x(hz, rect),
+            egui::Rangef::new(rect.top(), rect.top() + 3.0),
+            Stroke::new(1.0, crate::theme::scope_gray(80)),
+        );
+    }
+    for hz in gridlines_at(view.view_lo_hz, view.view_hi_hz, step) {
         let x = view.freq_to_x(hz, rect);
         painter.vline(
             x,
@@ -2754,21 +2872,163 @@ fn time_grid_step_s(visible_secs: f64) -> f64 {
 /// ([`crate::widgets::wide_spectrum`]), whose axis is the front end's whole
 /// window rather than a panadapter viewport, divides its scale the same way.
 pub(crate) fn freq_grid_step(lo_hz: f64, hi_hz: f64) -> f64 {
-    let raw = (hi_hz - lo_hz) / 8.0;
+    round_step((hi_hz - lo_hz) / 8.0)
+}
+
+/// The smallest 1/2/5·10^k step at or above `raw`, so a computed spacing comes
+/// out as a frequency a human reads as round.
+fn round_step(raw: f64) -> f64 {
     let mag = 10f64.powf(raw.log10().floor());
     [1.0, 2.0, 5.0, 10.0].iter().map(|m| m * mag).find(|&s| s >= raw).unwrap_or(mag * 10.0)
 }
 
-/// Gridline frequencies inside a range, at [`freq_grid_step`].
-pub(crate) fn freq_gridlines(lo_hz: f64, hi_hz: f64) -> Vec<f64> {
-    let step = freq_grid_step(lo_hz, hi_hz);
+/// Points of panadapter a labelled frequency marker is given to itself.
+///
+/// The labels are `{:.4}` MHz in monospace at [`crate::theme::panadapter_font_scale`],
+/// so the widest of them — a 10 GHz dial, ten characters — is around 60 points
+/// at the smallest step of the three. This leaves room for that and a gap.
+const FREQ_LABEL_PITCH: f32 = 96.0;
+
+/// [`freq_grid_step`] for an axis `width_px` points wide.
+///
+/// The fixed eighth was a spacing chosen for no particular screen: across a
+/// wide monitor it leaves four or five labels over a thousand points, which is
+/// what issue #174 asked for more of, while on a phone the same eighth ran the
+/// labels into each other. Dividing by the width instead gives one marker per
+/// [`FREQ_LABEL_PITCH`] points wherever the panadapter is drawn, and the 1/2/5
+/// rounding keeps them on round frequencies.
+///
+/// Bounded either way: at least three markers, so even the narrowest strip has
+/// an axis rather than a lone number, and at most twenty, because past that
+/// they are a texture and not a scale.
+pub(crate) fn freq_grid_step_for_width(lo_hz: f64, hi_hz: f64, width_px: f32) -> f64 {
+    let scale = crate::theme::panadapter_font_scale();
+    let lines = (width_px / (FREQ_LABEL_PITCH * scale)).clamp(3.0, 20.0) as f64;
+    round_step((hi_hz - lo_hz) / lines)
+}
+
+/// Tick spacing between two labelled gridlines: a fifth of the step, or a half
+/// when the step is 2·10^k — the two that land on round frequencies.
+pub(crate) fn minor_grid_step(step_hz: f64) -> f64 {
+    let mag = 10f64.powf(step_hz.log10().floor());
+    if (step_hz / mag).round() == 2.0 { step_hz / 2.0 } else { step_hz / 5.0 }
+}
+
+/// Gridline frequencies inside a range, at `step`.
+pub(crate) fn gridlines_at(lo_hz: f64, hi_hz: f64, step: f64) -> Vec<f64> {
     let mut out = Vec::new();
+    if !step.is_finite() || step <= 0.0 || hi_hz <= lo_hz {
+        return out;
+    }
     let mut hz = (lo_hz / step).ceil() * step;
     while hz <= hi_hz {
         out.push(hz);
         hz += step;
     }
     out
+}
+
+/// Gridline frequencies inside a range, at [`freq_grid_step`].
+pub(crate) fn freq_gridlines(lo_hz: f64, hi_hz: f64) -> Vec<f64> {
+    gridlines_at(lo_hz, hi_hz, freq_grid_step(lo_hz, hi_hz))
+}
+
+#[cfg(test)]
+mod centring_tests {
+    use super::*;
+
+    fn view_spanning(lo: f64, hi: f64) -> ViewState {
+        ViewState { view_lo_hz: lo, view_hi_hz: hi, ..ViewState::default() }
+    }
+
+    /// Zoomed in, centring is free: the window is a viewport onto a wider
+    /// captured span, so it slides under the dial and the receiver is never
+    /// told about it.
+    #[test]
+    fn centring_a_zoomed_view_asks_the_front_end_for_nothing() {
+        // 20 kHz of a 1 MHz window, and the dial 5 kHz above the middle of it.
+        let mut v = view_spanning(990_000.0, 1_010_000.0);
+        let over = center_on_dial(&mut v, 1_005_000.0, 1_000_000.0, 1_000_000.0, 1000.0);
+        assert_eq!(over, 0.0, "a zoomed-in slide reached the hardware");
+        assert_eq!((v.view_lo_hz, v.view_hi_hz), (995_000.0, 1_015_000.0));
+    }
+
+    /// Zoomed right out there is nowhere left to slide, so the whole move is
+    /// handed to the front end — which is the part that makes the picture
+    /// scroll instead of jumping a window at a time (issue #174).
+    #[test]
+    fn centring_at_full_zoom_out_hands_the_whole_move_over() {
+        let mut v = view_spanning(0.0, 1_000_000.0);
+        let over = center_on_dial(&mut v, 520_000.0, 500_000.0, 1_000_000.0, 1000.0);
+        assert!((over - 20_000.0).abs() < 0.5, "the front end was asked for {over} Hz, not 20 kHz");
+    }
+
+    /// A slide narrower than one column of the picture is not worth a retune:
+    /// the view still takes it — so the remainders add up rather than being
+    /// thrown away — but the front end is left alone until they come to a
+    /// pixel.
+    #[test]
+    fn a_sub_pixel_slide_leaves_the_front_end_alone() {
+        // 1 Msps across 1000 points is a kilohertz a column; the dial moves 100 Hz.
+        let mut v = view_spanning(0.0, 1_000_000.0);
+        let over = center_on_dial(&mut v, 500_100.0, 500_000.0, 1_000_000.0, 1000.0);
+        assert_eq!(over, 0.0, "a tenth of a column was sent to the hardware");
+        // Ten of them are a column, and by then it is.
+        let mut moved = 0.0;
+        for i in 1..=10 {
+            let mut v = view_spanning(0.0, 1_000_000.0);
+            moved = center_on_dial(&mut v, 500_000.0 + 100.0 * i as f64, 500_000.0, 1e6, 1000.0);
+        }
+        assert!((moved - 1_000.0).abs() < 0.5, "a whole column came out as {moved} Hz");
+    }
+}
+
+#[cfg(test)]
+mod axis_tests {
+    use super::*;
+
+    /// A wide panadapter earns more frequency markers than the fixed eighth
+    /// gave it, which is what issue #174 asked for; a phone-width strip, which
+    /// the same eighth crowded, gets fewer.
+    #[test]
+    fn the_marker_count_follows_the_width() {
+        let (lo, hi) = (14_000_000.0, 14_350_000.0);
+        let eighth = gridlines_at(lo, hi, freq_grid_step(lo, hi)).len();
+        let wide = gridlines_at(lo, hi, freq_grid_step_for_width(lo, hi, 1800.0)).len();
+        let narrow = gridlines_at(lo, hi, freq_grid_step_for_width(lo, hi, 360.0)).len();
+        assert!(wide > eighth, "a 1800 pt axis got {wide} markers against the old {eighth}");
+        assert!(narrow < eighth, "a 360 pt axis kept {narrow} markers against {eighth}");
+        assert!(narrow >= 2, "a 360 pt axis was left with {narrow} markers");
+    }
+
+    /// However wide the axis and whatever it spans, two labelled markers never
+    /// come closer than a label is wide.
+    #[test]
+    fn the_labels_never_touch() {
+        for width in [320.0f32, 640.0, 1280.0, 2560.0, 3840.0] {
+            for span in [3_000.0f64, 48_000.0, 350_000.0, 2_000_000.0, 32_400_000.0] {
+                let (lo, hi) = (14_000_000.0, 14_000_000.0 + span);
+                let step = freq_grid_step_for_width(lo, hi, width);
+                let pitch = width as f64 * step / span;
+                assert!(
+                    pitch >= 90.0,
+                    "a {width} pt axis over {span} Hz puts labels {pitch} pt apart",
+                );
+            }
+        }
+    }
+
+    /// The minor ticks land on round frequencies between the labelled ones —
+    /// four or one of them, never a count that puts a tick off the grid.
+    #[test]
+    fn the_minor_ticks_divide_the_step_evenly() {
+        for step in [1.0f64, 2.0, 5.0, 10.0, 200.0, 500.0, 1_000.0, 2_000_000.0] {
+            let minor = minor_grid_step(step);
+            let n = step / minor;
+            assert!((n - n.round()).abs() < 1e-9, "{step} Hz divides into {n} ticks");
+            assert!(matches!(n.round() as i64, 2 | 5), "{step} Hz got {n} ticks");
+        }
+    }
 }
 
 #[cfg(test)]

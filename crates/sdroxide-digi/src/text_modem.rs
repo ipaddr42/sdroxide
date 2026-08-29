@@ -149,14 +149,14 @@ impl TextModemController {
         // it is the offset the log has to take off again to name the contact.
         let audio_hz = match mode {
             Mode::Olivia | Mode::Thor | Mode::Fsq => 1500.0f32,
-            Mode::Rtty => sdroxide_types::RTTY_CENTER_HZ,
+            Mode::Rtty | Mode::RttyFm => sdroxide_types::RTTY_CENTER_HZ,
             _ => 1000.0f32,
         };
         let (baud, shift) = (cfg.rtty_baud as f64, cfg.rtty_shift_hz as f64);
         let (o_tones, o_bw) = (cfg.olivia_tones as usize, cfg.olivia_bw_hz as f64);
         let t_baud = cfg.thor_mode.baud() as f64;
         let rx = match mode {
-            Mode::Rtty => {
+            Mode::Rtty | Mode::RttyFm => {
                 let mut r = RttyRx::new(MODEM_RATE, audio_hz as f64, baud, shift);
                 r.set_reverse(cfg.rtty_reverse);
                 r.set_afc(cfg.rtty_afc);
@@ -169,7 +169,9 @@ impl TextModemController {
             _ => RxModem::Psk(PskRx::new(MODEM_RATE, audio_hz as f64)),
         };
         let tx = match mode {
-            Mode::Rtty => TxModem::Rtty(RttyTx::new(MODEM_RATE, audio_hz as f64, baud, shift)),
+            Mode::Rtty | Mode::RttyFm => {
+                TxModem::Rtty(RttyTx::new(MODEM_RATE, audio_hz as f64, baud, shift))
+            }
             Mode::Olivia => {
                 TxModem::Olivia(OliviaTx::new(MODEM_RATE, audio_hz as f64, o_tones, o_bw))
             }
@@ -249,6 +251,7 @@ impl TextModemController {
             fsq_messages: Vec::new(),
             rade: None,
             packet: None,
+            navtex: None,
             aprs: None,
             js8: None,
             fox_queue: Vec::new(),
@@ -285,7 +288,7 @@ impl DigiEngine for TextModemController {
         // to a station that is already transmitting seeds the "floor" at the
         // signal's own level and the gate never opens at all. Olivia and THOR
         // have no such internal gate and still need it.
-        let self_gating = matches!(self.mode, Mode::Rtty | Mode::Psk);
+        let self_gating = matches!(self.mode, Mode::Rtty | Mode::RttyFm | Mode::Psk);
         let open = self.sq.open(self.rx.magnitude(), self.cfg.digi_squelch) || self_gating;
         if !decoded.is_empty() && open {
             self.rx_text.push_str(&decoded);

@@ -102,7 +102,9 @@ pub fn wgpu_options() -> egui_wgpu::WgpuConfiguration {
     // `gl_fence_behavior`. Inert on every other backend.
     setup.instance_descriptor.backend_options.gl.fence_behavior = gl_fence_behavior();
     #[cfg(not(target_arch = "wasm32"))]
-    if let Some(backends) = v3dv_backends(setup.instance_descriptor.backends) {
+    if let Some(backends) = fallback_backends(setup.instance_descriptor.backends) {
+        setup.instance_descriptor.backends = backends;
+    } else if let Some(backends) = v3dv_backends(setup.instance_descriptor.backends) {
         setup.instance_descriptor.backends = backends;
     }
     egui_wgpu::WgpuConfiguration {
@@ -187,6 +189,106 @@ struct AdapterSummary {
     driver: String,
 }
 
+/// The file that says the last run died inside the graphics driver.
+///
+/// In the config directory rather than beside the binary: it is per-operator
+/// state about *this* machine, it has to survive a package upgrade, and the
+/// program already owns that directory.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn renderer_fallback_marker() -> Option<std::path::PathBuf> {
+    sdroxide_config::config_dir().ok().map(|d| d.join("renderer-fallback.txt"))
+}
+
+/// Substrings that identify a panic as the graphics driver's rather than ours.
+///
+/// Matched against the panic message and the file it came from. Deliberately
+/// narrow: an unrelated panic must not put the operator on a slower renderer
+/// for the rest of time, and the fallback is only useful for the failures it
+/// actually answers.
+#[cfg(not(target_arch = "wasm32"))]
+const RENDERER_PANIC_MARKS: [&str; 6] =
+    ["egui-wgpu", "egui_wgpu", "wgpu-core", "wgpu_core", "wgpu-hal", "staging buffer"];
+
+/// Remember that a panic came from the renderer, so the next start can come up
+/// on a different one.
+///
+/// Chained ahead of whatever hook is already installed, so the panic is still
+/// printed and still ends the process exactly as it did before — this only
+/// leaves a note behind.
+///
+/// The failure it is here for: an `egui-wgpu` frame whose staging allocation is
+/// refused panics outright, and once a wgpu device has reported a validation
+/// error every allocation after it can be refused. On the machine that reported
+/// it — an Intel HD 530 under Mesa — that was an hour into a session and there
+/// is nothing sdroxide can do to prevent it, but there is a second renderer on
+/// the same GPU that does not do it (issue #219).
+#[cfg(not(target_arch = "wasm32"))]
+pub fn install_renderer_panic_note() {
+    let Some(path) = renderer_fallback_marker() else { return };
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let msg = info
+            .payload()
+            .downcast_ref::<&str>()
+            .map(|s| (*s).to_string())
+            .or_else(|| info.payload().downcast_ref::<String>().cloned())
+            .unwrap_or_default();
+        let at = info.location().map(|l| l.to_string()).unwrap_or_default();
+        if is_renderer_panic(&at, &msg) {
+            // Best effort by necessity: the process is already going down, and
+            // a marker that could not be written costs the fallback and
+            // nothing else.
+            let _ = std::fs::write(
+                &path,
+                format!(
+                    "sdroxide {} died in the graphics driver.\n\nat {at}\n{msg}\n\n                     Delete this file to use the default renderer again.\n",
+                    env!("CARGO_PKG_VERSION"),
+                ),
+            );
+        }
+        previous(info);
+    }));
+}
+
+/// Whether a panic came from the graphics driver rather than from sdroxide.
+///
+/// Matched on both the location and the message: the failure this exists for
+/// (issue #219) is raised in `egui-wgpu`'s renderer, and the message names the
+/// staging buffer it could not make.
+#[cfg(not(target_arch = "wasm32"))]
+fn is_renderer_panic(at: &str, msg: &str) -> bool {
+    let hay = format!("{at} {msg}");
+    RENDERER_PANIC_MARKS.iter().any(|m| hay.contains(m))
+}
+
+/// OpenGL, where the last run died inside the graphics driver — or `None`,
+/// which is every ordinary start.
+///
+/// Written by [`install_renderer_panic_note`] and left in place afterwards: a
+/// driver that has crashed once will crash again, and re-learning that costs
+/// another lost session. It is a file the operator can delete, and the message
+/// below says so and names it.
+#[cfg(not(target_arch = "wasm32"))]
+fn fallback_backends(configured: egui_wgpu::wgpu::Backends) -> Option<egui_wgpu::wgpu::Backends> {
+    use egui_wgpu::wgpu;
+    // Whatever the environment names, it means it — the same rule as the Pi's.
+    if wgpu::Backends::from_env().is_some() {
+        return None;
+    }
+    if !configured.contains(wgpu::Backends::GL) {
+        return None;
+    }
+    let path = renderer_fallback_marker()?;
+    if !path.exists() {
+        return None;
+    }
+    eprintln!(
+        "sdroxide: the last session ended inside the graphics driver, so this window renders \n         through OpenGL instead. Delete {} to go back to the default renderer, or set \n         WGPU_BACKEND to choose one yourself.",
+        path.display()
+    );
+    Some(wgpu::Backends::GL)
+}
+
 /// Whether the Raspberry Pi's GPU is here behind Mesa's Vulkan driver.
 ///
 /// V3D is the 3D block in the Broadcom SoCs on the Pi 4 and Pi 5 (and so the
@@ -262,6 +364,36 @@ fn v3dv_backends(configured: egui_wgpu::wgpu::Backends) -> Option<egui_wgpu::wgp
          may not flicker on your compositor."
     );
     Some(wgpu::Backends::GL)
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod renderer_fallback_tests {
+    use super::is_renderer_panic;
+
+    /// The panic that reported issue #219, verbatim, and the one before it.
+    #[test]
+    fn a_wgpu_panic_is_recognised_as_the_drivers() {
+        assert!(is_renderer_panic(
+            "/home/runner/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/egui-wgpu-0.35.0/src/renderer.rs:981:17",
+            "Failed to create staging buffer for index data. Index count: 56838. Required index \
+             buffer size: 227352. Actual size 362544 and capacity: 362544 (bytes)",
+        ));
+        assert!(is_renderer_panic("src/lib.rs:1:1", "wgpu-hal: device lost"));
+    }
+
+    /// …and one of ours is not. A panic in sdroxide must not put the operator
+    /// on a slower renderer for every session after it.
+    #[test]
+    fn our_own_panics_leave_the_renderer_alone() {
+        assert!(!is_renderer_panic(
+            "crates/sdroxide-radio/src/engine.rs:1234:5",
+            "index out of bounds: the len is 3 but the index is 7",
+        ));
+        assert!(!is_renderer_panic(
+            "crates/sdroxide-ui/src/app/mod.rs:9:9",
+            "called `Option::unwrap()` on a `None` value"
+        ));
+    }
 }
 
 #[cfg(all(test, not(target_arch = "wasm32")))]

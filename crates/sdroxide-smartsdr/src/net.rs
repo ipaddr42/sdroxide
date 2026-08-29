@@ -1512,6 +1512,7 @@ fn mode_to_flex(m: Mode) -> &'static str {
         | Mode::Packet
         | Mode::Aprs
         | Mode::SstvFm
+        | Mode::RttyFm
         | Mode::Adsb => "FM",
         Mode::Digl => "DIGL",
         Mode::Digu
@@ -1528,7 +1529,7 @@ fn mode_to_flex(m: Mode) -> &'static str {
         | Mode::Hell
         | Mode::PacketHf
         | Mode::Rade => "DIGU",
-        Mode::Usb | Mode::Sstv | Mode::Wefax | Mode::RfPaint | Mode::Spec => "USB",
+        Mode::Usb | Mode::Sstv | Mode::Wefax | Mode::Navtex | Mode::RfPaint | Mode::Spec => "USB",
     }
 }
 

@@ -35,6 +35,22 @@ pub struct ViewState {
     pub spectrum_fraction: f32,
     /// Draw a decaying peak-hold trace over the spectrum.
     pub peak_hold: bool,
+    /// Keep the tuned frequency in the middle of the panadapter: every time
+    /// the dial moves, the window slides under it so the marker stays put
+    /// (issue #174).
+    ///
+    /// Off is the display as it always was — the window holds still and the
+    /// marker travels across it until the dial leaves the span, at which point
+    /// the picture jumps a whole window. That jump is what this exists to
+    /// remove: with it on the band scrolls past a fixed marker instead.
+    ///
+    /// Zoomed in the slide is free — the window is a viewport onto a wider
+    /// captured span. Zoomed all the way out there is nowhere left to slide,
+    /// so the front end's own centre is moved instead, exactly as a drag that
+    /// reaches the edge already does (issue #133). A receiver whose centre
+    /// *is* its dial has nothing to do either way: it is already centred.
+    #[serde(default)]
+    pub center_on_vfo: bool,
     /// Hide the spectrum line, showing only the waterfall (and, in FT8/FT4,
     /// giving the freed height to the operating panel).
     pub spectrum_collapsed: bool,
@@ -461,6 +477,7 @@ impl Default for ViewState {
             fft_size: 4096,
             spectrum_fraction: 0.35,
             peak_hold: false,
+            center_on_vfo: false,
             spectrum_collapsed: false,
             waterfall_collapsed: false,
             waterfall_flip: false,

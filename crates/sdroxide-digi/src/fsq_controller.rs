@@ -210,6 +210,7 @@ impl FsqController {
             fsq_messages: self.messages.clone(),
             rade: None,
             packet: None,
+            navtex: None,
             aprs: None,
             js8: None,
             fox_queue: Vec::new(),

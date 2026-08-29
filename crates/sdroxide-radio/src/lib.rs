@@ -8,6 +8,7 @@ mod device;
 pub mod engine;
 mod error;
 mod image_store;
+pub mod iq_wav;
 mod recorder;
 pub mod scanner;
 mod source;

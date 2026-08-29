@@ -166,6 +166,11 @@ struct Cli {
     #[arg(long, default_value_t = 100)]
     width: usize,
 
+    /// Whether `--freq` was given, kept across [`Cli::apply_session`] filling it
+    /// in from the remembered session — see there.
+    #[arg(skip)]
+    freq_named: bool,
+
     /// Allow transmit on any frequency the hardware supports, not just the
     /// amateur bands
     ///
@@ -203,6 +208,11 @@ impl Cli {
     /// other VFO never had a centre frequency to ask for — and the engine
     /// restores the pair once it has read the same session itself.
     fn apply_session(&mut self, session: sdroxide_config::Session) -> Option<sdroxide_types::Mode> {
+        // Remembered before the session fills it in, because after that
+        // `freq.is_some()` is true whether the operator typed one or not — and
+        // an I/Q capture's own centre frequency has to lose to the command line
+        // and win against the last session (issue #217).
+        self.freq_named = self.freq.is_some();
         self.freq = Some(self.freq.unwrap_or_else(|| session.active_dial_hz()));
         self.mode = Some(self.mode.unwrap_or(session.mode));
         self.mode
@@ -1116,8 +1126,14 @@ fn open_source(cli: &Cli, settings: &Settings) -> anyhow::Result<(Box<dyn IqSour
         let label = format!("IQ file {}", path.display());
         return Ok((
             Box::new(
-                FileSource::open(path, rate, cli.center_hz())
-                    .with_context(|| format!("opening IQ file {}", path.display()))?,
+                FileSource::open_with(
+                    path,
+                    rate,
+                    cli.center_hz(),
+                    cli.rate.is_some(),
+                    cli.freq_named,
+                )
+                .with_context(|| format!("opening IQ file {}", path.display()))?,
             ),
             synthetic_caps(&label),
         ));
@@ -1496,7 +1512,15 @@ fn open_soapy_source(
     _settings: &Settings,
     _radio: &RadioConfig,
 ) -> anyhow::Result<(Box<dyn IqSource>, DeviceCaps)> {
-    bail!("SoapySDR support is not compiled into this build")
+    // The message a fresh install of a `-no-soapysdr` package meets, because
+    // `Backend::Soapy` is what an unconfigured `radio.json` says (issue #220).
+    // So it has to name the way out rather than only the fault.
+    bail!(
+        "SoapySDR support is not compiled into this build — open Settings → Radio and pick a \
+         built-in interface (HackRF, RTL-SDR, Airspy, AirspyHF+, SDRplay, RX-888, LimeSDR, \
+         PlutoSDR, HPSDR, a CAT rig, a network radio…), or install the SoapySDR build of \
+         sdroxide"
+    )
 }
 
 /// Build the CAT + sound-card source and its capabilities from radio.json.

@@ -2602,48 +2602,29 @@ impl SdroxideApp {
                 }
             }
             RxChip::Rec => {
-                // Record both sides of the QSO to an MP3 file (toggling).
-                let recording = self.state.recording;
+                // Two things can be recorded and they are not the same thing:
+                // the audio of a QSO, and the band the receiver is hearing. The
+                // chip lights while either is running and opens a picker for
+                // both, rather than being a toggle for whichever one somebody
+                // decided was the default (issue #217).
+                let audio = self.state.recording;
+                let iq = self.state.iq_recording;
                 let rec = crate::chrome::chip_accent(
                     ui,
-                    recording,
+                    audio || iq,
                     "REC",
                     crate::theme::ALERT(),
                     Color32::WHITE,
                 )
-                .on_hover_text(match &self.state.recording_file {
-                    Some(f) => format!("Recording to {f} — click to stop"),
-                    None => "Record RX and TX audio to MP3".to_string(),
-                });
-                if rec.clicked() {
-                    cmds.push(Command::SetRecording(!recording));
-                }
-            }
-            RxChip::Mono => {
-                // Channel layout for the *next* recording — has no effect on one
-                // already running, hence the disabled look while `recording`.
-                let recording = self.state.recording;
-                let mono = self.state.recording_mono;
-                let mono_chip = ui
-                    .add_enabled_ui(!recording, |ui| {
-                        crate::chrome::chip_accent(
-                            ui,
-                            mono,
-                            "MONO",
-                            crate::theme::ALERT(),
-                            Color32::WHITE,
-                        )
-                    })
-                    .inner
-                    .on_hover_text(if mono {
-                        "Recording mixes RX/TX to one channel — click for two channels"
-                    } else {
-                        "Recording writes two channels: RX left / TX right while the sub receiver \
-                         is on, the same audio in both otherwise — click for a single mixed channel"
-                    });
-                if mono_chip.clicked() {
-                    cmds.push(Command::SetRecordingMono(!mono));
-                }
+                .on_hover_text(
+                    match (&self.state.recording_file, &self.state.iq_recording_file) {
+                        (Some(a), Some(q)) => format!("Recording {a} and {q}"),
+                        (Some(a), None) => format!("Recording audio to {a}"),
+                        (None, Some(q)) => format!("Recording I/Q to {q}"),
+                        (None, None) => "Record the audio, the raw I/Q, or both".to_string(),
+                    },
+                );
+                self.rec_popup(ui, cmds, &rec);
             }
             RxChip::Stereo => {
                 // WFM broadcast stereo: lit while a 19 kHz pilot is locked,
@@ -2757,6 +2738,131 @@ impl SdroxideApp {
             if r.response.contains_pointer() {
                 self.nr_popup_since = Some(now);
             }
+        }
+    }
+
+    /// What the REC chip opens: one row per thing that can be recorded.
+    ///
+    /// A popup rather than a toggle because there are two answers and neither
+    /// is the obvious one — an operator archiving a QSO wants the audio, one
+    /// capturing a band to work on offline wants the I/Q, and the second is not
+    /// reachable at all from a button that does the first (issue #217).
+    fn rec_popup(&mut self, ui: &mut egui::Ui, cmds: &mut Vec<Command>, btn: &egui::Response) {
+        let popup_id = egui::Popup::default_response_id(btn);
+        let now = ui.input(|i| i.time);
+        let alpha =
+            crate::chrome::popup_fade_alpha(ui.ctx(), popup_id, now, &mut self.rec_popup_since);
+        let resp = egui::Popup::from_toggle_button_response(btn)
+            .frame(crate::chrome::window_frame_alpha(alpha))
+            .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+            .show(|ui| {
+                ui.set_opacity(alpha);
+                crate::chrome::window_body_bg(ui);
+                ui.spacing_mut().item_spacing = egui::vec2(4.0, 4.0);
+                ui.set_max_width(300.0);
+                self.rec_controls(ui, cmds);
+            });
+        if let Some(r) = &resp {
+            crate::chrome::paint_popup_cut_border(ui.ctx(), &r.response, alpha);
+            if r.response.contains_pointer() {
+                self.rec_popup_since = Some(now);
+            }
+        }
+    }
+
+    /// The rows inside the REC popup. Split out for the same reason
+    /// [`Self::nr_controls`] is: a menu inlines them.
+    fn rec_controls(&mut self, ui: &mut egui::Ui, cmds: &mut Vec<Command>) {
+        let audio = self.state.recording;
+        let iq = self.state.iq_recording;
+
+        crate::chrome::menu_caption(ui, "Audio");
+        ui.horizontal_wrapped(|ui| {
+            if crate::chrome::chip_accent(
+                ui,
+                audio,
+                if audio { "● MP3" } else { "MP3" },
+                crate::theme::ALERT(),
+                Color32::WHITE,
+            )
+            .on_hover_text(
+                "What you hear, as an MP3: the receiver in one channel and your own transmit in \
+                 the other. This is the recording of a QSO.",
+            )
+            .clicked()
+            {
+                cmds.push(Command::SetRecording(!audio));
+            }
+            // Channel layout is a property of the *next* recording — the
+            // encoder is initialised with it — so it greys out while one runs.
+            let mono = self.state.recording_mono;
+            let mono_chip = ui
+                .add_enabled_ui(!audio, |ui| crate::chrome::chip(ui, mono, "MONO"))
+                .inner
+                .on_hover_text(if mono {
+                    "Mixed to one channel — click for two"
+                } else {
+                    "Two channels: RX left, TX right — click for one mixed channel"
+                });
+            if mono_chip.clicked() {
+                cmds.push(Command::SetRecordingMono(!mono));
+            }
+        });
+        if let Some(f) = &self.state.recording_file {
+            ui.label(RichText::new(f).size(9.5).color(crate::theme::CYAN_DIM()));
+        }
+
+        crate::chrome::menu_caption(ui, "Spectrum");
+        // A demod-audio radio hands over audio and no I/Q, so there is nothing
+        // for this to write. Said on the chip rather than hidden: an operator
+        // looking for the feature has to find out that this radio has not got
+        // it, not that sdroxide has not.
+        let have_iq = self.state.sample_rate > 96_000.0;
+        ui.horizontal_wrapped(|ui| {
+            let chip = ui
+                .add_enabled_ui(have_iq || iq, |ui| {
+                    crate::chrome::chip_accent(
+                        ui,
+                        iq,
+                        if iq { "● I/Q WAV" } else { "I/Q WAV" },
+                        crate::theme::ALERT(),
+                        Color32::WHITE,
+                    )
+                })
+                .inner
+                .on_hover_text(if have_iq || iq {
+                    "The raw spectrum the receiver is delivering, as a stereo 32-bit float WAV \
+                     (RF64 past 4 GB) that SDR#, SDRuno, HDSDR and SDRangel open — and that \
+                     sdroxide itself plays back with --file. Large: 8 bytes a sample."
+                } else {
+                    "This radio hands over demodulated audio, so there is no I/Q to record."
+                });
+            if chip.clicked() {
+                cmds.push(Command::SetIqRecording(!iq));
+            }
+            if iq {
+                let mb = self.state.iq_recording_mb;
+                let rate = self.state.sample_rate.max(1.0);
+                let secs = f64::from(mb) * f64::from(1u32 << 20) / (rate * 8.0);
+                ui.label(
+                    RichText::new(format!("{mb} MB · {:.0}:{:02}", secs / 60.0, secs as u64 % 60))
+                        .size(9.5)
+                        .color(crate::theme::ALERT()),
+                );
+            } else if have_iq {
+                // The bill, before it is run up rather than after: at 2.4 Msps
+                // this is a gigabyte a minute.
+                let mbs = self.state.sample_rate * 8.0 / f64::from(1u32 << 20);
+                ui.label(
+                    RichText::new(format!("{mbs:.0} MB/s"))
+                        .size(9.5)
+                        .color(crate::theme::CYAN_DIM()),
+                )
+                .on_hover_text("What a capture costs at this sample rate");
+            }
+        });
+        if let Some(f) = &self.state.iq_recording_file {
+            ui.label(RichText::new(f).size(9.5).color(crate::theme::CYAN_DIM()));
         }
     }
 
@@ -3545,7 +3651,7 @@ impl SdroxideApp {
     /// SNR a track must reach before it earns a box on the waterfall. Fades out
     /// on its own like the band/mode popup.
     fn skimmer_button(&mut self, ui: &mut egui::Ui, cmds: &mut Vec<Command>, extra: f32) {
-        let [_, skim, _] = DISPLAY_TOOL_CHIPS;
+        let [_, _, skim, _] = DISPLAY_TOOL_CHIPS;
         let btn = chip_stretched(ui, self.state.skimmer.any_enabled(), skim, extra).on_hover_text(
             "CW / PSK / RTTY skimmers — decode signals across the band and mark them on the waterfall",
         );
@@ -3903,7 +4009,7 @@ impl SdroxideApp {
         narrow: bool,
         extra: f32,
     ) {
-        let [fit, _, fft] = DISPLAY_TOOL_CHIPS;
+        let [fit, ctr, _, fft] = DISPLAY_TOOL_CHIPS;
         // Lit while the floor/ceiling are kept fitted by themselves. Switching
         // it on fits immediately, which is also how a one-off fit is asked for:
         // click it off and on again.
@@ -3919,6 +4025,23 @@ impl SdroxideApp {
             if self.view.auto_fit {
                 self.fit_levels_now(ui.input(|i| i.time));
             }
+        }
+        // FIT's twin for the frequency axis (issue #174): lit while the window
+        // follows the dial, so the tuned frequency stays in the middle of the
+        // picture and the band scrolls past it instead of the picture jumping a
+        // whole span every time the dial leaves it. Switching it on centres at
+        // once, which is also how a one-off "put me back in the middle" is
+        // asked for: click it on, and off again if you would rather pan freely.
+        if chip_stretched(ui, self.view.center_on_vfo, ctr, extra)
+            .on_hover_text(
+                "Keep the tuned frequency in the middle of the panadapter: the window slides \
+                 under the dial instead of the picture jumping a whole span when you tune off \
+                 the edge. Switch it on to centre at once; switch it off to pan and zoom \
+                 wherever you like.",
+            )
+            .clicked()
+        {
+            self.view.center_on_vfo = !self.view.center_on_vfo;
         }
         // In a box these two hang off chips of their own. A menu inlines
         // them below instead: a popup opened from a popup counts as a click
@@ -4369,9 +4492,10 @@ const SYSTEM_SPLIT: usize = 7;
 /// `app::solar`.
 pub(in crate::app) const DISPLAY_VIEW_CHIPS: [&str; 3] = ["☀ 3D", "SPEC", "WIDE"];
 
-/// The Display box's bottom row: the level fit, the skimmers, and the
-/// FFT/levels popup. Read by the measurement and by each chip's own draw site.
-const DISPLAY_TOOL_CHIPS: [&str; 3] = ["FIT", "SKIM", "FFT"];
+/// The Display box's bottom row: the level fit, centre tuning, the skimmers,
+/// and the FFT/levels popup. Read by the measurement and by each chip's own
+/// draw site.
+const DISPLAY_TOOL_CHIPS: [&str; 4] = ["FIT", "CTR", "SKIM", "FFT"];
 
 /// The keying chips' shared size: PTT and TUNE drawn to the wider of the two
 /// labels, so the chips match and the level blocks beside them start on the
@@ -4467,7 +4591,6 @@ enum RxChip {
     Nr,
     Mute,
     Rec,
-    Mono,
     /// WFM's stereo pilot.
     Stereo,
     /// WFM's RDS subcarrier.
@@ -4489,7 +4612,6 @@ impl RxChip {
             Self::Nr => "NR",
             Self::Mute => "MUTE",
             Self::Rec => "REC",
-            Self::Mono => "MONO",
             Self::Stereo => "ST",
             Self::Rds => "RDS",
             Self::Drm => "DRM",
@@ -4530,8 +4652,11 @@ fn div_rows_w(ui: &egui::Ui) -> f32 {
 /// The RX box's chip run in a mode: the six every mode carries, then whatever
 /// the mode itself brings — a subcarrier to read, a tone to gate on.
 fn rx_chips(mode: Mode) -> Vec<RxChip> {
-    let mut chips =
-        vec![RxChip::Nb, RxChip::Anc, RxChip::Nr, RxChip::Mute, RxChip::Rec, RxChip::Mono];
+    // MONO is not among them: it is the *recording's* channel layout, and it
+    // now sits beside the recording controls it belongs to, inside the REC
+    // popup (issue #217). That is also one chip fewer on a strip that has to
+    // fit on a 1366-pixel screen (issue #211).
+    let mut chips = vec![RxChip::Nb, RxChip::Anc, RxChip::Nr, RxChip::Mute, RxChip::Rec];
     match mode {
         // Only WFM has a stereo pilot to lock or an RDS subcarrier to decode.
         Mode::Wfm => chips.extend([RxChip::Stereo, RxChip::Rds]),
@@ -4930,11 +5055,8 @@ fn band_mode_menu(
             // DRM belongs with the analog modes rather than under "Digital"
             // below: that heading is the modes the digi engine decodes and
             // transmits, and DRM is a broadcast to listen to — a demodulator,
-            // like WFM beside it. ADS-B is here for the same reason: a
-            // receive-only signal to point the radio at, with no transmitter
-            // and nothing the digi engine touches.
+            // like WFM beside it.
             Mode::Drm,
-            Mode::Adsb,
             Mode::Digu,
             Mode::Digl,
             Mode::Dsb,
@@ -4948,7 +5070,12 @@ fn band_mode_menu(
     ui.add_space(6.0);
     crate::chrome::menu_caption(ui, "Digital");
     ui.horizontal_wrapped(|ui| {
-        for m in Mode::DIGITAL {
+        // ADS-B rides along at the end of this row rather than in
+        // [`Mode::DIGITAL`] itself: that list is what the digi engine decodes
+        // and transmits, and ADS-B is neither — its own lane, no QSO, no TX.
+        // It is a digital signal all the same, and this is where an operator
+        // looks for one.
+        for m in Mode::DIGITAL.into_iter().chain([Mode::Adsb]) {
             if crate::chrome::chip(ui, mode == m, m.label()).clicked() {
                 cmds.push(Command::SetMode { rx: RxId::Main, mode: m });
             }

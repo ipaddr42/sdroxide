@@ -846,7 +846,66 @@ use sdroxide_types::{
 /// here, and a remote client's window shows that the reading is local-only
 /// rather than sitting on "starting…". If it is bridged later that is its own
 /// append and its own bump.
-pub const PROTO_VERSION: u16 = 101;
+/// **102** — RTTY on an FM carrier (issue #214).
+///
+/// `Mode::RttyFm` is appended to [`sdroxide_types::Mode`]: the same Baudot
+/// modem, the same tone pair and the same panel as `Mode::Rtty`, into an FM
+/// transmitter rather than onto a sideband. Appending a mode is on its own
+/// enough to force this bump — every mode already on the wire keeps its number,
+/// but a v101 peer handed the new one has no variant to decode it into and
+/// desynchronises on the rest of the message. Same reasoning as v99's
+/// `Mode::Adsb`, v98's `Mode::SstvFm` and v89's `Mode::Aprs`.
+///
+/// Nothing else changed: every table the new mode needs an answer in is
+/// derived from the mode, not carried beside it.
+/// **103** — recording the raw I/Q (issue #217).
+///
+/// [`sdroxide_types::Command`] gained `SetIqRecording`, and
+/// [`sdroxide_types::RadioState`] gained `iq_recording`, `iq_recording_file`
+/// and `iq_recording_mb` beside the audio recorder's three, so a remote client
+/// can start a capture and watch it grow. Both appended at the tail of their
+/// type, so every variant and field already on the wire keeps its number; a
+/// v102 peer desynchronises on the tail of every `RadioState` regardless, and
+/// the handshake's equality test is what stops it trying.
+///
+/// The file is written by the *engine*, on the machine the receiver is plugged
+/// into — a remote client's capture lands on the station, not on the laptop
+/// that asked for it, because the alternative is a gigabyte a minute over the
+/// link. That is a property of the feature and not of the wire, so nothing here
+/// carries the samples.
+/// **104** — NAVTEX (issue #212).
+///
+/// `Mode::Navtex` is appended to [`sdroxide_types::Mode`] and
+/// [`sdroxide_types::DigiStatus`] gains `navtex`
+/// ([`sdroxide_types::NavtexStatus`]) beside the other per-mode panes, carrying
+/// the messages received, the one arriving and the loose text.
+/// [`sdroxide_types::DigiConfig`] gains `navtex_reverse`, the tone-sense
+/// control — the mode's only setting, since there is nothing to transmit and no
+/// callsign to give.
+///
+/// Appending a mode is on its own enough to force the bump, for the reason
+/// v102's `Mode::RttyFm` and v99's `Mode::Adsb` were: a v103 peer handed the
+/// new one has no variant to decode it into and desynchronises on the rest of
+/// the message.
+/// **105** — EU VHF contest operation (issue #223).
+///
+/// [`sdroxide_types::DigiConfig`] gains `contest` (a new `ContestMode` enum)
+/// and `contest_serial`, and [`sdroxide_types::Command`] gains
+/// `SetContestSerial` — the number's own write route, because the engine
+/// advances it as each contact is logged and a client's copy of the
+/// configuration is stale the moment one completes.
+///
+/// Both config fields are appended at the tail of the struct and the command at
+/// the tail of the enum, so every field and variant already on the wire keeps
+/// its number; a v104 peer desynchronises on the tail of every `DigiConfig`
+/// regardless — it rides inside `Command::SetDigiConfig` and
+/// `DigiStatus.config` — and the handshake's equality test is what stops it
+/// trying.
+///
+/// The `i3 = 5` message layout the mode transmits is not on this wire at all:
+/// it is packed and unpacked inside the engine, and what crosses the link is
+/// the decoded text, exactly as for every other 77-bit layout.
+pub const PROTO_VERSION: u16 = 105;
 const VERSION_BYTE: u8 = 0x12;
 
 #[derive(Debug, thiserror::Error)]

@@ -156,6 +156,8 @@ pub fn run_multi(
         })
     });
 
+    // Ahead of `wgpu_options`, which reads the note this leaves behind.
+    sdroxide_ui::install_renderer_panic_note();
     let options = eframe::NativeOptions {
         renderer: eframe::Renderer::Wgpu,
         // Limits taken from the adapter rather than eframe's WebGPU baseline,
@@ -370,6 +372,8 @@ fn remote_factory() -> sdroxide_ui::RemoteFactory {
 /// Native remote client: same app, `RemoteController` over WebSocket, audio
 /// through local cpal devices.
 pub fn run_remote(url: &str) -> Result<()> {
+    // Ahead of `wgpu_options`, which reads the note this leaves behind.
+    sdroxide_ui::install_renderer_panic_note();
     let options = eframe::NativeOptions {
         renderer: eframe::Renderer::Wgpu,
         wgpu_options: sdroxide_ui::wgpu_options(),

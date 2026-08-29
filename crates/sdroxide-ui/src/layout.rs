@@ -87,7 +87,7 @@ impl Tier {
 pub fn tier_for(size: egui::Vec2, mode: LayoutMode) -> Tier {
     match mode {
         LayoutMode::Desktop => Tier::Desktop,
-        LayoutMode::Tablet => Tier::Tablet,
+        LayoutMode::Tablet | LayoutMode::Small => Tier::Tablet,
         LayoutMode::Phone => Tier::Phone,
         LayoutMode::Auto => {
             let (w, h) = (size.x, size.y);
@@ -115,13 +115,99 @@ pub const SHORT_H: f32 = 740.0;
 /// than the stacked layout — see [`SHORT_H`]. Pure function of the size and
 /// override so it can be tested beside [`tier_for`].
 pub fn short_tablet_for(size: egui::Vec2, mode: LayoutMode) -> bool {
-    tier_for(size, mode) == Tier::Tablet && size.y < SHORT_H
+    // `Small` is the tablet tier with this said out loud: it exists for a
+    // screen that fits the stacked bar and cannot afford it.
+    mode == LayoutMode::Small || (tier_for(size, mode) == Tier::Tablet && size.y < SHORT_H)
 }
 
-/// [`short_tablet_for`] against the live viewport and the tier in force
-/// (which already folds the operator's override in).
+/// Whether the operating panels should pull their chips and spacing in.
+///
+/// The screen this answers is 1366×768: wide enough that the tablet tier fits
+/// and short enough that the panel and the waterfall are fighting over about
+/// six hundred points. Desktop-sized chips then spend two rows of that on the
+/// controls above a decode list with nothing left to list (issue #211).
+///
+/// A question about *height*, not about the tier, and deliberately a different
+/// threshold from [`SHORT_H`]: that one asks whether the stacked top bar fits,
+/// and at 768 it does. This asks what is left underneath it once it has, and at
+/// 768 that is about six hundred points for a waterfall and an operating panel
+/// both. A tall narrow window — a tablet in portrait, a docked column — is the
+/// tablet tier with height to spare and is not tight.
+///
+/// Always true under [`LayoutMode::Small`], which is the operator saying so on
+/// a screen of any size, and always on a phone.
+pub fn tight_for(size: egui::Vec2, mode: LayoutMode) -> bool {
+    mode == LayoutMode::Small
+        || tier_for(size, mode) == Tier::Phone
+        || (tier_for(size, mode) != Tier::Desktop && size.y < TIGHT_H)
+}
+
+/// Below this height an operating panel pulls its chips in — see
+/// [`tight_for`]. Above 768 so the commonest small laptop is caught, below the
+/// 900-odd a 1080 screen leaves a maximised window, so a full desktop is not.
+pub const TIGHT_H: f32 = 820.0;
+
+/// Where the tight flag lives between [`set_tight`] and [`tight`].
+fn tight_id() -> egui::Id {
+    egui::Id::new("sdroxide-tight")
+}
+
+/// Publish [`tight_for`] for this frame, beside [`set_tier`] and for the same
+/// reason: the panels that read it are too deep to thread it into.
+pub fn set_tight(ctx: &egui::Context, tight: bool) {
+    ctx.data_mut(|d| d.insert_temp(tight_id(), tight));
+}
+
+/// Whether this frame is drawing a small screen — see [`tight_for`].
+pub fn tight(ctx: &egui::Context) -> bool {
+    ctx.data(|d| d.get_temp(tight_id()))
+        .unwrap_or_else(|| tight_for(ctx.content_rect().size(), LayoutMode::Auto))
+}
+
+/// Pull a `Ui`'s chip padding and spacing in where the screen is small.
+///
+/// One call at the top of the operating-panel area rather than a `tight` test
+/// at every chip: the panels are thousands of lines of `chrome::chip`, and a
+/// switch at each of them would be missed at the next one added. egui sizes a
+/// button from its padding, so this shrinks every control below it at once —
+/// about eight points a row, which over the four rows of chips an FT8 panel
+/// carries is a decode list's worth of height.
+pub fn tighten(ui: &mut egui::Ui) {
+    // A phone's panel is already one pane at a time and has no rows to save;
+    // shrinking there would only cost the fingertip its target.
+    if !tight(ui.ctx()) || tier(ui.ctx()) == Tier::Phone {
+        return;
+    }
+    let s = ui.spacing_mut();
+    // Vertical only, and `interact_size` untouched: what a short screen is
+    // short of is height, and the tier's minimum target size is what keeps a
+    // chip hittable on a touched one. Taking the padding out of a row is worth
+    // about eight points; taking the target out of it is worth a bug report.
+    s.button_padding.y = s.button_padding.y.min(2.0);
+    s.item_spacing.y = s.item_spacing.y.min(3.0);
+}
+
+/// Where the short-bar decision lives between [`set_short_tablet`] and
+/// [`short_tablet`].
+fn short_id() -> egui::Id {
+    egui::Id::new("sdroxide-short-tablet")
+}
+
+/// Publish [`short_tablet_for`] for this frame, beside [`set_tier`].
+///
+/// Published rather than recomputed, for the reason the tier is: the operator's
+/// override lives in settings the context cannot see, and a `Small screen`
+/// asked for on a tall display would otherwise be measured back to "not short"
+/// at the one place that draws the bar.
+pub fn set_short_tablet(ctx: &egui::Context, short: bool) {
+    ctx.data_mut(|d| d.insert_temp(short_id(), short));
+}
+
+/// Whether this frame's top bar is the single-row strip — see
+/// [`short_tablet_for`].
 pub fn short_tablet(ctx: &egui::Context) -> bool {
-    tier(ctx) == Tier::Tablet && ctx.content_rect().height() < SHORT_H
+    ctx.data(|d| d.get_temp(short_id()))
+        .unwrap_or_else(|| tier(ctx) == Tier::Tablet && ctx.content_rect().height() < SHORT_H)
 }
 
 /// Where the tier lives between [`set_tier`] and [`tier`].
@@ -239,5 +325,38 @@ mod tests {
         assert_eq!(tier_for(big, LayoutMode::Tablet), Tier::Tablet);
         let small = vec2(360.0, 800.0);
         assert_eq!(tier_for(small, LayoutMode::Desktop), Tier::Desktop);
+    }
+
+    /// The screen issue #211 is about: 1366×768 fits the tablet tier and
+    /// cannot afford its chrome, so `Auto` already pulls the panels in — and
+    /// `Small screen` says so on any size, for an operator running a window
+    /// rather than a whole screen.
+    #[test]
+    fn a_small_screen_is_tight_whether_it_was_asked_for_or_measured() {
+        let small = egui::vec2(1366.0, 768.0);
+        assert_eq!(tier_for(small, LayoutMode::Auto), Tier::Tablet, "it is still a tablet");
+        assert!(tight_for(small, LayoutMode::Auto), "…and a short one");
+        // The stacked bar still fits at 768 and is still worth having (see
+        // `SHORT_H`); it is what is *under* it that has to be pulled in.
+        assert!(!short_tablet_for(small, LayoutMode::Auto));
+        // A window rather than a whole screen — a title bar and a taskbar off
+        // it — loses the stack as well.
+        assert!(short_tablet_for(egui::vec2(1366.0, 700.0), LayoutMode::Auto));
+
+        // A full desktop is not, however the operator sizes their window.
+        let desktop = egui::vec2(2560.0, 1440.0);
+        assert!(!tight_for(desktop, LayoutMode::Auto));
+        assert!(!tight_for(desktop, LayoutMode::Desktop));
+        // Forced, it is tight on any screen — the point of the setting.
+        assert!(tight_for(desktop, LayoutMode::Small));
+        assert!(short_tablet_for(desktop, LayoutMode::Small));
+        assert_eq!(tier_for(desktop, LayoutMode::Small), Tier::Tablet);
+        // …and the tablet setting alone is not: an operator who picked that
+        // asked for the menus, not for smaller chips.
+        assert!(!tight_for(desktop, LayoutMode::Tablet));
+
+        // A phone is tighter than either and stays that way.
+        assert!(tight_for(egui::vec2(390.0, 844.0), LayoutMode::Auto));
+        assert!(tight_for(desktop, LayoutMode::Phone));
     }
 }

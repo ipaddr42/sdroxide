@@ -48,6 +48,7 @@ pub fn make_modulator(mode: Mode, rate: f64, passband: (f32, f32)) -> Option<Box
         | Mode::Rtty
         | Mode::Sstv
         | Mode::Wefax
+        | Mode::Navtex
         | Mode::Olivia
         | Mode::Thor
         | Mode::Fsq
@@ -60,7 +61,7 @@ pub fn make_modulator(mode: Mode, rate: f64, passband: (f32, f32)) -> Option<Box
         // VHF SSTV modulates the carrier through the voice FM path — see the
         // demodulator, which is its other half: the picture goes into an FM
         // transmitter exactly as speech would.
-        Mode::Nfm | Mode::SstvFm => Some(Box::new(FmMod::new(rate))),
+        Mode::Nfm | Mode::SstvFm | Mode::RttyFm => Some(Box::new(FmMod::new(rate))),
         // RIFP keys the carrier itself rather than a sideband of it.
         Mode::Rifp => Some(Box::new(CpfskMod::new(rate))),
         // VHF packet frequency-modulates the carrier, at both bauds — the

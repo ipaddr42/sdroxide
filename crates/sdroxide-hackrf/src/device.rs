@@ -115,7 +115,32 @@ impl<T: Transport> Device<T> {
         self.set_mode(TransceiverMode::Off)?;
         self.io.set_gain(GainSetter::TxVga, 0.0)?;
         self.io.out(Request::AmpEnable, 0, 0)?;
-        self.io.out(Request::AntennaEnable, 0, 0)?;
+        // The bias tee is asked for and not insisted on, and this is the one
+        // line here that is allowed to fail (issue #220).
+        //
+        // `usb_vendor_request_set_antenna_enable` in the firmware
+        // (`hackrf_usb/usb_api_transceiver.c`) begins by switching on
+        // `detected_platform()` and **stalls** on anything that is not a
+        // HackRF One OG, a HackRF One r9 or a Pro — a Jawbreaker, a rad1o, and
+        // any board whose platform detection does not answer. A stall there is
+        // therefore the radio saying it has no bias tee to switch, which is
+        // exactly the state this line was asking it to be in.
+        //
+        // Insisting cost a whole radio: the stall came back as a fatal
+        // `control write failed` and the open was abandoned, three requests
+        // before the board had even been identified. libhackrf never sends this
+        // request unless the operator asks for the bias tee, which is why the
+        // same radio opens in every other program.
+        //
+        // `identify` cannot help: it runs *after* this, and deliberately —
+        // nothing may talk to a radio that might still be transmitting until
+        // the transmitter has been made safe.
+        if self.io.out(Request::AntennaEnable, 0, 0).is_err() {
+            self.io.trace().note(
+                "the radio refused SET_ANTENNA_ENABLE — it has no bias tee, so there is \
+                 nothing to switch off",
+            );
+        }
         Ok(())
     }
 
@@ -298,13 +323,29 @@ impl<T: Transport> Device<T> {
     }
 
     fn apply_bias_tee(&mut self) -> Result<()> {
-        // A board without the circuit is not sent the request at all: the
-        // firmware would accept it and nothing would happen, which is a worse
-        // answer than never offering the control.
+        // A board without the circuit is not sent the request at all. Not
+        // because the firmware would ignore it — it stalls (see
+        // [`Self::safety_rail`]) — but because a control the radio cannot
+        // honour is worse than no control at all.
         if !self.kind.has_bias_tee() {
             return Ok(());
         }
-        self.io.out(Request::AntennaEnable, self.bias_tee as u16, 0)
+        // And a board that says it *is* a HackRF One and then refuses anyway is
+        // still not a reason to take the radio off the air (issue #220): the
+        // answer is that this one has no bias tee, and the antenna port is
+        // unpowered either way. Cleared in the driver's own copy so the next
+        // front-end pass does not ask again, and noted once in the trace.
+        if self.bias_tee && self.io.out(Request::AntennaEnable, 1, 0).is_err() {
+            self.io
+                .trace()
+                .note("the radio refused the bias tee; it has no antenna-port power to switch");
+            self.bias_tee = false;
+            return Ok(());
+        }
+        if !self.bias_tee {
+            let _ = self.io.out(Request::AntennaEnable, 0, 0);
+        }
+        Ok(())
     }
 
     // ---- operations ------------------------------------------------------
@@ -654,6 +695,44 @@ mod tests {
         dev.io().clear();
         dev.shutdown();
         assert_eq!(dev.io().brief()[0], "SetTransceiverMode(0)");
+    }
+
+    /// Issue #220: a radio that refuses `SET_ANTENNA_ENABLE` still opens.
+    ///
+    /// The firmware stalls that request outright on any board that is not a
+    /// HackRF One OG, a HackRF One r9 or a Pro
+    /// (`hackrf_usb/usb_api_transceiver.c`), and the safety rail sends it
+    /// before the board has been identified. Treating the stall as fatal took
+    /// the radio off the air three requests into the open — while every other
+    /// program on the same machine, which only sends it when the operator asks
+    /// for the bias tee, worked fine.
+    #[test]
+    fn a_radio_that_refuses_the_bias_tee_still_opens() {
+        let io = FakeTransport::new().stalling(Request::AntennaEnable);
+        let dev = Device::open(io, &cfg(), 100.0e6).expect("the open must survive the refusal");
+        // And it got all the way through: tuned, and receiving.
+        assert_eq!(dev.mode(), TransceiverMode::Receive);
+        assert!(dev.io().first(Request::SetFreq).is_some(), "the radio was never tuned");
+        // The transmitter was still made safe, which is the whole point of the
+        // rail the refusal happened in.
+        let amp = dev.io().first(Request::AmpEnable).expect("the amp was bypassed");
+        assert_eq!(dev.io().calls()[amp].value, 0);
+    }
+
+    /// ...and asking for the bias tee on a radio that then refuses it is a
+    /// setting that does not take, not a radio that falls over.
+    #[test]
+    fn a_refused_bias_tee_is_a_setting_that_does_not_take() {
+        let mut c = cfg();
+        c.bias_tee = true;
+        let io = FakeTransport::new().stalling(Request::AntennaEnable);
+        let mut dev = Device::open(io, &c, 100.0e6).expect("opens");
+        dev.io().clear();
+        dev.set_bias_tee(true).expect("must not fail the radio");
+        assert!(
+            dev.io().all(Request::AntennaEnable).len() <= 1,
+            "a refusal must not be retried on every front-end pass",
+        );
     }
 
     /// A board with no bias-tee circuit must not be sent the request. The

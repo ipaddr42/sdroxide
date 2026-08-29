@@ -1235,18 +1235,54 @@ pub struct FileSource {
     path: String,
     sample_rate: f64,
     center_hz: f64,
+    /// Where the samples begin: past a WAV header, or zero for a raw stream.
+    /// The loop at the end of the file goes back to *this*, not to the start.
+    data_start: u64,
     throttle: Throttle,
 }
 
 impl FileSource {
+    /// Play a raw interleaved CF32 stream — or one of sdroxide's own I/Q WAV
+    /// captures, whose header says what the caller would otherwise have to
+    /// type: a capture made by the REC popup plays back at the rate and on the
+    /// frequency it was made, with `--file` and nothing else (issue #217).
+    ///
+    /// A rate or a centre given on the command line still wins; that is what
+    /// `--rate` and `--freq` are for, and a header is not an instruction.
     pub fn open(path: impl AsRef<Path>, sample_rate: f64, center_hz: f64) -> Result<Self> {
+        Self::open_with(path, sample_rate, center_hz, false, false)
+    }
+
+    /// [`FileSource::open`], told which of the two the operator named
+    /// themselves so the header does not overrule them.
+    pub fn open_with(
+        path: impl AsRef<Path>,
+        sample_rate: f64,
+        center_hz: f64,
+        rate_given: bool,
+        center_given: bool,
+    ) -> Result<Self> {
         let path_str = path.as_ref().display().to_string();
-        let reader = BufReader::new(File::open(path)?);
+        let wav = crate::iq_wav::probe(path.as_ref());
+        let sample_rate = match &wav {
+            Some(w) if !rate_given => w.rate_hz,
+            _ => sample_rate,
+        };
+        let center_hz = match &wav {
+            Some(w) if !center_given => w.center_hz.unwrap_or(center_hz),
+            _ => center_hz,
+        };
+        let mut reader = BufReader::new(File::open(path)?);
+        let start = wav.as_ref().map_or(0, |w| w.data_start);
+        if start > 0 {
+            reader.seek(SeekFrom::Start(start))?;
+        }
         Ok(FileSource {
             reader,
             path: path_str,
             sample_rate,
             center_hz,
+            data_start: start,
             throttle: Throttle::new(sample_rate),
         })
     }
@@ -1272,7 +1308,9 @@ impl IqSource for FileSource {
         while filled < raw.len() {
             let n = self.reader.read(&mut raw[filled..])?;
             if n == 0 {
-                self.reader.seek(SeekFrom::Start(0))?; // loop
+                // Loop — back to the first *sample*, which on a WAV is past the
+                // header. Restarting at zero would play the header as signal.
+                self.reader.seek(SeekFrom::Start(self.data_start))?;
                 continue;
             }
             filled += n;

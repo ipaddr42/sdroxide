@@ -321,7 +321,7 @@ pub fn show(
     );
 
     // Minor ticks between the labelled lines, at a round fraction of the step.
-    let minor = minor_step(spectrum_view::freq_grid_step(lo, hi));
+    let minor = spectrum_view::minor_grid_step(spectrum_view::freq_grid_step(lo, hi));
     let mut hz = (lo / minor).ceil() * minor;
     while hz <= hi {
         let x = x_of(hz);
@@ -435,13 +435,6 @@ fn mhz_decimals(step_hz: f64) -> usize {
     (-mhz.log10().floor()).clamp(0.0, 6.0) as usize
 }
 
-/// Tick spacing between two labelled gridlines: a fifth of the step, or a half
-/// when the step is 2·10^k — the two that land on round frequencies.
-fn minor_step(step_hz: f64) -> f64 {
-    let mag = 10f64.powf(step_hz.log10().floor());
-    if (step_hz / mag).round() == 2.0 { step_hz / 2.0 } else { step_hz / 5.0 }
-}
-
 /// Draw a scale label with a dark backing and return the box it took. Without
 /// the backing a label over a strong carrier — the brightest thing on the strip
 /// — is the one place the scale cannot be read.
@@ -552,7 +545,7 @@ mod tests {
     #[test]
     fn minor_ticks_land_on_round_frequencies() {
         for (step, want) in [(1e6, 200e3), (2e6, 1e6), (5e6, 1e6), (20e3, 10e3), (50e3, 10e3)] {
-            let got = minor_step(step);
+            let got = spectrum_view::minor_grid_step(step);
             assert!((got - want).abs() < 1.0, "step {step} gave a {got} Hz tick, wanted {want}");
         }
     }

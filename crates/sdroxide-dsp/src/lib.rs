@@ -21,6 +21,7 @@ mod interp;
 mod iqcorrect;
 mod mfsk;
 mod modulator;
+mod navtex;
 mod nb;
 mod nco;
 mod nnr;
@@ -64,6 +65,19 @@ pub use hell::{HELL_CELL_COLS, HELL_ROWS, HellRx, HellTx, render_columns as hell
 pub use interp::{Duc, HalfbandInterp};
 pub use iqcorrect::IqCorrect;
 pub use modulator::{Modulator, PACKET_DEVIATION_HZ, SsbMod, make_modulator};
+pub use navtex::{
+    CharSource as NavtexCharSource, NAVTEX_BAUD, NAVTEX_CENTER_HZ, NAVTEX_SHIFT_HZ, NavtexRx,
+};
+
+/// The NAVTEX transmit side, for tests and for anyone checking a receiver.
+///
+/// There is no NAVTEX transmitter in sdroxide and there will not be — the
+/// service is a coast station's — so this is exported as a signal *generator*
+/// rather than as part of a mode. It is what `sdroxide-digi`'s framing tests
+/// are built on, and what a bench check of the decoder would use.
+pub mod navtex_test {
+    pub use crate::navtex::{encode_bits, synth};
+}
 pub use nb::NoiseBlanker;
 pub use nco::Nco;
 pub use nnr::NeuralNr;

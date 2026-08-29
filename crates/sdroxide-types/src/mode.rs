@@ -155,6 +155,37 @@ pub enum Mode {
     /// listened to while it runs. Appended for the same reason as
     /// [`Mode::Hell`].
     Adsb,
+    /// RTTY on an FM carrier — Baudot AFSK into an FM transmitter, the way a
+    /// club bulletin is still sent on 2 m.
+    ///
+    /// The same modem, the same tone pair and the same panel as [`Mode::Rtty`];
+    /// what differs is the radio underneath. On HF an RTTY signal is a pair of
+    /// audio tones on a sideband, so the dial is the foot of the passband and
+    /// the on-air frequency is the dial plus the tone offset. On a VHF channel
+    /// the tones modulate an FM carrier, so the dial *is* the channel, nothing
+    /// is offset from it, and the transmitter has to be in FM to send it at all.
+    ///
+    /// A `Mode` of its own for exactly the reason [`Mode::SstvFm`] is one:
+    /// every per-mode table in the tree — the filter, the demodulator, the CAT
+    /// mode to command, the transmit level, whether the tone offset moves the
+    /// logged frequency — needs a different answer, and none of them has a dial
+    /// to work it out from. Answering by band would also take the choice away
+    /// from the operator, and RTTY on 2 m sideband is a thing people do.
+    /// Appended for the same reason as [`Mode::Hell`] (issue #214).
+    RttyFm,
+    /// NAVTEX — the maritime safety broadcast on 518, 490 and 4209.5 kHz.
+    ///
+    /// SITOR-B (ITU-R M.625 collective B-mode): 100 baud FSK, 170 Hz shift, a
+    /// seven-bit constant-ratio alphabet and time diversity instead of a
+    /// checksum. Receive only, and not because sdroxide could not key it — the
+    /// service is a coast station's, and an amateur transmitting on it would be
+    /// putting false safety information on a distress-adjacent frequency.
+    ///
+    /// The channel frequencies are the *assigned* frequency, which is the
+    /// centre of the two tones, so the dial sits 1700 Hz below it in USB and
+    /// [`Mode::standard_tone_offset_hz`] is what does that arithmetic — the
+    /// same bargain RTTY strikes with its tone pair (issue #212).
+    Navtex,
 }
 
 /// The bands on which analog SSTV rides the lower sideband, as (low, high) Hz.
@@ -169,7 +200,7 @@ const SSTV_LSB_BANDS: [(f64, f64); 3] =
 impl Mode {
     /// Every mode, in the order they cycle and appear in the picker — which is
     /// deliberately *not* the enum's declaration order (see [`Mode::Hell`]).
-    pub const ALL: [Mode; 33] = [
+    pub const ALL: [Mode; 35] = [
         Mode::Lsb,
         Mode::Usb,
         Mode::Cw,
@@ -190,6 +221,7 @@ impl Mode {
         Mode::Wspr,
         Mode::Psk,
         Mode::Rtty,
+        Mode::RttyFm,
         Mode::Packet,
         Mode::PacketHf,
         Mode::Aprs,
@@ -197,6 +229,7 @@ impl Mode {
         Mode::SstvFm,
         Mode::Rifp,
         Mode::Wefax,
+        Mode::Navtex,
         Mode::Olivia,
         Mode::Thor,
         Mode::Fsq,
@@ -209,7 +242,7 @@ impl Mode {
     /// slotted FT8/FT4 modes, the continuous keyboard modes, Hell, SSTV, RIFP,
     /// packet, RF Paint). All are USB underneath except RIFP, VHF packet and
     /// VHF SSTV, which frequency-modulate the carrier.
-    pub const DIGITAL: [Mode; 20] = [
+    pub const DIGITAL: [Mode; 22] = [
         Mode::Ft8,
         Mode::Ft4,
         Mode::Ft2,
@@ -217,6 +250,7 @@ impl Mode {
         Mode::Wspr,
         Mode::Psk,
         Mode::Rtty,
+        Mode::RttyFm,
         Mode::Olivia,
         Mode::Thor,
         Mode::Fsq,
@@ -225,6 +259,7 @@ impl Mode {
         Mode::SstvFm,
         Mode::Rifp,
         Mode::Wefax,
+        Mode::Navtex,
         Mode::RfPaint,
         Mode::Rade,
         Mode::Packet,
@@ -243,6 +278,7 @@ impl Mode {
                 | Mode::Wspr
                 | Mode::Psk
                 | Mode::Rtty
+                | Mode::RttyFm
                 | Mode::Sstv
                 | Mode::SstvFm
                 | Mode::Rifp
@@ -253,6 +289,7 @@ impl Mode {
                 | Mode::RfPaint
                 | Mode::Rade
                 | Mode::Wefax
+                | Mode::Navtex
                 | Mode::Packet
                 | Mode::PacketHf
                 | Mode::Aprs
@@ -303,7 +340,7 @@ impl Mode {
     /// audio on a sideband like any other keyboard mode. APRS is VHF packet
     /// under another name, so it is.
     pub fn is_carrier_centered(self) -> bool {
-        matches!(self, Mode::Rifp | Mode::Packet | Mode::Aprs | Mode::SstvFm)
+        matches!(self, Mode::Rifp | Mode::Packet | Mode::Aprs | Mode::SstvFm | Mode::RttyFm)
     }
 
     /// True for the modes that go out on a *frequency-modulated* carrier.
@@ -321,7 +358,13 @@ impl Mode {
     pub fn is_fm_carrier(self) -> bool {
         matches!(
             self,
-            Mode::Nfm | Mode::Wfm | Mode::Rifp | Mode::Packet | Mode::Aprs | Mode::SstvFm
+            Mode::Nfm
+                | Mode::Wfm
+                | Mode::Rifp
+                | Mode::Packet
+                | Mode::Aprs
+                | Mode::SstvFm
+                | Mode::RttyFm
         )
     }
 
@@ -347,7 +390,10 @@ impl Mode {
     /// / FSQ), as opposed to the slotted FT8/FT4 modes. Drives which decode
     /// engine + panel is used.
     pub fn is_text_modem(self) -> bool {
-        matches!(self, Mode::Psk | Mode::Rtty | Mode::Olivia | Mode::Thor | Mode::Fsq)
+        matches!(
+            self,
+            Mode::Psk | Mode::Rtty | Mode::RttyFm | Mode::Olivia | Mode::Thor | Mode::Fsq
+        )
     }
 
     /// True for the slotted FT8/FT4 modes, as opposed to the continuous
@@ -467,7 +513,11 @@ impl Mode {
     /// True for the receive-only modes, so the UI can leave the transmit
     /// controls out rather than showing ones that refuse.
     pub fn is_rx_only(self) -> bool {
-        matches!(self, Mode::Wefax | Mode::Adsb)
+        // NAVTEX is receive-only by choice rather than by capability: the
+        // service belongs to coast stations, and an amateur transmitting on it
+        // would be putting false safety information on a distress-adjacent
+        // channel.
+        matches!(self, Mode::Wefax | Mode::Adsb | Mode::Navtex)
     }
 
     /// True for Hellschreiber. Forks the digi panel to the scrolling raster UI:
@@ -517,6 +567,8 @@ impl Mode {
             Mode::Ft2 => "FT2",
             Mode::Psk => "PSK",
             Mode::Rtty => "RTTY",
+            Mode::RttyFm => "RTTY-FM",
+            Mode::Navtex => "NAVTEX",
             Mode::Sstv => "SSTV",
             Mode::SstvFm => "SSTV-FM",
             Mode::Olivia => "OLIVIA",
@@ -584,6 +636,10 @@ impl Mode {
             // room for a receiver tuned a few hundred hertz off, which is the
             // normal state of affairs on a chart found by ear.
             Mode::Wefax => (500.0, 3300.0),
+            // The two NAVTEX tones are 1615 and 1785 Hz; a few hundred hertz
+            // either side leaves room for a receiver that is not exactly on the
+            // channel, which is the usual state of a signal found by ear.
+            Mode::Navtex => (1300.0, 2100.0),
             // WSPR lives in one 200 Hz window, 1400–1600 Hz above the dial, and
             // the decoder searches nowhere else. Narrow rather than the usual
             // digital 100–3300 on purpose: the QRSS beacons just below the
@@ -609,7 +665,7 @@ impl Mode {
             // 1200 Bell 202 on FM whatever the region. VHF SSTV is the same
             // shape of thing — an FM channel, not a sideband — and its video
             // subcarrier runs to 2300 Hz, well inside it.
-            Mode::Packet | Mode::Aprs | Mode::SstvFm => (-8_000.0, 8_000.0),
+            Mode::Packet | Mode::Aprs | Mode::SstvFm | Mode::RttyFm => (-8_000.0, 8_000.0),
             // HF packet is 300 baud AFSK on a sideband, tones around
             // 1600/1800 Hz — an ordinary keyboard-mode passband.
             Mode::PacketHf => (150.0, 2850.0),
@@ -694,6 +750,11 @@ impl Mode {
     pub fn standard_tone_offset_hz(self) -> Option<f32> {
         match self {
             Mode::Rtty => Some(crate::RTTY_CENTER_HZ),
+            // The channel frequencies (518, 490, 4209.5 kHz) are the assigned
+            // frequency, which is the *centre* of the two tones — so the dial
+            // is 1700 Hz below the channel, and a decode logged at the dial
+            // would be logged 1.7 kHz low.
+            Mode::Navtex => Some(crate::NAVTEX_TONE_HZ),
             _ => None,
         }
     }
@@ -740,10 +801,12 @@ impl Mode {
             | Mode::Wspr
             | Mode::Psk
             | Mode::Rtty
+            | Mode::RttyFm
             | Mode::Sstv
             | Mode::SstvFm
             | Mode::Rifp
             | Mode::Wefax
+            | Mode::Navtex
             | Mode::Olivia
             | Mode::Thor
             | Mode::Fsq
@@ -814,7 +877,9 @@ impl Mode {
             // VHF SSTV joins NFM rather than packet's wider pair: it is a voice
             // channel with a picture on it, and the deviation is a voice
             // channel's.
-            Mode::Nfm | Mode::SstvFm => &[("8k", -4000.0, 4000.0), ("16k", -8000.0, 8000.0)],
+            Mode::Nfm | Mode::SstvFm | Mode::RttyFm => {
+                &[("8k", -4000.0, 4000.0), ("16k", -8000.0, 8000.0)]
+            }
             Mode::Dsb => &[("5k", -2500.0, 2500.0), ("6k", -3000.0, 3000.0)],
             // Both wider than any filter would be: a Mode S reply reaches its
             // first nulls about 6 MHz out and is read by a slicer rather than
@@ -857,6 +922,7 @@ impl Mode {
             | Mode::RfPaint
             | Mode::Rifp
             | Mode::Wefax
+            | Mode::Navtex
             | Mode::PacketHf
             | Mode::Rade => &[],
         }
@@ -1311,6 +1377,8 @@ mod tests {
             (Mode::Aprs, 30),
             (Mode::SstvFm, 31),
             (Mode::Adsb, 32),
+            (Mode::RttyFm, 33),
+            (Mode::Navtex, 34),
         ];
         for (mode, index) in pinned {
             assert_eq!(mode as u8, index, "{} moved", mode.label());
@@ -1355,12 +1423,46 @@ mod tests {
         // `Mode::ALL`'s length is checked by the array type; what needs
         // checking is that it is a permutation of the enum, with nothing
         // dropped and nothing listed twice.
-        let last = Mode::Adsb as u8;
+        let last = Mode::Navtex as u8;
         for i in 0..=last {
             let present = Mode::ALL.iter().filter(|m| **m as u8 == i).count();
             assert_eq!(present, 1, "discriminant {i} appears {present} times in Mode::ALL");
         }
         assert_eq!(Mode::ALL.len(), last as usize + 1);
+    }
+
+    /// RTTY on an FM carrier is the same modem on a different radio, and every
+    /// table that decides *where the signal is* has to say so (issue #214).
+    ///
+    /// The tone offset is the one that bites. On a sideband the mark/space pair
+    /// sits 2210 Hz above the dial, so the contact is logged there; on a channel
+    /// the tones are inside the FM carrier and the dial *is* the frequency.
+    /// Copying `Mode::Rtty`'s answer would log every VHF bulletin 2.2 kHz high.
+    #[test]
+    fn rtty_on_fm_is_a_channel_not_a_sideband() {
+        assert!(Mode::RttyFm.is_text_modem(), "it is the RTTY modem and wants the RTTY panel");
+        assert!(Mode::RttyFm.is_digital());
+        assert!(Mode::RttyFm.is_fm_carrier(), "the level is deviation, not drive");
+        assert!(Mode::RttyFm.is_carrier_centered(), "the dial is the channel centre");
+
+        // No tone offset: the dial is where the contact was.
+        assert_eq!(Mode::RttyFm.standard_tone_offset_hz(), None);
+        assert_eq!(Mode::RttyFm.on_air_hz(145_500_000.0, crate::RTTY_CENTER_HZ), 145_500_000.0);
+        // …where the HF twin's is not.
+        assert_eq!(Mode::Rtty.on_air_hz(14_080_000.0, crate::RTTY_CENTER_HZ), 14_082_210.0);
+
+        // An FM channel's passband, whatever the band, where the sideband twin
+        // has a sideband's.
+        assert_eq!(Mode::RttyFm.default_filter(), (-8000.0, 8000.0));
+        for dial in [50_150_000.0, 145_500_000.0, 433_500_000.0, 7_040_000.0] {
+            assert_eq!(
+                Mode::RttyFm.default_filter_at(dial),
+                (-8000.0, 8000.0),
+                "at {:.3} MHz",
+                dial / 1e6
+            );
+        }
+        assert_ne!(Mode::Rtty.default_filter(), Mode::RttyFm.default_filter());
     }
 
     /// The wire is the declaration order. Every discriminant that has ever been

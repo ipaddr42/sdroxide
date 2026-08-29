@@ -27,10 +27,9 @@ use sdroxide_types::{DeviceCaps, Mode, TciServerConfig};
 /// One engine transmit block: 10 ms at 48 kHz.
 const BLOCK: usize = 480;
 const RATE: usize = 48_000;
-/// The standing depth the engine starts out pacing the queue towards
-/// (`TCI_TX_TARGET`), and the ceiling it learns up to (`TCI_TX_MAX_TARGET`).
-const TARGET: usize = BLOCK * 4;
-const MAX_TARGET: usize = BLOCK * 25;
+/// How far ahead of the transmitter the engine asks a client to run
+/// (`TCI_TX_LEAD`).
+const LEAD: usize = BLOCK * 24;
 /// Blocks of silence before an unanswered chrono is written off
 /// (`TCI_TX_ASK_TIMEOUT_BLOCKS`).
 const ASK_TIMEOUT_BLOCKS: u32 = 50;
@@ -144,8 +143,9 @@ fn a_chrono_driven_client_is_never_asked_for_more_than_fits() {
     // depth.
     let mut fifo: Vec<f32> = Vec::new();
     let mut block = [0.0f32; BLOCK];
-    let mut outstanding = 0usize;
-    let mut target = TARGET;
+    let mut asked_total = 0usize;
+    let mut supplied = 0usize;
+    let mut consumed = 0usize;
     let mut quiet = 0u32;
     let mut played: Vec<f32> = Vec::new();
     let mut padded = 0usize;
@@ -161,16 +161,19 @@ fn a_chrono_driven_client_is_never_asked_for_more_than_fits() {
                 break;
             }
         }
-        outstanding = outstanding.saturating_sub(got);
+        supplied += got;
+        consumed += BLOCK;
         quiet = if got > 0 { 0 } else { quiet + 1 };
         if quiet >= ASK_TIMEOUT_BLOCKS {
             quiet = 0;
-            outstanding = 0;
+            asked_total = supplied;
         }
-        let deficit = target.saturating_sub(fifo.len() + outstanding);
-        if deficit >= BLOCK {
-            srv.request_chrono(deficit as u32);
-            outstanding += deficit;
+        if fifo.len() < LEAD * 2 {
+            let deficit = (consumed + LEAD).saturating_sub(asked_total);
+            if deficit >= BLOCK {
+                srv.request_chrono(deficit as u32);
+                asked_total += deficit;
+            }
         }
         if fifo.len() > FIFO_CAP {
             let cut = fifo.len() - FIFO_CAP;
@@ -179,11 +182,8 @@ fn a_chrono_driven_client_is_never_asked_for_more_than_fits() {
         let take = fifo.len().min(BLOCK);
         played.extend_from_slice(&fifo[..take]);
         fifo.drain(..take);
-        // An underrun means the standing queue was too shallow for this
-        // client's cadence: deepen it by the block that was missed.
         if take < BLOCK {
             padded += BLOCK - take;
-            target = (target + BLOCK).min(MAX_TARGET);
         }
         let due = Duration::from_secs_f64((i + 1) as f64 * BLOCK as f64 / RATE as f64);
         if let Some(d) = due.checked_sub(start.elapsed()) {
@@ -197,10 +197,9 @@ fn a_chrono_driven_client_is_never_asked_for_more_than_fits() {
     let asked = sent.load(Ordering::Relaxed);
     eprintln!(
         "over {:.2}s: client sent {asked} frames, {} reached the air, {padded} silent; \
-         depth settled at {target} ({} ms)",
+         asked for {asked_total}, supplied {supplied}",
         start.elapsed().as_secs_f64(),
         played.len(),
-        target * 1000 / RATE,
     );
 
     // Nothing of the client's stream may be skipped: its samples are a counter,

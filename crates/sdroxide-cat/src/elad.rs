@@ -218,6 +218,7 @@ fn mode_digit(m: Mode) -> char {
         | Mode::Packet
         | Mode::Aprs
         | Mode::SstvFm
+        | Mode::RttyFm
         | Mode::Adsb => '4',
         Mode::Am | Mode::Sam | Mode::Dsb | Mode::Drm => '5',
         // Everything else is upper sideband: the digital and keyboard modes,
@@ -240,6 +241,7 @@ fn mode_digit(m: Mode) -> char {
         | Mode::Spec
         | Mode::Sstv
         | Mode::Wefax
+        | Mode::Navtex
         | Mode::RfPaint => '2',
     }
 }

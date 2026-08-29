@@ -672,6 +672,22 @@ fn yes() -> bool {
 pub struct RadiosFile {
     pub radios: Vec<RadioSlot>,
     pub next_id: u32,
+    /// The operator's own left-to-right order for the tab strip, by radio id
+    /// (issue #224). Empty — the default — means "the order they were created
+    /// in", which is what [`RadiosFile::radios`] is already in.
+    ///
+    /// Deliberately *not* the order of `radios` itself. That list is the
+    /// station's identity: its first entry is the radio that holds the shared
+    /// network services, takes the command line's overrides and the legacy
+    /// configuration paths, and cannot be closed — here and, over the wire, at
+    /// every client. Rearranging the strip is a display choice and must not
+    /// hand any of that to a different radio, so the two are kept apart.
+    ///
+    /// Read through [`RadiosFile::display_order`], never raw: a hand-edited or
+    /// stale list may name a radio that has been closed or leave out one that
+    /// has been added.
+    #[serde(default)]
+    pub order: Vec<u32>,
 }
 
 impl Default for RadiosFile {
@@ -679,6 +695,7 @@ impl Default for RadiosFile {
         RadiosFile {
             radios: vec![RadioSlot { id: 0, name: String::new(), enabled: true }],
             next_id: 1,
+            order: Vec::new(),
         }
     }
 }
@@ -707,6 +724,30 @@ impl RadiosFile {
     /// turn a lost roster into a station with no radios.
     pub fn is_enabled(&self, id: u32) -> bool {
         self.radios.iter().find(|r| r.id == id).is_none_or(|r| r.enabled)
+    }
+
+    /// Every radio in the roster, in the order the tab strip should show them:
+    /// [`RadiosFile::order`] first, then anything it does not name, in the
+    /// order the roster has it.
+    ///
+    /// Always a permutation of the roster, whatever is in the file. A radio
+    /// named in `order` that is no longer in the roster is dropped, and one the
+    /// roster has gained since — added from another client, or by hand — lands
+    /// at the end rather than disappearing off the strip.
+    pub fn display_order(&self) -> Vec<u32> {
+        let mut out: Vec<u32> = self
+            .order
+            .iter()
+            .copied()
+            .filter(|id| self.radios.iter().any(|r| r.id == *id))
+            .collect();
+        out.dedup();
+        for r in &self.radios {
+            if !out.contains(&r.id) {
+                out.push(r.id);
+            }
+        }
+        out
     }
 }
 
@@ -757,6 +798,19 @@ pub fn set_radio_enabled(id: u32, enabled: bool) -> Result<(), ConfigError> {
     if let Some(slot) = roster.radios.iter_mut().find(|r| r.id == id) {
         slot.enabled = enabled;
     }
+    save_radios(&roster)
+}
+
+/// Record the operator's left-to-right order for the tab strip (issue #224).
+///
+/// Only the order is written — the roster itself is untouched, so the station's
+/// first radio stays the station's first radio however the strip is arranged.
+/// Ids that are not in the roster are dropped rather than stored, so a stale
+/// list cannot grow in the file.
+pub fn reorder_radios(ids: &[u32]) -> Result<(), ConfigError> {
+    let mut roster = load_radios();
+    roster.order =
+        ids.iter().copied().filter(|id| roster.radios.iter().any(|r| r.id == *id)).collect();
     save_radios(&roster)
 }
 
@@ -860,6 +914,17 @@ pub fn solar_cache_dir() -> Result<PathBuf, ConfigError> {
 /// directory (`<Music>/sdroxide`), or the config directory
 /// (`~/.config/sdroxide/recordings`) when the platform exposes no music folder.
 pub fn recordings_dir() -> Result<PathBuf, ConfigError> {
+    // An isolated configuration is isolated: `SDROXIDE_CONFIG_DIR` is how a
+    // test, a second station or a throwaway session says "keep everything
+    // here", and a recording written into the operator's real music folder
+    // from one of those is the one file that escapes. Checked here rather than
+    // inside `config_dir` because the two answer different questions — that one
+    // is where settings live, and it has an isolated form already.
+    if std::env::var_os("SDROXIDE_CONFIG_DIR").is_some() {
+        let dir = config_dir()?.join("recordings");
+        fs::create_dir_all(&dir)?;
+        return Ok(dir);
+    }
     let dir = match directories::UserDirs::new()
         .and_then(|u| u.audio_dir().map(std::path::Path::to_path_buf))
     {
@@ -2495,6 +2560,32 @@ mod tests {
         let again = create_radio("Bench RX").unwrap();
         assert_eq!(again.id, 2, "id 1 was used once; it stays used");
         assert_eq!(again.name, "Bench RX");
+
+        // The strip's order (issue #224). Nothing said yet is the roster's own
+        // order; what the operator arranges survives a reload and leaves the
+        // roster — and so the station's first radio — exactly where it was.
+        let third = create_radio("Bench RX 2").unwrap();
+        assert_eq!(load_radios().display_order(), vec![0, again.id, third.id]);
+        reorder_radios(&[third.id, 0, again.id]).unwrap();
+        let after = load_radios();
+        assert_eq!(after.display_order(), vec![third.id, 0, again.id]);
+        assert_eq!(
+            after.radios.iter().map(|r| r.id).collect::<Vec<_>>(),
+            vec![0, again.id, third.id],
+            "the roster itself must not be rearranged: its first radio is the station",
+        );
+
+        // A stale order — one that names a radio that has since been closed,
+        // and misses one that has since been added — is still a permutation of
+        // the roster, with the newcomer at the end.
+        remove_radio(third.id).unwrap();
+        let fourth = create_radio("Bench RX 3").unwrap();
+        assert_eq!(load_radios().display_order(), vec![0, again.id, fourth.id]);
+        // And the file never grows an id the roster does not have.
+        reorder_radios(&[fourth.id, third.id, 0, again.id]).unwrap();
+        assert_eq!(load_radios().order, vec![fourth.id, 0, again.id]);
+        remove_radio(again.id).unwrap();
+        remove_radio(fourth.id).unwrap();
 
         // A radio.json that does not parse (truncated by a crash mid-write,
         // disk full, hand edit gone wrong) silently stripping the operator's
