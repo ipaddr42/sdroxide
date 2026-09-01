@@ -362,13 +362,32 @@ pub fn build_dax_tx_audio(stream_id: u32, count: u8, samples: &[f32]) -> Vec<u8>
     out
 }
 
-/// Decode a `dax_iq` payload into interleaved I/Q floats appended to `out`.
+/// Where 0 dBFS sits in a `dax_iq` payload: the floats are full-scale at
+/// **2^15**, not at 1.0, so a client has to divide by this to get the ±1.0 a
+/// receive chain expects.
+///
+/// It is a float carrying an integer's scale — FlexRadio's own description of
+/// DAX IQ is "32-bit fixed point, left justified", and what crosses the wire is
+/// that number in a float. Nothing in the protocol says so; the constant is
+/// `hb9fxq/flexlib-go`'s `ONE_OVER_ZERO_DBFS = 1/2^15`, applied in its
+/// `ParseFData` to exactly these packet classes.
+///
+/// Missing it is 90.3 dB of gain that nothing downstream can undo: a FLEX-6600
+/// showed its band noise at the top of the panadapter, the waterfall saturated
+/// end to end and the S-meter pinned at S9+109 with the overload light on
+/// (issue #184). Auto-fit cannot rescue that — the picture is not badly
+/// *scaled*, it is genuinely at +0 dBFS and clipping.
+pub const DAX_IQ_FULL_SCALE: f32 = 32_768.0;
+
+/// Decode a `dax_iq` payload into interleaved I/Q floats appended to `out`,
+/// normalised to ±1.0 full scale.
 ///
 /// **Little**-endian, alone among the stream types — see the module docs. A
-/// truncated final sample pair is dropped rather than half-decoded.
+/// truncated final sample pair is dropped rather than half-decoded. The scale
+/// is [`DAX_IQ_FULL_SCALE`].
 pub fn decode_dax_iq(payload: &[u8], out: &mut Vec<f32>) {
     for chunk in payload.chunks_exact(4) {
-        out.push(f32::from_le_bytes(chunk.try_into().unwrap()));
+        out.push(f32::from_le_bytes(chunk.try_into().unwrap()) / DAX_IQ_FULL_SCALE);
     }
     // Keep the interleave aligned: a partial I with no Q would swap the two for
     // the whole rest of the stream.
@@ -378,10 +397,11 @@ pub fn decode_dax_iq(payload: &[u8], out: &mut Vec<f32>) {
 }
 
 /// Build a `dax_iq` payload from interleaved I/Q floats (the simulator's side of
-/// [`decode_dax_iq`]).
+/// [`decode_dax_iq`]), taking ±1.0 full scale and putting the radio's own
+/// [`DAX_IQ_FULL_SCALE`] on the wire.
 pub fn encode_dax_iq(samples: &[f32], out: &mut Vec<u8>) {
     for &s in samples {
-        out.extend_from_slice(&s.to_le_bytes());
+        out.extend_from_slice(&(s * DAX_IQ_FULL_SCALE).to_le_bytes());
     }
 }
 
@@ -540,21 +560,35 @@ mod tests {
         let samples = [1.0f32, -0.5, 0.25, 0.0];
         let mut wire = Vec::new();
         encode_dax_iq(&samples, &mut wire);
-        assert_eq!(&wire[0..4], &1.0f32.to_le_bytes());
+        assert_eq!(&wire[0..4], &DAX_IQ_FULL_SCALE.to_le_bytes());
 
         let mut back = Vec::new();
         decode_dax_iq(&wire, &mut back);
         assert_eq!(back, samples);
     }
 
+    /// The radio's floats are full scale at 2^15, and a client that takes them
+    /// at face value is 90 dB hot — a saturated waterfall and a pinned S-meter
+    /// (issue #184). Pinned as a number rather than left to the round trip
+    /// above, which would pass just as happily with no scaling at either end.
+    #[test]
+    fn dax_iq_full_scale_is_two_to_the_fifteenth() {
+        assert_eq!(DAX_IQ_FULL_SCALE, 32_768.0);
+        let mut back = Vec::new();
+        // One I/Q pair at the radio's own full scale reads as ±1.0 here.
+        let wire: Vec<u8> = [32_768.0f32, -32_768.0].iter().flat_map(|s| s.to_le_bytes()).collect();
+        decode_dax_iq(&wire, &mut back);
+        assert_eq!(back, vec![1.0, -1.0]);
+    }
+
     #[test]
     fn dax_iq_drops_a_dangling_i_sample() {
         // A truncated pair would swap I and Q for the rest of the stream.
         let mut wire = Vec::new();
-        encode_dax_iq(&[1.0, 2.0, 3.0], &mut wire);
+        encode_dax_iq(&[1.0, 0.5, 0.25], &mut wire);
         let mut back = Vec::new();
         decode_dax_iq(&wire, &mut back);
-        assert_eq!(back, vec![1.0, 2.0]);
+        assert_eq!(back, vec![1.0, 0.5]);
     }
 
     #[test]

@@ -15,7 +15,7 @@ use std::sync::Arc;
 use rustfft::{Fft, FftPlanner};
 use sdroxide_deepcw::Pool;
 use sdroxide_dsp::{Complex32 as C32, CwDecoder};
-use sdroxide_types::{CwSkimmerDecoder, SkimmerKind, SkimmerSettings, SkimmerSpot};
+use sdroxide_types::{CwSkimmerDecoder, SkimmerKind, SkimmerSettings, SkimmerSpot, is_cw_segment};
 
 use crate::callsign::find_callsign;
 use crate::deep::DeepFront;
@@ -142,6 +142,22 @@ fn build_deep(skim_rate: f64, max_tracks: usize) -> Option<(DeepFront, Pool)> {
     }
 }
 
+/// Which bins of a `rate`-wide window on `center_hz` sit in a CW sub-segment,
+/// indexed the way the transform is (bin 0 at DC, the top half negative).
+///
+/// All false where the window is nowhere near an amateur CW allocation, which
+/// is the whole of VHF broadcast, the whole of the air band, and most of what
+/// anyone points an RTL-SDR at.
+fn cw_bin_mask(rate: f64, center_hz: f64) -> Vec<bool> {
+    let bin_hz = rate / FFT_SIZE as f64;
+    (0..FFT_SIZE)
+        .map(|k| {
+            let off = if k <= FFT_SIZE / 2 { k as i64 } else { k as i64 - FFT_SIZE as i64 };
+            is_cw_segment(center_hz + off as f64 * bin_hz)
+        })
+        .collect()
+}
+
 struct Track {
     id: u64,
     bin: i64, // signed offset bin from DC (negative = below center)
@@ -235,6 +251,25 @@ pub struct CwSkimmer {
     /// Centers seen last frame, so a track spawns only on a peak that persists
     /// (a single-frame noise blip never becomes a track).
     prev_centers: Vec<i64>,
+    /// Which FFT bins of this window fall in a CW sub-segment of the band plan,
+    /// by bin index. Rebuilt whenever the window is placed.
+    ///
+    /// The engine throws away every spot outside one
+    /// (`Engine::poll_skimmer`), so a track anywhere else can only ever produce
+    /// a result nobody is shown — while costing a DeepCW inference every few
+    /// seconds for as long as it lives. On a broadcast FM station, which has no
+    /// CW segment anywhere near it, *every* track was of that kind: measured on
+    /// an RTL-SDR at 2.4 Msps, the model and its four inference threads were
+    /// two thirds of everything the program spent, all of it discarded.
+    ///
+    /// A mask rather than a test per candidate because the candidate loop runs
+    /// over the whole transform two hundred times a second, and a band-plan
+    /// lookup is a search through the region's segment table.
+    cw_bins: Vec<bool>,
+    /// Whether any bin of this window is in one at all. False stands the
+    /// skimmer down entirely — no transform, no detection — because there is
+    /// nowhere in the window a CW spot could come from.
+    any_cw: bool,
     /// Windows the pool took, and windows it refused, for the cost harness.
     #[cfg(test)]
     submits: u64,
@@ -288,6 +323,8 @@ impl CwSkimmer {
             decoder: cfg.cw_decoder,
             slots: cfg.cw_slots as usize,
             prev_centers: Vec::new(),
+            any_cw: false, // set below, from the mask
+            cw_bins: cw_bin_mask(skim_rate, skim_center_hz),
             #[cfg(test)]
             submits: 0,
             #[cfg(test)]
@@ -295,6 +332,14 @@ impl CwSkimmer {
             #[cfg(test)]
             empty: 0,
         }
+        .with_cw_mask_applied()
+    }
+
+    /// Finish construction: the "is there any CW here at all" flag is read off
+    /// the mask, so the two cannot disagree.
+    fn with_cw_mask_applied(mut self) -> Self {
+        self.any_cw = self.cw_bins.iter().any(|&b| b);
+        self
     }
 
     /// Apply new settings to a running skimmer.
@@ -331,6 +376,8 @@ impl CwSkimmer {
     pub fn set_center(&mut self, center_hz: f64) {
         if (center_hz - self.skim_center_hz).abs() > 1.0 {
             self.skim_center_hz = center_hz;
+            self.cw_bins = cw_bin_mask(self.skim_rate, center_hz);
+            self.any_cw = self.cw_bins.iter().any(|&b| b);
             self.reset();
         }
     }
@@ -403,6 +450,14 @@ impl CwSkimmer {
 
     /// Feed a block of complex baseband IQ (skim-rate, centered on skim_center).
     pub fn process(&mut self, iq: &[C32]) {
+        // Nowhere in this window can a CW spot come from, so there is nothing
+        // for the transform to find — see [`CwSkimmer::cw_bins`]. Ahead of the
+        // buffering as well as the analysis: a stand-down that kept filling
+        // `inbuf` would hand the band back as a backlog the moment the operator
+        // tuned onto an amateur band.
+        if !self.any_cw {
+            return;
+        }
         self.inbuf.extend_from_slice(iq);
         while self.read_pos + FFT_SIZE <= self.inbuf.len() {
             let base = self.read_pos;
@@ -546,7 +601,9 @@ impl CwSkimmer {
         cands.clear();
         for k in 0..n {
             let off = self.offset_bin(k);
-            if self.at_dc(off) || !self.in_view(off) {
+            // `cw_bins` first: it is the cheapest of the three and the one that
+            // rejects the most — off an amateur band it rejects everything.
+            if !self.cw_bins[k] || self.at_dc(off) || !self.in_view(off) {
                 continue;
             }
             let p = self.power[k];
@@ -1175,6 +1232,51 @@ mod tests {
 
         sk.set_view(Some((center + 50_000.0, center + 90_000.0)));
         assert!(sk.spots().is_empty(), "a track survived the pan away from it");
+    }
+
+    /// A window with no CW allocation in it tracks nothing, however loud the
+    /// keying.
+    ///
+    /// The engine discards every CW spot outside a CW sub-segment, so a track
+    /// anywhere else was decoder time spent on a result nobody is ever shown.
+    /// On the broadcast FM band — where a great many RTL-SDRs live — that was
+    /// every track there was.
+    #[test]
+    fn a_window_with_no_cw_allocation_tracks_nothing() {
+        let rate = 192_000.0;
+        let off = 5_000.0;
+        let iq = synth("CQ DE W1AW", off, 20.0, rate, 0.02);
+
+        // The same signal on 20 m, to show the test is of the band and not of
+        // the signal.
+        let mut ham = skimmer(rate, 14_020_000.0, CwSkimmerDecoder::Timing);
+        feed(&mut ham, &iq);
+        settle(&mut ham);
+        assert!(!ham.spots().is_empty(), "the control case decoded nothing");
+
+        let mut fm = skimmer(rate, 96_300_000.0, CwSkimmerDecoder::Timing);
+        feed(&mut fm, &iq);
+        settle(&mut fm);
+        assert!(fm.spots().is_empty(), "tracked a station on the broadcast FM band");
+    }
+
+    /// And the mask travels with the window: a skimmer moved onto a CW segment
+    /// starts working, one moved off it stops.
+    #[test]
+    fn moving_the_window_onto_a_cw_segment_starts_the_tracking() {
+        let rate = 192_000.0;
+        let off = 5_000.0;
+        let iq = synth("CQ DE W1AW", off, 20.0, rate, 0.02);
+
+        let mut sk = skimmer(rate, 96_300_000.0, CwSkimmerDecoder::Timing);
+        feed(&mut sk, &iq);
+        settle(&mut sk);
+        assert!(sk.spots().is_empty(), "tracked a station off any CW allocation");
+
+        sk.set_center(14_020_000.0);
+        feed(&mut sk, &iq);
+        settle(&mut sk);
+        assert!(!sk.spots().is_empty(), "nothing was tracked after moving onto 20 m");
     }
 
     /// Clearing the view goes back to skimming the whole window — what a

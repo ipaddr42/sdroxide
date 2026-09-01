@@ -91,6 +91,40 @@ pub struct ScannerConfig {
     pub resume_ms: u32,
     /// Memory ids to pass over.
     pub skip: Vec<u32>,
+    /// Which memory folders a [`ScanKind::Memories`] scan runs over: `None` is
+    /// the top level (the unfiled channels), `Some(id)` is one folder.
+    ///
+    /// **Empty means all of them** — the historic behaviour, and what a station
+    /// with no folders always does. That way round rather than listing every
+    /// folder by default because a folder made after the setting was last
+    /// touched has to be scanned rather than silently left out, and because a
+    /// list that has to be kept in step with the folders is a list that goes
+    /// stale the moment one is renamed or removed.
+    ///
+    /// A folder holds channels for one service — marine, airband, the local
+    /// repeaters — and scanning all of them at once is a scan that spends most
+    /// of its time somewhere the operator is not listening (issue #236).
+    #[serde(default)]
+    pub folders: Vec<Option<u32>>,
+    /// Read a memory scan's channels off the wideband spectrum instead of
+    /// visiting each one (issue #228).
+    ///
+    /// A memory scan tunes to every channel in turn and listens, which is what a
+    /// handheld scanner has to do and costs a settling time each — a hundred
+    /// channels at the default dwell is fifteen seconds a lap. A receiver with
+    /// I/Q of its own can instead put every channel that falls inside one window
+    /// on the same transform the panadapter is already made from, and only visit
+    /// the ones something is on. A list on one band then costs a single tune a
+    /// lap however long it is.
+    ///
+    /// Off by default, and an opt-in rather than the new behaviour: the sweep
+    /// measures a channel through the FFT rather than through the receiver's own
+    /// filter and AGC, so a threshold that was right for one is not always right
+    /// for the other, and an operator with a list short enough not to care
+    /// should not have to work that out. Ignored on a front end with no span to
+    /// search — a CAT rig on a sound card — which visits channels either way.
+    #[serde(default)]
+    pub mem_fast: bool,
     /// Frequencies (Hz, on the channel grid) a range scan passes over.
     ///
     /// The range-scan twin of [`Self::skip`], and it has to be a frequency
@@ -124,6 +158,8 @@ impl Default for ScannerConfig {
             resume: ScanResume::Carrier,
             resume_ms: 2_000,
             skip: Vec::new(),
+            folders: Vec::new(),
+            mem_fast: false,
             skip_freq_hz: Vec::new(),
             skip_freq_for: (0.0, 0.0, 0.0),
         }
@@ -183,6 +219,28 @@ impl ScannerConfig {
     pub fn skips_freq(&self, hz: f64) -> bool {
         let tol = self.step_hz.max(1.0) / 2.0;
         self.skip_freq_hz.iter().any(|&f| (f - hz).abs() < tol)
+    }
+
+    /// Whether a memory filed under `folder` is one this scan runs over.
+    ///
+    /// `folder` is the channel's folder *as the list draws it*: a memory whose
+    /// folder has gone from under it reads as unfiled, here as everywhere else,
+    /// so the caller resolves the id against the folders that exist before
+    /// asking.
+    pub fn scans_folder(&self, folder: Option<u32>) -> bool {
+        self.folders.is_empty() || self.folders.contains(&folder)
+    }
+
+    /// Drop a folder that no longer exists from [`Self::folders`].
+    ///
+    /// Its channels are back at the top level by then, and a selection still
+    /// naming it would be a scan quietly looking for them where they are not.
+    /// Returns whether anything changed, so the caller only persists a config
+    /// that moved.
+    pub fn forget_folder(&mut self, id: u32) -> bool {
+        let before = self.folders.len();
+        self.folders.retain(|f| *f != Some(id));
+        self.folders.len() != before
     }
 
     /// Whether the settings describe a scan that could ever stop anywhere.
@@ -277,4 +335,44 @@ pub struct ScanState {
     pub running: bool,
     /// Stopped on a busy channel rather than moving.
     pub holding: bool,
+}
+
+#[cfg(test)]
+mod folder_tests {
+    use super::*;
+
+    /// No selection is every folder — including one made since the setting was
+    /// last touched, which is the reason it is stored as a selection rather
+    /// than as a list of everything (issue #236).
+    #[test]
+    fn an_empty_selection_scans_everything() {
+        let c = ScannerConfig::default();
+        assert!(c.scans_folder(None));
+        assert!(c.scans_folder(Some(1)));
+        assert!(c.scans_folder(Some(99)));
+    }
+
+    /// And a selection is exactly what it names. The top level is a place a
+    /// channel can be filed under, so it is selectable like any other.
+    #[test]
+    fn a_selection_is_the_folders_it_names() {
+        let c = ScannerConfig { folders: vec![Some(2)], ..ScannerConfig::default() };
+        assert!(c.scans_folder(Some(2)));
+        assert!(!c.scans_folder(Some(1)));
+        assert!(!c.scans_folder(None), "the unfiled channels are not folder 2");
+
+        let top = ScannerConfig { folders: vec![None], ..ScannerConfig::default() };
+        assert!(top.scans_folder(None));
+        assert!(!top.scans_folder(Some(1)));
+    }
+
+    /// A deleted folder's channels go back to the top level, so a selection
+    /// still naming it would look for them where they are not.
+    #[test]
+    fn a_deleted_folder_leaves_the_selection() {
+        let mut c = ScannerConfig { folders: vec![Some(1), Some(2)], ..ScannerConfig::default() };
+        assert!(c.forget_folder(2));
+        assert_eq!(c.folders, vec![Some(1)]);
+        assert!(!c.forget_folder(2), "asking twice is not a change to persist");
+    }
 }

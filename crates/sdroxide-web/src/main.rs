@@ -1,6 +1,30 @@
 //! Browser client: the same `SdroxideApp` over a WebSocket
 //! `RemoteController`, with audio through a JS AudioWorklet bridge.
 
+/// The directory this page was served from, as a path ending in `/`.
+///
+/// Every address the client builds hangs off this rather than off the root,
+/// because the page need not be at the root: behind a reverse proxy it is
+/// commonly under a prefix — `https://host/sdroxide/` on a Tailscale
+/// certificate, where subdomains are not on offer (issue #241) — and a socket
+/// opened at `wss://host/ws` would then be asking the proxy for something it
+/// has never heard of.
+///
+/// A path ending in `/` is already a directory. Anything else has its last
+/// segment dropped, which is a file name: `/sdroxide/index.html` was served
+/// from `/sdroxide/`. A path with no `/` at all — which a browser does not
+/// produce — reads as the root.
+///
+/// Not gated on wasm like the rest of this file, so the rule can be checked on
+/// the machine it is built on rather than only in a browser.
+#[cfg_attr(not(test), allow(dead_code))]
+fn page_base(pathname: &str) -> String {
+    match pathname.rfind('/') {
+        Some(i) => pathname[..=i].to_string(),
+        None => "/".to_string(),
+    }
+}
+
 #[cfg(target_arch = "wasm32")]
 mod web {
     use eframe::wasm_bindgen::{self, JsCast, prelude::*};
@@ -154,6 +178,8 @@ mod web {
             let ws_proto =
                 if location.protocol().as_deref() == Ok("https:") { "wss" } else { "ws" };
             let host = location.host().unwrap_or_else(|_| "localhost:4950".into());
+            // Where this page came from, not the root — see `page_base`.
+            let base = crate::page_base(&location.pathname().unwrap_or_else(|_| "/".into()));
 
             let runner = eframe::WebRunner::new();
             let result = if solar {
@@ -161,7 +187,7 @@ mod web {
                 // for the microphone, and its own endpoint, so it does not take
                 // the control slot the main tab holds.
                 document.set_title("sdroxide — solar system");
-                let url = format!("{ws_proto}://{host}/solar-ws");
+                let url = format!("{ws_proto}://{host}{base}solar-ws");
                 runner
                     .start(
                         canvas,
@@ -179,12 +205,12 @@ mod web {
                 // page opens the first. Either way the station says what else
                 // it has and the shell brings the rest up as tabs, so a
                 // browser holds a whole station exactly as the desktop client
-                // does. (The list is also at `/radios` on the same host, for
+                // does. (The list is also at `radios` beside this page, for
                 // anyone looking from outside the app.)
                 let first = radio_query(&search);
                 let url = match first {
-                    Some(id) => format!("{ws_proto}://{host}/ws/{id}"),
-                    None => format!("{ws_proto}://{host}/ws"),
+                    Some(id) => format!("{ws_proto}://{host}{base}ws/{id}"),
+                    None => format!("{ws_proto}://{host}{base}ws"),
                 };
                 runner
                     .start(
@@ -216,4 +242,27 @@ mod web {
 fn main() {
     #[cfg(target_arch = "wasm32")]
     web::run();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::page_base;
+
+    /// Every address this client builds hangs off the directory the page came
+    /// from, so the whole client works under a reverse proxy's path prefix
+    /// (issue #241).
+    #[test]
+    fn the_base_is_the_directory_the_page_came_from() {
+        assert_eq!(page_base("/"), "/");
+        assert_eq!(page_base("/index.html"), "/");
+        assert_eq!(page_base("/sdroxide/"), "/sdroxide/");
+        assert_eq!(page_base("/sdroxide/index.html"), "/sdroxide/");
+        assert_eq!(page_base("/shack/sdr/index.html"), "/shack/sdr/");
+        // A prefix with no trailing slash is a *file* as far as the browser is
+        // concerned, and it resolves relative URLs beside it — so this has to
+        // agree with what the page's own `<script src>` tags will do.
+        assert_eq!(page_base("/sdroxide"), "/");
+        // Not a shape a browser produces, but the answer is still an address.
+        assert_eq!(page_base(""), "/");
+    }
 }

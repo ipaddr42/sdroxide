@@ -9,7 +9,7 @@ use eframe::egui::{self, RichText};
 use sdroxide_types::{Command, IsmFamily, IsmReport, IsmSettings, Mode, Vfo};
 
 use crate::app::SdroxideApp;
-use crate::app::panels::widgets::row_cell;
+use crate::app::panels::widgets::{row_cell, sort_head_cell};
 use crate::app::util::fmt_age;
 use crate::theme::ThemedScroll;
 
@@ -24,19 +24,6 @@ pub(in crate::app) enum IsmSort {
     Count,
     Signal,
     Frequency,
-}
-
-impl IsmSort {
-    const ALL: [IsmSort; 4] = [IsmSort::Heard, IsmSort::Count, IsmSort::Signal, IsmSort::Frequency];
-
-    fn label(self) -> &'static str {
-        match self {
-            IsmSort::Heard => "HEARD",
-            IsmSort::Count => "SEEN",
-            IsmSort::Signal => "SIG",
-            IsmSort::Frequency => "FREQ",
-        }
-    }
 }
 
 /// Least tall a device row may be. Rows grow past it: the readings column wraps,
@@ -154,7 +141,7 @@ impl SdroxideApp {
 
         ui.add_space(6.0);
         ui.separator();
-        self.ism_sort_chips(ui);
+        self.ism_count(ui);
         ui.add_space(2.0);
         self.ism_list(ui, cmds);
     }
@@ -411,22 +398,11 @@ impl SdroxideApp {
         }
     }
 
-    fn ism_sort_chips(&mut self, ui: &mut egui::Ui) {
+    /// How many devices are in the list. The ordering used to live here as a
+    /// row of chips and is now on the column headings themselves, where a table
+    /// is sorted everywhere else.
+    fn ism_count(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
-            ui.label(RichText::new("sort").size(10.0).color(crate::theme::CYAN_DIM()));
-            for s in IsmSort::ALL {
-                let on = self.ism_sort == s;
-                if crate::chrome::chip(ui, on, s.label()).clicked() {
-                    // Pressing the active one flips the direction, as the decode
-                    // list's sort chips do.
-                    if on {
-                        self.ism_sort_desc = !self.ism_sort_desc;
-                    } else {
-                        self.ism_sort = s;
-                        self.ism_sort_desc = true;
-                    }
-                }
-            }
             crate::chrome::row_tail(ui, |ui| {
                 ui.label(
                     RichText::new(format!("{} devices", self.ism_reports.len()))
@@ -465,7 +441,7 @@ impl SdroxideApp {
         // tune command through `cmds`.
         let mut tune_to: Option<f64> = None;
         let narrow = ui.available_width() < NARROW_W;
-        ism_header(ui, narrow);
+        ism_header(ui, narrow, &mut self.ism_sort, &mut self.ism_sort_desc);
         egui::ScrollArea::vertical()
             .id_salt("ism-devices")
             .max_height(ui.available_height())
@@ -489,33 +465,28 @@ impl SdroxideApp {
     }
 }
 
-/// The column headings, so the numbers in a row say what they are.
-fn ism_header(ui: &mut egui::Ui, narrow: bool) {
-    let head = |ui: &mut egui::Ui, w: f32, right: bool, text: &str| {
-        row_cell(
-            ui,
-            w,
-            14.0,
-            right,
-            egui::Label::new(
-                RichText::new(text).size(9.5).color(crate::theme::CYAN_DIM()).monospace(),
-            )
-            .truncate(),
-        );
-    };
+/// The column headings, so the numbers in a row say what they are — and what
+/// re-orders the list.
+fn ism_header(ui: &mut egui::Ui, narrow: bool, sort: &mut IsmSort, desc: &mut bool) {
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = COL_GAP;
         // The frame's left margin, so the headings sit over their columns.
         ui.add_space(6.0);
-        head(ui, W_AGE, true, "age");
-        head(ui, W_FREQ, true, "MHz");
-        head(ui, W_KIND, false, "device");
-        head(ui, W_DEVICE, false, "id");
+        let mut head = |ui: &mut egui::Ui, w: f32, right: bool, text: &str, key| {
+            sort_head_cell(ui, w, right, text, key, sort, desc);
+        };
+        head(ui, W_AGE, true, "age", Some(IsmSort::Heard));
+        head(ui, W_FREQ, true, "MHz", Some(IsmSort::Frequency));
+        // The model name and the device id are labels, not measurements: an
+        // alphabetical sky of thermometers answers no question this window is
+        // for.
+        head(ui, W_KIND, false, "device", None);
+        head(ui, W_DEVICE, false, "id", None);
         if !narrow {
-            head(ui, W_SNR, true, "sig");
-            head(ui, W_COUNT, true, "n");
+            head(ui, W_SNR, true, "sig", Some(IsmSort::Signal));
+            head(ui, W_COUNT, true, "n", Some(IsmSort::Count));
         }
-        head(ui, ui.available_width().max(40.0), false, "readings");
+        head(ui, ui.available_width().max(40.0), false, "readings", None);
     });
 }
 

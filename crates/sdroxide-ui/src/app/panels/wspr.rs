@@ -23,6 +23,7 @@ use crate::app::panels::widgets::{SlotState, row_cell, slot_bar, slot_phase_s};
 use crate::app::util::fmt_age;
 use crate::app::{SdroxideApp, rx_only_hint};
 use crate::chrome::StyledCombo;
+use crate::theme::ThemedScroll;
 use crate::time::{now_unix, now_unix_f64};
 
 /// How many receptions the panel keeps. Two hours of a busy 20 m evening.
@@ -55,7 +56,7 @@ impl SdroxideApp {
                 1 => {
                     self.wspr_map(ui, panel_h);
                 }
-                _ => self.wspr_status_pane(ui, cmds),
+                _ => self.wspr_status_scroll(ui, cmds),
             }
             return;
         }
@@ -92,7 +93,7 @@ impl SdroxideApp {
                 if map_h > 0.0 {
                     ui.add_space(6.0);
                 }
-                self.wspr_status_pane(ui, cmds);
+                self.wspr_status_scroll(ui, cmds);
             });
         });
     }
@@ -188,6 +189,22 @@ impl SdroxideApp {
 
     /// The beacon's own state, and the two settings an operator reaches for
     /// most: whether it transmits, and whether it moves between bands.
+    /// [`Self::wspr_status_pane`] with a scrollbar under it.
+    ///
+    /// The beacon's state is a fixed stack of rows — the band, the transmit
+    /// switch, the duty cycle, the power — and none of them can be dropped
+    /// without dropping a control. On a screen with less height than the stack
+    /// needs they used to run off the bottom edge and simply not be there: a
+    /// 1366×768 laptop, which is the tablet tier with its taller rows, lost the
+    /// transmit controls outright (issue #231). Scrolled, the same stack is all
+    /// still reachable, and on a screen with the room the bar never appears.
+    fn wspr_status_scroll(&mut self, ui: &mut egui::Ui, cmds: &mut Vec<Command>) {
+        egui::ScrollArea::vertical()
+            .id_salt("wspr-status")
+            .auto_shrink([false, false])
+            .show_themed(ui, |ui| self.wspr_status_pane(ui, cmds));
+    }
+
     fn wspr_status_pane(&mut self, ui: &mut egui::Ui, cmds: &mut Vec<Command>) {
         let status = self.digi_status.clone();
         let w = status.as_ref().and_then(|s| s.wspr.clone()).unwrap_or_default();

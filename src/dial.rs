@@ -25,6 +25,9 @@ pub(crate) struct Dial {
     rit: f64,
     /// Where an over has parked the dial, or `None` while receiving.
     tx: Option<f64>,
+    /// The frequency the last over parked the dial on, until the rig has
+    /// reported something else. See [`Self::report`].
+    stale_tx: Option<f64>,
 }
 
 impl Dial {
@@ -62,22 +65,45 @@ impl Dial {
             return None;
         }
         self.tx = Some(tx_hz);
+        self.stale_tx = None;
         Some(tx_hz)
     }
 
     /// Give the dial back, including any retune deferred during the over.
     /// `None` when the over never moved it.
     pub(crate) fn end_tx(&mut self) -> Option<f64> {
-        self.tx.take().map(|_| self.rx_hz())
+        self.tx.take().map(|tx| {
+            self.stale_tx = Some(tx);
+            self.rx_hz()
+        })
     }
 
     /// Fold a dial frequency the *rig* reported back into the VFO, returning the
     /// operator's new VFO. `None` while an over owns the dial: what the rig
     /// reports then is our own transmit frequency, which says nothing about
     /// where the operator wants to listen.
+    ///
+    /// The over is not over the moment the key comes up. A frequency read
+    /// issued during the transmission is answered a round trip later, and on a
+    /// polled link (CI-V over a serial port or a LAN session) that answer
+    /// routinely arrives *after* [`Self::end_tx`] has already handed the dial
+    /// back. Folded in, it would move the operator's VFO onto the transmit
+    /// frequency — a repeater over would leave the receiver sitting on the
+    /// machine's input, one shift away from the channel that was being worked
+    /// (issue #233). So the frequency the over parked on is remembered and
+    /// ignored until the rig reports something else, which the restore write
+    /// makes it do on the very next poll.
     pub(crate) fn report(&mut self, dial_hz: f64) -> Option<f64> {
         if self.tx.is_some() {
             return None;
+        }
+        if let Some(stale) = self.stale_tx {
+            if (dial_hz - stale).abs() < 1.0 {
+                return None;
+            }
+            // Anything else is the rig answering for where it is now — the
+            // restore write's own echo, or the operator's hand on the knob.
+            self.stale_tx = None;
         }
         self.vfo = dial_hz - self.rit;
         Some(self.vfo)
@@ -134,6 +160,42 @@ mod tests {
         // Unkey: back to the receive frequency, RIT included.
         assert_eq!(d.end_tx(), Some(14_074_700.0));
         assert_eq!(d.end_tx(), None, "the dial is only given back once");
+    }
+
+    /// Issue #233: a repeater over on an Icom left the receiver on the
+    /// machine's input. The read that went out mid-over is answered after the
+    /// key comes up, and folding that answer in moves the VFO onto the
+    /// transmit frequency — which is where the *next* over then applies the
+    /// shift again.
+    #[test]
+    fn the_answer_to_a_mid_over_read_does_not_move_the_vfo() {
+        let mut d = at(147_000_000.0);
+        // A 2 m repeater, DUP− 600: the over borrows the dial.
+        assert_eq!(d.begin_tx(146_400_000.0), Some(146_400_000.0));
+        assert_eq!(d.end_tx(), Some(147_000_000.0));
+        // The poll issued during the over lands now, carrying the transmit
+        // frequency. It says nothing about where the operator is listening.
+        assert_eq!(d.report(146_400_000.0), None);
+        assert_eq!(d.vfo, 147_000_000.0);
+        // The restore write's own echo clears the guard…
+        assert_eq!(d.report(147_000_000.0), Some(147_000_000.0));
+        // …so the operator really tuning to the input afterwards is adopted.
+        assert_eq!(d.report(146_400_000.0), Some(146_400_000.0));
+    }
+
+    /// The guard lasts one over, not for good: a fresh over re-arms it, and
+    /// nothing survives from the previous one.
+    #[test]
+    fn the_stale_guard_belongs_to_the_over_that_set_it() {
+        let mut d = at(145_600_000.0);
+        d.begin_tx(145_000_000.0);
+        d.end_tx();
+        assert_eq!(d.report(145_000_000.0), None);
+        // Another over, somewhere else. The first one's frequency is no longer
+        // special.
+        assert_eq!(d.begin_tx(144_000_000.0), Some(144_000_000.0));
+        assert_eq!(d.end_tx(), Some(145_600_000.0));
+        assert_eq!(d.report(145_000_000.0), Some(145_000_000.0));
     }
 
     #[test]

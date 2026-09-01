@@ -26,7 +26,7 @@ ewebsock = { path = "vendor/ewebsock" }
 soapysdr = { path = "vendor/soapysdr" }
 
 [workspace.package]
-version = "1.6.0"
+version = "1.6.3"
 edition = "2024"
 # The native binary links mfsk-core (GPL-3.0-or-later) for FT8/FT4 and the
 # DeepCW model (AGPL-3.0-only) for CW, so the built binary carries both. AGPL is
@@ -63,6 +63,13 @@ opt-level = 2
 # then slices 112 bits per candidate; unoptimized it costs more than everything
 # else in the receive chain put together.
 [profile.dev.package.sdroxide-adsb]
+opt-level = 2
+
+# Seven VDL2 channels each get a downconverter and a burst gate over the same
+# window, and every one of them measures the power of every sample; unoptimized
+# that alone outweighs the rest of the receive chain, exactly as the ISM gate
+# does.
+[profile.dev.package.sdroxide-vdl2]
 opt-level = 2
 
 # RADE's per-frame buffer shuffling sits between two C libraries that are
@@ -110,7 +117,10 @@ sdroxide-sdrplay = { path = "crates/sdroxide-sdrplay" }
 sdroxide-elad = { path = "crates/sdroxide-elad" }
 sdroxide-lime = { path = "crates/sdroxide-lime" }
 sdroxide-limerfe = { path = "crates/sdroxide-limerfe" }
+sdroxide-fobos = { path = "crates/sdroxide-fobos" }
+sdroxide-relay = { path = "crates/sdroxide-relay" }
 sdroxide-spyserver = { path = "crates/sdroxide-spyserver" }
+sdroxide-kiwisdr = { path = "crates/sdroxide-kiwisdr" }
 sdroxide-net = { path = "crates/sdroxide-net" }
 sdroxide-winlink = { path = "crates/sdroxide-winlink" }
 sdroxide-ax25 = { path = "crates/sdroxide-ax25" }
@@ -119,6 +129,7 @@ sdroxide-deepcw = { path = "crates/sdroxide-deepcw" }
 sdroxide-ism = { path = "crates/sdroxide-ism" }
 sdroxide-aprs = { path = "crates/sdroxide-aprs" }
 sdroxide-adsb = { path = "crates/sdroxide-adsb" }
+sdroxide-vdl2 = { path = "crates/sdroxide-vdl2" }
 
 serde = { version = "1", features = ["derive"] }
 num-complex = "0.4"
@@ -165,13 +176,16 @@ sdroxide-rx888.workspace = true
 sdroxide-airspyhf.workspace = true
 sdroxide-airspy.workspace = true
 sdroxide-hydrasdr.workspace = true
+sdroxide-fobos.workspace = true
 sdroxide-hackrf.workspace = true
 sdroxide-pluto.workspace = true
 sdroxide-sdrplay.workspace = true
 sdroxide-elad.workspace = true
 sdroxide-lime.workspace = true
 sdroxide-limerfe.workspace = true
+sdroxide-relay.workspace = true
 sdroxide-spyserver.workspace = true
+sdroxide-kiwisdr.workspace = true
 sdroxide-ui = { workspace = true, features = ["remote"] }
 # `accesskit` is one of eframe's defaults, and turning the defaults off
 # silently switched it back off: without it the whole widget tree is
@@ -233,6 +247,7 @@ assets = [
     ["packaging/linux/60-sdroxide-hydrasdr.rules", "usr/lib/udev/rules.d/", "644"],
     ["packaging/linux/60-sdroxide-elad.rules", "usr/lib/udev/rules.d/", "644"],
     ["packaging/linux/60-sdroxide-limerfe.rules", "usr/lib/udev/rules.d/", "644"],
+    ["packaging/linux/60-sdroxide-relay.rules", "usr/lib/udev/rules.d/", "644"],
     ["packaging/icons/sdroxide.svg", "usr/share/icons/hicolor/scalable/apps/sdroxide.svg", "644"],
     ["packaging/icons/sdroxide-16.png", "usr/share/icons/hicolor/16x16/apps/sdroxide.png", "644"],
     ["packaging/icons/sdroxide-24.png", "usr/share/icons/hicolor/24x24/apps/sdroxide.png", "644"],

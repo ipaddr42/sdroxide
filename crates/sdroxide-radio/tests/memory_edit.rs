@@ -54,6 +54,9 @@ fn caps() -> DeviceCaps {
         rx_channels: 1,
         sample_rates: vec![RATE],
         freq_ranges_rx: vec![(1_000_000.0, 60_000_000.0)],
+        // Three sockets, like an RSPdx: enough for the editor's antenna field
+        // to be a choice rather than a formality (issue #246).
+        antennas_rx: vec!["Antenna A".into(), "Antenna B".into(), "Antenna C".into()],
         ..DeviceCaps::default()
     }
 }
@@ -119,6 +122,7 @@ fn an_edit_rewrites_the_channel_it_names() {
         freq_hz: 0.0,
         mode: Mode::Cw,
         repeater: None,
+        antenna: None,
     });
     send(Command::EditMemory {
         id,
@@ -126,6 +130,7 @@ fn an_edit_rewrites_the_channel_it_names() {
         freq_hz: f64::NAN,
         mode: Mode::Cw,
         repeater: None,
+        antenna: None,
     });
 
     // ---- The name alone: everything else, the filter included, survives ----
@@ -135,6 +140,7 @@ fn an_edit_rewrites_the_channel_it_names() {
         freq_hz: STORED_HZ,
         mode: Mode::Usb,
         repeater: None,
+        antenna: None,
     });
     let renamed = memories(&h.event_rx, 1, |m| m.name == "DWD");
     assert_eq!(renamed[0].id, id, "an edit is the same channel, not a new one");
@@ -156,6 +162,7 @@ fn an_edit_rewrites_the_channel_it_names() {
         freq_hz: EDITED_HZ,
         mode: Mode::Cw,
         repeater: None,
+        antenna: None,
     });
     let edited = memories(&h.event_rx, 1, |m| m.name == "DDK2");
     assert_eq!(edited[0].id, id);
@@ -166,6 +173,33 @@ fn an_edit_rewrites_the_channel_it_names() {
         Mode::Cw.default_filter_at(EDITED_HZ),
         "the stored SSB passband would be a CW channel nobody could hear"
     );
+
+    // ---- The antenna is the operator's to set, not only the radio's ----
+    // Storing a channel captures whichever socket the radio was on; the editor
+    // is where an operator says which one it should have been.
+    send(Command::EditMemory {
+        id,
+        name: "DDK2".into(),
+        freq_hz: EDITED_HZ,
+        mode: Mode::Cw,
+        repeater: None,
+        antenna: Some("Antenna B".into()),
+    });
+    let on_b = memories(&h.event_rx, 1, |m| m.antenna.as_deref() == Some("Antenna B"));
+    assert_eq!(on_b[0].id, id, "still the same channel");
+
+    // A socket this front end does not have would be a channel that recalls
+    // onto nothing, so it reads as "leave the antenna alone" instead.
+    send(Command::EditMemory {
+        id,
+        name: "DDK2".into(),
+        freq_hz: EDITED_HZ,
+        mode: Mode::Cw,
+        repeater: None,
+        antenna: Some("Beverage".into()),
+    });
+    let cleared = memories(&h.event_rx, 1, |m| m.antenna.is_none());
+    assert_eq!(cleared[0].id, id);
 
     // ---- And it is on disk, not merely announced ----
     // The operator who corrected a typo did it once.

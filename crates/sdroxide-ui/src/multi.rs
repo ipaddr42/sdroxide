@@ -158,6 +158,10 @@ pub struct MultiApp {
     /// settings page. Cleared as soon as one arrives — see
     /// [`MultiApp::open_peer_radios`].
     pending_add: Option<String>,
+    /// A configuration to hand the radio `pending_add` is waiting for, from
+    /// "Public SDRs". Separate from `pending_add` because the plain "+" has
+    /// none and must still open the settings page.
+    pending_preset: Option<Box<sdroxide_types::RadioConfig>>,
     /// Addresses of a station's further radios that have already been opened
     /// beside the one that was dialled. Kept for the whole session and never
     /// cleared on close: a tab the operator shut is one they did not want, and
@@ -175,6 +179,14 @@ pub struct MultiApp {
     /// dragged. `None` only where every tab is somebody else's station, which
     /// is every browser client.
     station_radio: Option<u32>,
+    /// Whether the window has been checked against the screen it opened on.
+    ///
+    /// Once, on the first frame that knows both sizes. A window is only ever
+    /// brought *in* — see [`crate::layout::fit_inner_size`] — and doing it
+    /// every frame would fight an operator dragging their window bigger than
+    /// the display on purpose.
+    #[cfg(not(target_arch = "wasm32"))]
+    fitted: bool,
 }
 
 impl MultiApp {
@@ -241,8 +253,11 @@ impl MultiApp {
             remote,
             wgpu: cc.wgpu_render_state.clone(),
             pending_add: None,
+            pending_preset: None,
             peers_opened: std::collections::HashSet::new(),
             station_radio,
+            #[cfg(not(target_arch = "wasm32"))]
+            fitted: false,
         }
     }
 
@@ -491,7 +506,7 @@ impl MultiApp {
                         self.tabs[i].app.open_radio_settings();
                     }
                 }
-                RadioTabRequest::Add { station } => self.add_radio(&station, ctx),
+                RadioTabRequest::Add { station, preset } => self.add_radio(&station, preset, ctx),
                 #[cfg(not(target_arch = "wasm32"))]
                 RadioTabRequest::Connect { url, name } => self.connect_tab(&url, name, ctx),
                 RadioTabRequest::Close(id) => {
@@ -562,7 +577,7 @@ impl MultiApp {
                 // in the way. Adding a radio at a station is one screen away,
                 // in Settings → Radio, where the two rosters are already side
                 // by side.
-                StripAction::Add => self.add_radio("", ctx),
+                StripAction::Add => self.add_radio("", None, ctx),
             }
         }
     }
@@ -667,10 +682,15 @@ impl MultiApp {
                     // The switch. A radio at the far end of a connection has
                     // one too — the request goes to the station, which is where
                     // such a radio has always been switched on and off.
+                    //
+                    // Lit while the radio is on, like every other chip in the
+                    // program: a chip wears the accent when what it says is the
+                    // state in force, and this one says which state its radio is
+                    // in. Lighting it for OFF read as the opposite (issue #253).
                     if Self::switchable(tab) && tab.attached_to.is_none() {
                         let power = crate::chrome::chip(
                             ui,
-                            !tab.enabled,
+                            tab.enabled,
                             RichText::new(if tab.enabled { "ON" } else { "OFF" }).size(11.0),
                         );
                         let tip = if tab.enabled {
@@ -782,9 +802,14 @@ impl MultiApp {
     /// starts its engine and announces its roster again, and the new radio
     /// arrives as one more of that station's, through the same path the rest of
     /// them did.
-    fn add_radio(&mut self, station: &str, ctx: &egui::Context) {
+    fn add_radio(
+        &mut self,
+        station: &str,
+        preset: Option<Box<sdroxide_types::RadioConfig>>,
+        ctx: &egui::Context,
+    ) {
         if station.is_empty() {
-            self.add_tab(ctx);
+            self.add_tab(preset, ctx);
             return;
         }
         let Some(t) = self.tabs.iter_mut().find(|t| t.remote && t.app.station_key() == station)
@@ -796,6 +821,10 @@ impl MultiApp {
         // says otherwise.
         t.app.add_station_radio("");
         self.pending_add = Some(station.to_string());
+        // Held until the station announces the radio and `open_peer_radios`
+        // opens it: the radio does not exist yet, so there is nothing to
+        // configure until then.
+        self.pending_preset = preset;
         // Nothing else happens here. The station answers with its roster, and
         // `open_peer_radios` opens what is new in it — including, for a radio
         // this screen asked for, putting it in front of the operator.
@@ -819,14 +848,20 @@ impl MultiApp {
         t.app.remove_station_radio(station_id);
     }
 
-    fn add_tab(&mut self, ctx: &egui::Context) {
+    fn add_tab(&mut self, preset: Option<Box<sdroxide_types::RadioConfig>>, ctx: &egui::Context) {
         let Some(factory) = self.factory.as_mut() else { return };
         match factory() {
             Ok(r) => {
                 let i = self.install_tab(r, ctx);
-                // The new tab has no interface yet; the operator's next stop
-                // is Settings → Radio, so open it for them.
-                self.tabs[i].app.open_radio_settings();
+                match preset {
+                    // Already configured — it came from "Public SDRs", which
+                    // knows the whole answer. Opening the settings page over it
+                    // would be asking a question that has been answered.
+                    Some(cfg) => self.tabs[i].app.apply_radio_config(*cfg),
+                    // The new tab has no interface yet; the operator's next
+                    // stop is Settings → Radio, so open it for them.
+                    None => self.tabs[i].app.open_radio_settings(),
+                }
             }
             // Into the focused tab's dismissable banner — the main window's
             // strip may not be on screen to carry a message.
@@ -944,7 +979,10 @@ impl MultiApp {
                     let i = if asked_for {
                         self.pending_add = None;
                         let i = self.install_tab(r, ctx);
-                        self.tabs[i].app.open_radio_settings();
+                        match self.pending_preset.take() {
+                            Some(cfg) => self.tabs[i].app.apply_radio_config(*cfg),
+                            None => self.tabs[i].app.open_radio_settings(),
+                        }
                         i
                     } else {
                         self.append_tab(r, ctx)
@@ -1101,9 +1139,61 @@ impl MultiApp {
     }
 }
 
+impl MultiApp {
+    /// Bring a window that opened bigger than its screen back onto it.
+    ///
+    /// The size asked for at startup is in *points*, and a scaled display has
+    /// fewer of them than its pixel count suggests: a 1920×1080 screen at 150%
+    /// is 1280×720 points, and the 1280×800 window sdroxide asks for is then
+    /// wider than the whole desktop and 80 points taller. What that looks like
+    /// is the controls along the right-hand edge — the Setup gear at the end of
+    /// the top bar among them — simply not being on the display (issue #234).
+    ///
+    /// Run once, on the first frame where the window manager has reported both
+    /// the screen and the window, and it only ever makes the window smaller. An
+    /// operator who has deliberately dragged a window past the edge of their
+    /// display keeps it.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn fit_window(&mut self, ctx: &egui::Context) {
+        if self.fitted {
+            return;
+        }
+        let (monitor, inner, outer) = ctx.input(|i| {
+            let v = i.viewport();
+            (v.monitor_size, v.inner_rect.map(|r| r.size()), v.outer_rect.map(|r| r.size()))
+        });
+        // Nothing is claimed until the window manager has answered. On a
+        // desktop that never does, the check simply never runs — which is the
+        // behaviour every release before this one had.
+        let (Some(monitor), Some(inner), Some(outer)) = (monitor, inner, outer) else {
+            return;
+        };
+        self.fitted = true;
+        // The floor is the window's own minimum, as `gui_main` sets it: a
+        // screen too small for that is one where something has to be cut off
+        // either way.
+        if let Some(want) =
+            crate::layout::fit_inner_size(monitor, outer, inner, egui::vec2(800.0, 500.0))
+        {
+            tracing::info!(
+                "window {}x{} does not fit a {}x{} point screen — bringing it in to {}x{}",
+                inner.x.round(),
+                inner.y.round(),
+                monitor.x.round(),
+                monitor.y.round(),
+                want.x.round(),
+                want.y.round(),
+            );
+            ctx.send_viewport_cmd(egui::ViewportCommand::InnerSize(want));
+        }
+    }
+}
+
 impl eframe::App for MultiApp {
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        #[cfg(not(target_arch = "wasm32"))]
+        self.fit_window(&ctx);
         let now = ctx.input(|i| i.time);
         self.sanitize_panes(&ctx);
         // Pane order → tab index; `sanitize_panes` guaranteed each exists.

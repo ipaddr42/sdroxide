@@ -72,8 +72,11 @@ const MAX_STEP: usize = 8;
 /// starts trading columns for the budget.
 const VERTEX_BUDGET: usize = 260_000;
 
-/// Fraction of the strip's height the receding axis takes; the rest is the
-/// amplitude the newest row is drawn at.
+/// How the strip's height is split between the receding axis and the amplitude
+/// the newest row is drawn at: this much depth to `1 - DEPTH_FRAC` of
+/// amplitude. A ratio rather than a fraction of the strip, because [`FILL`]
+/// then scales the pair of them up together until the picture reaches the top
+/// edge.
 ///
 /// Nearly half, because the two compete: what the depth axis is given is what
 /// separates one row from the next, and a surface whose noise floor alone is
@@ -90,6 +93,25 @@ const PERSP: f32 = 0.85;
 /// How far the far end of the surface is dimmed towards the background, so
 /// depth reads as depth and not as a signal that got weaker.
 const FOG: f32 = 0.55;
+
+/// The share of the strip a picture built straight out of [`DEPTH_FRAC`] and
+/// [`PERSP`] would actually reach into, and so the divisor that takes the
+/// slack back out again.
+///
+/// The tallest thing the surface can draw is the *oldest* row at full scale:
+/// it stands on the back of the floor, [`DEPTH_FRAC`] up the strip, and adds
+/// its own amplitude foreshortened by `1/(1 + PERSP)` on top. That comes to
+/// about three quarters of the height, which left the top quarter of the strip
+/// unreachable — dead in every picture, and a quarter of a *bigger* number
+/// every time the operator dragged the separator down, so the display answered
+/// being given more room by growing its own margin.
+///
+/// Dividing both axes by it scales the picture up until the far row at the
+/// ceiling touches the top edge, which fixes the waste at nothing whatever the
+/// strip's height. The two axes keep their ratio to each other, so this is the
+/// same picture drawn larger and not a different balance between depth and
+/// amplitude.
+const FILL: f32 = DEPTH_FRAC + (1.0 - DEPTH_FRAC) / (1.0 + PERSP);
 
 /// One remembered spectrum, with the window it was taken over.
 ///
@@ -215,7 +237,7 @@ impl Surface {
 /// — the passband, the filter edges, the tuning lines — are kept inside, so
 /// they mark the front plane rather than cutting through the rows behind it.
 pub fn front_plane_h(strip_h: f32) -> f32 {
-    strip_h * (1.0 - DEPTH_FRAC)
+    strip_h * (1.0 - DEPTH_FRAC) / FILL
 }
 
 /// One-point perspective onto the strip: the newest row across the front at
@@ -232,7 +254,7 @@ impl Proj {
         Proj {
             cx: rect.center().x,
             front_y: rect.bottom(),
-            depth_h: rect.height() * DEPTH_FRAC,
+            depth_h: rect.height() * DEPTH_FRAC / FILL,
             amp_h: front_plane_h(rect.height()),
         }
     }
@@ -717,7 +739,8 @@ mod tests {
 
         let far = p.scale(1.0);
         assert!(far < 1.0, "the oldest row is not foreshortened");
-        assert!((p.base_y(1.0) - (rect.bottom() - rect.height() * DEPTH_FRAC)).abs() < 1e-3);
+        let depth_h = rect.height() * DEPTH_FRAC / FILL;
+        assert!((p.base_y(1.0) - (rect.bottom() - depth_h)).abs() < 1e-3);
         assert!(p.x(rect.left(), far) > rect.left(), "the back edge is not inset");
         assert!(p.x(rect.right(), far) < rect.right(), "the back edge is not inset");
     }
@@ -734,5 +757,40 @@ mod tests {
             assert!(top >= rect.top() - 0.001, "depth {d} drew above the strip: {top}");
             assert!(top <= rect.bottom(), "depth {d} drew below the strip: {top}");
         }
+    }
+
+    /// ...and it must reach it. The picture is built from the two axes and the
+    /// perspective, and left to itself it stopped a quarter of the way down
+    /// from the top edge — a band nothing could ever be drawn in, which grew
+    /// with the strip, so dragging the separator down bought the operator more
+    /// empty sky rather than more surface. [`FILL`] is what takes it out, and
+    /// it has to take *all* of it out at *every* height.
+    #[test]
+    fn the_surface_reaches_the_top_of_the_strip_at_any_height() {
+        for h in [40.0, 120.0, 400.0, 900.0, 1440.0] {
+            let rect = Rect::from_min_size(pos2(0.0, 7.0), egui::vec2(300.0, h));
+            let p = Proj::new(&rect);
+            // The tallest the surface can draw, which is the oldest row at the
+            // ceiling: it stands furthest back and its amplitude is stacked on
+            // top of the whole depth axis.
+            let top = (0..=20)
+                .map(|s| {
+                    let d = s as f32 / 20.0;
+                    p.base_y(d) - p.amp_h * p.scale(d)
+                })
+                .fold(f32::INFINITY, f32::min);
+            let waste = top - rect.top();
+            assert!(waste.abs() < 0.01, "a {h}-point strip left {waste} points above the surface");
+        }
+    }
+
+    /// The front plane the passband and the filter edges are drawn on is the
+    /// amplitude axis, so it has to be the *scaled* one — marks laid out on the
+    /// unscaled height would sit a third of the way down the row they annotate.
+    #[test]
+    fn the_marks_plane_is_the_amplitude_axis() {
+        let rect = Rect::from_min_size(pos2(0.0, 0.0), egui::vec2(300.0, 500.0));
+        let p = Proj::new(&rect);
+        assert!((front_plane_h(rect.height()) - p.amp_h).abs() < 1e-3);
     }
 }

@@ -1,0 +1,17 @@
+# Assets are addressed *relative to the page*, not to the server's root.
+#
+# Trunk's default writes `/sdroxide-web-<hash>.js` into index.html, which is an
+# address at the top of the host. That is only right where the client is served
+# from the root: behind a reverse proxy it commonly is not — an operator with a
+# Tailscale certificate gets no subdomains, so the natural home is
+# `https://host/sdroxide/` — and the bundle then 404s while the page itself
+# loads, which reads as the client being broken rather than misaddressed
+# (issue #241).
+#
+# `./` makes every emitted URL relative, so the browser resolves it against
+# whatever directory the page came from, prefix and all. It is also what the
+# hand-written `<script src="ws_arraybuffer.js">` tags in index.html already do,
+# and what the client's own socket address is built to do — see `page_base` in
+# src/main.rs.
+[build]
+public_url = "./"

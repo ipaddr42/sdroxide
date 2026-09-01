@@ -1,6 +1,7 @@
 mod adc;
 pub mod afsk;
 mod agc;
+mod binaural;
 mod ctcss;
 mod cw;
 mod ddc;
@@ -36,6 +37,8 @@ mod resample;
 pub mod rifp;
 mod rtty;
 mod sbnr;
+#[macro_use]
+mod simd;
 mod spectrum;
 mod spectrum_paint;
 mod sstv;
@@ -49,6 +52,7 @@ mod window;
 pub use adc::AdcMeter;
 pub use afsk::{AFSK_TX_PEAK, AfskProfile, AfskRx, AfskTx};
 pub use agc::Agc;
+pub use binaural::Binaural;
 pub use ctcss::{SubToneDetect, golay23_decode, golay23_encode};
 pub use cw::{CwDecoder, CwRx, CwTx, morse_decode, morse_encode, text_duration_s};
 pub use ddc::Ddc;
@@ -99,9 +103,54 @@ pub use spectrum_paint::{
 pub use sstv::{SstvEvent, SstvRx, SstvTx};
 pub use thor::{ThorRx, ThorTx};
 pub use tonegen::{BURST_LEVEL, SUB_TONE_LEVEL, SubToneGen, ToneBurst};
-pub use wbddc::WbDdc;
+pub use wbddc::{WbDdc, clamp_center_hz, reachable_range_hz};
 pub use wbspectrum::WideSpectrum;
 pub use wefax::{Ioc as WefaxIoc, Lpm as WefaxLpm, WefaxEvent, WefaxRx};
 pub use window::blackman_harris;
 
 pub type Complex32 = num_complex::Complex<f32>;
+
+/// A complex buffer seen as the interleaved `[re, im, re, im, …]` floats every
+/// backend's ring carries.
+///
+/// The two are the same bytes: `num_complex::Complex<f32>` is `#[repr(C)]` over
+/// two `f32` fields and so has an `f32`'s alignment and exactly twice its size,
+/// with no padding to skip. Every backend used to spell the conversion out a
+/// sample at a time — a scratch `Vec<f32>`, a loop pushing `re` and `im`, and
+/// another loop reading them back into `Complex32` — which is two passes over
+/// the whole stream to change nothing but the type. On an RX-888 at 16.2 Msps
+/// that was measured at about 6 % of everything the process was doing.
+pub fn as_interleaved(z: &[Complex32]) -> &[f32] {
+    // SAFETY: `Complex<f32>` is `#[repr(C)] { re: f32, im: f32 }`, so a slice of
+    // `n` of them is `2n` consecutive `f32` at the same address and alignment.
+    unsafe { std::slice::from_raw_parts(z.as_ptr().cast::<f32>(), z.len() * 2) }
+}
+
+/// [`as_interleaved`] for a buffer the caller wants *written* — a device read
+/// that fills interleaved floats can fill the engine's complex block directly.
+pub fn as_interleaved_mut(z: &mut [Complex32]) -> &mut [f32] {
+    // SAFETY: as `as_interleaved`, and the exclusive borrow is preserved.
+    unsafe { std::slice::from_raw_parts_mut(z.as_mut_ptr().cast::<f32>(), z.len() * 2) }
+}
+
+#[cfg(test)]
+mod interleave_tests {
+    use super::*;
+
+    /// The layout this is all built on, checked rather than assumed: a wrong
+    /// answer here would silently swap I and Q or halve the block length.
+    #[test]
+    fn a_complex_slice_is_its_own_interleaved_floats() {
+        assert_eq!(size_of::<Complex32>(), 2 * size_of::<f32>());
+        assert_eq!(align_of::<Complex32>(), align_of::<f32>());
+
+        let mut z = vec![Complex32::new(1.0, 2.0), Complex32::new(3.0, 4.0)];
+        assert_eq!(as_interleaved(&z), &[1.0, 2.0, 3.0, 4.0]);
+
+        as_interleaved_mut(&mut z).copy_from_slice(&[5.0, 6.0, 7.0, 8.0]);
+        assert_eq!(z, vec![Complex32::new(5.0, 6.0), Complex32::new(7.0, 8.0)]);
+
+        // An empty block must not produce a dangling non-empty slice.
+        assert!(as_interleaved(&[]).is_empty());
+    }
+}

@@ -17,7 +17,7 @@
 //! a loopback socket delivers in order and instantly, so nothing here proves
 //! anything about behaviour on a congested link.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, UdpSocket};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -63,6 +63,11 @@ pub struct SimOptions {
     /// looks like from outside: control answers, login succeeds, the data ports
     /// are named — and nothing ever answers on them.
     pub mute_data_ports: bool,
+    /// What every Set-mode menu item holds before the client writes anything
+    /// (`1A 05`). `0x00` is MIC on an IC-7300MK2's modulation inputs, and on no
+    /// model is it the value that means LAN — so a test can tell "the client
+    /// put this back" from "it was never changed".
+    pub menu_default: u8,
 }
 
 impl Default for SimOptions {
@@ -81,6 +86,7 @@ impl Default for SimOptions {
             port: 0,
             bind: Ipv4Addr::LOCALHOST,
             mute_data_ports: false,
+            menu_default: 0x00,
         }
     }
 }
@@ -102,6 +108,10 @@ struct Recorded {
     /// Set when the client pinged the audio stream — the keepalive that stops
     /// a radio timing out a receive-only session's silent uplink.
     audio_pinged: bool,
+    /// Set-mode menu items the client has written, by item number. The radio
+    /// keeps these across a session, which is the whole of issue #252: what is
+    /// left here when the client goes is what the operator finds on the rig.
+    menu: BTreeMap<u16, u8>,
 }
 
 /// A running simulated radio. Dropping it stops the thread.
@@ -109,6 +119,8 @@ pub struct Sim {
     port: u16,
     alive: Arc<AtomicBool>,
     recorded: Arc<Mutex<Recorded>>,
+    /// What an item nobody has written holds — see [`SimOptions::menu_default`].
+    menu_default: u8,
     /// Whether the scope is streaming — `27 11` sets it, and a test can clear
     /// it. See [`Sim::stall_scope`].
     scope_out: Arc<AtomicBool>,
@@ -131,6 +143,7 @@ impl Sim {
         // on the radio's own display streams nothing until `27 11`.
         let scope_out = Arc::new(AtomicBool::new(false));
 
+        let menu_default = opts.menu_default;
         let mut civ = SimStream::new(civ, "civ");
         let mut audio_stream = SimStream::new(audio, "audio");
         civ.mute = opts.mute_data_ports;
@@ -154,7 +167,14 @@ impl Sim {
         };
         let join =
             std::thread::Builder::new().name("icomnet-sim".into()).spawn(move || radio.run())?;
-        Ok(Sim { port, alive, recorded: recorded.clone(), scope_out, join: Some(join) })
+        Ok(Sim {
+            port,
+            alive,
+            recorded: recorded.clone(),
+            menu_default,
+            scope_out,
+            join: Some(join),
+        })
     }
 
     /// The control port to point a client at.
@@ -190,6 +210,21 @@ impl Sim {
     /// Whether the client gave its token back on the way out.
     pub fn token_returned(&self) -> bool {
         self.recorded.lock().unwrap_or_else(|e| e.into_inner()).token_returned
+    }
+
+    /// What Set-mode menu item `item` holds now: the value the client last
+    /// wrote into it, or [`SimOptions::menu_default`] if it never did.
+    ///
+    /// This is the state a radio is *left* in — what the operator walks up to
+    /// after the program has gone (issue #252).
+    pub fn menu_item(&self, item: u16) -> u8 {
+        self.recorded
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .menu
+            .get(&item)
+            .copied()
+            .unwrap_or(self.menu_default)
     }
 
     /// Whether the client has pinged the audio stream.
@@ -583,6 +618,28 @@ impl SimRadio {
                 Some(0x12) => Some(reply(vec![0x15, 0x12, 0x00, 0x00])),
                 _ => None,
             },
+            // The Set-mode menu, `1A 05 <hi> <lo> [value]`. A bare item number
+            // is a question and is answered with what the item holds; anything
+            // after it is a write, and the radio keeps it — which is what lets
+            // a test see what state the client left the rig in (issue #252).
+            0x1a if frame.get(5) == Some(&0x05) && frame.len() >= 9 => {
+                let item = (u16::from(frame[6]) << 8) | u16::from(frame[7]);
+                let value = &frame[8..frame.len() - 1];
+                match value.first() {
+                    Some(&v) => {
+                        self.recorded
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .menu
+                            .insert(item, v);
+                        Some(vec![0xfe, 0xfe, 0xe0, addr, 0xfb, 0xfd])
+                    }
+                    None => {
+                        let held = self.menu_item(item);
+                        Some(reply(vec![0x1a, 0x05, frame[6], frame[7], held]))
+                    }
+                }
+            }
             // Anything we are told to set is simply acknowledged.
             0x05 | 0x06 | 0x0f | 0x14 | 0x16 | 0x1a | 0x1c | 0x21 | 0x27 => {
                 Some(vec![0xfe, 0xfe, 0xe0, addr, 0xfb, 0xfd])
@@ -597,6 +654,18 @@ impl SimRadio {
             self.scope_out.store(frame.get(6) == Some(&0x01), Ordering::Relaxed);
             self.next_scope = Instant::now();
         }
+    }
+
+    /// What a Set-mode menu item holds: whatever the client last wrote there,
+    /// or the radio's own starting value.
+    fn menu_item(&self, item: u16) -> u8 {
+        self.recorded
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .menu
+            .get(&item)
+            .copied()
+            .unwrap_or(self.opts.menu_default)
     }
 
     fn send_civ(&mut self, frame: Vec<u8>) {

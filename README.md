@@ -47,7 +47,8 @@ One binary, three ways to run it:
   verified / TX unmeasured), Airspy R2/Mini (native support, experimental!),
   HydraSDR RFOne (native support, experimental!),
   ELAD FDM-DUO / FDM-S1 / FDM-S2 (native support, experimental!),
-  LimeSDR family + LimeRFE front end (via LimeSuite, experimental!)
+  LimeSDR family + LimeRFE front end (via LimeSuite, experimental!),
+  RigExpert Fobos SDR (native, via libfobos)
 - **Panadapter** — GPU (wgpu) waterfall + spectrum line, wheel-zoom around the
   cursor, drag-to-pan, per-digit frequency readout, selectable colormaps,
   peak-hold, and **auto-contrast** ("FIT", on by default) that keeps the display
@@ -70,7 +71,9 @@ One binary, three ways to run it:
   station picker, phasing and slant correction), transmit-only **RF Paint**
   (spectrum painting of text and images onto the waterfall), and receive-only
   **ADS-B** — the aircraft overhead on 1090 MHz, on a radar display with history
-  dots, speed vectors and data blocks.
+  dots, speed vectors and data blocks — and receive-only **VDL2**, the VHF
+  datalink those same aircraft exchange ACARS over, on all seven channels around
+  136.8 MHz at once, with the messages and the stations sending them.
 - **Receiver** — hang AGC, draggable passband filter edges (on the spectrum and
   the waterfall), noise blanker, auto-notch, **four noise-reduction engines**
   (RNNoise, DeepFilterNet3, a libspecbleach port and the built-in spectral NR,
@@ -116,6 +119,16 @@ One binary, three ways to run it:
   Announcements play on their own sound device, so they are never recorded and
   never sent to a remote listener. The window is also exposed to NVDA, Orca and
   VoiceOver.
+- **T/R switch** — drives an external relay that disconnects and grounds the
+  SDR's antenna input while the station transmits, and sequences an amplifier or
+  an outboard T/R relay with it (per-contact lead and hold, so the antenna
+  always throws before the amplifier is keyed and unkeys before it comes back).
+  Works with the cheap USB relay boards (LCUS/CH340, KMtronic, Numato), USB HID
+  relay boards, CM108/CM119 sound-card GPIO, a serial RTS/DTR line into any
+  interface that wants a PTT closure, a Raspberry Pi GPIO line, or an external
+  command. An optional transmit-sense input on the same port sees a rig keyed at
+  its own microphone in milliseconds instead of the few hundred a CAT poll
+  takes. See "T/R switch" in the user manual for what this cannot do.
 - **Persistence** — device, rates, gains, memories, band stacks, the FT8/FT4/FT2
   operator profile, network/QSL credentials, control bindings, and the logbook
   are all stored under `~/.config/sdroxide/`.
@@ -415,6 +428,18 @@ starting sdroxide before the rig is fine:
   kilobytes a frame. Roughly a hundredth of the link a wideband Airspy stream
   needs.
 
+- **KiwiSDR / Web-888 (network)** — one of the ~900 receivers published on
+  `rx.kiwisdr.com`, or a private one on the same firmware. Receive only: these
+  are other people's antennas. A KiwiSDR has no wideband I/Q to give — what it
+  has is user channels about 12 kHz wide, one of which it will send as complex
+  baseband instead of as audio — so the panadapter is that window and the strip
+  above it is the receiver's own 0–30 MHz waterfall. Tuning across the strip
+  retunes the receiver. About 64 kB/s while connected.
+
+  Browse the public ones with **PUBLIC SDR** in the System box; picking one there
+  fills the address in and opens it, either in this radio or in a tab of its
+  own.
+
 - **RX-888 (USB)** — an RX-888 or RX-888 Mk2 direct-sampling HF receiver
   (LTC2208 16-bit ADC, Cypress FX3), driven directly over USB by a native
   pure-Rust driver. **No SoapySDR, no libusb, and no vendor driver package.**
@@ -703,6 +728,50 @@ starting sdroxide before the rig is fine:
   For the LimeRFE specifically, `cargo run -p sdroxide-limerfe --example rfe --
   /dev/ttyUSB0` talks to the board on its own and prints what happened at each
   step.
+
+- **RigExpert Fobos SDR (USB)** — a Fobos SDR, driven through RigExpert's own
+  **libfobos**. That library is LGPL-2.1 and open source
+  ([github.com/rigexpert/libfobos](https://github.com/rigexpert/libfobos)), but
+  it is still **found at runtime rather than linked** — same as SDRplay and
+  LimeSuite above, and for the same reason: this interface is in every build
+  variant, nobody needs the library installed to compile sdroxide, and a
+  machine without it enumerates nothing and says what to install. Receive only.
+
+  **Three inputs, and they are genuinely different radios.** The **RF port**
+  goes through the tuner — 25 MHz–5.4 GHz, the receiver's own reported sample
+  rates up to 80 Msps, with the LNA (0–3) and VGA (0–31) gain stages on the
+  Radio tab. **HF1** and **HF2** bypass the tuner for direct sampling, which
+  means no local oscillator at all: the receiver hands back two independent
+  *real* ADC channels, and sdroxide turns the selected one into complex
+  baseband itself with the same wideband channelizer the RX-888 uses for the
+  identical problem. Tuning on those two is therefore pure software — nothing
+  is commanded at the radio — and the gain sliders do nothing, because the
+  front end they belong to is powered down while direct sampling runs. The
+  panel says so rather than leaving them looking broken.
+
+  **The rate you pick on HF1/HF2 sets how low you can tune.** The
+  downconverter selects a band out of a real spectrum, so it can never centre
+  closer to DC than half its own output rate: at 2.5 Msps the floor is
+  1.25 MHz, which puts the whole AM broadcast band out of reach. The default is
+  **625 kHz** for exactly that reason — a floor of 312.5 kHz, under every
+  mediumwave channel — and a dial below whatever the current floor is says so
+  in the log and reports the frequency it really landed on, rather than
+  labelling something else with the frequency you asked for.
+
+  **HF1 + HF2 runs both real channels at once**, combined by the same adaptive
+  filter the RSPduo's second tuner and the LimeSDR's second chain use: *cancel*
+  to null a local noise source, or *combine* for diversity reception, with mode,
+  adaptation rate and hold on the main strip and the filter length on the Radio
+  tab. Both channels come off one ADC on one clock, so unlike two independent
+  tuners the phase between them is reproducible across a restart. An external
+  clock reference is a switch on the same tab.
+
+  **Verified against real hardware** by the contributor who wrote it, on all
+  three inputs — including 38.6 dB of measured cancellation on real aerials.
+  Two ADC rates turned out to be unusable for streaming on that unit (40 Msps
+  never streams; 50 Msps streams but distorts audibly), and the rate selection
+  steers around both, at the cost of a practical ceiling around 10 MHz for the
+  widest HF views.
 
 - **PlutoSDR (network)** — an ADALM-Pluto, driven directly over the **IIOD**
   protocol its on-board daemon serves. **No SoapySDR and no libiio**, so it
@@ -1311,6 +1380,44 @@ you do not recognise, note that LimeSuite claims the bare Cypress FX3 id that an
 *unprogrammed RX-888* also presents — sdroxide filters those out by board name
 and `--probe` names what it skipped.
 
+### T/R switch permissions
+
+Only two of the six kinds of switching hardware need anything here.
+
+**USB HID relay boards and CM108 sound-card GPIO.** sdroxide writes HID reports
+to these, and no distribution grants that by default — a card that plainly works
+for audio still cannot switch anything until the rule is in:
+
+```sh
+sudo cp packaging/linux/60-sdroxide-relay.rules /usr/lib/udev/rules.d/
+sudo udevadm control --reload
+```
+
+The `.deb` installs it for you. As with the LimeRFE rule, it is worth knowing
+what it costs: the dcttech relay boards carry `16c0:05df`, a *V-USB hobby id*
+shared with other people's home-made keyboards and LED controllers, so the rule
+loosens permissions on any such device on the machine. sdroxide's own device list
+additionally filters on the product string (`USBRelay…`), so it does not offer
+you somebody's keyboard as an antenna relay — but udev cannot make that
+distinction.
+
+**Serial relay boards** (LCUS, KMtronic, Numato) and **RTS/DTR lines** need
+nothing from this file: they are serial ports, so add yourself to `dialout` as
+you would for a CAT cable.
+
+To check what a machine can see, and to throw one contact with the transmitter
+cold:
+
+```sh
+cargo run -p sdroxide-relay --example relay -- --list --all
+cargo run -p sdroxide-relay --example relay -- --serial /dev/ttyUSB0 --board lcus --set 1 on
+```
+
+**Windows and macOS.** No driver and no permissions to set — but note that the
+HID paths on both have never been run against hardware, only compiled. If a
+board is not found or does not switch on either, the `--list --all` transcript
+above is what to attach to a bug report.
+
 ### SDRplay RSP prerequisites
 
 SDR Oxide does not interface with the USB device itself. It talks to the [SDRplay API](https://www.sdrplay.com/api/)
@@ -1363,7 +1470,7 @@ way.
 | `--freq <HZ>` | Center frequency in Hz (default: where the last session was left; `14200000` on a first run). |
 | `--rate <HZ>` | Sample rate in Hz (default: from config). |
 | `--gain <DB>` | Overall RX gain in dB (default: hardware AGC / moderate). |
-| `--mode <MODE>` | Initial mode: `USB LSB CW AM SAM NFM WFM DIGU DIGL DSB SPEC FT8 FT4 FT2 PSK RTTY OLIVIA THOR FSQ HELL SSTV RIFP WEFAX RFPAINT RADE ADS-B`. Default: the mode the last session was left in. |
+| `--mode <MODE>` | Initial mode: `USB LSB CW AM SAM NFM WFM DIGU DIGL DSB SPEC FT8 FT4 FT2 PSK RTTY OLIVIA THOR FSQ HELL SSTV RIFP WEFAX RFPAINT RADE ADS-B VDL2`. Default: the mode the last session was left in. |
 | `--antenna <NAME>` | RX antenna port, as the device names it (`LNAH`, `TX/RX`; see `--probe`). Default: the port the last session was left on. |
 | `--tx-antenna <NAME>` | TX antenna port, likewise (`BAND1`, `BAND2`). |
 | `--server` | Run as a server: HTTP web client + WebSocket streaming backend. |

@@ -18,8 +18,22 @@ use sdroxide_types::{Command, Mode, SatLockConfig, SatUplink, Vfo};
 
 use crate::app::SdroxideApp;
 use crate::theme;
+use crate::theme::ThemedScroll;
 
 /// Everything the window remembers between frames.
+/// Which page of the SATELLITE window is showing.
+///
+/// QO-100 lives here rather than in a window of its own because it *is* a
+/// satellite — a geostationary one with a transponder, which is the only kind
+/// this program can work through without Doppler. Its calibration simply
+/// arrived first, before there was a satellite window to put it in.
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+pub(in crate::app) enum SatTab {
+    #[default]
+    Satellites,
+    Qo100,
+}
+
 #[derive(Default)]
 pub(in crate::app) struct SatWinState {
     pub search: String,
@@ -565,6 +579,11 @@ impl SdroxideApp {
             return;
         }
         let mut win = std::mem::take(&mut self.sat_win);
+        // The QO-100 page keeps its own waterfall rows and texture between
+        // frames, exactly as the picker keeps its element list. Taken here
+        // rather than inside the tab arm because `qo100_body` needs `&mut self`
+        // and the state lives on `self`.
+        let mut qo100 = std::mem::take(&mut self.qo100_win);
         let mut open = self.show_sat;
         let resp = egui::Window::new("SATELLITE")
             .id(crate::layout::salted_id(ctx, "SATELLITE"))
@@ -575,16 +594,61 @@ impl SdroxideApp {
             .default_height(crate::layout::window_h(ctx, 520.0))
             .show(ctx, |ui| {
                 crate::chrome::window_body_bg(ui);
-                self.sat_body(ui, &mut win, cmds)
+                self.sat_body(ui, &mut win, &mut qo100, cmds)
             });
         if let Some(r) = &resp {
             crate::chrome::paint_window_border(ctx, &r.response);
         }
         self.show_sat = open;
         self.sat_win = win;
+        self.qo100_win = qo100;
     }
 
-    fn sat_body(&mut self, ui: &mut egui::Ui, win: &mut SatWinState, cmds: &mut Vec<Command>) {
+    fn sat_body(
+        &mut self,
+        ui: &mut egui::Ui,
+        win: &mut SatWinState,
+        qo100: &mut crate::app::qo100::Qo100WinState,
+        cmds: &mut Vec<Command>,
+    ) {
+        // A dot on the tab whose work is running, so the *other* page's state
+        // is not invisible while this one is open. The same argument the
+        // System chip's green accent makes one level up — here as a mark rather
+        // than a colour, because a tab's colour already means "selected".
+        let live = |on: bool, label: &str| {
+            if on { format!("{label} •") } else { label.to_string() }
+        };
+        let locked = self.sat_track.is_some();
+        let hunting = self.state.qo100.enabled;
+        crate::chrome::tab_bar(ui, |ui, bar| {
+            for (tab, label) in [
+                (SatTab::Satellites, live(locked, "SATELLITES")),
+                (SatTab::Qo100, live(hunting, "QO-100")),
+            ] {
+                if bar.tab(ui, self.sat_tab == tab, label).clicked() {
+                    self.sat_tab = tab;
+                }
+            }
+        });
+        // No separator: the strip's own baseline is the line between the tabs
+        // and the page they open.
+        ui.add_space(8.0);
+
+        match self.sat_tab {
+            SatTab::Satellites => self.sat_page(ui, win, cmds),
+            // Its own scroll area: the beacon page is a 130 pt waterfall plus a
+            // grid plus the telemetry frame, which is taller than this window
+            // opens at, and the satellite page below sizes itself.
+            SatTab::Qo100 => {
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .show_themed(ui, |ui| self.qo100_body(ui, qo100, cmds));
+            }
+        }
+    }
+
+    /// The satellite page: the live lock, then the picker.
+    fn sat_page(&mut self, ui: &mut egui::Ui, win: &mut SatWinState, cmds: &mut Vec<Command>) {
         // (Re)built here rather than down in the picker: the lock pane draws
         // its pass diagram from the same element sets, and it runs first.
         let now = crate::time::now_unix();

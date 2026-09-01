@@ -32,7 +32,6 @@ const SILENCE_BEFORE_RECONNECT: Duration = Duration::from_secs(5);
 pub struct RtlSdrSource {
     handle: RtlSdrHandle,
     center: f64,
-    rx_scratch: Vec<f32>,
     label: String,
     /// Last gain the operator asked for, and what the hardware snapped it to.
     gain_db: f64,
@@ -97,7 +96,6 @@ impl RtlSdrSource {
         tracing::info!("RTL-SDR source ready: {label}, center {center_hz:.0} Hz");
         RtlSdrSource {
             center: center_hz,
-            rx_scratch: Vec::new(),
             label,
             gain_db: s.gain_db,
             agc: s.agc,
@@ -173,19 +171,17 @@ impl IqSource for RtlSdrSource {
     }
 
     fn read(&mut self, buf: &mut [Complex32]) -> Result<usize> {
-        let need = buf.len() * 2;
-        if self.rx_scratch.len() < need {
-            self.rx_scratch.resize(need, 0.0);
-        }
-        let n = self.handle.rx_read(&mut self.rx_scratch[..need]);
+        // Straight into the caller's block: the ring's interleaved floats and a
+        // complex buffer are the same bytes, so there is nothing to unpack —
+        // see `sdroxide_dsp::as_interleaved_mut`. The scratch vector and the
+        // loop that copied out of it were a second pass over the whole stream
+        // to change nothing but the type.
+        let n = self.handle.rx_read(sdroxide_dsp::as_interleaved_mut(buf));
         let pairs = n / 2;
         if pairs == 0 {
             // Nothing yet — brief nap so the DSP loop doesn't spin hot.
             std::thread::sleep(Duration::from_millis(2));
             return Ok(0);
-        }
-        for p in 0..pairs {
-            buf[p] = Complex32::new(self.rx_scratch[2 * p], self.rx_scratch[2 * p + 1]);
         }
         if let Some(iq) = self.iq_correct.as_mut() {
             iq.process(&mut buf[..pairs]);

@@ -141,6 +141,25 @@ struct Track {
     hits: u32,
 }
 
+/// Whether any part of a `rate`-wide window on `center_hz` is in a sub-segment
+/// this skimmer's mode is called on.
+///
+/// The whole window at once, rather than a mask per bin as the CW skimmer
+/// keeps: the per-bin test here is already done inside the candidate loop
+/// ([`DigiSkimmer::on_frame`]), and what is missing is only the outer question
+/// — is there any point running the transform at all.
+fn any_segment(kind: SkimmerKind, rate: f64, center_hz: f64) -> bool {
+    let bin_hz = rate / FFT_SIZE as f64;
+    (0..FFT_SIZE).any(|k| {
+        let off = if k <= FFT_SIZE / 2 { k as i64 } else { k as i64 - FFT_SIZE as i64 };
+        let hz = center_hz + off as f64 * bin_hz;
+        match kind {
+            SkimmerKind::Rtty => is_rtty_segment(hz),
+            _ => is_psk_segment(hz),
+        }
+    })
+}
+
 pub struct DigiSkimmer {
     kind: SkimmerKind,
     skim_rate: f64,
@@ -180,6 +199,14 @@ pub struct DigiSkimmer {
     psk_sps: f32,
     rtty_bit_len: f32,
     rtty_shift_bins: i64,
+    /// Whether this window holds any of the calling sub-bands this skimmer
+    /// reads. False stands it down entirely — no transform, no detection.
+    ///
+    /// The candidate loop already refuses everything outside them, so off an
+    /// amateur band every frame of the transform was work whose every result
+    /// was thrown away: two of these run beside the CW skimmer, and on an
+    /// RTL-SDR at 2.4 Msps they were the whole of the skimmer thread.
+    any_seg: bool,
 }
 
 impl DigiSkimmer {
@@ -219,12 +246,14 @@ impl DigiSkimmer {
             psk_sps: (frame_rate / PSK_BAUD) as f32,
             rtty_bit_len: (frame_rate / RTTY_BAUD) as f32,
             rtty_shift_bins: (RTTY_SHIFT / bin_hz).round() as i64,
+            any_seg: any_segment(kind, skim_rate, skim_center_hz),
         }
     }
 
     pub fn set_center(&mut self, center_hz: f64) {
         if (center_hz - self.skim_center_hz).abs() > 1.0 {
             self.skim_center_hz = center_hz;
+            self.any_seg = any_segment(self.kind, self.skim_rate, center_hz);
             self.reset();
         }
     }
@@ -288,6 +317,13 @@ impl DigiSkimmer {
     }
 
     pub fn process(&mut self, iq: &[C32]) {
+        // Nowhere in this window is a sub-band this skimmer reads, so there is
+        // nothing for the transform to find — see [`DigiSkimmer::any_seg`].
+        // Ahead of the buffering, so a stand-down does not hand the band back
+        // as a backlog when the operator tunes onto one.
+        if !self.any_seg {
+            return;
+        }
         self.inbuf.extend_from_slice(iq);
         while self.read_pos + FFT_SIZE <= self.inbuf.len() {
             let base = self.read_pos;
@@ -602,6 +638,36 @@ mod tests {
             shown.process(chunk);
         }
         assert!(!shown.spots().is_empty(), "no spots with the view cleared");
+    }
+
+    /// A window with none of the mode's calling sub-bands in it does no work at
+    /// all — the candidate loop would refuse everything the transform found, so
+    /// the transform itself is what has to stop.
+    #[test]
+    fn a_window_with_no_calling_sub_band_skims_nothing() {
+        let rate = 192_000.0;
+        let off = 2_000.0;
+        let iq = synth_psk("CQ CQ DE AB1CD K ", off, rate);
+
+        // The control: the same signal in the 20 m PSK area.
+        let mut ham = DigiSkimmer::new(SkimmerKind::Psk, rate, 14_070_000.0);
+        for chunk in iq.chunks(8192) {
+            ham.process(chunk);
+        }
+        assert!(!ham.spots().is_empty(), "the control case decoded nothing");
+
+        let mut fm = DigiSkimmer::new(SkimmerKind::Psk, rate, 96_300_000.0);
+        for chunk in iq.chunks(8192) {
+            fm.process(chunk);
+        }
+        assert!(fm.spots().is_empty(), "spotted a carrier on the broadcast FM band");
+
+        // And the stand-down travels with the window.
+        fm.set_center(14_070_000.0);
+        for chunk in iq.chunks(8192) {
+            fm.process(chunk);
+        }
+        assert!(!fm.spots().is_empty(), "nothing decoded after moving onto 20 m");
     }
 
     #[test]

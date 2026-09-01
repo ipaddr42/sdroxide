@@ -417,19 +417,30 @@ impl RtlSdrHandle {
     /// Drain interleaved I,Q floats into `out`. Always returns an even count,
     /// so the stream can never come out of alignment. Zero means nothing is
     /// available yet.
+    ///
+    /// One chunk, not a value at a time. `Consumer::pop` publishes the read
+    /// index with a release store on **every element**, so draining a block of
+    /// sixteen thousand complex samples was thirty-two thousand stores to a
+    /// cache line the producer thread also holds — for what is otherwise a
+    /// `memcpy`. Measured at 0.75 % of everything the program was doing on an
+    /// RTL-SDR at 2.4 Msps, which is a tenth of the DSP thread that the
+    /// overrun message blames. Same shape as the RX-888 backend's drain.
     pub fn rx_read(&mut self, out: &mut [f32]) -> usize {
-        let take = self.rx.slots().min(out.len()) & !1;
-        let mut n = 0;
-        while n < take {
-            match self.rx.pop() {
-                Ok(v) => {
-                    out[n] = v;
-                    n += 1;
-                }
-                Err(_) => break,
-            }
+        let n = self.rx.slots().min(out.len()) & !1;
+        if n == 0 {
+            return 0;
         }
-        n
+        match self.rx.read_chunk(n) {
+            Ok(chunk) => {
+                // Two slices where the ring wraps, one where it does not.
+                let (a, b) = chunk.as_slices();
+                out[..a.len()].copy_from_slice(a);
+                out[a.len()..a.len() + b.len()].copy_from_slice(b);
+                chunk.commit_all();
+                n
+            }
+            Err(_) => 0,
+        }
     }
 
     fn send(&self, c: Ctrl) {

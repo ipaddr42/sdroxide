@@ -288,6 +288,47 @@ fn selecting_the_tx_antenna_reaches_the_hardware() {
     let _ = thread.map(|t| t.join());
 }
 
+/// A station with more than one antenna has one *per band*: the beam on 2 m and
+/// the wire on 40. Switching bands has to bring the socket with it, or the
+/// operator reaches for the antenna control every time the dial crosses a band
+/// edge — which is an antenna selector not doing its job (issues #235, #238).
+#[test]
+fn the_antenna_follows_the_band_it_was_chosen_on() {
+    let ports = Ports::fresh();
+    let mut h =
+        start_engine(Box::new(Rig { ports: ports.clone() }), caps(), EngineConfig::default());
+    let thread = h.thread.take();
+    let send = |c: Command| h.cmd_tx.send(c).unwrap();
+
+    // 40 m on LNAL…
+    send(Command::SetVfo { vfo: sdroxide_types::Vfo::A, hz: 7_100_000.0 });
+    send(Command::SetAntenna { dir: Direction::Rx, name: "LNAL".into() });
+    assert!(wait_for_state(&h.event_rx, |s| s.antenna_rx == "LNAL"));
+
+    // …20 m on LNAW.
+    send(Command::SetVfo { vfo: sdroxide_types::Vfo::A, hz: 14_100_000.0 });
+    send(Command::SetAntenna { dir: Direction::Rx, name: "LNAW".into() });
+    assert!(wait_for_state(&h.event_rx, |s| s.antenna_rx == "LNAW"));
+
+    // Back to 40 m: the socket comes back on its own.
+    send(Command::SetVfo { vfo: sdroxide_types::Vfo::A, hz: 7_050_000.0 });
+    assert!(
+        wait_for_state(&h.event_rx, |s| s.antenna_rx == "LNAL"),
+        "40 m was left on LNAL and has to come back to it"
+    );
+    assert_eq!(ports.rx(), "LNAL", "and the socket reached the hardware");
+
+    // A band nobody has chosen on is left exactly where the radio already is:
+    // no preference means no assertion, the same rule a restored session
+    // follows.
+    send(Command::SetVfo { vfo: sdroxide_types::Vfo::A, hz: 28_100_000.0 });
+    std::thread::sleep(Duration::from_millis(200));
+    assert_eq!(ports.rx(), "LNAL", "10 m has no remembered socket, so nothing moved");
+
+    drop(h);
+    let _ = thread.map(|t| t.join());
+}
+
 /// A rig that drops out and comes back is reopened by the engine, and a freshly
 /// opened device is on its driver's default port. The antenna belongs to the
 /// station's coax rather than to the front end, so it has to be restored — an

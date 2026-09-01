@@ -23,11 +23,25 @@ struct ApiState {
     opened: bool,
     /// One log line per absence, not one per rescan tick.
     complained: bool,
+    /// The receivers this process has selected and not yet released, as
+    /// (serial, `hwVer`) — one entry per live selection.
+    ///
+    /// The service's device table only lists receivers that are *free*: the
+    /// moment `SelectDevice` succeeds the device disappears from
+    /// `GetDevices`, for us as much as for anybody else. So on a station with
+    /// two RSPs, opening one left the picker listing the other and nothing
+    /// else — the operator's own receiver had vanished from the list of
+    /// receivers, and every row the dialog draws from the listed model (ports,
+    /// tuners, LNA range) then described the wrong box (issue #259). This is
+    /// what puts it back.
+    held: Vec<(String, u8)>,
 }
 
 fn state() -> &'static Mutex<ApiState> {
     static STATE: OnceLock<Mutex<ApiState>> = OnceLock::new();
-    STATE.get_or_init(|| Mutex::new(ApiState { api: None, opened: false, complained: false }))
+    STATE.get_or_init(|| {
+        Mutex::new(ApiState { api: None, opened: false, complained: false, held: Vec::new() })
+    })
 }
 
 /// Load the library and connect to the service, both idempotent.
@@ -112,16 +126,34 @@ fn devices_locked(api: &ffi::Api) -> Result<Vec<ffi::DeviceT>> {
         .collect())
 }
 
-/// List the RSPs the service reports, or say why that is impossible — the
+/// List the RSPs this machine has, or say why that is impossible — the
 /// distinction `--probe` needs between "no library", "no service" and simply
 /// "no devices".
+///
+/// The receivers this process already holds lead the list, ahead of the free
+/// ones the service reports: they are missing from the service's table
+/// precisely *because* they are ours, and a picker that leaves them out is a
+/// picker that cannot describe the receiver it is open on. Leading rather
+/// than trailing because an empty serial means "the first one found", and the
+/// one already found is the one already open.
 pub fn try_list() -> Result<Vec<SdrPlayDevice>> {
     let mut s = state().lock().expect("sdrplay api state poisoned");
     let api = ensure_open(&mut s)?;
-    Ok(devices_locked(&api)?
+    let mut out: Vec<SdrPlayDevice> = s
+        .held
         .iter()
-        .map(|d| SdrPlayDevice { serial: d.serial(), hw_ver: d.hw_ver })
-        .collect())
+        .map(|(serial, hw_ver)| SdrPlayDevice { serial: serial.clone(), hw_ver: *hw_ver })
+        .collect();
+    for d in devices_locked(&api)? {
+        let serial = d.serial();
+        // A device cannot be both free and ours, but the service has been
+        // known to list a stale entry across a re-enumeration; one row per
+        // receiver either way.
+        if !out.iter().any(|h| h.serial == serial) {
+            out.push(SdrPlayDevice { serial, hw_ver: d.hw_ver });
+        }
+    }
+    Ok(out)
 }
 
 /// List the RSPs the service reports. Best-effort: no library, no service or
@@ -215,13 +247,20 @@ pub(crate) fn select(
         Ok(dev)
     })();
     unsafe { (api.unlock_device_api)() };
+    if let Ok(dev) = &result {
+        s.held.push((dev.serial(), dev.hw_ver));
+    }
     result.map(|dev| (api, dev))
 }
 
 /// Hand a selected device back to the service. Best-effort: on an unplugged
 /// device the service has already reclaimed it and the error means nothing.
 pub(crate) fn release(dev: &mut ffi::DeviceT) {
-    let s = state().lock().expect("sdrplay api state poisoned");
+    let mut s = state().lock().expect("sdrplay api state poisoned");
+    let serial = dev.serial();
+    if let Some(i) = s.held.iter().position(|(h, _)| *h == serial) {
+        s.held.remove(i);
+    }
     if let Some(api) = &s.api {
         let err = unsafe { (api.release_device)(dev) };
         if err != ffi::ERR_SUCCESS {

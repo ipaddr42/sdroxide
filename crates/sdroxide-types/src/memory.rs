@@ -40,6 +40,19 @@ pub struct MemoryChannel {
     /// standing on the simplex channel at the end of it.
     #[serde(default)]
     pub repeater: Option<crate::RepeaterState>,
+    /// The antenna socket this channel was stored on, by the name the front end
+    /// gives the port (`"ANT2"`, `"Antenna B"`).
+    ///
+    /// `None` — and that is every channel stored on a radio with one antenna,
+    /// as well as every one written before this existed — means "leave the
+    /// antenna alone", which is the opposite of how [`Self::repeater`] reads an
+    /// absent field and deliberately so. A shift left standing from the last
+    /// recall transmits on the wrong frequency; an antenna left standing is at
+    /// worst the wrong one to listen on, and inventing "put it back on ANT1"
+    /// for a list of channels that never said anything about antennas would
+    /// move a relay every time one was recalled (issue #235).
+    #[serde(default)]
+    pub antenna: Option<String>,
 }
 
 /// The RTTY modem setup captured alongside a memory stored in RTTY mode.
@@ -192,6 +205,7 @@ mod tests {
             folder: None,
             rtty: None,
             repeater: None,
+            antenna: None,
         }
     }
 

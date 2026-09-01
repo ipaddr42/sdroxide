@@ -332,6 +332,7 @@ impl RemoteController {
             ServerMsg::IsmReports(r) => self.pending.push_back(RadioEvent::IsmReports(r)),
             ServerMsg::IsmStatus(s) => self.pending.push_back(RadioEvent::IsmStatus(s)),
             ServerMsg::AdsbStatus(s) => self.pending.push_back(RadioEvent::AdsbStatus(s)),
+            ServerMsg::Vdl2Status(s) => self.pending.push_back(RadioEvent::Vdl2Status(s)),
             ServerMsg::RifpRows { image_id, y, w, h, rows } => {
                 self.pending.push_back(RadioEvent::RifpRows { image_id, y, w, h, rows })
             }
@@ -384,6 +385,7 @@ impl RemoteController {
             ServerMsg::RotatorStatus { connected, az_deg, el_deg, error } => self
                 .pending
                 .push_back(RadioEvent::RotatorStatus { connected, az_deg, el_deg, error }),
+            ServerMsg::RelayStatus(st) => self.pending.push_back(RadioEvent::RelayStatus(st)),
             ServerMsg::RadioConfig(c) => {
                 // Adopted only when nothing of ours is waiting to go out. This
                 // message is usually the echo of our own write, but it can

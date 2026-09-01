@@ -131,6 +131,39 @@ fn n2adr_oc(freq_hz: f64) -> u8 {
     (1 << lpf) | hpf
 }
 
+/// Open-collector byte for an Alex-style filter board when tuned to `freq_hz`.
+///
+/// Not one-hot like the N2ADR board above: this is the band as a four-bit
+/// number on outputs 1–4, which is the mapping a Hermes/ANAN's Alex board, a
+/// Zeus SDR, a HiQSDR and Quisk's own filter switching all share (issue #196).
+/// 160 m is 1 and the code counts upwards by band — except 60 m, which is 0,
+/// the same byte as "nothing selected", because that is what the boards
+/// expect.
+///
+/// Outputs 5–7 are left off: they carry no part of the band code, and on the
+/// boards that use this mapping they are the spare pins an operator wires to a
+/// preamplifier, an attenuator or a transverter.
+///
+/// Between the bands the boundary sits in the middle of the gap, so a
+/// short-wave listener gets the nearer of the two filters rather than silence,
+/// and everything below 160 m and above 10 m is carried by the band at that
+/// end.
+fn alex_oc(freq_hz: f64) -> u8 {
+    match freq_hz {
+        f if f < 2_750_000.0 => 0x01,  // 160 m
+        f if f < 4_650_000.0 => 0x02,  // 80 m
+        f if f < 6_200_000.0 => 0x00,  // 60 m — no pins, by the board's table
+        f if f < 8_700_000.0 => 0x03,  // 40 m
+        f if f < 12_100_000.0 => 0x04, // 30 m
+        f if f < 16_200_000.0 => 0x05, // 20 m
+        f if f < 19_600_000.0 => 0x06, // 17 m
+        f if f < 23_200_000.0 => 0x07, // 15 m
+        f if f < 26_500_000.0 => 0x08, // 12 m
+        f if f < 39_900_000.0 => 0x09, // 10 m
+        _ => 0x0A,                     // 6 m
+    }
+}
+
 /// Everything the rotating register slots need. `lna_gain` and `pa` are `None`
 /// on boards whose Hermes-Lite-specific register fields we must not touch.
 #[derive(Clone, Copy)]
@@ -168,6 +201,7 @@ impl Regs {
         match self.filter_board {
             HpsdrFilterBoard::None => 0,
             HpsdrFilterBoard::N2adr => n2adr_oc(freq),
+            HpsdrFilterBoard::Alex => alex_oc(freq),
         }
     }
 
@@ -1054,6 +1088,36 @@ mod tests {
     }
 
     #[test]
+    fn alex_filter_selection_is_the_band_as_a_four_bit_code() {
+        // The table an ANAN/Hermes Alex board, a Zeus SDR, a HiQSDR and Quisk
+        // all share, quoted band for band from issue #196.
+        for (hz, want) in [
+            (1_840_000.0, 0x01), // 160 m
+            (3_573_000.0, 0x02), // 80 m
+            (5_357_000.0, 0x00), // 60 m — deliberately no pins
+            (7_074_000.0, 0x03), // 40 m
+            (10_136_000.0, 0x04),
+            (14_074_000.0, 0x05),
+            (18_100_000.0, 0x06),
+            (21_074_000.0, 0x07),
+            (24_915_000.0, 0x08),
+            (28_074_000.0, 0x09),
+            (50_313_000.0, 0x0A), // 6 m
+        ] {
+            assert_eq!(alex_oc(hz), want, "{hz} Hz");
+        }
+        // Everything below 160 m rides the 160 m code and everything above 6 m
+        // the 6 m one, so a listener off the ham bands still gets a filter.
+        assert_eq!(alex_oc(198_000.0), 0x01);
+        assert_eq!(alex_oc(70_200_000.0), 0x0A);
+        // The code is four bits: outputs 5-7 carry no part of it, and the byte
+        // fits the seven lines the header has.
+        for hz in [198_000.0, 5_000_000.0, 9_000_000.0, 27_555_000.0, 50_313_000.0] {
+            assert_eq!(alex_oc(hz) & !0x0F, 0, "outputs 5-7 stay off at {hz} Hz");
+        }
+    }
+
+    #[test]
     fn open_collector_bits_land_in_c2_and_are_off_without_a_board() {
         // The seven lines sit at bits [23:17] of the register's 32-bit view,
         // which is C2 bits [7:1].
@@ -1079,6 +1143,11 @@ mod tests {
         };
         assert_eq!(split.oc(), n2adr_oc(14_074_000.0), "receiving: follows RX");
         assert_eq!(Regs { ptt: true, ..split }.oc(), n2adr_oc(7_074_000.0), "keyed: follows TX");
+        // And the same rule on the band-code preset.
+        let alex = Regs { filter_board: HpsdrFilterBoard::Alex, ..split };
+        assert_eq!(alex.oc(), 0x05, "receiving on 20 m");
+        assert_eq!(Regs { ptt: true, ..alex }.oc(), 0x03, "keyed on 40 m");
+        assert_eq!(config_cc(3, 0, alex.oc())[2], 0x05 << 1);
     }
 
     #[test]

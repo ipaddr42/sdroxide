@@ -23,6 +23,73 @@ pub fn bandpass_taps(ntaps: usize, lo_hz: f64, hi_hz: f64, sample_rate: f64) -> 
         .collect()
 }
 
+/// Independent running sums a filter window is walked with — see
+/// [`crate::decim`], where the same reasoning and the same measurements apply.
+/// A single accumulator makes the whole dot product one dependency chain: every
+/// multiply-accumulate waits on the one before it, and a band-pass long enough
+/// to shape an SSB channel is a chain some hundreds of adds deep.
+const FIR_ACCUMULATORS: usize = 8;
+
+crate::simd::kernel! {
+    /// A complete complex-tap FIR: one dot product per output sample.
+    fn complex_fir / complex_fir_portable / complex_fir_avx2 / complex_fir_avx512 (
+        dst: &mut [Complex32],
+        buf: &[Complex32],
+        taps: &[Complex32],
+    ) {
+        let n = taps.len();
+        for (o, d) in dst.iter_mut().enumerate() {
+            let w = &buf[o..o + n];
+            let mut acc = [Complex32::default(); FIR_ACCUMULATORS];
+            let mut ws = w.chunks_exact(FIR_ACCUMULATORS);
+            let mut ts = taps.chunks_exact(FIR_ACCUMULATORS);
+            for (xs, tt) in (&mut ws).zip(&mut ts) {
+                for i in 0..FIR_ACCUMULATORS {
+                    acc[i] += xs[i] * tt[i];
+                }
+            }
+            let mut sum = Complex32::default();
+            for a in acc {
+                sum += a;
+            }
+            for (x, &t) in ws.remainder().iter().zip(ts.remainder()) {
+                sum += x * t;
+            }
+            *d = sum;
+        }
+    }
+}
+
+crate::simd::kernel! {
+    /// [`complex_fir`]'s real-valued counterpart.
+    fn real_fir / real_fir_portable / real_fir_avx2 / real_fir_avx512 (
+        dst: &mut [f32],
+        buf: &[f32],
+        taps: &[f32],
+    ) {
+        let n = taps.len();
+        for (o, d) in dst.iter_mut().enumerate() {
+            let w = &buf[o..o + n];
+            let mut acc = [0.0f32; FIR_ACCUMULATORS];
+            let mut ws = w.chunks_exact(FIR_ACCUMULATORS);
+            let mut ts = taps.chunks_exact(FIR_ACCUMULATORS);
+            for (xs, tt) in (&mut ws).zip(&mut ts) {
+                for i in 0..FIR_ACCUMULATORS {
+                    acc[i] += xs[i] * tt[i];
+                }
+            }
+            let mut sum = 0.0;
+            for a in acc {
+                sum += a;
+            }
+            for (x, &t) in ws.remainder().iter().zip(ts.remainder()) {
+                sum += x * t;
+            }
+            *d = sum;
+        }
+    }
+}
+
 /// Streaming complex FIR (complex in, complex out).
 pub struct ComplexFir {
     taps: Vec<Complex32>,
@@ -46,14 +113,9 @@ impl ComplexFir {
             return;
         }
         let count = self.buf.len() - n + 1;
-        out.reserve(count);
-        for o in 0..count {
-            let mut acc = Complex32::default();
-            for (k, &t) in self.taps.iter().enumerate() {
-                acc += self.buf[o + k] * t;
-            }
-            out.push(acc);
-        }
+        let start = out.len();
+        out.resize(start + count, Complex32::default());
+        complex_fir(&mut out[start..], &self.buf, &self.taps);
         self.buf.drain(..count);
     }
 
@@ -69,6 +131,10 @@ pub struct RealFir {
 }
 
 impl RealFir {
+    pub fn new(taps: Vec<f32>) -> Self {
+        RealFir { taps, buf: Vec::new() }
+    }
+
     pub fn lowpass(ntaps: usize, cutoff_hz: f64, sample_rate: f64) -> Self {
         RealFir { taps: lowpass_taps(ntaps, cutoff_hz / sample_rate), buf: Vec::new() }
     }
@@ -80,14 +146,9 @@ impl RealFir {
             return;
         }
         let count = self.buf.len() - n + 1;
-        out.reserve(count);
-        for o in 0..count {
-            let mut acc = 0.0f32;
-            for (k, &t) in self.taps.iter().enumerate() {
-                acc += self.buf[o + k] * t;
-            }
-            out.push(acc);
-        }
+        let start = out.len();
+        out.resize(start + count, 0.0);
+        real_fir(&mut out[start..], &self.buf, &self.taps);
         self.buf.drain(..count);
     }
 }

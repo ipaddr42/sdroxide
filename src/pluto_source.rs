@@ -67,6 +67,9 @@ pub struct PlutoSource {
     tx_scratch: Vec<f32>,
     dc: ComplexDcBlock,
     lo_offset: f64,
+    /// The connection's sample rate, kept here so a released source still
+    /// answers `IqSource::sample_rate` — see that method.
+    rate: f64,
     label: String,
 }
 
@@ -109,6 +112,7 @@ impl PlutoSource {
             tx_scratch: Vec::new(),
             dc: ComplexDcBlock::new(DC_BLOCK_HZ, rate),
             lo_offset,
+            rate,
             label,
             rx: Some(rx),
             rig: Some(rig),
@@ -166,8 +170,11 @@ impl PlutoSource {
 }
 
 impl IqSource for PlutoSource {
+    /// The connection's rate, remembered rather than asked for: it is fixed
+    /// when the Pluto is opened, and [`IqSource::release`] lets the connection
+    /// go while the engine is still running on this source.
     fn sample_rate(&self) -> f64 {
-        self.rig.as_deref().map_or(0.0, PlutoRig::sample_rate_hz)
+        self.rate
     }
 
     fn center_hz(&self) -> f64 {
@@ -356,32 +363,43 @@ impl IqSource for PlutoSource {
         self.rx.as_ref().is_none_or(|rx| !rx.is_alive() || rx.silent_for() >= SILENCE_BEFORE_REOPEN)
     }
 
-    /// Give this chain's stream back ahead of a rebuild — and only the stream,
-    /// as long as the connection still works. It is deliberately kept: a
-    /// sibling may be streaming the other chain over it, and even alone, an
-    /// Apply with the address unchanged should re-attach over the live
-    /// connection (the registry will find it through this very `Arc`) rather
-    /// than reopen the device — `iiod` will not hand the same buffer to a
-    /// second connection, so a premature close-and-redial is exactly the
-    /// "device busy" failure this avoids. The connection closes when the last
-    /// source holding it is dropped, which for a genuine backend switch happens
-    /// right after the replacement is adopted.
+    /// Give this chain's stream back ahead of a rebuild — **and the connection
+    /// with it, unless a sibling radio is still streaming the other chain.**
     ///
-    /// A connection that has already failed is the opposite case, and it gets
-    /// the opposite treatment. Nothing will be attached to it again — the
-    /// registry hands out no dead device — while its receive thread may still
-    /// be sitting in a `READBUF` that has seconds left to run, and until that
-    /// returns the *device's* buffer stays open. The reconnect this release is
-    /// preparing for would then be refused as busy, back off, and try again:
-    /// the several-second gap between "the radio froze" and "the radio came
-    /// back" that has nothing to do with what broke the link. Shutting the
-    /// sockets down here ends that read at once.
+    /// The connection used to be kept deliberately, so that an Apply with the
+    /// address unchanged re-attached over the live link (the registry finds it
+    /// through this very `Arc`) rather than redialling the board. That saved a
+    /// second and cost the operator every setting they had just changed:
+    /// everything the session is made of — the sample rate, the RF bandwidth,
+    /// the duplex, and which GPO pins key the amplifier — is decided in
+    /// `PlutoRig::open` and reaches the AD9361 through an `initialize` that
+    /// re-runs its whole setup. A live connection outliving its last radio
+    /// makes an Apply that changes any of them do nothing at all, which is
+    /// exactly what issue #135 reported: the GPO pair and the sample rate only
+    /// took effect after quitting and restarting sdroxide. The RSP backend
+    /// already closes on the last stream for the same reason.
+    ///
+    /// So the `Arc` goes here. Dropping the last one runs the connection's own
+    /// teardown — threads joined, sockets shut down — *before* this returns, so
+    /// the redial that follows meets a Pluto whose buffer `iiod` has already
+    /// let go of rather than the "device busy" a premature close would give.
+    /// A sibling holding its own `Arc` keeps the link up, and the registry
+    /// hands the replacement straight back to it.
+    ///
+    /// A connection that has already failed is released explicitly rather than
+    /// merely dropped. Its receive thread may still be sitting in a `READBUF`
+    /// that has seconds left to run, and until that returns the *device's*
+    /// buffer stays open — the reconnect this release is preparing for would
+    /// be refused as busy, back off, and try again: the several-second gap
+    /// between "the radio froze" and "the radio came back" that has nothing to
+    /// do with what broke the link. Shutting the sockets down here ends that
+    /// read at once, whether or not a sibling still holds the `Arc`.
     fn release(&mut self) {
         self.rx = None;
-        if let Some(rig) = self.rig.as_ref()
-            && !rig.is_alive()
-        {
+        let Some(rig) = self.rig.take() else { return };
+        if !rig.is_alive() {
             rig.release();
         }
+        // and the drop below closes a healthy one, if this was the last holder
     }
 }

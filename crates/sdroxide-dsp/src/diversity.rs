@@ -479,6 +479,50 @@ mod tests {
         assert_eq!(d.w, held, "the filter moved while frozen");
     }
 
+    /// [`Diversity::reset`] zeroes the filter but, deliberately, never
+    /// touches [`Diversity::frozen`] — its own doc comment says it is meant
+    /// to be usable "under a frozen null". Left frozen, that leaves the
+    /// filter permanently parked at zero: `Cancel` becomes indistinguishable
+    /// from `Combine`, since nothing after `reset` ever adapts again. This
+    /// is what a real Fobos capture reproduced (a 33 dB null vanishing the
+    /// instant Restart was pressed with HOLD selected, silently, with
+    /// nothing on screen to say why) — a caller reaching for `reset` while
+    /// frozen, meaning to "find the null again" per the RESTART control's
+    /// own tooltip, must also call `set_frozen(false)` itself, which is
+    /// exactly the two-call sequence `src/fobos_source.rs`'s
+    /// `DIV_RESET_ELEMENT` handler now performs.
+    #[test]
+    fn reset_alone_leaves_a_frozen_filter_permanently_zeroed() {
+        let n = 40_000;
+        let qrm = noise(n, 7);
+        let mut main: Vec<Complex32> = qrm.iter().map(|q| q * 0.5).collect();
+        let mut d = Diversity::new(DiversityMode::Cancel, 4, 0.9);
+        d.process(&mut main, &qrm);
+        assert_ne!(d.w, vec![Complex32::new(0.0, 0.0); 4], "should have converged to something");
+
+        d.set_frozen(true);
+        d.reset();
+        assert_eq!(d.w, vec![Complex32::new(0.0, 0.0); 4], "reset should zero the taps");
+        assert!(d.frozen(), "reset alone must not clear frozen — that's the bug");
+
+        // Frozen and zeroed: further samples change nothing, exactly the
+        // silent no-cancellation state the bug report captured.
+        let mut main2: Vec<Complex32> = qrm.iter().map(|q| q * 0.5).collect();
+        d.process(&mut main2, &qrm);
+        assert_eq!(d.w, vec![Complex32::new(0.0, 0.0); 4], "still zeroed while frozen");
+
+        // The fix: also clearing `frozen` after `reset` lets it actually
+        // "find the null again", the way RESTART's own tooltip promises.
+        d.set_frozen(false);
+        let mut main3: Vec<Complex32> = qrm.iter().map(|q| q * 0.5).collect();
+        d.process(&mut main3, &qrm);
+        assert_ne!(
+            d.w,
+            vec![Complex32::new(0.0, 0.0); 4],
+            "clearing frozen after reset should let the filter adapt again"
+        );
+    }
+
     /// The rate control spans the documented range and is monotonic, because a
     /// slider that goes the wrong way at one end is worse than no slider.
     #[test]

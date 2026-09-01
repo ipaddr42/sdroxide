@@ -154,6 +154,7 @@ impl<'a> Speaker<'a> {
             Mode::Wspr => "whisper",
             Mode::Drm => "D R M",
             Mode::Adsb => "A D S B",
+            Mode::Vdl2 => "V D L 2",
         }
     }
 

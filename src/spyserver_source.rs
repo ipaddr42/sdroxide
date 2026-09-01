@@ -220,6 +220,13 @@ impl IqSource for SpyServerSource {
     /// window moves. Nothing here can be demodulated — it is a picture, like
     /// an Icom's scope sweep — and the engine's own auto-levelling decides how
     /// it is drawn.
+    /// The span the server's FFT covers, which is a stage of its own ladder and
+    /// settled at connect — so how far the panadapter may be zoomed out is
+    /// known before a single frame has arrived.
+    fn wide_span_hz(&self) -> f64 {
+        if self.fft_enabled { self.handle.fft_span_hz } else { 0.0 }
+    }
+
     fn wide_spectrum_db(&mut self, out: &mut Vec<f32>) -> Option<(f64, f64)> {
         let frame = self.handle.take_fft()?;
         out.clear();

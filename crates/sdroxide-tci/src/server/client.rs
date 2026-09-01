@@ -10,7 +10,7 @@
 
 use std::net::TcpStream;
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crossbeam_channel::{Receiver, Sender, TryRecvError};
 use tracing::{debug, warn};
@@ -20,6 +20,12 @@ use crate::protocol as p;
 
 /// Socket read timeout; also the loop's tick.
 const READ_TIMEOUT: Duration = Duration::from_millis(20);
+
+/// How long a client has to complete its upgrade. Held as the socket's read
+/// timeout for the duration, because [`READ_TIMEOUT`] is far too short to cover
+/// a request arriving over anything but the loopback — and a read that expires
+/// mid-upgrade is only resumable on Unix (see `crate::ws_handshake`).
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Realtime frames written per iteration before we go back to reading, so a
 /// backlog can drain quickly without starving inbound control.
@@ -64,12 +70,17 @@ fn run(pr: ClientParams) {
         debug!(id, "TCI client: could not disable Nagle");
     }
     // The handshake needs a timeout too, or a peer that connects and says
-    // nothing would pin this thread forever.
-    if stream.set_read_timeout(Some(READ_TIMEOUT)).is_err() {
+    // nothing would pin this thread forever. Wide enough for the upgrade, then
+    // the loop's own tick once there is a WebSocket to poll.
+    if stream.set_read_timeout(Some(HANDSHAKE_TIMEOUT)).is_err() {
         warn!(id, "TCI client: could not set read timeout");
         return;
     }
     let Some(mut ws) = accept(id, stream) else { return };
+    if ws.get_ref().set_read_timeout(Some(READ_TIMEOUT)).is_err() {
+        warn!(id, "TCI client: could not set read timeout");
+        return;
+    }
 
     let mut scratch: Vec<f32> = Vec::new();
     loop {
@@ -143,14 +154,22 @@ fn run(pr: ClientParams) {
     }
 }
 
-/// Complete the server-side WebSocket handshake, retrying while the
-/// non-blocking read timeout interrupts it.
+/// Complete the server-side WebSocket handshake, retrying while the read
+/// timeout interrupts it, and giving up at [`HANDSHAKE_TIMEOUT`] so a peer that
+/// connects and says nothing cannot hold the thread.
 fn accept(id: u64, stream: TcpStream) -> Option<WebSocket<TcpStream>> {
+    let deadline = Instant::now() + HANDSHAKE_TIMEOUT;
     let mut result = tungstenite::accept(stream);
     loop {
         match result {
             Ok(ws) => return Some(ws),
-            Err(HandshakeError::Interrupted(mid)) => result = mid.handshake(),
+            Err(HandshakeError::Interrupted(mid)) => {
+                if Instant::now() > deadline {
+                    debug!(id, "TCI client never finished its handshake");
+                    return None;
+                }
+                result = mid.handshake();
+            }
             Err(HandshakeError::Failure(e)) => {
                 debug!(id, "TCI client handshake failed: {e}");
                 return None;

@@ -149,6 +149,138 @@ pub(in crate::app) fn row_cell(
     ui.new_child(egui::UiBuilder::new().max_rect(rect).layout(layout)).add(lbl);
 }
 
+// ── Sortable table headings ──
+
+/// The marker on the column a table is ordered by.
+fn sort_arrow(desc: bool) -> &'static str {
+    if desc { " ▼" } else { " ▲" }
+}
+
+/// A painted table heading row whose columns sort the table when clicked.
+///
+/// The tables that use this paint their rows with a `Painter` at fixed x
+/// offsets rather than laying them out as widgets — that is what keeps a column
+/// of numbers reading straight down the list — so their headings are painted
+/// the same way, and the click targets have to be worked out from the same
+/// offsets rather than come free with a layout.
+///
+/// `cols` is `(x offset, alignment, heading, sort key)`. An `f32::NAN` offset
+/// is a column the width has dropped; a `None` key is a heading there is
+/// nothing to sort on (an aircraft's track, a station's type), which is drawn
+/// but not clickable.
+///
+/// Clicking the column already sorted on reverses it, which is what every table
+/// in every other program does; clicking another sorts on that one, descending,
+/// because on every column here the interesting end is the top.
+pub(in crate::app) fn sort_head_row<K: Copy + PartialEq>(
+    ui: &mut egui::Ui,
+    cols: &[(f32, egui::Align2, &str, Option<K>)],
+    sort: &mut K,
+    desc: &mut bool,
+) {
+    const H: f32 = 14.0;
+    let w = ui.available_width();
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(w, H), egui::Sense::click());
+    if !ui.is_rect_visible(rect) {
+        return;
+    }
+    let p = ui.painter_at(rect);
+    let font = egui::FontId::monospace(8.5);
+    let pointer = resp.hover_pos();
+    let mut hit = None;
+
+    for (x, align, text, key) in cols {
+        if x.is_nan() {
+            continue;
+        }
+        let on = key.is_some_and(|k| k == *sort);
+        let label = if on { format!("{text}{}", sort_arrow(*desc)) } else { (*text).to_string() };
+        // Laid out with no colour of its own, so the one worked out below is
+        // what `Painter::galley` paints it in — a colour baked in here would
+        // make every heading look like the active one.
+        let galley = p.layout_no_wrap(label, font.clone(), Color32::PLACEHOLDER);
+        let anchor = egui::pos2(rect.left() + x, rect.center().y);
+        let text_rect = align.anchor_size(anchor, galley.size());
+        // A heading is four or five characters of 8.5 pt type. Widened a little
+        // and taken to the full height of the row, it is a target a pointer can
+        // actually land on.
+        let target = egui::Rect::from_x_y_ranges(
+            (text_rect.left() - 4.0)..=(text_rect.right() + 4.0),
+            rect.y_range(),
+        );
+        let hovered = key.is_some() && pointer.is_some_and(|p| target.contains(p));
+        if hovered {
+            hit = *key;
+        }
+        let ink = if on {
+            crate::theme::CYAN()
+        } else if hovered {
+            crate::theme::gray(180)
+        } else {
+            crate::theme::gray(110)
+        };
+        p.galley(text_rect.min, galley, ink);
+    }
+
+    if hit.is_some() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    if let Some(key) = hit.filter(|_| resp.clicked()) {
+        if key == *sort {
+            *desc = !*desc;
+        } else {
+            *sort = key;
+            *desc = true;
+        }
+    }
+}
+
+/// [`row_cell`] for a heading that sorts the table when it is clicked.
+///
+/// The [`sort_head_row`] of the tables that lay their columns out as widgets
+/// rather than painting them at fixed offsets. Same rule on the click: the
+/// active column reverses, any other becomes the new one, descending.
+pub(in crate::app) fn sort_head_cell<K: Copy + PartialEq>(
+    ui: &mut egui::Ui,
+    w: f32,
+    align_right: bool,
+    text: &str,
+    key: Option<K>,
+    sort: &mut K,
+    desc: &mut bool,
+) {
+    const H: f32 = 14.0;
+    let on = key.is_some_and(|k| k == *sort);
+    let label = if on { format!("{text}{}", sort_arrow(*desc)) } else { text.to_string() };
+    let sense = if key.is_some() { egui::Sense::click() } else { egui::Sense::hover() };
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(w, H), sense);
+    let ink = if on {
+        crate::theme::CYAN()
+    } else if resp.hovered() {
+        crate::theme::gray(180)
+    } else {
+        crate::theme::CYAN_DIM()
+    };
+    let layout = if align_right {
+        egui::Layout::right_to_left(egui::Align::Center)
+    } else {
+        egui::Layout::left_to_right(egui::Align::Center)
+    };
+    ui.new_child(egui::UiBuilder::new().max_rect(rect).layout(layout))
+        .add(egui::Label::new(RichText::new(label).size(9.5).color(ink).monospace()).truncate());
+    if key.is_some() && resp.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    if let Some(key) = key.filter(|_| resp.clicked()) {
+        if key == *sort {
+            *desc = !*desc;
+        } else {
+            *sort = key;
+            *desc = true;
+        }
+    }
+}
+
 /// [`row_cell`] for a column that draws something other than a label — the
 /// flag image, which is a texture rather than text but has to reserve its
 /// width the same way or the columns after it walk about between rows.

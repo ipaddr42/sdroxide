@@ -1,11 +1,14 @@
 //! Connecting to a rig that is slow to answer the WebSocket upgrade.
 //!
-//! The client puts a read timeout on the socket (it polls the connection rather
-//! than blocking on it), and tungstenite reports a read that timed out during
-//! the upgrade as `Interrupted` — the server hasn't answered *yet*, which is not
-//! a failure. Treating it as one is what made a freshly started sdroxide fail to
-//! attach to an ExpertSDR3 that was running all along, leaving the operator to
-//! open Settings → Radio and press "Apply / reconnect" by hand.
+//! Treating a slow answer as a failure is what made a freshly started sdroxide
+//! fail to attach to an ExpertSDR3 that was running all along, leaving the
+//! operator to open Settings → Radio and press "Apply / reconnect" by hand. Two
+//! things keep that from happening: tungstenite reports a read that timed out
+//! during the upgrade as `Interrupted` — the server hasn't answered *yet* — and
+//! the client resumes rather than giving up; and the socket carries the whole
+//! upgrade budget as its read timeout until there is a WebSocket to poll. The
+//! second is what makes it work on Windows, where the expiry arrives as
+//! `WSAETIMEDOUT` and tungstenite cannot tell it from a real I/O failure.
 //!
 //! Ports are in the 50081.. range (not the default 50001, which a local
 //! ExpertSDR3 or another sdroxide would hold); a test whose port is unavailable
@@ -20,8 +23,9 @@ use tungstenite::{Message, WebSocket};
 
 const IQ_RATE: f64 = 96_000.0;
 
-/// Longer than the client's per-read poll during the upgrade, so the handshake
-/// is guaranteed to be interrupted at least once and have to resume.
+/// A rig taking its time. Well inside the client's upgrade budget, and far past
+/// the 20 ms poll it switches to once the socket is a WebSocket — so a budget
+/// narrowed back to that poll fails this test on Windows.
 const STALL: Duration = Duration::from_millis(700);
 
 fn bind(port: u16) -> Option<TcpListener> {

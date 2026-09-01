@@ -5,6 +5,7 @@
 //! panel:
 //!
 //! - [`adsb`] — the aircraft list and the 1090 MHz radar picture
+//! - [`vdl2`] — the VDL Mode 2 message log and station list
 //! - [`aprs`] — the APRS station list, map and messages
 //! - [`cw`] — the Morse decode/keyboard panel, the one non-digital mode here
 //! - [`decodes`] — the FT8/FT4/JS8 decode list and the QSO sequencer beside it
@@ -29,6 +30,7 @@ pub(in crate::app) mod rf_paint;
 pub(in crate::app) mod setup;
 pub(in crate::app) mod sstv;
 pub(in crate::app) mod text_modem;
+pub(in crate::app) mod vdl2;
 pub(in crate::app) mod wefax;
 pub(in crate::app) mod widgets;
 pub(in crate::app) mod wspr;
@@ -71,6 +73,10 @@ pub(in crate::app) fn panel_panes(mode: Mode) -> &'static [&'static str] {
         // Two, because there is nothing to say back: this is a surveillance
         // downlink, and the aircraft are not listening.
         Mode::Adsb => &["AIRCRAFT", "MAP"],
+        // Two, because a datalink is a conversation and a list of who is having
+        // it. No map: VDL2 carries a position only occasionally, so one would be
+        // mostly empty of the traffic this panel exists to show.
+        Mode::Vdl2 => &["MESSAGES", "STATIONS"],
         Mode::Wefax => &["CHART", "SAVED"],
         Mode::Navtex => &["MESSAGES", "READING"],
         Mode::RfPaint => &["TEXT", "IMAGE"],

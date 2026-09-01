@@ -10,6 +10,8 @@
 use std::ffi::c_char;
 use std::sync::Arc;
 
+use sdroxide_types::LimeConfig;
+
 use crate::error::{Error, Result};
 use crate::ffi;
 use crate::trace::Trace;
@@ -451,12 +453,19 @@ pub fn auto_antenna_rx(hz: f64, available: &[String], has_rfe: bool) -> Option<S
         .cloned()
 }
 
-/// The transmit port to use when the operator has not named one. BAND1 is the
-/// one wired to a connector on every board in the family.
-pub fn auto_antenna_tx(available: &[String]) -> Option<String> {
+/// The transmit port to use when the operator has not named one.
+///
+/// Follows the frequency, exactly as [`auto_antenna_rx`] does and for exactly
+/// the same reason: the two sockets are different matching networks, not two
+/// jacks onto the same one. See [`tx_port_band`] for which is which — BAND1
+/// carries everything from 30 MHz to 1.9 GHz, so it is the answer on every band
+/// this is normally pointed at, and BAND2 is for 13 cm.
+pub fn auto_antenna_tx(hz: f64, available: &[String]) -> Option<String> {
+    let want = if LimeConfig::tx_port_covers("BAND2", hz) { "BAND2" } else { "BAND1" };
     available
         .iter()
-        .find(|a| a.eq_ignore_ascii_case("BAND1"))
+        .find(|a| a.eq_ignore_ascii_case(want))
+        .or_else(|| available.iter().find(|a| a.eq_ignore_ascii_case("BAND1")))
         .or_else(|| available.first())
         .cloned()
 }
@@ -535,13 +544,34 @@ mod tests {
         assert_eq!(auto_antenna_rx(14.2e6, &[], false), None);
     }
 
+    /// The two transmit sockets are two matching networks, and the whole of
+    /// amateur radio below 23 cm lives in one of them. Ranges from LimeSuite's
+    /// own `GetTxPathBand` — see [`LimeConfig::tx_port_band`].
     #[test]
-    fn the_automatic_transmit_port_prefers_band1() {
+    fn the_automatic_transmit_port_follows_the_band() {
         let all: Vec<String> = ["BAND1", "BAND2"].iter().map(|s| s.to_string()).collect();
-        assert_eq!(auto_antenna_tx(&all).as_deref(), Some("BAND1"));
+        for hz in [3.573e6, 14.074e6, 145.5e6, 435.0e6, 1.296e9] {
+            assert_eq!(auto_antenna_tx(hz, &all).as_deref(), Some("BAND1"), "{hz} Hz");
+        }
+        assert_eq!(auto_antenna_tx(2.4e9, &all).as_deref(), Some("BAND2"), "13 cm");
+        // A board offering only the microwave port gets it whatever the dial
+        // says — a transmitter with one socket has no choice to make.
         let only2 = vec!["BAND2".to_string()];
-        assert_eq!(auto_antenna_tx(&only2).as_deref(), Some("BAND2"));
-        assert_eq!(auto_antenna_tx(&[]), None);
+        assert_eq!(auto_antenna_tx(145.5e6, &only2).as_deref(), Some("BAND2"));
+        assert_eq!(auto_antenna_tx(145.5e6, &[]), None);
+    }
+
+    /// The report behind issue #94: keyed on 2 m out of BAND2, which this board
+    /// matches for 13 cm. Every call answers `ok` and no RF appears.
+    #[test]
+    fn the_microwave_transmit_port_does_not_cover_two_metres() {
+        assert!(!LimeConfig::tx_port_covers("BAND2", 145.475e6));
+        assert!(LimeConfig::tx_port_covers("BAND1", 145.475e6));
+        assert!(LimeConfig::tx_port_covers("BAND2", 2.4e9));
+        assert!(!LimeConfig::tx_port_covers("BAND1", 2.4e9));
+        // A name this table does not describe is left alone rather than
+        // second-guessed.
+        assert!(LimeConfig::tx_port_covers("TXW", 145.475e6));
     }
 
     /// The field report this exists for: with a LimeRFE on the wideband socket

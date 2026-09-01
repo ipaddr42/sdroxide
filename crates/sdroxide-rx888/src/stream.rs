@@ -22,7 +22,7 @@ use crossbeam_channel::{Receiver, Sender, TrySendError};
 use nusb::MaybeFuture;
 use nusb::transfer::{Bulk, In, TransferError};
 use rtrb::Producer;
-use sdroxide_dsp::{Complex32, WbDdc, WideSpectrum};
+use sdroxide_dsp::{Complex32, WbDdc, WideSpectrum, as_interleaved};
 
 use crate::band::{self, Band};
 use crate::convert;
@@ -502,7 +502,6 @@ fn convert_loop(
     let mut carry: Option<u8> = None;
     let mut real: Vec<f32> = Vec::with_capacity(1 << 20);
     let mut cplx: Vec<Complex32> = Vec::with_capacity(1 << 16);
-    let mut inter: Vec<f32> = Vec::with_capacity(1 << 17);
     let started = Instant::now();
 
     while let Ok(filled) = full.recv() {
@@ -533,20 +532,26 @@ fn convert_loop(
         ddc.process(&real, &mut cplx);
 
         if !cplx.is_empty() {
-            inter.clear();
-            inter.reserve(cplx.len() * 2);
-            for v in &cplx {
-                inter.push(v.re);
-                // The R828D's LO sits above the wanted signal, so its IF runs
-                // backwards and the whole VHF spectrum arrives mirrored.
-                // Negating Q is the conjugate, which puts it the right way
-                // round — measured on the bench, see `crate::band`. Without
-                // it every VHF signal tunes the wrong way and every SSB
-                // sideband is the other one.
-                inter.push(if conjugate { -v.im } else { v.im });
+            // The R828D's LO sits above the wanted signal, so its IF runs
+            // backwards and the whole VHF spectrum arrives mirrored. Negating Q
+            // is the conjugate, which puts it the right way round — measured on
+            // the bench, see `crate::band`. Without it every VHF signal tunes
+            // the wrong way and every SSB sideband is the other one.
+            //
+            // In place, and skipped entirely on HF: the ring carries the same
+            // bytes a complex block is already made of, so there is nothing to
+            // pack for it — see `sdroxide_dsp::as_interleaved`.
+            if conjugate {
+                for v in cplx.iter_mut() {
+                    v.im = -v.im;
+                }
             }
-            let dropped =
-                push_iq(&mut rx, &inter, &mut stats, shared.rx_paused.load(Ordering::Relaxed));
+            let dropped = push_iq(
+                &mut rx,
+                as_interleaved(&cplx),
+                &mut stats,
+                shared.rx_paused.load(Ordering::Relaxed),
+            );
             if dropped > 0 {
                 shared.dropped.fetch_add(dropped as u64, Ordering::Relaxed);
             }

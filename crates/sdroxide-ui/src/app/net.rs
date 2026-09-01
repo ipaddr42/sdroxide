@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
 use sdroxide_types::{
-    CallsignInfo, LookupProvider, NetworkConfig, QsoRecord, UploadResult, UploadTarget,
+    CallsignInfo, Command, LookupProvider, NetworkConfig, QsoRecord, UploadResult, UploadTarget,
 };
 
 use crate::app::SdroxideApp;
@@ -284,5 +284,54 @@ impl SdroxideApp {
         self.push_net_log(format!(
             "ADIF import: {added} added, {skipped} duplicates skipped{assumed}"
         ));
+    }
+
+    /// Drain a pending channel-list import: parse the CHIRP CSV and hand the
+    /// channels to the engine, which owns the memory list and the numbering in
+    /// it — including the duplicate check, because only it knows what is
+    /// already stored (issue #234).
+    ///
+    /// Under [`catch_unwind`] for the reason the ADIF import is: this is the
+    /// frame loop handing an operator-supplied file to a parser, and a file it
+    /// cannot make sense of has to cost the import rather than the application.
+    pub(in crate::app) fn poll_chirp_import(&mut self, cmds: &mut Vec<Command>) {
+        let loaded = self.chirp_import_inbox.lock().ok().and_then(|mut g| g.take());
+        let Some(loaded) = loaded else { return };
+        let loaded = match loaded {
+            Ok(loaded) => loaded,
+            Err(e) => {
+                self.push_net_log(format!("Channel import failed: {e}"));
+                return;
+            }
+        };
+        let text = loaded.text;
+        let parsed =
+            catch_unwind(AssertUnwindSafe(|| sdroxide_types::chirp_csv_to_memories(&text)));
+        let Ok((channels, skipped)) = parsed else {
+            self.push_net_log("Channel import failed: the file could not be read".to_string());
+            return;
+        };
+        if channels.is_empty() {
+            // The commonest way to get here is a file that is not a CHIRP
+            // export at all, so say what was expected rather than "0 imported".
+            self.push_net_log(
+                "Channel import: nothing to read — a CHIRP CSV file starts with a header                  row naming its columns, one of which must be Frequency"
+                    .to_string(),
+            );
+            return;
+        }
+        let n = channels.len();
+        cmds.push(Command::ImportMemories(channels));
+        let skipped = match skipped {
+            0 => String::new(),
+            n => format!(", {n} line(s) skipped"),
+        };
+        let assumed = match loaded.assumed {
+            Some(enc) => format!(" (not Unicode; read as {enc})"),
+            None => String::new(),
+        };
+        // "read", not "added": the engine drops the channels already stored,
+        // and the memory list itself is what shows the result.
+        self.push_net_log(format!("Channel import: {n} channel(s) read{skipped}{assumed}"));
     }
 }

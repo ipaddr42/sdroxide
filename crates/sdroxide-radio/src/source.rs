@@ -186,6 +186,42 @@ pub trait IqSource: Send {
     fn current_antenna(&self) -> String {
         String::new()
     }
+    /// The receive antenna sockets the *radio* has since said it has, when that
+    /// is not settled at the moment the device is opened.
+    ///
+    /// `None` — the default — leaves `DeviceCaps::antennas_rx` exactly as it
+    /// was built, which is the right answer for every front end whose ports are
+    /// a fact about the hardware. A control link is different: every Icom
+    /// speaks one dialect, and whether this one has an antenna selector is only
+    /// learned when it answers (or NAKs) the read that goes out a round trip
+    /// after the port opens. Answering `Some` here re-publishes the list when
+    /// it changes — see `Engine::refresh_antennas`, which is the same shape as
+    /// `refresh_center_is_dial` and exists for the same reason.
+    ///
+    /// Borrowed names rather than owned ones, because this is asked on every
+    /// pass of the engine loop and a control link's vocabulary is fixed: the
+    /// answer is a slice of the family's own constant, and building two short
+    /// `String`s a thousand times a second to compare them against the same two
+    /// would be the whole cost of the check.
+    fn learned_antennas(&self) -> Option<&'static [&'static str]> {
+        None
+    }
+    /// Switch the *radio* off, or back on again, over its control link.
+    ///
+    /// The radio's own power switch, not sdroxide's: an Icom answers `18 00` /
+    /// `18 01` on CI-V and keeps the control end of the link alive while the
+    /// set is off, which is what lets the second of those reach it (issue
+    /// #239). A no-op on every front end whose only power switch is its USB
+    /// cable, and the engine does not offer the control there — see
+    /// [`Self::commands_rig_power`].
+    fn set_rig_power(&mut self, _on: bool) -> Result<()> {
+        Ok(())
+    }
+    /// Whether [`Self::set_rig_power`] reaches this radio, for
+    /// `DeviceCaps::commands_rig_power`.
+    fn commands_rig_power(&self) -> bool {
+        false
+    }
     /// Whether the receive port is the source's own to decide, so a remembered
     /// one must not be restored over the top of it.
     ///
@@ -320,6 +356,35 @@ pub trait IqSource: Send {
     /// centre or that don't expose a per-VFO offset.
     fn set_if_offset(&mut self, _hz: f64) {}
 
+    /// How long after [`IqSource::set_center_hz`] returns the samples arriving
+    /// here are actually on the new centre. Default: no delay worth naming.
+    ///
+    /// A retune is a command, not an event: the engine learns the new centre
+    /// the instant the call returns, but the pipeline behind it is still full
+    /// of samples taken at the old one. Label those with the new centre and
+    /// they are drawn at the wrong frequency — by the distance the centre moved
+    /// in the meantime. Standing still nobody would ever see it, because the
+    /// centre stops moving and the picture catches up within one delay. It is a
+    /// **drag** that makes it visible: with the view fully zoomed out a pan
+    /// sends `SetCenter` once per displayed frame (issue #133), so the label
+    /// runs continuously ahead of the data and the whole spectrum sits
+    /// displaced by `drag rate × delay` — in the direction of the drag — until
+    /// the operator lets go and it snaps back.
+    ///
+    /// A local USB front end is a millisecond or two of this and nothing to
+    /// see. A radio at the end of a socket is not: measured on a SunSDR2DX
+    /// through ExpertSDR3's TCI on the loopback interface, **131 ms** at
+    /// 192 kHz — of which only 21 ms was sdroxide's own ring, the rest inside
+    /// the rig. Nothing on the wire marks it, either: the `dds:` echo comes
+    /// back in 0.4 ms, so it acknowledges the command rather than the data.
+    ///
+    /// Hence a declaration rather than a measurement. Sources that do not
+    /// override this are unchanged in every respect — the engine's compensation
+    /// is skipped outright at zero.
+    fn stream_delay_s(&self) -> f64 {
+        0.0
+    }
+
     /// The frequency this radio would transmit on — split, XIT and a satellite
     /// uplink already in it — told to the source *while receiving*, whenever it
     /// changes.
@@ -359,6 +424,19 @@ pub trait IqSource: Send {
     /// Default: nothing to show.
     fn wide_spectrum_db(&mut self, _out: &mut Vec<f32>) -> Option<(f64, f64)> {
         None
+    }
+
+    /// How wide [`IqSource::wide_spectrum_db`]'s window is, in Hz — `0.0` for a
+    /// source that publishes none.
+    ///
+    /// Answered at open, before any frame has been built, because it is what
+    /// the client's zoom-out is bounded by: see `DeviceCaps::wide_span_hz`. A
+    /// source whose lane is a fixed width knows this from its handshake; one
+    /// whose width moves should report the widest it will send.
+    ///
+    /// Default: no lane.
+    fn wide_span_hz(&self) -> f64 {
+        0.0
     }
 
     /// Whether this front end's centre *is* the rig's dial — one synthesiser
@@ -517,6 +595,27 @@ pub trait IqSource: Send {
     fn mutes_rx_audio_on_tx(&self) -> bool {
         false
     }
+
+    /// Whether receive audio must be silenced while the transceiver in front of
+    /// us transmits **under its own control** — someone with their hand on its
+    /// microphone ([`ControlUpdate::RigTx`]).
+    ///
+    /// Separate from [`Self::mutes_rx_audio_on_tx`], and not a spelling of it.
+    /// That one answers only for the arrangement where the receiver is read
+    /// through an over sdroxide keyed, and is false wherever the engine stops
+    /// reading instead — which is how a half-duplex front end goes quiet
+    /// without anyone muting anything. Nothing here drives a rig-keyed over, so
+    /// the receiver is read right through *every* one of them, and a front end
+    /// that would have been stopped for an over of ours has to ask for the
+    /// silence explicitly.
+    ///
+    /// Default: true. An over is an over, and a receiver on the station's own
+    /// antenna — or on the rig's I.F. — hears its own transmitter whoever
+    /// keyed it. A source with a setting for it says so instead (issue #244).
+    fn mutes_rx_audio_on_rig_tx(&self) -> bool {
+        true
+    }
+
     /// Write real TX audio to the rig's sound card (used instead of `tx_write`
     /// in demod-audio mode, where the rig does its own modulation).
     fn tx_write_audio(&mut self, _audio: &[f32]) -> Result<()> {
@@ -820,6 +919,11 @@ impl IqSource for ConvertedSource {
         Some((self.down(center), span))
     }
 
+    /// A converter shifts where the lane sits, never how wide it is.
+    fn wide_span_hz(&self) -> f64 {
+        self.inner.wide_span_hz()
+    }
+
     fn poll_control(&mut self) -> Vec<ControlUpdate> {
         self.inner
             .poll_control()
@@ -884,6 +988,15 @@ impl IqSource for ConvertedSource {
 
     fn current_antenna(&self) -> String {
         self.inner.current_antenna()
+    }
+    fn learned_antennas(&self) -> Option<&'static [&'static str]> {
+        self.inner.learned_antennas()
+    }
+    fn set_rig_power(&mut self, on: bool) -> Result<()> {
+        self.inner.set_rig_power(on)
+    }
+    fn commands_rig_power(&self) -> bool {
+        self.inner.commands_rig_power()
     }
 
     fn owns_rx_antenna(&self) -> bool {
@@ -980,6 +1093,12 @@ impl IqSource for ConvertedSource {
         self.inner.set_if_offset(hz);
     }
 
+    /// A property of the pipeline behind the converter, which a frequency
+    /// translation does not change.
+    fn stream_delay_s(&self) -> f64 {
+        self.inner.stream_delay_s()
+    }
+
     /// A transmit frequency, so it takes the transmit offset: what the hardware
     /// behind the converter actually emits is what its accessory boards switch
     /// bands for. With transmit withdrawn there is no such frequency, and a
@@ -1025,6 +1144,10 @@ impl IqSource for ConvertedSource {
 
     fn mutes_rx_audio_on_tx(&self) -> bool {
         self.inner.mutes_rx_audio_on_tx()
+    }
+
+    fn mutes_rx_audio_on_rig_tx(&self) -> bool {
+        self.inner.mutes_rx_audio_on_rig_tx()
     }
 
     fn tx_write_audio(&mut self, audio: &[f32]) -> Result<()> {

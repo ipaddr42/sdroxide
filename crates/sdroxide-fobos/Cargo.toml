@@ -1,0 +1,35 @@
+[package]
+name = "sdroxide-fobos"
+version.workspace = true
+edition.workspace = true
+
+# RigExpert Fobos SDR support through `libfobos` — LGPL-2.1, open source
+# (github.com/rigexpert/libfobos), found with dlopen at *runtime* exactly the
+# way sdroxide-sdrplay finds the closed `sdrplay_api` and sdroxide-lime finds
+# the open-source `libLimeSuite`: nothing is linked at build time regardless
+# of which of those libraries is open, because the point is not licensing —
+# it's that this crate builds and ships in every variant without every
+# contributor needing the vendor library installed just to compile sdroxide,
+# and a machine without it gets an empty device list with an explanation
+# rather than a build failure.
+#
+# `ffi`, `error`, `device` (enumerate/open), `handle`/`stream` (RF-port,
+# single-channel HF/direct-sampling, and dual-channel HF sync-mode
+# streaming, one thread + an `rtrb` ring, same shape as
+# sdroxide-hydrasdr/sdroxide-airspy). `sdroxide-dsp` is `WbDdc`, the
+# real-to-complex wideband downconverter sdroxide-rx888 already built and
+# verified for the identical direct-sampling problem, reused here rather
+# than reinvented, plus the adaptive `Diversity` filter for the dual-channel
+# combining. `FobosConfig` and `Backend::Fobos` registration live in
+# `sdroxide-types`/the `sdroxide` binary crate, not here — this crate has no
+# dependency on either.
+[dependencies]
+thiserror.workspace = true
+tracing.workspace = true
+libloading.workspace = true
+crossbeam-channel.workspace = true
+rtrb.workspace = true
+sdroxide-dsp.workspace = true
+
+[dev-dependencies]
+tracing-subscriber.workspace = true

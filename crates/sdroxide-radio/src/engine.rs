@@ -6,6 +6,7 @@
 //! (persisted engine-side), hardware gain/antenna control, and
 //! viewport-aware spectrum frames. TX arrives in M5.
 
+use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -22,8 +23,8 @@ use sdroxide_digi::{
 };
 use sdroxide_drm::DrmDemod;
 use sdroxide_dsp::{
-    AdcMeter, Agc, AutoNotch, DcBlock, Ddc, Decimator, DeepFilterNr, Demodulator, Duc, Modulator,
-    MonoResampler, Nco, NeuralNr, NoiseBlanker, ParametricEq, SpecBleachNr, SpectralNr,
+    AdcMeter, Agc, AutoNotch, Binaural, DcBlock, Ddc, Decimator, DeepFilterNr, Demodulator, Duc,
+    Modulator, MonoResampler, Nco, NeuralNr, NoiseBlanker, ParametricEq, SpecBleachNr, SpectralNr,
     SpectrumAnalyzer, StereoResampler, SubToneGen, ToneBurst, channel_target, make_demod,
     make_modulator,
 };
@@ -38,6 +39,7 @@ use sdroxide_types::{
     RepeaterState, RigctldConfig, RxId, RxState, ScanKind, ScanResume, SpectrumConfig,
     SpectrumFrame, TciServerConfig, TxEqState, TxMeters, Vfo,
 };
+use sdroxide_vdl2::{Vdl2Action, Vdl2Controller};
 
 use crate::recorder::{Recorder, RecordingChannels};
 use crate::voice::VoiceKeyer;
@@ -88,6 +90,26 @@ pub const WIDE_BINS: usize = 2048;
 /// more signal than the lane's hop can hide (see [`MAX_HOP_DIV`]).
 fn zoom_lane_fft(display_bins: usize) -> usize {
     (display_bins * 8).next_power_of_two().clamp(4096, 32_768)
+}
+
+/// Where a `span_hz` window on `center_hz` sits inside a `full_span_hz` band on
+/// `full_center_hz`, as the ascending pair of fractions
+/// [`SpectrumAnalyzer::seed_from`] takes.
+///
+/// Outside `0.0..=1.0` where the window is not wholly inside the band, which is
+/// what `seed_from` refuses on: there is no picture of what it cannot see.
+fn span_fraction(
+    full_center_hz: f64,
+    full_span_hz: f64,
+    center_hz: f64,
+    span_hz: f64,
+) -> (f64, f64) {
+    if full_span_hz <= 0.0 {
+        return (0.0, 0.0);
+    }
+    let base = full_center_hz - full_span_hz / 2.0;
+    let lo = (center_hz - span_hz / 2.0 - base) / full_span_hz;
+    (lo, lo + span_hz / full_span_hz)
 }
 
 /// How many transforms a waterfall row is built from, when there are enough to
@@ -213,6 +235,17 @@ const SCOPE_MAIN_STALE: Duration = Duration::from_secs(10);
 /// payload is a handful of floats, so the extra traffic is immaterial even over
 /// the remote-client WebSocket.
 const METER_INTERVAL: Duration = Duration::from_millis(33);
+
+/// The longest the engine's thread will be held waiting for the external T/R
+/// switch's contacts before RF is let out.
+///
+/// A relay throws in five to fifteen milliseconds and a sequencer wants a
+/// little more; anything beyond this is an audible hole in the receive tail and
+/// a delay between the operator's thumb and their own transmitter, and is far
+/// more likely to be a mistyped setting than a real requirement. Capped rather
+/// than refused, because a switch that leads by a quarter of a second is still
+/// a switch that protects the receiver.
+const MAX_TR_LEAD: Duration = Duration::from_millis(250);
 
 /// Consecutive over-limit SWR readings required before the guard fires. At the
 /// 33 ms meter interval this is about a fifth of a second of genuinely bad SWR,
@@ -425,6 +458,14 @@ pub struct EngineConfig {
     /// Which radio is on FreeDV, shared like `tx_gate`. `None` (the default,
     /// and every single-radio start): this engine's own mode is the answer.
     pub rade_watch: Option<Arc<crate::RadeWatch>>,
+    /// The station's external T/R switch, shared like `tx_gate` — the relay
+    /// that grounds the SDR's antenna while anything in this process is on the
+    /// air. `None` (the default) switches nothing.
+    ///
+    /// Shared rather than per-engine because the relay is in the antenna line,
+    /// not in a front end: whichever radio keys, the same contacts have to
+    /// throw, and they must not open while another one is still transmitting.
+    pub tr_switch: Option<Arc<crate::TrSwitch>>,
 }
 
 impl Default for EngineConfig {
@@ -446,6 +487,7 @@ impl Default for EngineConfig {
             tx_gate: None,
             store_sync: None,
             rade_watch: None,
+            tr_switch: None,
             record_iq: None,
         }
     }
@@ -1000,6 +1042,17 @@ struct Scan {
     /// Channels a stepped range scan walks, and how far along it is.
     stepped: Vec<f64>,
     step_at: usize,
+    /// A fast memory scan's plan: each hardware centre to look from, with the
+    /// memory ids it can see from there — and which one is up.
+    ///
+    /// Ids rather than indices into the store: the store is republished
+    /// whenever anything edits it, and a plan holding positions in a list that
+    /// has since been re-ordered would scan the wrong channels. Emptied at the
+    /// end of every lap, so a channel stored, skipped or re-filed mid-scan is
+    /// picked up on the next one — the same bargain the plain memory scan
+    /// strikes by rebuilding its queue each lap.
+    mem_slices: Vec<(f64, Vec<u32>)>,
+    mem_slice: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -1606,6 +1659,53 @@ fn run_chain_block(
     }
 }
 
+/// Binaural (pseudo-stereo) audio: spread the receive passband across the two
+/// ears, so that pitch becomes direction and tuning a signal floats it from one
+/// ear to the other (issue #263). What it actually does to the audio is
+/// [`sdroxide_dsp::Binaural`]'s business; this is where the receiver decides
+/// whether it runs at all.
+///
+/// `mono` comes in as the speaker audio and goes out as the left ear, with the
+/// right in `right`; `scratch` is where the left is built before the two are
+/// swapped, so nothing is copied twice. Both are left exactly as they were —
+/// and the widener dropped, rather than left holding a filter's worth of stale
+/// audio — whenever it is not wanted:
+///
+/// * the operator has not asked for it, or the mode is not one that has it
+///   ([`Mode::binaural_audio`]);
+/// * something else already owns the right ear. The sub receiver claims it
+///   explicitly and WFM stereo fills it automatically, and neither is worth
+///   giving up for an effect: the same order of precedence the stereo
+///   broadcast itself yields to.
+///
+/// A free function rather than a method for the reason [`run_chain_block`] is
+/// one: the buffers it works on and the widener that owns the filter state are
+/// separate fields of the engine, and both receive paths — a demodulated radio
+/// and a transceiver handing over its own audio — have to reach it.
+fn binaural_split(
+    slot: &mut Option<Binaural>,
+    rx: &RxState,
+    rate: f64,
+    right_free: bool,
+    mono: &mut Vec<f32>,
+    scratch: &mut Vec<f32>,
+    right: &mut Vec<f32>,
+) {
+    if !rx.binaural || !rx.mode.binaural_audio() || !right_free || !right.is_empty() {
+        *slot = None;
+        return;
+    }
+    let b = slot.get_or_insert_with(|| Binaural::new(rate, rx.filter_lo, rx.filter_hi));
+    // Both re-asserted per block and both no-ops when nothing has moved: the
+    // speaker's rate changes when the operator picks another sound card, and
+    // the passband every time a filter edge is dragged.
+    b.set_rate(rate);
+    b.set_passband(rx.filter_lo, rx.filter_hi);
+    scratch.clear();
+    b.process(mono, scratch, right);
+    std::mem::swap(mono, scratch);
+}
+
 /// A satellite lock in progress: the parsed propagator, who is watching from
 /// where, and the numbers most recently computed from them.
 struct ActiveSatLock {
@@ -1723,17 +1823,38 @@ impl ZoomLane {
     /// `in_rate_hz`. A lane that is keeps its filters and its averaging — and
     /// so keeps the waterfall running — across everything except a real change
     /// of window.
+    ///
+    /// **Where the window sits is not part of that.** Moving it is a matter of
+    /// re-pointing the NCO ([`ZoomLane::aim`]), and the filter ladder behind it
+    /// does not care where it was pointed; only the decimation it runs at and
+    /// the rate it is fed decide what those filters are. A pan sends a viewport
+    /// once per displayed frame, so a lane that treated a moved window as a
+    /// different lane rebuilt itself sixty times a second — and each of those
+    /// replacements held no spectrum at all until its first transform, which is
+    /// a quarter of a second at the rate a zoom lane runs at. The waterfall
+    /// went black for the whole of the drag and stayed black until after the
+    /// operator let go.
     fn serves(&self, want: (f64, u32), in_rate_hz: f64) -> bool {
-        self.decim == want.1
-            && (self.center_hz - want.0).abs() < 0.5
-            && (self.in_rate_hz - in_rate_hz).abs() < 0.5
+        self.decim == want.1 && (self.in_rate_hz - in_rate_hz).abs() < 0.5
     }
 
-    /// Re-point the NCO after the front end moved out from under the lane —
-    /// which, since the panadapter's own pan can now move it, happens under an
-    /// operator's hand rather than only at a band change.
-    fn point_at(&mut self, dev_center_hz: f64) {
-        let want = self.center_hz - dev_center_hz;
+    /// Put the lane's window on `center_hz` with the front end on
+    /// `dev_center_hz` — either of which may have moved: the operator drags the
+    /// window across the band, and the panadapter's own pan carries the front
+    /// end under it.
+    ///
+    /// The NCO retunes phase-continuously and the decimator keeps its state, so
+    /// this costs a `sin`/`cos` and the averaging survives. The one thing that
+    /// does not survive is the filter's memory of the old window, which washes
+    /// out over a few tap lengths — a hundredth of what rebuilding costs.
+    ///
+    /// Written only when it is worth a write: the comparison is against the
+    /// offset actually in force, not against the last request, so a drag of
+    /// many sub-hertz steps cannot creep away from the window it is labelled
+    /// with.
+    fn aim(&mut self, center_hz: f64, dev_center_hz: f64) {
+        self.center_hz = center_hz;
+        let want = center_hz - dev_center_hz;
         if (want - self.offset_hz).abs() >= 0.5 {
             self.offset_hz = want;
             self.ddc.set_offset_hz(want);
@@ -1752,6 +1873,45 @@ struct Engine {
     caps: DeviceCaps,
     state: RadioState,
     cfg: SpectrumConfig,
+    /// Where the centre has been, newest last, for a front end whose samples
+    /// arrive later than the command that moved them
+    /// ([`IqSource::stream_delay_s`]).
+    ///
+    /// The panadapter's axis is a statement about the samples in the frame, not
+    /// about the last order given to the radio, and on a radio at the end of a
+    /// socket those are a tenth of a second apart. Empty — and never even
+    /// looked at — for every source that answers zero.
+    ///
+    /// Stamped with [`Engine::samples_read`] rather than with a clock. The
+    /// question is "how much signal has gone by since that retune", and a wall
+    /// clock answers it only while nothing is queued: a frame is built some
+    /// time *after* the block it draws was read, and at a drag's speed that gap
+    /// is worth as much error as a whole step. Counting samples is the same
+    /// arithmetic against the clock that actually carries the data.
+    center_trail: VecDeque<(u64, f64)>,
+    /// The centre the samples now arriving were taken at: the last entry of
+    /// [`Engine::center_trail`] to have aged in. Seeded from the front end's
+    /// own centre at open, and re-seeded whenever the source is replaced.
+    ///
+    /// Only meaningful on a front end that *declares* a stream delay — the
+    /// others have no trail to age anything in, and this stays on its seed
+    /// however far the dial travels. Read it through
+    /// [`Engine::stream_center_now`], never directly.
+    stream_center_hz: f64,
+    /// Device-rate samples this engine has taken from the front end, ever.
+    ///
+    /// A position on the stream, not a statistic — the only thing that reads it
+    /// is [`Engine::display_center_hz`]. At 32 Msps a `u64` runs for eighteen
+    /// thousand years.
+    samples_read: u64,
+    /// How many samples the newest block held.
+    ///
+    /// [`Engine::samples_read`] is the position at the *end* of that block, and
+    /// the picture drawn from it covers the whole of it — so taking the end as
+    /// "when this was" reads the stream half a block too new, every time. On a
+    /// pan that bias is half a block of drag, and it showed up as a frame here
+    /// and there jumping a whole step ahead of the rest.
+    last_block: u64,
     analyzer: SpectrumAnalyzer,
     /// The newest finished sweep from a source that computes its own spectrum.
     ///
@@ -2091,6 +2251,30 @@ struct Engine {
     /// panel that connected while the lane was down would sit on "starting the
     /// decoder" forever.
     adsb_idle_sent: Option<Option<String>>,
+
+    /// The VDL Mode 2 lane: a fourth window, on the 136.7-137.0 MHz datalink
+    /// channels.
+    ///
+    /// Its own for the same reason ADS-B's is — it is somewhere else entirely —
+    /// but shaped like the ISM decoder's inside, because VDL2 is a plan of seven
+    /// channels rather than one frequency. It only runs in `Mode::Vdl2`: the
+    /// window is a third of a megahertz wide and nothing else can be listened to
+    /// through a receiver parked on it.
+    vdl2_ddc: Option<Ddc>,
+    vdl2: Option<Vdl2Controller>,
+    vdl2_buf: Vec<Complex32>,
+    /// Absolute frequency the window is centred on.
+    vdl2_center_hz: f64,
+    /// The stream rate `vdl2_ddc` was built to decimate, so a retune can tell a
+    /// window that merely moved from one that has to be rebuilt.
+    vdl2_in_rate: f64,
+    /// The operator's persisted preference, kept apart from `state.vdl2` for the
+    /// same reason `adsb_cfg` is.
+    vdl2_cfg: sdroxide_types::Vdl2Settings,
+    /// The last "cannot run" sentence sent to the panel, so it is sent once
+    /// rather than on every block. The outer `None` means nothing has been said
+    /// yet, which is different from having said "there is nothing wrong".
+    vdl2_idle_sent: Option<Option<String>>,
     /// QO-100 beacon decoder: a fixed downconversion onto
     /// [`sdroxide_types::QO100_BEACON_HZ`] plus a worker-thread demodulator,
     /// present only while the decoder is enabled. Simpler than the ISM
@@ -2191,8 +2375,15 @@ struct Engine {
     /// chain ends before a digital-voice mode gets the chance to replace it.
     main_play: Vec<f32>,
     /// Right channel of the main chain, non-empty only while WFM stereo is
-    /// decoding and the sub receiver is off.
+    /// decoding and the sub receiver is off — or while the binaural widener
+    /// below is placing the passband across the two ears.
     main_play_r: Vec<f32>,
+    /// Binaural (pseudo-stereo) audio: built on the first block that asks for it
+    /// and dropped when the operator switches it off, so a receiver that never
+    /// uses it carries no filter state. Its left ear lands in `bin_left`, which
+    /// is then swapped into `main_play` — see [`binaural_split`].
+    binaural: Option<Binaural>,
+    bin_left: Vec<f32>,
     /// Speaker-path attenuation asked for by a local spoken announcement.
     /// Held here as well as in the mixer so a device swap, which builds a new
     /// mixer, does not come back at full volume mid-announcement.
@@ -2304,6 +2495,22 @@ struct Engine {
     /// connection transitions bypass the throttle, movement does not.
     rot_last_status: Option<sdroxide_rotator::RotStatus>,
     next_rot_emit: Instant,
+    /// The external T/R switch's config as persisted (`relay.json`), announced
+    /// in the station bundle the way the rotator's is.
+    relay_cfg: sdroxide_types::RelayConfig,
+    /// The switch itself, shared with every other engine. The driver behind it
+    /// is built by the primary engine only — one station, one antenna line —
+    /// but every engine publishes into it, because any of them keying is the
+    /// station being on the air.
+    tr_switch: Option<Arc<crate::TrSwitch>>,
+    /// What was last told to the clients, so a status only goes out when it
+    /// changed.
+    relay_last_status: Option<sdroxide_types::RelayStatus>,
+    /// A configuration that arrived while the station was on the air, waiting
+    /// for the over to end. See [`Engine::sync_relay`].
+    relay_pending: bool,
+    /// Whether the lead cap has already been complained about this session.
+    relay_lead_capped: bool,
     /// What was last written to `session.json`, so the periodic check only
     /// touches the disk when the operator has actually moved. `None` when this
     /// engine does not remember its session (see
@@ -2320,6 +2527,11 @@ struct Engine {
     /// held rather than dropped: swapping back to the radio it belongs to
     /// restores it.
     want_antenna: (Option<String>, Option<String>),
+    /// The socket the operator last chose on each band, `(RX, TX)`, restored
+    /// as the dial crosses into that band — see
+    /// [`sdroxide_config::Session::band_antenna`] and
+    /// [`Engine::follow_band_antenna`].
+    band_antenna: sdroxide_config::BandAntennas,
     /// The front-end gain stages the operator has set, RX then TX, as
     /// `(element, dB)` — held for the same reason [`Self::want_antenna`] is,
     /// and applied by [`Engine::restore_gains`] after every open.
@@ -2599,6 +2811,8 @@ fn engine_thread(
     caps.center_is_dial = source.center_is_dial();
     caps.cw_audio_keyed = source.cw_audio_keyed();
     caps.commands_squelch = source.commands_squelch();
+    caps.commands_rig_power = source.commands_rig_power();
+    caps.wide_span_hz = source.wide_span_hz();
     let audio_mode = caps.audio_mode;
     let radio_fs = source.sample_rate();
     let audio_bw = source.display_bandwidth().unwrap_or(radio_fs / 2.0);
@@ -2676,6 +2890,22 @@ fn engine_thread(
             }
             state.band = Band::containing(hz);
         }
+        // ...and VDL2, which is a plan of seven channels rather than one, so the
+        // dial goes to the middle of the group and the lane's own window slides
+        // from there to take in as much of it as the front end can reach.
+        if mode.is_vdl2() {
+            let hz = sdroxide_types::VDL2_PLAN_CENTER_HZ;
+            info!(
+                from = state.active_freq_hz(),
+                to = hz,
+                "VDL2 lives around 136.8 MHz; tuning there"
+            );
+            match state.active_vfo {
+                Vfo::A => state.vfo_a_hz = hz,
+                Vfo::B => state.vfo_b_hz = hz,
+            }
+            state.band = Band::containing(hz);
+        }
     }
     let skim_cfg = sdroxide_config::load_skimmer_config();
     state.skimmer = if audio_mode {
@@ -2703,6 +2933,12 @@ fn engine_thread(
         sdroxide_types::IsmSettings::OFF // wideband-only, like the skimmers
     } else {
         ism_cfg
+    };
+    let vdl2_cfg = sdroxide_config::load_vdl2_config();
+    state.vdl2 = if audio_mode {
+        sdroxide_types::Vdl2Settings::OFF // wideband-only, like the rest of the lanes
+    } else {
+        vdl2_cfg
     };
     let adsb_cfg = sdroxide_config::load_adsb_config();
     state.adsb = if audio_mode {
@@ -2807,6 +3043,7 @@ fn engine_thread(
         state.rx[0].agc = s.agc;
         state.rx[0].squelch_db = s.squelch_db;
         state.rx[0].noise_reduction = s.noise_reduction;
+        state.rx[0].binaural = s.binaural;
         state.tx.drive = s.drive;
         state.tx.tune_drive = s.tune_drive;
         state.tx.mic_gain = s.mic_gain;
@@ -2829,12 +3066,16 @@ fn engine_thread(
     // the operator last set on this radio, and nothing at all on a first run.
     let want_gains =
         session.as_ref().map(|s| (s.gains.clone(), s.tx_gains.clone())).unwrap_or_default();
+    let band_antenna = session.as_ref().map(|s| s.band_antenna.clone()).unwrap_or_default();
 
     let mut engine = Engine {
         // Out of declaration order on purpose: literal fields are evaluated
         // top to bottom and the `state` shorthand below moves it, so the band
         // has to be copied out of it first.
         band_seen: state.band,
+        // Read before `state` is moved below, for the same reason `band_seen`
+        // is: the stream starts wherever the front end already was.
+        stream_center_hz: state.center_hz,
         source,
         caps,
         state,
@@ -2880,6 +3121,9 @@ fn engine_thread(
         swr_tripped: None,
         wide_bins: Vec::new(),
         row_batch: Vec::new(),
+        center_trail: VecDeque::new(),
+        samples_read: 0,
+        last_block: 0,
         row_axis: None,
         row_samples: 0,
         row_sample_clock: false,
@@ -2951,6 +3195,13 @@ fn engine_thread(
         adsb_cfg,
         adsb_home: None,
         adsb_idle_sent: None,
+        vdl2_ddc: None,
+        vdl2: None,
+        vdl2_buf: Vec::new(),
+        vdl2_center_hz: 0.0,
+        vdl2_in_rate: 0.0,
+        vdl2_cfg,
+        vdl2_idle_sent: None,
         qo100_ddc: None,
         qo100: None,
         qo100_buf: Vec::new(),
@@ -2990,6 +3241,8 @@ fn engine_thread(
         voice_play: Vec::new(),
         main_play: Vec::new(),
         main_play_r: Vec::new(),
+        binaural: None,
+        bin_left: Vec::new(),
         speech_duck: 1.0,
         main_play_rec: Vec::new(),
         main_play_r_rec: Vec::new(),
@@ -3025,11 +3278,17 @@ fn engine_thread(
         tle_refresh: None,
         sat_lock: None,
         rot_cfg: sdroxide_types::RotatorConfig::default(),
+        relay_cfg: sdroxide_types::RelayConfig::default(),
+        tr_switch: engine_cfg.tr_switch.clone(),
+        relay_last_status: None,
+        relay_pending: false,
+        relay_lead_capped: false,
         rotator: None,
         rot_last_status: None,
         next_rot_emit: Instant::now(),
         session,
         want_antenna,
+        band_antenna,
         want_gains,
         want_decimation,
         store: engine_cfg.store,
@@ -3068,6 +3327,7 @@ fn engine_thread(
         engine.sync_ism(); // likewise, from ism.json
         engine.sync_adsb_home();
         engine.sync_adsb(); // and the aircraft lane, if the mode is already ADS-B
+        engine.sync_vdl2(); // ...and the datalink lane, likewise
         engine.sync_qo100(); // a no-op today: `qo100_cfg` starts disabled and is never loaded
     }
     // Start any enabled network spot feeds from the persisted config. The
@@ -3121,6 +3381,12 @@ fn engine_thread(
     engine.rot_cfg = sdroxide_config::load_rotator_config();
     if engine.primary {
         engine.sync_rotator();
+    }
+    engine.relay_cfg = sdroxide_config::load_relay_config();
+    // One station, one antenna line: only the primary engine opens the switch.
+    // Every engine still publishes into it — see `Engine::poll_tr_switch`.
+    if engine.primary {
+        engine.sync_relay();
     }
     // Seed clients with the whole station configuration up front, for the same
     // reason as the operator config above: a settings dialog that has not been
@@ -3197,7 +3463,12 @@ fn engine_thread(
                         let _ = engine.source.tx_end();
                     }
                     // A dying engine must not leave the station interlock
-                    // claimed, or no surviving radio could ever key again.
+                    // claimed, or no surviving radio could ever key again —
+                    // nor its claim on the T/R switch, or the station's antenna
+                    // relay stays where this engine left it.
+                    engine.tx_active = false;
+                    engine.rig_tx = false;
+                    engine.cw_gate_until = None;
                     engine.release_tx_gate();
                     info!("all controllers gone; engine stopping");
                     return;
@@ -3244,6 +3515,9 @@ fn engine_thread(
         // whether the front end's centre is a dial we can move is not fixed for
         // every source (see `Self::refresh_center_is_dial`).
         engine.refresh_center_is_dial();
+        // …and whether it has an antenna selector, which a CI-V rig only
+        // answers once its control link has been open a round trip.
+        engine.refresh_antennas();
 
         // Drive the FT8/FT4 slot machine (runs in both RX and TX). Returns
         // owned actions to avoid borrowing `engine.digi` and `engine` at once.
@@ -3252,6 +3526,7 @@ fn engine_thread(
         engine.poll_skimmer();
         engine.poll_ism();
         engine.poll_adsb();
+        engine.poll_vdl2();
         engine.poll_qo100();
         engine.poll_scanner();
         engine.poll_tci_server();
@@ -3265,6 +3540,7 @@ fn engine_thread(
         engine.poll_tle_refresh();
         engine.poll_sat_track();
         engine.poll_rotator_status();
+        engine.poll_tr_switch();
         // Attach (or re-attach) the configured radio on its own when the
         // front-end is only a stand-in — no trip through Settings.
         engine.poll_reconnect();
@@ -3286,7 +3562,10 @@ fn engine_thread(
                     warn!("could not unkey after a transmit failure: {e}");
                 }
                 // Same as the controller-gone exit: a dead engine must not
-                // keep the station interlock.
+                // keep the station interlock, nor the T/R switch.
+                engine.tx_active = false;
+                engine.rig_tx = false;
+                engine.cw_gate_until = None;
                 engine.release_tx_gate();
                 return;
             }
@@ -3298,6 +3577,8 @@ fn engine_thread(
             // over on the air as chirps. See `IqSource::read_available`.
             if engine.caps.full_duplex && !engine.audio_mode {
                 if let Ok(n @ 1..) = engine.source.read_available(&mut buf) {
+                    engine.samples_read += n as u64;
+                    engine.last_block = n as u64;
                     engine.adc.observe(&buf[..n]);
                     let iq = decimate(engine.decim.as_mut(), &buf[..n], &mut dbuf);
                     engine.run_audio(iq);
@@ -3308,11 +3589,17 @@ fn engine_thread(
                 Ok(0) => continue, // timeout
                 Ok(n) if engine.audio_mode => {
                     lane_samples += n as u64;
+                    engine.samples_read += n as u64;
+                    engine.last_block = n as u64;
                     engine.adc.observe(&buf[..n]);
                     engine.run_audio_mode(&buf[..n]);
                 }
                 Ok(n) => {
                     lane_samples += n as u64;
+                    // Where on the stream we are, for a front end whose retunes
+                    // land later than they are given — see `center_trail`.
+                    engine.samples_read += n as u64;
+                    engine.last_block = n as u64;
                     // Ahead of the blanker and of `decimate`, both of which
                     // destroy what this is looking for. See `AdcMeter`.
                     engine.adc.observe(&buf[..n]);
@@ -3363,27 +3650,34 @@ fn engine_thread(
         if now >= next_frame {
             next_frame = now + Duration::from_secs_f64(1.0 / engine.cfg.fps.max(1) as f64);
             let mut frame = engine.make_spectrum_frame();
-            engine.attach_rows(&mut frame);
-            // A triple buffer keeps only the newest value, so a client that
-            // repaints more slowly than this engine publishes loses whole
-            // frames — and every waterfall row that rode in them. The picture
-            // then scrolls slower than the time axis beside it says it does,
-            // by exactly the fraction dropped, and goes on doing so for ever.
-            //
-            // `publish` reports the overwrite, and the buffer handed back is
-            // the frame nobody fetched, so its rows can be carried into this
-            // one. Same rule and the same bound as the network client's
-            // `carry_rows_from` — a backlog longer than that is a client that
-            // stopped drawing, not a hitch to be made good.
-            if dropped_frame {
-                frame.carry_rows_from(spec_in.input_buffer());
+            // Nothing measured yet on the lane that drew — see
+            // `Engine::drew_empty`. Held back rather than published: the client
+            // goes on showing the picture it has, and the batched rows wait for
+            // a frame that has something in it. The next tick is scheduled
+            // either way, so this costs at most one frame period.
+            if !engine.drew_empty() {
+                engine.attach_rows(&mut frame);
+                // A triple buffer keeps only the newest value, so a client that
+                // repaints more slowly than this engine publishes loses whole
+                // frames — and every waterfall row that rode in them. The picture
+                // then scrolls slower than the time axis beside it says it does,
+                // by exactly the fraction dropped, and goes on doing so for ever.
+                //
+                // `publish` reports the overwrite, and the buffer handed back is
+                // the frame nobody fetched, so its rows can be carried into this
+                // one. Same rule and the same bound as the network client's
+                // `carry_rows_from` — a backlog longer than that is a client that
+                // stopped drawing, not a hitch to be made good.
+                if dropped_frame {
+                    frame.carry_rows_from(spec_in.input_buffer());
+                }
+                *spec_in.input_buffer_mut() = frame;
+                dropped_frame = spec_in.publish();
+                if dropped_frame {
+                    lane_dropped += 1;
+                }
+                lane_frames += 1;
             }
-            *spec_in.input_buffer_mut() = frame;
-            dropped_frame = spec_in.publish();
-            if dropped_frame {
-                lane_dropped += 1;
-            }
-            lane_frames += 1;
         }
         // Once a second, and only where somebody asked for it: this is the
         // measurement that tells a starved front end from a lane that is
@@ -3953,6 +4247,22 @@ impl Engine {
             }
         }
 
+        // Binaural audio, if the operator asked for it: one ear becomes two, with
+        // the passband spread across them. Here rather than inside the receive
+        // chain because this is where the demodulated path and the transceiver's
+        // own audio have met, and because everything the decoders, the recorder
+        // and the remote stream tap is upstream of it — turning this on changes
+        // what the operator hears and nothing else.
+        binaural_split(
+            &mut self.binaural,
+            &self.state.rx[0],
+            out_rate,
+            !self.state.sub_rx_enabled,
+            &mut self.main_play,
+            &mut self.bin_left,
+            &mut self.main_play_r,
+        );
+
         // Both taps come out of one borrow: `run`'s own return would keep the
         // chain mutably borrowed, leaving no way to ask for the recorder tap
         // as well.
@@ -4019,6 +4329,17 @@ impl Engine {
             ddc.process(iq, &mut self.adsb_buf);
             if let Some(d) = self.adsb.as_ref() {
                 d.on_rx_iq(&self.adsb_buf);
+            }
+        }
+        // ...and the VDL2 lane, from a third of a megahertz around 136.8 MHz.
+        // The seven channels are split out inside the worker rather than here:
+        // one downconverter per channel is the worker's business, and the engine
+        // only has to place the window they all come off.
+        if let Some(ddc) = self.vdl2_ddc.as_mut() {
+            self.vdl2_buf.clear();
+            ddc.process(iq, &mut self.vdl2_buf);
+            if let Some(d) = self.vdl2.as_ref() {
+                d.on_rx_iq(&self.vdl2_buf);
             }
         }
         // ...and the QO-100 beacon decoder from its own fixed downconversion
@@ -4119,24 +4440,40 @@ impl Engine {
     /// [`Engine::feed_panadapter`] and the two analysers then run side by side.
     fn sync_zoom(&mut self) {
         let in_rate = self.state.sample_rate;
+        // The lane mixes down by an offset from the front end's centre, so the
+        // centre it is pointed with has to be the one the *samples* carry —
+        // otherwise, on a source whose stream lags its retunes, the lane lands
+        // beside the window it labels itself with. Same reasoning as
+        // [`Engine::display_center_hz`], which labels the frame.
+        let dev_center = self.display_center_hz();
         match self.wanted_zoom() {
             None => {
                 self.zoom = None;
                 return;
             }
             Some(want) => match self.zoom.as_mut() {
-                // The same window: only the front end may have moved under it.
-                Some(z) if z.serves(want, in_rate) => z.point_at(self.state.center_hz),
+                // The same lane: the window, the front end, or both may have
+                // moved under it, and re-pointing is all either needs.
+                Some(z) if z.serves(want, in_rate) => z.aim(want.0, dev_center),
                 _ => {
                     let fft = zoom_lane_fft(self.cfg.bins());
-                    let lane = ZoomLane::new(
+                    let mut lane = ZoomLane::new(
                         in_rate,
                         want.1,
                         want.0,
-                        self.state.center_hz,
+                        dev_center,
                         self.cfg.avg_tc,
                         fft,
                         f64::from(self.cfg.rows()),
+                    );
+                    // Start it on the device-wide analyser's picture of the
+                    // same window, so the zoom step that builds it does not
+                    // black the waterfall out for as long as the lane takes to
+                    // fill — a quarter of a second at the rate a deep zoom runs
+                    // at. See [`SpectrumAnalyzer::seed_from`].
+                    lane.analyzer.seed_from(
+                        &self.analyzer,
+                        span_fraction(dev_center, in_rate, lane.center_hz, lane.rate_hz),
                     );
                     debug!(
                         center = lane.center_hz,
@@ -4166,10 +4503,23 @@ impl Engine {
         self.analyzer.process(iq);
 
         self.play_rx_audio(self.radio_fs);
-        // Mono: a demod-audio rig has one receiver and no sub, so there is
-        // never a second ear to fill.
+        // A demod-audio rig has one receiver and no sub, so the second ear is
+        // free — and the binaural widener is the one thing that fills it. This
+        // is the front end a great many operators are listening on, so it gets
+        // the same treatment the demodulated path does.
+        self.main_play_r.clear();
+        binaural_split(
+            &mut self.binaural,
+            &self.state.rx[0],
+            self.audio_out_rate,
+            true,
+            &mut self.audio_play,
+            &mut self.bin_left,
+            &mut self.main_play_r,
+        );
+        let right = (!self.main_play_r.is_empty()).then_some(&self.main_play_r[..]);
         if let Some(mixer) = self.mixer.as_mut() {
-            mixer.push(&self.audio_play, None, &self.audio_play_rec, None);
+            mixer.push(&self.audio_play, right, &self.audio_play_rec, None);
         }
     }
 
@@ -4465,6 +4815,7 @@ impl Engine {
                 self.sync_skim_window();
                 self.sync_ism_window();
                 self.sync_adsb_window();
+                self.sync_vdl2_window();
                 self.sync_qo100_window();
                 self.update_tuning();
                 let _ = self.event_tx.send(RadioEvent::State(self.state.clone()));
@@ -4529,18 +4880,7 @@ impl Engine {
             // An over the operator started at the radio. Recorded, never
             // answered: see [`ControlUpdate::RigTx`] for why keying along with
             // it would talk over the person holding the microphone.
-            ControlUpdate::RigTx(on) => {
-                if on != self.rig_tx {
-                    self.rig_tx = on;
-                    info!(
-                        "the radio is {} under its own control",
-                        match on {
-                            true => "transmitting",
-                            false => "receiving",
-                        }
-                    );
-                }
-            }
+            ControlUpdate::RigTx(on) => self.adopt_rig_tx(on, "its own control"),
             ControlUpdate::Mode(m) => {
                 let cur = self.state.rx[0].mode;
                 // Against the mode we *command*, not the one on screen: SSTV is
@@ -4656,6 +4996,13 @@ impl Engine {
             return;
         }
         self.state.center_hz = center;
+        // A move we did not command, learned about from a report that arrives
+        // *after* the rig made it — so the stream is already there, or as near
+        // as anything here can tell. Anything still queued in the trail was
+        // superseded by it. Compensating a move nobody timed would be guessing
+        // in the other direction.
+        self.center_trail.clear();
+        self.stream_center_hz = center;
         // Where the hardware demonstrably is, is by definition a frequency it
         // took — this is the dial the rig itself just reported.
         self.good_vfo_hz = self.state.active_freq_hz();
@@ -4672,6 +5019,11 @@ impl Engine {
         // target rather than a plan of them: 1090 MHz is where it has to be, and
         // the only question is whether the new span still reaches it.
         self.sync_adsb_window();
+        // The VDL2 window is a plan of channels like the ISM one, but unlike it
+        // the whole plan fits in a single window, so there is nothing to choose
+        // between — it goes where the span can reach the group and follows the
+        // hardware centre when it has to.
+        self.sync_vdl2_window();
         // The QO-100 window, unlike the ISM one, *does* follow the hardware
         // centre — its one target frequency never moves, so re-seating the
         // mixer is all a retune ever needs.
@@ -4764,6 +5116,10 @@ impl Engine {
         if std::mem::replace(&mut self.band_seen, band) == band {
             return;
         }
+        // The antenna first, and outside the WSPR exemption below: a beam that
+        // hears 2 m and a vertical that hears 40 are not a mode's business, and
+        // a receiver left on the wrong socket hears nothing to decode.
+        self.follow_band_antenna(band);
         if self.state.rx[0].mode.is_wspr() {
             return;
         }
@@ -5059,6 +5415,12 @@ impl Engine {
                         // control — the rig keys its own transmitter here and
                         // never looks at the audio we send it.
                         self.source.set_tx_drive(self.state.tx.drive as f64);
+                        // And throw the external T/R switch, for the same
+                        // reason and with the same lead. `tx_active` never
+                        // becomes true on this path, so nothing else in the
+                        // engine would ever key the relay for a message the rig
+                        // is about to put on the air at full power.
+                        self.lead_tr_switch();
                         self.source.send_cw(&text);
                     }
                 }
@@ -5067,6 +5429,13 @@ impl Engine {
                     self.cw_gate_until = None;
                     if !self.tx_active {
                         self.release_tx_gate();
+                        // The message never finished, so the hold has to start
+                        // now rather than at the length it was going to be.
+                        // `poll_tr_switch` would get there on the next tick;
+                        // this makes the receiver's return prompt instead.
+                        if let Some(hub) = self.tr_switch.as_ref() {
+                            hub.unkey(self.instance);
+                        }
                     }
                 }
             }
@@ -5413,7 +5782,20 @@ impl Engine {
                 // 16k-point FFT over the ~50 kHz channel ≈ 3 Hz/bin, enough to
                 // resolve 6.25 Hz FT8 tones.
                 let ch_rate = self.channel_rate_hz;
-                self.channel_analyzer = Some(SpectrumAnalyzer::new(16_384, ch_rate, 0.10));
+                let mut ca = SpectrumAnalyzer::new(16_384, ch_rate, 0.10);
+                // 16384 points at the channel rate is over a second of signal
+                // before the first transform lands, and this window *is* the
+                // panadapter while a digital mode is up — so unseeded, entering
+                // FT8 blacks the display out for the whole of it. The
+                // device-wide analyser has the same band already.
+                let window = span_fraction(
+                    self.display_center_hz(),
+                    self.state.sample_rate,
+                    self.state.rx_freq_hz(),
+                    ch_rate,
+                );
+                ca.seed_from(&self.analyzer, window);
+                self.channel_analyzer = Some(ca);
             }
             // Covers arriving in CW from a digital mode, where the analyzer is
             // already up and nothing else would take it down.
@@ -5501,6 +5883,38 @@ impl Engine {
             .chain(self.channel_analyzer.as_mut())
     }
 
+    /// Whether the frame just built came out of an analyser holding nothing —
+    /// a lane rebuilt a moment ago, or one reset across a transmit — and so
+    /// reads the display floor in every column.
+    ///
+    /// The invariant: **a picture nobody has measured is not published.** A
+    /// black frame is a lie about the band, and a black waterfall row is a
+    /// permanent one — it scrolls away up the history and stays there. Holding
+    /// the last honest picture for the millisecond or two an analyser takes to
+    /// fill is what every part of this file's row plumbing already does when
+    /// there is nothing new to say.
+    ///
+    /// Asked afterwards rather than worked out in advance for the same reason
+    /// [`SpectrumAnalyzer::took_row`] is: which lane draws is a dozen
+    /// conditions deep in [`Engine::make_spectrum_frame`], and a second copy of
+    /// that branch here would go wrong the first time either changed. Every
+    /// lane is polled, not just until one answers, so no flag is left standing
+    /// for the next frame to trip over.
+    ///
+    /// **Not the channel analyser.** Every other lane is fed straight off the
+    /// front end and fills within one transform of it, so waiting is a matter
+    /// of milliseconds. That one is fed from the receive chain's DDC output and
+    /// there may not be a receive chain — an engine with no audio configured
+    /// never feeds it at all — so holding the panadapter until it has something
+    /// could hold it for ever. It is seeded instead, where there is a wider
+    /// picture to seed it from.
+    fn drew_empty(&mut self) -> bool {
+        std::iter::once(&mut self.analyzer)
+            .chain(std::iter::once(&mut self.tx_analyzer))
+            .chain(self.zoom.as_mut().map(|z| &mut z.analyzer))
+            .fold(false, |empty, a| a.drew_empty() | empty)
+    }
+
     /// One waterfall row: the strongest thing each column saw since the last
     /// row was taken.
     ///
@@ -5545,7 +5959,9 @@ impl Engine {
                 a.set_row_hold(false);
             }
         });
-        Some(frame)
+        // A row is history: published black it stays black for as long as the
+        // operator scrolls back. See [`Engine::drew_empty`].
+        (!self.drew_empty()).then_some(frame)
     }
 
     /// Feed the panadapter lanes a block, clocking waterfall rows off the
@@ -5745,6 +6161,42 @@ impl Engine {
         self.wide_window
     }
 
+    /// The full-band window, when the viewport has been zoomed out past what
+    /// the I/Q covers and that spectrum is the only thing that reaches it.
+    ///
+    /// [`Engine::scope_main_window`] is the same idea for a front end with no
+    /// I/Q at all; this is for one that has some, but not as much as the
+    /// operator is asking to see. The test is containment rather than width: a
+    /// viewport that has been *panned* off the edge of the passband is as far
+    /// outside it as one that is simply wider, and neither has anything for the
+    /// device analyser to draw.
+    ///
+    /// `None` in audio mode — the branch above owns that case — and while the
+    /// front end has published nothing wide lately, so a lane that stops
+    /// arriving hands the picture back rather than freezing it.
+    fn wide_main_window(&self) -> Option<(f64, f64)> {
+        if self.audio_mode || self.wide_at.elapsed() >= SCOPE_MAIN_STALE {
+            return None;
+        }
+        let (wide_center, wide_span) = self.wide_window?;
+        let (vp_lo, vp_hi) = self.cfg.viewport?;
+        if !(wide_span > 0.0 && vp_hi > vp_lo) {
+            return None;
+        }
+        // What the device analyser can actually draw. Its centre is the one the
+        // samples in hand were taken at, not the one most recently commanded —
+        // on a laggy front end those differ, and the wrong one here would flip
+        // the panadapter between the two sources every time the dial moved.
+        wide_covers_viewport(
+            (vp_lo, vp_hi),
+            self.stream_center_now(),
+            self.state.sample_rate,
+            (wide_center, wide_span),
+            self.wide_bins.len(),
+        )
+        .then_some((wide_center, wide_span))
+    }
+
     /// The RF window the rig's demodulated audio covers: its passband, on the
     /// side of the dial the mode puts it.
     fn audio_band(&self) -> (f64, f64) {
@@ -5827,6 +6279,77 @@ impl Engine {
         )
     }
 
+    /// Remember where the centre went, for a front end whose stream lags the
+    /// command that moved it. A no-op — and no allocation — at zero delay.
+    fn note_center_change(&mut self, center_hz: f64) {
+        if self.source.stream_delay_s() <= 0.0 {
+            return;
+        }
+        self.center_trail.push_back((self.samples_read, center_hz));
+    }
+
+    /// Where the samples in hand were taken, for a decision that has to be made
+    /// against the stream rather than against the dial.
+    ///
+    /// [`Engine::display_center_hz`] walks [`Engine::center_trail`] to work
+    /// this out, but only a front end that declares a stream delay ever builds
+    /// a trail: with no delay the samples in hand *are* at the commanded
+    /// centre, that function short-circuits, and
+    /// [`Engine::stream_center_hz`] is never written after its seed.
+    ///
+    /// Reading the field regardless is how the main panadapter came to compare
+    /// its viewport against wherever the receiver happened to be when the
+    /// engine opened. Every tune after that looked, to
+    /// [`Engine::wide_main_window`], like a viewport panned clean off the
+    /// passband — so an RX-888 drew the whole of HF from its 64.8 MHz overview
+    /// lane at 16 kHz a bin, everywhere except the one window the engine had
+    /// started in.
+    fn stream_center_now(&self) -> f64 {
+        if self.source.stream_delay_s() > 0.0 {
+            self.stream_center_hz
+        } else {
+            self.state.center_hz
+        }
+    }
+
+    /// The centre the samples now being drawn were actually taken at.
+    ///
+    /// [`Engine::note_center_change`] logs each retune; this reads back the one
+    /// in force `stream_delay_s` ago and drops everything older, so the trail
+    /// stays a handful of entries however long a drag runs. A source that
+    /// declares no delay never reaches past the first line, and gets the
+    /// commanded centre exactly as before.
+    fn display_center_hz(&mut self) -> f64 {
+        let delay = self.source.stream_delay_s();
+        if delay <= 0.0 {
+            return self.state.center_hz;
+        }
+        // The samples the analyser is holding were taken this far back up the
+        // stream. Counted at the *device* rate, which is what
+        // [`Engine::samples_read`] counts: `state.sample_rate` is what is left
+        // after front-end decimation, and using it would under-count the delay
+        // by exactly that factor.
+        let behind = (delay * self.radio_fs) as u64 + self.last_block / 2;
+        let Some(cutoff) = self.samples_read.checked_sub(behind) else {
+            return self.state.center_hz;
+        };
+        // Every entry at or before the cutoff has now reached the analyser; the
+        // last of them is the centre these samples were taken at, and anything
+        // still ahead of the cutoff is a retune the stream has yet to show.
+        let mut center = None;
+        while let Some(&(at, hz)) = self.center_trail.front() {
+            if at > cutoff {
+                break;
+            }
+            center = Some(hz);
+            self.center_trail.pop_front();
+        }
+        if let Some(hz) = center {
+            self.stream_center_hz = hz;
+        }
+        self.stream_center_hz
+    }
+
     fn make_spectrum_frame(&mut self) -> SpectrumFrame {
         if self.tx_active {
             return self.make_tx_frame();
@@ -5904,9 +6427,36 @@ impl Engine {
                 );
             }
         }
+        // Zoomed out past what the I/Q covers, onto a front end that also
+        // publishes a wider spectrum: draw the main panadapter from *that*.
+        //
+        // The same fallback the channel analyser makes to the device analyser
+        // one step up, for the same reason — coarser, but it actually contains
+        // the window being asked for. Without it the zoom-out stops at the I/Q
+        // span, which on a receiver whose I/Q is a narrow window onto a wide
+        // band is a hard floor a long way in: a KiwiSDR sends 12 kHz of I/Q and
+        // a picture of the whole 0-30 MHz, and the panadapter could only ever
+        // show the 12 kHz.
+        //
+        // Deliberately all-or-nothing rather than a composite of the two: the
+        // I/Q's own bins are finer in the middle, but splicing two spectra with
+        // different noise floors and different analysers leaves a visible seam
+        // at the join that reads as a signal. The whole window comes from one
+        // source, and which one is decided by whether the I/Q still covers it.
+        if let Some((wide_center, wide_span)) = self.wide_main_window() {
+            return self.make_scope_frame(wide_center, wide_span);
+        }
         // The zoomed window at its own resolution, where the device-wide
         // analyser has run out of bins to give it.
-        if let Some(z) = self.zoom.as_mut() {
+        //
+        // Only once the lane has a spectrum. A lane just built holds zeros, and
+        // zero is the display floor in every column — so the frames and the
+        // waterfall rows drawn from it between its construction and its first
+        // transform are black, for a quarter of a second at the rate a deep
+        // zoom's lane runs at. The device-wide analyser covers the same window
+        // the whole time, coarser but live, which is exactly the picture the
+        // operator had one zoom step ago.
+        if let Some(z) = self.zoom.as_mut().filter(|z| z.analyzer.primed()) {
             return z.analyzer.make_frame(
                 z.center_hz,
                 z.rate_hz,
@@ -5916,8 +6466,9 @@ impl Engine {
                 self.cfg.viewport,
             );
         }
+        let center = self.display_center_hz();
         self.analyzer.make_frame(
-            self.state.center_hz,
+            center,
             self.state.sample_rate,
             self.cfg.db_floor,
             self.cfg.db_ceil,
@@ -6123,6 +6674,7 @@ impl Engine {
             }
             SetAutoNotch { rx, on } => self.state.rx[rx.index()].auto_notch = on,
             SetWfmStereo { rx, on } => self.state.rx[rx.index()].wfm_stereo = on,
+            SetBinaural { rx, on } => self.state.rx[rx.index()].binaural = on,
             // Main receiver only, like the status it answers: the DRM panel
             // shows the broadcast being listened to.
             SetDrmService { service } => {
@@ -6137,7 +6689,11 @@ impl Engine {
             }
             SetToneSquelch { rx, tone } => self.state.rx[rx.index()].tone_sql = tone,
             SetScannerConfig(mut cfg) => {
-                let restart = self.state.scan.running && cfg.kind != self.scan_cfg.kind;
+                // A different kind of scan, or the same kind gathering its
+                // candidates a different way, is a different scan: the plan in
+                // flight belongs to the old setting.
+                let restart = self.state.scan.running
+                    && (cfg.kind != self.scan_cfg.kind || cfg.mem_fast != self.scan_cfg.mem_fast);
                 // Retuning the range (or changing the grid under it) retires the
                 // channels skipped in the old one — they described *that* band.
                 cfg.forget_stale_skips();
@@ -6363,22 +6919,42 @@ impl Engine {
                     self.notice(&format!("The radio would not take {key} = {value}: {e}"));
                 }
             }
-            SetAntenna { dir, name } => match dir {
-                Direction::Rx => {
-                    if let Err(e) = self.source.set_antenna(&name) {
-                        warn!("set RX antenna {name}: {e}");
-                    }
-                    self.state.antenna_rx = self.source.current_antenna();
-                    self.want_antenna.0 = Some(name);
+            // The radio's own power switch. Nothing else here changes: what
+            // sdroxide believes about a radio that has just been switched off is
+            // the link's business to notice, and the reconnect that follows is
+            // what puts a radio switched back on into a known state.
+            SetRigPower(on) => {
+                if !self.caps.commands_rig_power {
+                    return;
                 }
-                Direction::Tx => {
-                    if let Err(e) = self.source.set_tx_antenna(&name) {
-                        warn!("set TX antenna {name}: {e}");
-                    }
-                    self.state.antenna_tx = self.source.current_tx_antenna();
-                    self.want_antenna.1 = Some(name);
+                if let Err(e) = self.source.set_rig_power(on) {
+                    warn!("switching the radio {}: {e}", if on { "on" } else { "off" });
                 }
-            },
+            }
+            SetAntenna { dir, name } => {
+                match dir {
+                    Direction::Rx => {
+                        if let Err(e) = self.source.set_antenna(&name) {
+                            warn!("set RX antenna {name}: {e}");
+                        }
+                        self.state.antenna_rx = self.source.current_antenna();
+                        self.want_antenna.0 = Some(name.clone());
+                        self.band_antenna.entry(self.state.band).or_default().0 = Some(name);
+                    }
+                    Direction::Tx => {
+                        if let Err(e) = self.source.set_tx_antenna(&name) {
+                            warn!("set TX antenna {name}: {e}");
+                        }
+                        self.state.antenna_tx = self.source.current_tx_antenna();
+                        self.want_antenna.1 = Some(name.clone());
+                        self.band_antenna.entry(self.state.band).or_default().1 = Some(name);
+                    }
+                }
+                // The choice belongs to the band it was made on, so the band it
+                // is next left on is the one it has to be remembered against —
+                // `poll_band_change` puts it back when the dial returns.
+                self.band_seen = self.state.band;
+            }
             StoreMemory { name } => {
                 let id = self.memories.iter().map(|m| m.id).max().unwrap_or(0) + 1;
                 let rx = &self.state.rx[0];
@@ -6405,6 +6981,11 @@ impl Engine {
                     // stored before this field existed, and a recall reads that
                     // as simplex too — see `RecallMemory` below.
                     repeater: Some(self.state.repeater),
+                    // Only where there is a socket to choose. A front end with
+                    // one antenna stores `None`, which is what tells a recall
+                    // to leave the relay alone — see `MemoryChannel::antenna`.
+                    antenna: (self.caps.antennas_rx.len() > 1 && !self.state.antenna_rx.is_empty())
+                        .then(|| self.state.antenna_rx.clone()),
                 });
                 self.save_memories();
             }
@@ -6440,6 +7021,18 @@ impl Engine {
                     // 145.500 off a list that says 145.500 and transmitting
                     // 600 kHz down with the last repeater's tone still on.
                     self.set_repeater(m.repeater.unwrap_or_default().clamped());
+                    // The antenna the channel was stored on, where this front
+                    // end still has that socket. Absent means "leave it alone",
+                    // unlike the repeater setup above — see
+                    // `MemoryChannel::antenna` for why the two read an empty
+                    // field differently.
+                    if let Some(name) = m
+                        .antenna
+                        .filter(|n| self.caps.antennas_rx.contains(n))
+                        .filter(|n| !self.source.owns_rx_antenna() && self.state.antenna_rx != *n)
+                    {
+                        self.apply(SetAntenna { dir: Direction::Rx, name });
+                    }
                     if m.rtty.is_some() {
                         // Already in RTTY when recalled: the mode didn't change,
                         // so no rebuild happened and the live modem still holds
@@ -6458,11 +7051,45 @@ impl Engine {
                     }
                 }
             }
+            ImportMemories(channels) => {
+                // The engine owns the numbering: an id that came in over the
+                // wire, or out of somebody's file, is not one this list can
+                // trust not to collide with what is already stored.
+                let mut next = self.memories.iter().map(|m| m.id).max().unwrap_or(0) + 1;
+                let mut added = 0usize;
+                for mut m in channels {
+                    let name = m.name.trim().to_string();
+                    if !m.freq_hz.is_finite() || m.freq_hz <= 0.0 {
+                        continue;
+                    }
+                    // A channel already on the list is not stored twice, so
+                    // re-importing an updated directory adds what is new
+                    // rather than doubling what is not. Frequency and mode
+                    // rather than name: two clubs name the same machine
+                    // differently, and nobody wants it twice for that.
+                    if self
+                        .memories
+                        .iter()
+                        .any(|o| (o.freq_hz - m.freq_hz).abs() < 1.0 && o.mode == m.mode)
+                    {
+                        continue;
+                    }
+                    m.id = next;
+                    m.name = name;
+                    m.repeater = Some(m.repeater.unwrap_or_default().clamped());
+                    next += 1;
+                    self.memories.push(m);
+                    added += 1;
+                }
+                if added > 0 {
+                    self.save_memories();
+                }
+            }
             DeleteMemory(id) => {
                 self.memories.retain(|m| m.id != id);
                 self.save_memories();
             }
-            EditMemory { id, name, freq_hz, mode, repeater } => {
+            EditMemory { id, name, freq_hz, mode, repeater, antenna } => {
                 // A dial that is not a number would be stored, scanned and
                 // tuned to; refuse it here rather than in each of those.
                 let name = name.trim().to_string();
@@ -6501,6 +7128,13 @@ impl Engine {
                     // command is a door a remote client can push anything
                     // through.
                     m.repeater = repeater.map(|r| r.clamped());
+                    // Only a socket this front end actually has. The editor
+                    // offers nothing else, but the command is a door a remote
+                    // client can push anything through, and a name no antenna
+                    // answers to is a channel that recalls onto nothing — so it
+                    // reads as "leave the antenna alone", which is what an
+                    // absent field means anyway.
+                    m.antenna = antenna.filter(|n| self.caps.antennas_rx.contains(n));
                     self.save_memories();
                 }
             }
@@ -6523,6 +7157,12 @@ impl Engine {
                     m.folder = None;
                 }
                 self.save_mem_folders();
+                // …and out of the scanner's selection with it: its channels are
+                // back at the top level, and a scan still naming the folder
+                // would be looking for them where they are not.
+                if self.scan_cfg.forget_folder(id) {
+                    self.save_scanner_config();
+                }
                 self.save_memories();
             }
             MoveMemoryToFolder { id, folder } => {
@@ -6564,12 +7204,21 @@ impl Engine {
                     self.zoom = None;
                 }
                 if rebuild {
-                    self.analyzer = build_analyzer(
+                    let mut next = build_analyzer(
                         self.cfg.fft_size as usize,
                         rate,
                         self.cfg.avg_tc,
                         f64::from(self.cfg.rows()),
                     );
+                    // The replacement covers the same span, so the picture in
+                    // hand is a true picture of it — coarser or finer than what
+                    // this one will settle at, but a picture. Started empty it
+                    // would answer the display floor until its first transform
+                    // instead, which is the waterfall going black; and since
+                    // the client grows its FFT as the operator zooms, that is
+                    // once per zoom step rather than once a session.
+                    next.seed_from(&self.analyzer, (0.0, 1.0));
+                    self.analyzer = next;
                     self.tx_analyzer = SpectrumAnalyzer::new(
                         self.cfg.fft_size as usize,
                         TX_MONITOR_RATE,
@@ -6869,6 +7518,22 @@ impl Engine {
                 }
                 self.sync_adsb();
                 if let Some(d) = self.adsb.as_ref() {
+                    d.set_config(cfg);
+                }
+            }
+
+            // VDL Mode 2 decoder.
+            SetVdl2Config(cfg) => {
+                let cfg = cfg.sane();
+                self.state.vdl2 = cfg;
+                // Remembered before `sync_vdl2` may force the live state off, so
+                // a source swap back restores what was chosen.
+                self.vdl2_cfg = cfg;
+                if let Err(e) = sdroxide_config::save_vdl2_config(&cfg) {
+                    warn!("saving VDL2 config: {e}");
+                }
+                self.sync_vdl2();
+                if let Some(d) = self.vdl2.as_ref() {
                     d.set_config(cfg);
                 }
             }
@@ -7242,6 +7907,32 @@ impl Engine {
                 self.rot_cfg = cfg;
                 self.sync_rotator();
                 self.emit_station_config();
+                return;
+            }
+            SetRelayConfig(cfg) => {
+                if let Err(e) = sdroxide_config::save_relay_config(&cfg) {
+                    warn!("saving T/R switch config: {e}");
+                }
+                self.relay_cfg = *cfg;
+                // Whichever engine is told opens the hardware and becomes the
+                // switch's owner — *not* only the primary one.
+                //
+                // The primary opens it at startup because somebody has to and
+                // one of them has to be chosen. But a remote client is attached
+                // to one radio's session, so its `SetRelayConfig` reaches that
+                // radio and no other: gating this on `primary` would mean an
+                // operator who set the switch up from their second radio's tab
+                // saved a configuration that never opened anything. The hub
+                // holds a single driver either way, and `sync_relay` closes the
+                // old one before opening the new.
+                self.sync_relay();
+                self.emit_station_config();
+                return;
+            }
+            TestRelay { channel } => {
+                if let Some(hub) = self.tr_switch.as_ref() {
+                    hub.test(channel);
+                }
                 return;
             }
             SetRegion(region) => {
@@ -8077,6 +8768,216 @@ impl Engine {
         }
     }
 
+    /// The rate the VDL2 window asks its down-converter for.
+    ///
+    /// Capped at what the front end delivers, because a window is a decimation
+    /// of that stream and not a second tuner. A receiver too narrow to hold even
+    /// one channel therefore lands on its own rate, `sync_vdl2` refuses to
+    /// start, and the panel says why.
+    fn vdl2_target_rate_hz(&self) -> f64 {
+        sdroxide_vdl2::plan::WINDOW_TARGET_RATE_HZ.min(self.state.sample_rate)
+    }
+
+    /// Where the window sits: over the channel plan where the span reaches it,
+    /// and as close as the span allows otherwise.
+    fn vdl2_window_center_hz(&self, rate: f64) -> f64 {
+        sdroxide_vdl2::plan::window_center_for(self.state.center_hz, self.state.sample_rate, rate)
+    }
+
+    /// Why the decoder cannot run here, if it cannot. `None` means it can.
+    ///
+    /// Every sentence names the number it is talking about. "Nothing on the air"
+    /// and "this receiver was never going to hear any of it" produce the same
+    /// empty log, and only this tells them apart.
+    fn vdl2_unavailable(&self) -> Option<String> {
+        if self.audio_mode {
+            return Some(
+                "this front end hands over demodulated audio; VDL2 needs the raw I/Q stream"
+                    .to_string(),
+            );
+        }
+        if self.state.sample_rate < sdroxide_types::VDL2_MIN_RATE_HZ {
+            return Some(format!(
+                "VDL2 needs at least {:.0} kHz of stream and this one is {:.1} kHz — \
+                 lower the front-end decimation, or raise the device sample rate",
+                sdroxide_types::VDL2_MIN_RATE_HZ / 1e3,
+                self.state.sample_rate / 1e3
+            ));
+        }
+        if !self.caps.can_rx_hz(sdroxide_types::VDL2_PLAN_CENTER_HZ) {
+            return Some("this receiver does not tune to 136.8 MHz".to_string());
+        }
+        let rate = Ddc::rate_for(self.state.sample_rate, self.vdl2_target_rate_hz());
+        let center = self.vdl2_window_center_hz(rate);
+        if !sdroxide_vdl2::window_covers(center, rate) {
+            return Some(format!(
+                "no VDL2 channel is inside the receiver's window, which is {:.3} MHz wide \
+                 about {:.3} MHz",
+                rate / 1e6,
+                center / 1e6
+            ));
+        }
+        None
+    }
+
+    /// Why the decoder will do less than it could here, even though it runs.
+    ///
+    /// A different kind of statement from [`Self::vdl2_unavailable`]: the lane is
+    /// working, and an operator who sees three channels lit out of seven would
+    /// otherwise have to guess whether the other four are quiet or out of reach.
+    fn vdl2_degraded(&self) -> Option<String> {
+        if self.vdl2_unavailable().is_some() {
+            return None;
+        }
+        let rate = Ddc::rate_for(self.state.sample_rate, self.vdl2_target_rate_hz());
+        let center = self.vdl2_window_center_hz(rate);
+        let reached = sdroxide_vdl2::plan::channels_in_window(center, rate);
+        let total = sdroxide_vdl2::plan::CHANNELS.len();
+        if reached.len() < total {
+            let missing: Vec<String> = (0..total)
+                .filter(|i| !reached.contains(i))
+                .map(|i| format!("{:.3}", sdroxide_vdl2::plan::CHANNELS[i].center_hz / 1e6))
+                .collect();
+            return Some(format!(
+                "this window is {:.0} kHz wide and reaches {} of the {total} channels — \
+                 {} MHz {} outside it",
+                rate / 1e3,
+                reached.len(),
+                missing.join(", "),
+                if missing.len() == 1 { "is" } else { "are" }
+            ));
+        }
+        let sps = Ddc::rate_for(rate, sdroxide_vdl2::plan::CHANNEL_TARGET_RATE_HZ)
+            / sdroxide_types::VDL2_SYMBOL_RATE;
+        if sps < sdroxide_types::VDL2_GOOD_SPS {
+            return Some(format!(
+                "this window leaves only {sps:.1} samples per symbol; below \
+                 {:.0} the symbol timing has too little to work with",
+                sdroxide_types::VDL2_GOOD_SPS
+            ));
+        }
+        None
+    }
+
+    /// A down-converter for the VDL2 window, already mixed onto it, and the
+    /// absolute frequency it is centred on.
+    fn build_vdl2_window(&mut self) -> (Ddc, f64) {
+        let target = self.vdl2_target_rate_hz();
+        let mut ddc = Ddc::new(self.state.sample_rate, target);
+        let center = self.vdl2_window_center_hz(ddc.out_rate());
+        ddc.set_offset_hz(center - self.state.center_hz);
+        self.vdl2_in_rate = self.state.sample_rate;
+        (ddc, center)
+    }
+
+    /// Start or stop the VDL2 lane to match the mode and the front end.
+    ///
+    /// Follows the *mode*, like the ADS-B lane and unlike the ISM decoder: it
+    /// needs the receiver parked on the datalink group, and nothing else can be
+    /// listened to through that.
+    fn sync_vdl2(&mut self) {
+        let want = self.state.rx[0].mode.is_vdl2() && self.vdl2_unavailable().is_none();
+        // The operator's own preference survives being overruled: `state.vdl2`
+        // is what the panel reads, `vdl2_cfg` is what they chose.
+        if self.audio_mode {
+            self.state.vdl2 = sdroxide_types::Vdl2Settings::OFF;
+        } else {
+            self.state.vdl2 = self.vdl2_cfg;
+        }
+        match (want, self.vdl2.is_some()) {
+            (true, false) => {
+                let (ddc, center) = self.build_vdl2_window();
+                let out_rate = ddc.out_rate();
+                self.vdl2 = Some(Vdl2Controller::new(center, out_rate, self.state.vdl2));
+                self.vdl2_ddc = Some(ddc);
+                self.vdl2_center_hz = center;
+                info!(rate = out_rate, center, "VDL2 decoder started");
+            }
+            (false, true) => {
+                self.vdl2 = None;
+                self.vdl2_ddc = None;
+                self.vdl2_buf.clear();
+                info!("VDL2 decoder stopped");
+            }
+            (true, true) => self.sync_vdl2_window(),
+            _ => {}
+        }
+    }
+
+    /// Re-place the window after a retune or a rate change.
+    ///
+    /// The log and the station table survive: a receiver nudged a hundred
+    /// kilohertz is still listening to the same aeroplanes. The chain that feeds
+    /// them is another matter — a `Ddc` bakes in both its input rate and its
+    /// decimation, so a change in either is a rebuild rather than a retune.
+    fn sync_vdl2_window(&mut self) {
+        let Some(ddc) = self.vdl2_ddc.as_ref() else { return };
+        let want_rate = Ddc::rate_for(self.state.sample_rate, self.vdl2_target_rate_hz());
+        if (want_rate - ddc.out_rate()).abs() >= 1.0
+            || (self.state.sample_rate - self.vdl2_in_rate).abs() >= 1.0
+        {
+            let (ddc, center) = self.build_vdl2_window();
+            let rate = ddc.out_rate();
+            self.vdl2_ddc = Some(ddc);
+            self.vdl2_center_hz = center;
+            if let Some(d) = self.vdl2.as_ref() {
+                d.set_window(center, rate);
+            }
+            info!(rate, center, "VDL2 window rebuilt");
+            return;
+        }
+
+        let center = self.vdl2_window_center_hz(want_rate);
+        let Some(ddc) = self.vdl2_ddc.as_mut() else { return };
+        // Re-seated even when the window has not moved in absolute terms: the
+        // offset is measured from the *hardware* centre, and a retune is exactly
+        // what moves that.
+        ddc.set_offset_hz(center - self.state.center_hz);
+        if (center - self.vdl2_center_hz).abs() < 1.0 {
+            return;
+        }
+        self.vdl2_center_hz = center;
+        if let Some(d) = self.vdl2.as_ref() {
+            d.set_window(center, want_rate);
+        }
+    }
+
+    /// Drain the VDL2 decoder's log and station table and forward them.
+    ///
+    /// The worker knows what it is decoding but not what the receiver could have
+    /// been decoding, so the "why is this empty" fields are filled in here,
+    /// where the front end's capabilities are.
+    fn poll_vdl2(&mut self) {
+        let unavailable = self.vdl2_unavailable();
+        let Some(d) = self.vdl2.as_ref() else {
+            // Nothing running. On the VDL2 mode that is a fact worth sending —
+            // it is the only way the panel can say what is wrong — but off it
+            // there is nobody listening. Once, not per block.
+            if self.state.rx[0].mode.is_vdl2() && self.vdl2_idle_sent.as_ref() != Some(&unavailable)
+            {
+                self.vdl2_idle_sent = Some(unavailable.clone());
+                let st = sdroxide_types::Vdl2Status {
+                    unavailable,
+                    suggest_center_hz: Some(sdroxide_types::VDL2_PLAN_CENTER_HZ),
+                    ..Default::default()
+                };
+                let _ = self.event_tx.send(RadioEvent::Vdl2Status(Box::new(st)));
+            }
+            return;
+        };
+        // Running again: whatever was last said about it being down is stale.
+        self.vdl2_idle_sent = None;
+        let degraded = self.vdl2_degraded();
+        for action in d.poll() {
+            let Vdl2Action::Status(mut st) = action;
+            st.unavailable = unavailable.clone();
+            st.degraded = degraded.clone();
+            st.suggest_center_hz = (unavailable.is_some() || degraded.is_some())
+                .then_some(sdroxide_types::VDL2_PLAN_CENTER_HZ);
+            let _ = self.event_tx.send(RadioEvent::Vdl2Status(st));
+        }
+    }
+
     /// The main receiver's clean audio tap is shared: the digital-mode engine
     /// and the TCI server's RX-audio stream both read `tap_out`. Whoever wants
     /// it turns it on; it switches off only when nobody does. Every decision to
@@ -8608,6 +9509,7 @@ impl Engine {
                 wsjtx: self.wsjtx_cfg.clone(),
                 sat: self.sat_cfg.clone(),
                 rotator: self.rot_cfg.clone(),
+                relay: self.relay_cfg.clone(),
                 region: sdroxide_types::region(),
                 band_plan: sdroxide_types::band_plan().clone(),
             },
@@ -8969,6 +9871,166 @@ impl Engine {
         }
     }
 
+    /// (Re)build the external T/R switch to match the config.
+    ///
+    /// Refused while anything is on the air. Rebuilding drops the driver, and
+    /// dropping it puts every contact back to receive — under live RF that is
+    /// an antenna relay thrown mid-over, which is precisely the accident the
+    /// whole subsystem exists to prevent. The operator pressing APPLY during
+    /// their own transmission is not a rare mistake; it is what happens when
+    /// they are trying to fix the thing while testing it.
+    fn sync_relay(&mut self) {
+        let Some(hub) = self.tr_switch.clone() else { return };
+        if hub.busy() {
+            warn!("not rebuilding the T/R switch while the station is on the air");
+            self.notice("the T/R switch will be reconfigured after this over");
+            self.relay_pending = true;
+            return;
+        }
+        self.relay_pending = false;
+        self.relay_last_status = None;
+        // Close the old one *first*. Its thread owns a serial port or a device
+        // node, and the new configuration is very often the same one with a
+        // number changed — so opening before closing would have this engine
+        // race itself for its own hardware. Also the moment the contacts are
+        // put back to receive, which is why this is refused while on the air.
+        hub.install(None, &self.relay_cfg);
+        match sdroxide_relay::open(&self.relay_cfg) {
+            Ok(handle) => {
+                if let Some(h) = handle.as_ref() {
+                    info!("T/R switch: {}. {}", h.describe(), self.relay_cfg.sequence_note());
+                }
+                hub.set_open_error(None);
+                hub.install(handle, &self.relay_cfg);
+            }
+            Err(e) => {
+                warn!("T/R switch: {e}");
+                hub.install(None, &self.relay_cfg);
+                hub.set_open_error(Some(e.to_string()));
+            }
+        }
+        self.emit_relay_status();
+    }
+
+    /// Whether this radio is on the air by any route.
+    ///
+    /// Three terms, and the absence of a fourth is deliberate. `hw_ptt` is
+    /// **not** here: [`Engine::apply_hw_ptt`] sets it and *then* asks for the
+    /// over, so a key-down the rails refuse leaves it standing true with
+    /// nothing transmitting — and a relay driven from it would ground the
+    /// antenna for an over that never happened and hold it there until the
+    /// operator let go of the foot switch. A hardware PTT line reaches the
+    /// switch through `tx_active` like every other route.
+    fn on_air(&self) -> bool {
+        // `cw_gate_until` covers the one over with no key-up of its own: a
+        // message the rig's own keyer is sending, where `tx_active` is false
+        // throughout and the radio is nonetheless transmitting.
+        self.tx_active || self.rig_tx || self.cw_gate_until.is_some()
+    }
+
+    /// Throw the contacts and wait for them, immediately before RF.
+    ///
+    /// Blocking the engine's thread here is deliberate. The relay *command*
+    /// does not block it — the driver owns the port on its own thread and this
+    /// is a channel send — but the lead is waited out, because on a CAT rig
+    /// `tx_begin` **is** the key-down: RF appears the moment the PTT frame goes
+    /// out. Anything that did not block could not promise "contacts before RF",
+    /// which is the only thing this feature is for. The wait lands in the gap
+    /// where the receive path is about to be paused anyway, and at the ten or
+    /// twenty milliseconds a relay actually needs it is inside what the output
+    /// ring already carries.
+    ///
+    /// Capped, because an operator who types 500 ms should get a switch that
+    /// works and not a radio that stutters.
+    fn lead_tr_switch(&mut self) {
+        let Some(hub) = self.tr_switch.as_ref() else { return };
+        let wait = hub.key(self.instance);
+        if wait.is_zero() {
+            return;
+        }
+        if wait > MAX_TR_LEAD {
+            if !self.relay_lead_capped {
+                self.relay_lead_capped = true;
+                warn!(
+                    "the T/R switch asks for {} ms before transmit; waiting {} ms — a longer \
+                     lead would be an audible hole in the receive audio and a delay between the \
+                     operator and their own transmitter",
+                    wait.as_millis(),
+                    MAX_TR_LEAD.as_millis()
+                );
+            }
+            std::thread::sleep(MAX_TR_LEAD);
+        } else {
+            std::thread::sleep(wait);
+        }
+    }
+
+    /// Keep the shared switch in step with this radio, and relay its health.
+    ///
+    /// Called every tick. In the common case that is one atomic load and a
+    /// comparison — see [`crate::TrSwitch::publish`].
+    fn poll_tr_switch(&mut self) {
+        let Some(hub) = self.tr_switch.clone() else { return };
+        hub.publish(self.instance, self.on_air());
+
+        // A transmitter out in the shack keyed itself, and the sense line saw
+        // it in milliseconds rather than the few hundred the CAT poll takes.
+        // Adopted by exactly one engine — the hub decides which, since on a
+        // multi-radio station only one of them is the transceiver with the wire
+        // in it and telling the others would mute the wrong receiver and refuse
+        // the wrong key-down.
+        if let Some(keyed) = hub.take_sense_edge(self.instance) {
+            self.adopt_rig_tx(keyed, "the transmit sense line");
+        }
+
+        // A configuration that arrived mid-over, applied now that the station
+        // is off the air.
+        if self.relay_pending && !hub.busy() {
+            self.sync_relay();
+        }
+
+        if self.primary {
+            let st = hub.status();
+            if self.relay_last_status.as_ref() != Some(&st) {
+                self.relay_last_status = Some(st.clone());
+                let _ = self.event_tx.send(RadioEvent::RelayStatus(Box::new(st)));
+            }
+        }
+    }
+
+    fn emit_relay_status(&mut self) {
+        let Some(hub) = self.tr_switch.as_ref() else { return };
+        let st = hub.status();
+        self.relay_last_status = Some(st.clone());
+        let _ = self.event_tx.send(RadioEvent::RelayStatus(Box::new(st)));
+    }
+
+    /// The radio in front of us started an over of its own — reported over CAT,
+    /// or seen on the T/R switch's sense line, which is the same fact arriving
+    /// a few hundred milliseconds sooner.
+    ///
+    /// Recorded, never answered: keying along with it would talk over the
+    /// person holding the microphone. See [`ControlUpdate::RigTx`].
+    fn adopt_rig_tx(&mut self, on: bool, how: &str) {
+        if on == self.rig_tx {
+            return;
+        }
+        self.rig_tx = on;
+        info!(
+            "the radio is {} under {how}",
+            match on {
+                true => "transmitting",
+                false => "receiving",
+            }
+        );
+        self.follow_rig_tx(on);
+        // Straight through to the switch rather than waiting for the next tick.
+        // The whole value of hearing about this early is spending none of it.
+        if let Some(hub) = self.tr_switch.as_ref() {
+            hub.publish(self.instance, self.on_air());
+        }
+    }
+
     /// The receive Doppler correction currently in force, Hz — zero unless a
     /// lock is active with corrections running.
     fn sat_rx_doppler_hz(&self) -> f64 {
@@ -9303,6 +10365,24 @@ impl Engine {
             self.state.band = Band::containing(hz);
             self.follow_dial();
         }
+        // VDL2 is the same argument with one difference: the channels are a
+        // group rather than a point, so "already inside the window" is asked of
+        // the whole plan, and a receiver that reaches only part of it is left
+        // where it is and told so rather than dragged across the band.
+        if rx == RxId::Main
+            && mode.is_vdl2()
+            && !self.state.rx[0].mode.is_vdl2()
+            && self.caps.can_rx_hz(sdroxide_types::VDL2_PLAN_CENTER_HZ)
+            && !sdroxide_vdl2::window_covers(self.state.center_hz, self.state.sample_rate)
+        {
+            let hz = sdroxide_types::VDL2_PLAN_CENTER_HZ;
+            match self.state.active_vfo {
+                Vfo::A => self.state.vfo_a_hz = hz,
+                Vfo::B => self.state.vfo_b_hz = hz,
+            }
+            self.state.band = Band::containing(hz);
+            self.follow_dial();
+        }
         // Changing modes under a running keyer message would leave it playing
         // into a transmit chain that has just been rebuilt (or into a digital
         // mode that has no use for it).
@@ -9355,6 +10435,7 @@ impl Engine {
             // ...and the ADS-B lane, which unlike the other wideband decoders
             // runs only while its mode is selected.
             self.sync_adsb();
+            self.sync_vdl2();
             self.emit_digi_status();
             // A wider channel needs a wider berth from the LO: switching a
             // narrow mode that was happily sitting 30 kHz off the LO into WFM
@@ -9503,6 +10584,22 @@ impl Engine {
         self.scan_level_dbfs().is_some_and(|level| level >= self.scan_threshold_db())
     }
 
+    /// The stored channels a memory scan would visit, in the order the store
+    /// holds them: not skipped, and filed under a folder the operator has the
+    /// scan set to (issue #236).
+    ///
+    /// A channel whose folder has gone from under it counts as unfiled — the
+    /// same reading the memory list draws it with, so what the scan runs over
+    /// is what the operator can see.
+    fn scannable_memories(&self) -> impl Iterator<Item = &sdroxide_types::MemoryChannel> {
+        let cfg = &self.scan_cfg;
+        let folders = &self.mem_folders;
+        self.memories.iter().filter(move |m| {
+            let filed = m.folder.filter(|id| folders.iter().any(|f| f.id == *id));
+            !cfg.skip.contains(&m.id) && cfg.scans_folder(filed)
+        })
+    }
+
     /// Whether this front end can search a whole span at once. A demod-audio
     /// source has no span to search, so it walks channels instead.
     fn scan_can_sweep(&self) -> bool {
@@ -9531,9 +10628,12 @@ impl Engine {
         }
         let usable = match self.scan_cfg.kind {
             ScanKind::Memories => {
-                let any = self.memories.iter().any(|m| !self.scan_cfg.skip.contains(&m.id));
+                let any = self.scannable_memories().next().is_some();
                 if !any {
-                    self.notice("nothing to scan: no memory channels, or all of them skipped");
+                    self.notice(
+                        "nothing to scan: no memory channels in the chosen folders, or all of \
+                         them skipped",
+                    );
                 }
                 any
             }
@@ -9556,6 +10656,8 @@ impl Engine {
             slice: usize::MAX, // rolls over to 0 on the first refill
             stepped: Vec::new(),
             step_at: 0,
+            mem_slices: Vec::new(),
+            mem_slice: usize::MAX, // as `slice` above
         });
         self.state.scan = sdroxide_types::ScanState { running: true, holding: false };
         // Pick the first target now rather than waiting a poll for it, so
@@ -9674,6 +10776,9 @@ impl Engine {
     /// and queue everything busy in it.
     fn scan_read_slice(&mut self, now: Instant) {
         self.analyzer.spectrum_db(&mut self.scan_db);
+        if self.scan_cfg.kind == ScanKind::Memories {
+            return self.scan_read_mem_slice(now);
+        }
         let (lo, hi) = self.scan_cfg.range();
         let (flo, fhi) = self.scan_cfg.mode.default_filter();
         let found = crate::scanner::busy_channels(
@@ -9756,15 +10861,16 @@ impl Engine {
     /// moving towards them.
     fn scan_refill(&mut self, now: Instant) -> Refill {
         match self.scan_cfg.kind {
+            ScanKind::Memories if self.scan_cfg.mem_fast && self.scan_can_sweep() => {
+                self.scan_next_mem_slice(now)
+            }
             ScanKind::Memories => {
-                let targets: Vec<ScanTarget> = self
-                    .memories
-                    .iter()
-                    .filter(|m| !self.scan_cfg.skip.contains(&m.id))
-                    .map(|m| ScanTarget::Memory(m.id))
-                    .collect();
+                let targets: Vec<ScanTarget> =
+                    self.scannable_memories().map(|m| ScanTarget::Memory(m.id)).collect();
                 if targets.is_empty() {
-                    self.stop_scan(Some("scan stopped: every memory channel is skipped"));
+                    self.stop_scan(Some(
+                        "scan stopped: every memory channel in the chosen folders is skipped",
+                    ));
                     return Refill::Stopped;
                 }
                 if let Some(sc) = self.scan.as_mut() {
@@ -9817,6 +10923,119 @@ impl Engine {
         self.update_tuning();
         self.emit_state();
         Refill::Waiting
+    }
+
+    /// Move the front end to the next window of a fast memory scan's plan,
+    /// building the plan first if there is none.
+    ///
+    /// The memory twin of [`Engine::scan_next_slice`], and the same shape: the
+    /// spectrum is read once the front end has settled, a poll or two later.
+    /// What differs is what the windows are for. A range sweep tiles a band it
+    /// has to search; this one covers a *list*, so its windows are placed on
+    /// where the channels are and nowhere else, and a whole band's worth of
+    /// them is one tune (issue #228).
+    fn scan_next_mem_slice(&mut self, now: Instant) -> Refill {
+        let span = self.state.sample_rate;
+        let settle = self.scan_settle();
+        if self.scan.as_ref().is_some_and(|sc| sc.mem_slices.is_empty()) {
+            let chans: Vec<(u32, f64)> =
+                self.scannable_memories().map(|m| (m.id, m.freq_hz)).collect();
+            let freqs: Vec<f64> = chans.iter().map(|(_, hz)| *hz).collect();
+            let plan: Vec<(f64, Vec<u32>)> = crate::scanner::memory_slices(&freqs, span)
+                .into_iter()
+                .map(|(c, group)| (c, group.into_iter().map(|i| chans[i].0).collect()))
+                .collect();
+            if plan.is_empty() {
+                self.stop_scan(Some(
+                    "scan stopped: every memory channel in the chosen folders is skipped",
+                ));
+                return Refill::Stopped;
+            }
+            if let Some(sc) = self.scan.as_mut() {
+                sc.mem_slices = plan;
+            }
+        }
+        let Some(sc) = self.scan.as_mut() else { return Refill::Stopped };
+        sc.mem_slice = sc.mem_slice.wrapping_add(1);
+        if sc.mem_slice >= sc.mem_slices.len() {
+            // Round again on a plan built from the store as it stands now: a
+            // channel stored, deleted or re-filed during the last lap belongs
+            // in this one. Back to `usize::MAX` rather than to 0, because the
+            // rebuild below goes through the same `wrapping_add` and 0 would
+            // start the new lap on the second window.
+            sc.mem_slice = usize::MAX;
+            sc.mem_slices.clear();
+            return Refill::Queued;
+        }
+        let center = sc.mem_slices[sc.mem_slice].0;
+        sc.phase = ScanPhase::Settling(now + settle);
+
+        // Whether this is a move at all. A list that fits in one window is the
+        // common case and has exactly one of these, so a lap comes back to a
+        // centre the front end is already on — and throwing the analyser away
+        // there would blank the panadapter several times a second for a scan
+        // that never moved the radio.
+        let moved = (self.state.center_hz - center).abs() > 0.5;
+        // The dial goes with it, as it does on a range sweep: the operator
+        // should see where the scan is looking rather than a readout left
+        // behind on the last channel it stopped at.
+        match self.state.active_vfo {
+            Vfo::A => self.state.vfo_a_hz = center,
+            Vfo::B => self.state.vfo_b_hz = center,
+        }
+        self.state.band = Band::containing(center);
+        if !self.retune(center) {
+            // Out of the front end's range — `tune_refused` has put the dial
+            // back and said so, and the next window may still be reachable.
+            return Refill::Waiting;
+        }
+        if moved {
+            // The running average is still holding the last window's samples,
+            // and they are from another part of the band entirely.
+            self.analyzer.reset();
+            self.zoom = None;
+        }
+        self.update_tuning();
+        self.emit_state();
+        Refill::Waiting
+    }
+
+    /// The front end has settled on a fast memory scan's window: measure every
+    /// channel it can see, and queue the ones something is on.
+    ///
+    /// The dwell still confirms each of them through the receiver itself, so
+    /// this decides only what is worth a visit — which is why a channel the
+    /// transform cannot honestly answer for is queued rather than dropped (see
+    /// [`crate::scanner::busy_memories`]).
+    fn scan_read_mem_slice(&mut self, now: Instant) {
+        let ids = self
+            .scan
+            .as_ref()
+            .and_then(|sc| sc.mem_slices.get(sc.mem_slice))
+            .map(|(_, ids)| ids.clone())
+            .unwrap_or_default();
+        // Resolved against the store rather than remembered with the plan: a
+        // channel edited or deleted between the tune and this read is one this
+        // window no longer knows anything about.
+        let here: Vec<(u32, f64, f64)> = ids
+            .iter()
+            .filter_map(|id| self.memories.iter().find(|m| m.id == *id))
+            .map(|m| (m.id, m.freq_hz, (m.filter_hi - m.filter_lo).abs() as f64))
+            .collect();
+        let freqs: Vec<f64> = here.iter().map(|(_, hz, _)| *hz).collect();
+        let widths: Vec<f64> = here.iter().map(|(_, _, bw)| *bw).collect();
+        let busy = crate::scanner::busy_memories(
+            &self.scan_db,
+            self.state.center_hz,
+            self.state.sample_rate,
+            &freqs,
+            &widths,
+            self.scan_threshold_db(),
+        );
+        if let Some(sc) = self.scan.as_mut() {
+            sc.queue.extend(busy.into_iter().map(|i| ScanTarget::Memory(here[i].0)));
+        }
+        self.scan_advance(now);
     }
 
     /// One channel at a time along the range's grid — for a front end with no
@@ -9885,7 +11104,19 @@ impl Engine {
                     filter_lo: m.filter_lo,
                     filter_hi: m.filter_hi,
                 };
+                // The setup the channel was stored with, read exactly as
+                // `RecallMemory` reads it — an absent one as plain simplex with
+                // no tone (issue #204). A scan stops on a channel to be worked,
+                // and the operator who answers the call reaches for the PTT
+                // rather than for the shift: without this the over goes out on
+                // the last repeater's shift and tone, whichever channel the
+                // scan is actually sitting on (issue #264).
+                let repeater = m.repeater.unwrap_or_default().clamped();
                 self.place_entry_in_span(entry);
+                // After the dial, not before it: a channel stored with AUTO on
+                // resolves its shift against the frequency it lands on, and the
+                // one being left is the wrong band to ask about.
+                self.set_repeater(repeater);
             }
             ScanTarget::Freq(hz) => {
                 if self.state.rx[0].mode != self.scan_cfg.mode {
@@ -9966,10 +11197,21 @@ impl Engine {
         self.notice(&format!("transmit refused — {reason}"));
     }
 
-    /// Hand back the station's transmit interlock, if this engine holds it.
+    /// Hand back the station's transmit interlock, if this engine holds it,
+    /// and reconcile the external T/R switch with what is actually happening.
+    ///
+    /// Reconciled rather than released, and the difference matters: this is
+    /// called from [`Engine::deny_tx`], which runs on refusals that have
+    /// nothing to do with whether the station is on the air — a key-down
+    /// refused *because the rig is transmitting on its own PTT* being the case
+    /// in point. Dropping the contacts there would open an antenna relay under
+    /// somebody else's live RF and throw it straight back on the next tick.
     fn release_tx_gate(&self) {
         if let Some(gate) = self.tx_gate.as_ref() {
             gate.release(self.instance);
+        }
+        if let Some(hub) = self.tr_switch.as_ref() {
+            hub.publish(self.instance, self.on_air());
         }
     }
 
@@ -10057,6 +11299,81 @@ impl Engine {
             }
             self.state.antenna_tx = self.source.current_tx_antenna();
         }
+    }
+
+    /// Put the socket the operator last chose on `band` back, as the dial
+    /// crosses into it.
+    ///
+    /// A station with more than one antenna has one per band rather than one
+    /// altogether, and a radio with a selector is expected to know that: an
+    /// Icom's band stacking register carries the socket beside the frequency,
+    /// and an SDRplay operator switching between an HF wire and a VHF discone
+    /// should not have to reach for the control every time (issues #235, #238).
+    ///
+    /// Only bands the operator has actually chosen on are remembered, so a band
+    /// never worked leaves the front end exactly where it was — the same
+    /// "no preference means no assertion" rule [`Engine::restore_antennas`]
+    /// follows, and for the same reason.
+    ///
+    /// The socket is *asserted*, not compared: on a band change the radio may
+    /// already have moved it under us. An Icom's band stacking register carries
+    /// a socket of its own, so crossing into 40 m puts the rig on whatever was
+    /// last used there — and if that happens to match what sdroxide last read,
+    /// a comparison against the cached socket sends nothing and the wrong
+    /// aerial stays connected. That is why 30 m → 40 m left an IC-7610 on ANT1
+    /// while 20 m → 40 m switched it correctly: the same preference, and only
+    /// the *cached* value differed (issue #258).
+    fn follow_band_antenna(&mut self, band: Band) {
+        // Not where the source owns the receive port: a LimeRFE listens on the
+        // socket it is cabled to whatever the band. Same exemption as
+        // `restore_antennas`.
+        let Some((rx, tx)) = self.band_antenna.get(&band).cloned() else { return };
+        let before = (self.state.antenna_rx.clone(), self.state.antenna_tx.clone());
+        if let Some(name) =
+            rx.filter(|n| !self.source.owns_rx_antenna() && self.caps.antennas_rx.contains(n))
+        {
+            if let Err(e) = self.source.set_antenna(&name) {
+                warn!("switching to RX antenna {name} for {band:?}: {e}");
+            }
+            self.state.antenna_rx = self.source.current_antenna();
+            self.want_antenna.0 = Some(name);
+        }
+        if let Some(name) = tx.filter(|n| self.caps.antennas_tx.contains(n)) {
+            if let Err(e) = self.source.set_tx_antenna(&name) {
+                warn!("switching to TX antenna {name} for {band:?}: {e}");
+            }
+            self.state.antenna_tx = self.source.current_tx_antenna();
+            self.want_antenna.1 = Some(name);
+        }
+        if before != (self.state.antenna_rx.clone(), self.state.antenna_tx.clone()) {
+            let _ = self.event_tx.send(RadioEvent::State(self.state.clone()));
+        }
+    }
+
+    /// Re-publish the antenna list when the *radio* has since said what it is.
+    ///
+    /// The same shape as [`Engine::refresh_center_is_dial`], and there for the
+    /// same reason: a control link answers a round trip after the device was
+    /// built, and the capabilities went out before it did. Every CI-V rig
+    /// speaks one dialect, so whether this one has an antenna selector is not
+    /// known until it answers — or NAKs — the read the link sends on opening.
+    /// A front end whose ports are a fact about the hardware says nothing here
+    /// and nothing happens.
+    fn refresh_antennas(&mut self) {
+        let Some(list) = self.source.learned_antennas() else { return };
+        // Compared without building anything: this runs on every pass of the
+        // loop and the answer changes once a session at most.
+        if list.len() == self.caps.antennas_rx.len()
+            && list.iter().zip(&self.caps.antennas_rx).all(|(a, b)| a == b)
+        {
+            return;
+        }
+        self.caps.antennas_rx = list.iter().map(|a| (*a).to_string()).collect();
+        let _ = self.event_tx.send(RadioEvent::Capabilities(self.caps.clone()));
+        // A port the session remembered may only now be one this radio offers.
+        self.restore_antennas();
+        self.follow_band_antenna(self.state.band);
+        let _ = self.event_tx.send(RadioEvent::State(self.state.clone()));
     }
 
     /// Note down a gain stage the operator has set, so it can be put back on
@@ -10187,6 +11504,7 @@ impl Engine {
             tx_eq: self.state.tx.eq,
             squelch_db: self.state.rx[0].squelch_db,
             noise_reduction: self.state.rx[0].noise_reduction,
+            binaural: self.state.rx[0].binaural,
             // The standing choice again, not what the front end of the moment
             // could do with it: a session written while the radio was switched
             // off would otherwise put 1 on disk and lose it for good.
@@ -10200,6 +11518,7 @@ impl Engine {
             gains: self.want_gains.0.clone(),
             tx_gains: self.want_gains.1.clone(),
             recording_mono: self.state.recording_mono,
+            band_antenna: self.band_antenna.clone(),
         };
         if now == *saved {
             return;
@@ -10440,6 +11759,13 @@ impl Engine {
         self.adsb_ddc = None;
         self.adsb = None;
         self.adsb_buf.clear();
+        // The VDL2 lane goes the same way. Decimating the front end below about
+        // 440 kHz is what takes the plan's outer channels out of reach, and
+        // `sync_vdl2` says which ones are left rather than restarting a decoder
+        // that will quietly hear a third of the traffic.
+        self.vdl2_ddc = None;
+        self.vdl2 = None;
+        self.vdl2_buf.clear();
         // Dropped outright rather than left to `sync_tci_iq`'s own comparison:
         // two device rates can snap to the same client rate, and it would then
         // keep a decimation chain built for the rate we have just left.
@@ -10450,6 +11776,7 @@ impl Engine {
         self.sync_skimmer();
         self.sync_ism();
         self.sync_adsb();
+        self.sync_vdl2();
         self.sync_qo100();
         self.sync_audio_tap();
         self.sync_tci_iq();
@@ -10639,10 +11966,15 @@ impl Engine {
             let _ = self.source.tx_end();
         }
         self.source = source;
+        // The old front end's pipeline went with it.
+        self.center_trail.clear();
+        self.stream_center_hz = self.source.center_hz();
         self.caps = caps;
         self.caps.center_is_dial = self.source.center_is_dial();
         self.caps.cw_audio_keyed = self.source.cw_audio_keyed();
         self.caps.commands_squelch = self.source.commands_squelch();
+        self.caps.commands_rig_power = self.source.commands_rig_power();
+        self.caps.wide_span_hz = self.source.wide_span_hz();
         self.audio_mode = self.caps.audio_mode;
         self.radio_fs = self.source.sample_rate();
         self.audio_bw = self.source.display_bandwidth().unwrap_or(self.radio_fs / 2.0);
@@ -10813,6 +12145,7 @@ impl Engine {
             self.sync_skimmer();
             self.sync_ism();
             self.sync_adsb();
+            self.sync_vdl2();
             self.sync_qo100();
         }
         // Re-derive the TCI streams at the new device rate and push a fresh
@@ -11100,6 +12433,51 @@ impl Engine {
         self.sync_tx_state();
     }
 
+    /// The transceiver has keyed or unkeyed itself, and the receiver on this
+    /// side is still running: give the loudspeaker the same treatment an over
+    /// of our own would.
+    ///
+    /// Nothing here drives that over — see [`ControlUpdate::RigTx`] — so the
+    /// engine never enters the transmit path for it, and the receive read at
+    /// the top of the engine loop keeps going. On an arrangement where the
+    /// receiver is a different device from the transmitter, that means it is
+    /// listening to the station's own transmitter for the length of the over:
+    /// an RTL-SDR watching the antenna a KX3 is transmitting into (issue #244),
+    /// or a dongle on the rig's I.F. output. "Mute on transmit" was already
+    /// answered for overs sdroxide keys; an over the operator keys with the
+    /// microphone in their hand is the one they are most likely to be holding
+    /// a headphone to their ear through.
+    ///
+    /// Whether to do it at all is the front end's to say
+    /// ([`IqSource::mutes_rx_audio_on_rig_tx`]) — for a paired receiver it is
+    /// the operator's own **Mute on transmit**, and everywhere else an over is
+    /// an over.
+    ///
+    /// The picture is deliberately left running. A receiver that is still
+    /// receiving has something to show, and an operator on the microphone
+    /// watching their own signal go out is a reason to have paired one at all;
+    /// **Blank on transmit** answers for the overs sdroxide keys, where there
+    /// is nothing coming in to draw.
+    ///
+    /// The recording tap goes quiet with the speaker, as it does on our own
+    /// overs: what it would capture is not a band.
+    fn follow_rig_tx(&mut self, on: bool) {
+        // Our own over owns the mixer while it lasts, and its unkey is what
+        // clears these. A rig report must never be the thing that un-mutes one.
+        // (The CAT thread already drops the rig's transmit reads across our own
+        // PTT edges, so this is the belt to those braces.)
+        if self.tx_active {
+            return;
+        }
+        if !self.source.mutes_rx_audio_on_rig_tx() {
+            return;
+        }
+        if let Some(mixer) = self.mixer.as_mut() {
+            mixer.tx_muted = on;
+            mixer.rx_rec_enabled = !on;
+        }
+    }
+
     /// The radio's own PTT line changed state — a foot switch, a mic button, or
     /// whatever is wired to the board's PTT input.
     ///
@@ -11266,6 +12644,18 @@ impl Engine {
             // frequency, and the contact sits a sidetone above the dial — the
             // same offset the receive window already rides on.
             let rig_txf = txf + self.rig_cw_offset_hz();
+            // Every rail has passed and the station is about to be on the air.
+            // The external T/R switch leads the RF — contacts first, drive
+            // second, always — which is the one guarantee that whole subsystem
+            // exists to make. Placed after the rails on purpose, so a refused
+            // key-down never touches the hardware and there is nothing to
+            // unwind.
+            if let Some(hub) = self.tr_switch.as_ref() {
+                if let Some(why) = hub.refusal() {
+                    return self.deny_tx(&why);
+                }
+            }
+            self.lead_tr_switch();
             match self.source.tx_begin(rig_txf, begin_rate) {
                 Ok(tx_rate) => {
                     // Rate-match the digital modes to whatever this radio
@@ -11378,11 +12768,28 @@ impl Engine {
                         self.burst_unkeys = false;
                     }
                 }
-                Err(e) => self.deny_tx(&format!("the radio refused to key: {e}")),
+                Err(e) => {
+                    // The contacts were thrown a moment ago and nothing came of
+                    // it. Dropped with no hold: there was never anything on the
+                    // air to protect, and a receiver held off for it would be
+                    // deaf for no reason.
+                    if let Some(hub) = self.tr_switch.as_ref() {
+                        hub.abort(self.instance);
+                    }
+                    self.deny_tx(&format!("the radio refused to key: {e}"))
+                }
             }
         } else {
             if let Err(e) = self.source.tx_end() {
                 warn!("tx_end: {e}");
+            }
+            // Immediately after the radio has been told to stop, so the hold
+            // times are measured from when the RF actually ends rather than
+            // from whenever the next loop tick happens to come round. Returns
+            // at once — the holds are the driver's business and this thread has
+            // a receiver to get back to.
+            if let Some(hub) = self.tr_switch.as_ref() {
+                hub.unkey(self.instance);
             }
             // Give a rig with its own power control its operating level back.
             // TUNE holds it at the (deliberately low) tune level for the length
@@ -12436,12 +13843,14 @@ impl Engine {
         match self.source.set_center_hz(center_hz) {
             Ok(()) => {
                 self.state.center_hz = center_hz;
+                self.note_center_change(center_hz);
                 // Re-place the skim window inside the span that has just moved;
                 // one that really moves re-labels its spots and clears its
                 // tracks, so none straddles the old and new axis.
                 self.sync_skim_window();
                 self.sync_ism_window();
                 self.sync_adsb_window();
+                self.sync_vdl2_window();
                 self.sync_qo100_window();
                 true
             }
@@ -12547,7 +13956,8 @@ fn rig_mode_class(m: Mode) -> u8 {
         // ADS-B is not a mode any rig has, and no rig will ever be in it: the
         // dial is at 1090 MHz. Grouped with FM so an echo is never read as the
         // operator having left the mode.
-        | Mode::Adsb => 5,
+        | Mode::Adsb
+        | Mode::Vdl2 => 5,
     }
 }
 
@@ -13045,6 +14455,118 @@ fn slide_rows(batch: &mut [u8], from: (f64, f64, usize), to: (f64, f64, usize)) 
 }
 
 #[cfg(test)]
+mod binaural_tests {
+    use super::*;
+
+    const RATE: f64 = 48_000.0;
+
+    fn cw(binaural: bool) -> RxState {
+        RxState { binaural, ..RxState::with_mode(Mode::Cw) }
+    }
+
+    /// A 700 Hz note in the middle of the CW passband, at a level the clamp
+    /// never reaches.
+    fn note() -> Vec<f32> {
+        (0..4_096)
+            .map(|i| 0.3 * (std::f64::consts::TAU * 700.0 * f64::from(i) / RATE).cos() as f32)
+            .collect()
+    }
+
+    /// `binaural_split` against one block: what came back in each ear, and
+    /// whether the widener was kept.
+    fn split(rx: &RxState, right_free: bool, right_in: &[f32]) -> (Vec<f32>, Vec<f32>, bool) {
+        let mut slot = None;
+        let (mut mono, mut scratch) = (note(), Vec::new());
+        let mut right = right_in.to_vec();
+        binaural_split(&mut slot, rx, RATE, right_free, &mut mono, &mut scratch, &mut right);
+        (mono, right, slot.is_some())
+    }
+
+    /// With it on in CW, the second ear is filled and the two are no longer
+    /// the same signal — but they still sum back to the audio that went in.
+    #[test]
+    fn cw_fills_the_second_ear() {
+        let (left, right, kept) = split(&cw(true), true, &[]);
+        assert!(kept, "the widener should be kept while it is running");
+        assert_eq!(left.len(), 4_096);
+        assert_eq!(right.len(), 4_096);
+        assert!(left != right, "the two ears are the same signal");
+        // Past the latency, where both ears carry real audio rather than the
+        // priming zeros.
+        let mono = note();
+        let far = 2_048;
+        assert!(
+            (far..4_096).any(|i| (left[i] - mono[i]).abs() > 0.05),
+            "the left ear is unchanged, so nothing was spread"
+        );
+        assert!(right[far..].iter().any(|s| s.abs() > 0.05), "the right ear is silent");
+    }
+
+    /// SSB is spread too — the same treatment as CW, which is what the modes
+    /// the chip is drawn in ask for.
+    #[test]
+    fn ssb_is_spread_as_well() {
+        let rx = RxState { binaural: true, ..RxState::with_mode(Mode::Usb) };
+        let (left, right, kept) = split(&rx, true, &[]);
+        assert!(kept);
+        assert_eq!(right.len(), 4_096);
+        assert!(left != right, "the two ears are the same signal");
+    }
+
+    /// Every mode that is *not* offered it is left exactly as it was: no second
+    /// ear, no widener, and the audio untouched.
+    #[test]
+    fn other_modes_are_left_mono() {
+        for mode in [Mode::Am, Mode::Nfm, Mode::Ft8, Mode::Digu] {
+            let rx = RxState { binaural: true, ..RxState::with_mode(mode) };
+            let (left, right, kept) = split(&rx, true, &[]);
+            assert_eq!(left, note(), "{mode:?} was widened");
+            assert!(right.is_empty(), "{mode:?} filled the right ear");
+            assert!(!kept);
+        }
+    }
+
+    /// …and so is CW with it switched off, which is also where the filter
+    /// state is dropped rather than left to go stale.
+    #[test]
+    fn switching_it_off_leaves_the_audio_alone() {
+        let (left, right, kept) = split(&cw(false), true, &[]);
+        assert_eq!(left, note());
+        assert!(right.is_empty());
+        assert!(!kept);
+
+        let mut slot = None;
+        let (mut mono, mut scratch, mut right) = (note(), Vec::new(), Vec::new());
+        binaural_split(&mut slot, &cw(true), RATE, true, &mut mono, &mut scratch, &mut right);
+        assert!(slot.is_some());
+        right.clear();
+        binaural_split(&mut slot, &cw(false), RATE, true, &mut mono, &mut scratch, &mut right);
+        assert!(slot.is_none(), "the widener outlived the setting that asked for it");
+    }
+
+    /// The sub receiver owns the right ear when it is running: an explicit
+    /// second receiver outranks an effect on the first.
+    #[test]
+    fn the_sub_receiver_keeps_the_right_ear() {
+        let (left, right, kept) = split(&cw(true), false, &[]);
+        assert_eq!(left, note());
+        assert!(right.is_empty());
+        assert!(!kept);
+    }
+
+    /// So does audio that is already stereo — nothing here overwrites an ear
+    /// something else has filled.
+    #[test]
+    fn an_ear_that_is_already_filled_is_not_taken() {
+        let filled = vec![0.1f32; 4_096];
+        let (left, right, kept) = split(&cw(true), true, &filled);
+        assert_eq!(left, note());
+        assert_eq!(right, filled);
+        assert!(!kept);
+    }
+}
+
+#[cfg(test)]
 mod slide_rows_tests {
     use super::slide_rows;
 
@@ -13397,6 +14919,150 @@ mod zoom_lane_fft_tests {
             assert!((4096..=32_768).contains(&n), "{w} gave {n}");
             assert!(n.is_power_of_two(), "{w} gave {n}");
         }
+    }
+}
+
+/// Whether the full-band lane, rather than the device analyser, is what covers
+/// `viewport`.
+///
+/// True once the viewport reaches outside the passband — by being wider than
+/// it, or by having been panned off its edge; the device analyser has nothing
+/// to draw there either way — and only while the wide lane really is the wider
+/// of the two.
+///
+/// `dev_center` is the centre the samples in hand were taken at rather than the
+/// one most recently commanded. On a front end whose stream lags its tuning the
+/// two differ, and the commanded one would flip the panadapter between the two
+/// sources on every dial move.
+fn wide_covers_viewport(
+    (vp_lo, vp_hi): (f64, f64),
+    dev_center: f64,
+    dev_span: f64,
+    (_wide_center, wide_span): (f64, f64),
+    wide_bins: usize,
+) -> bool {
+    if !(dev_span > 0.0 && wide_span > dev_span) || wide_bins == 0 {
+        return false;
+    }
+    // Never for a window this lane cannot resolve. Its bins are the whole band
+    // divided a thousand-odd ways — 29 kHz apiece on a KiwiSDR — so a viewport
+    // a few kilohertz wide pools down into one of them and draws as a flat line
+    // straight across the panadapter. Whatever the I/Q has is worth more than
+    // that, even where it does not cover the whole window; and a window this
+    // narrow sitting outside the passband is a retune waiting to happen rather
+    // than a picture to be drawn (`follow_view_into_the_band`).
+    const MIN_BINS_ACROSS: f64 = 8.0;
+    if (vp_hi - vp_lo) < wide_span / wide_bins as f64 * MIN_BINS_ACROSS {
+        return false;
+    }
+    let (dev_lo, dev_hi) = (dev_center - dev_span / 2.0, dev_center + dev_span / 2.0);
+    // A hair of tolerance: a viewport fitted to the passband is built as
+    // `centre ± span/2` in one place and clamped in another, and the two round
+    // differently — which would otherwise put a fully-zoomed-out view
+    // permanently on the coarser lane.
+    let eps = dev_span * 1e-6;
+    vp_lo < dev_lo - eps || vp_hi > dev_hi + eps
+}
+
+#[cfg(test)]
+mod wide_main_window_tests {
+
+    /// A KiwiSDR: 12 kHz of I/Q at 10 MHz, and a 1024-bin picture of the whole
+    /// 0-30 MHz — 29.3 kHz a bin.
+    const KIWI_DEV: (f64, f64) = (10_000_000.0, 12_000.0);
+    const KIWI_WIDE: (f64, f64) = (15_000_000.0, 30_000_000.0);
+    const KIWI_WIDE_BINS: usize = 1024;
+
+    /// [`wide_covers_viewport`] with this file's KiwiSDR figures.
+    fn covers(vp: (f64, f64), dev: (f64, f64)) -> bool {
+        super::wide_covers_viewport(vp, dev.0, dev.1, KIWI_WIDE, KIWI_WIDE_BINS)
+    }
+
+    /// Zoomed in, or fitted to the passband: the I/Q is finer and covers it.
+    #[test]
+    fn the_passband_keeps_its_own_picture() {
+        let (c, span) = KIWI_DEV;
+        assert!(!covers((c - 1_000.0, c + 1_000.0), (c, span)));
+        assert!(
+            !covers((c - span / 2.0, c + span / 2.0), (c, span)),
+            "a view fitted exactly to the passband must not fall to the coarser lane"
+        );
+    }
+
+    /// The rounding this tolerance exists for: `centre ± span/2` computed in
+    /// two places, differing in the last bit.
+    #[test]
+    fn a_viewport_a_whisker_outside_still_counts_as_inside() {
+        let (c, span) = KIWI_DEV;
+        let nudge = span * 1e-9;
+        assert!(!covers((c - span / 2.0 - nudge, c + span / 2.0 + nudge), (c, span)));
+    }
+
+    /// Zoomed out past the I/Q — the case the whole thing exists for.
+    #[test]
+    fn zooming_out_past_the_iq_reaches_the_wide_lane() {
+        let (c, span) = KIWI_DEV;
+        assert!(covers((c - 500_000.0, c + 500_000.0), (c, span)));
+        assert!(covers((0.0, 30_000_000.0), (c, span)));
+    }
+
+    /// Panned off the edge rather than widened: the device analyser has nothing
+    /// there either, so the test is containment and not width. Wide enough for
+    /// the lane to resolve, which a window of a few kilohertz is not — see
+    /// `a_window_too_narrow_for_the_lane_is_left_to_the_iq`.
+    #[test]
+    fn a_viewport_panned_off_the_edge_reaches_it_too() {
+        let (c, span) = KIWI_DEV;
+        let lo = c + 5e6;
+        assert!(covers((lo, lo + 1e6), (c, span)));
+    }
+
+    /// The flat line this cost before it was caught: the receiver restates its
+    /// sample rate every session — a KiwiSDR's arrives as 11998.876277 one
+    /// time and 11998.876241 the next — so a view fitted to one of those is a
+    /// fraction of a hertz wider than the other, and the client asked for a
+    /// window twice the passband. The lane's bins are 29 kHz apiece, so a
+    /// 24 kHz window pooled from them is a single bin drawn straight across the
+    /// panadapter. Refused on resolution: whatever the I/Q has beats that.
+    #[test]
+    fn a_window_too_narrow_for_the_lane_is_left_to_the_iq() {
+        let (c, span) = KIWI_DEV;
+        // Twice the passband, centred on it — outside it at both ends.
+        assert!(!covers((c - span, c + span), (c, span)));
+        // Even far away from the passband, where the I/Q covers none of it.
+        assert!(!covers((c + 5e6, c + 5e6 + span), (c, span)));
+        // Eight of the lane's own bins is enough to draw.
+        let bin = KIWI_WIDE.1 / KIWI_WIDE_BINS as f64;
+        assert!(covers((c + 5e6, c + 5e6 + bin * 8.5), (c, span)));
+    }
+
+    /// A front end whose "wide" lane is no bigger than its I/Q has nothing to
+    /// add, and switching to it would cost resolution for no reach.
+    #[test]
+    fn a_wide_lane_no_wider_than_the_iq_is_never_used() {
+        let (c, span) = (10_000_000.0, 2_000_000.0);
+        let narrow_lane = |wide: (f64, f64)| {
+            super::wide_covers_viewport((c - 5e6, c + 5e6), c, span, wide, KIWI_WIDE_BINS)
+        };
+        assert!(!narrow_lane((c, 100_000.0)));
+        assert!(!narrow_lane((c, span)));
+    }
+
+    /// A front end still coming up, before it has said what it streams.
+    #[test]
+    fn nothing_happens_before_the_passband_is_known() {
+        assert!(!covers((0.0, 1e6), (0.0, 0.0)));
+    }
+
+    /// The lag case: the centre the samples were taken at is the one that
+    /// decides, so a dial that has moved ahead of the stream does not flip the
+    /// panadapter between the two sources.
+    #[test]
+    fn the_stream_centre_decides_not_the_commanded_one() {
+        let span = 12_000.0;
+        let stream_center = 10_000_000.0;
+        // A viewport still sitting on the samples in hand.
+        assert!(!covers((stream_center - 4_000.0, stream_center + 4_000.0), (stream_center, span)));
     }
 }
 

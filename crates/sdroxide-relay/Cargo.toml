@@ -1,0 +1,55 @@
+[package]
+name = "sdroxide-relay"
+version.workspace = true
+edition.workspace = true
+
+# The station's external transmit/receive switch: the relay board, handshake
+# line, sound-card GPIO pin or Raspberry Pi header that grounds the SDR's
+# antenna input while the station transmits, and keys whatever else has to be
+# sequenced with the over.
+#
+# Pure Rust and no system libraries, for the same reason `sdroxide-limerfe` is:
+# this is a *station* accessory that sits in front of whatever radio the program
+# happens to be receiving with, so it must work in every build variant on every
+# target rather than only where some vendor package is installed.
+#
+# Native-only (links `serialport`, opens device nodes). Must never be a
+# dependency of any wasm-targeted crate — the settings UI reaches the
+# vocabulary through `sdroxide-types` instead, which is wasm-safe.
+[dependencies]
+sdroxide-types.workspace = true
+# `default-features = false` for the same reason `sdroxide-cat` and
+# `sdroxide-limerfe` do it: drop the `libudev` feature so libudev-sys is not
+# linked. We only need the path.
+serialport = { version = "4.10", default-features = false }
+crossbeam-channel.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+# hidraw ioctls and the GPIO character device. Already in the tree; no new
+# system dependency, and nothing here is linked against a C library.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+# SetupAPI and the HID user-mode calls. Pure-Rust bindings to system DLLs that
+# every Windows install already has — no vendored C, nothing to build. `hid.dll`
+# itself is not among the libraries these bindings link, so `src/hid/windows.rs`
+# declares those four functions and links it explicitly.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+  "Win32_Foundation",
+  # `CreateFileW` takes a `SECURITY_ATTRIBUTES` and `WriteFile` an `OVERLAPPED`,
+  # so both of those modules have to be enabled for the functions to exist.
+  "Win32_Security",
+  "Win32_System_IO",
+  "Win32_Storage_FileSystem",
+  "Win32_Devices_DeviceAndDriverInstallation",
+] }
+
+[dev-dependencies]
+tracing-subscriber.workspace = true
+# For the pty in tests/serial_protocol.rs. A fake board is the only way to
+# check these protocols without owning all three, and the LimeRFE's first
+# release is the standing evidence that unit tests over one's own reading of a
+# datasheet are not enough.
+libc = "0.2"

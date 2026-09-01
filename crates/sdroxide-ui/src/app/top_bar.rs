@@ -337,6 +337,7 @@ enum MenuChip {
     Vfo,
     Div,
     Sub,
+    Rig,
     Tx,
     Disp,
     Sys,
@@ -349,6 +350,7 @@ impl MenuChip {
             Self::Vfo => "VFO",
             Self::Div => "DIV",
             Self::Sub => "SUB",
+            Self::Rig => "RIG",
             Self::Tx => "TX",
             Self::Disp => "DISP",
             Self::Sys => "SYS",
@@ -709,6 +711,7 @@ impl SdroxideApp {
             RxFilter,
             Div,
             Sub,
+            Rig,
             Tx,
             Display,
             System,
@@ -741,6 +744,14 @@ impl SdroxideApp {
                 Kind::Sub,
                 StripBox { w: SUB_W, flex: 1.0, max_w: SUB_W + RAIL_STRETCH_MAX },
             ));
+        }
+        // The transceiver's own switches — the aerial socket and the mains
+        // switch — for a radio that has either. On the strip because an
+        // operator changes bands and reaches for the other aerial in the same
+        // breath, and both were reachable only through Settings (issue #258).
+        if self.rig_box_shown() {
+            let w = self.rig_rows_w(ui);
+            boxes.push((Kind::Rig, StripBox { w, flex: 1.0, max_w: w * CHIP_STRETCH_FACTOR }));
         }
         if self.tx_capable() {
             let w = self.tx_rows_w(ui);
@@ -779,6 +790,7 @@ impl SdroxideApp {
                         Kind::RxFilter => self.rx_filter_module(ui, cmds, w),
                         Kind::Div => self.div_module(ui, cmds, w),
                         Kind::Sub => self.sub_rx_module(ui, cmds, w),
+                        Kind::Rig => self.rig_module(ui, cmds, w),
                         Kind::Tx => self.tx_condensed(ui, cmds, w),
                         Kind::Display => self.display_condensed(ui, cmds, w),
                         Kind::System => self.windows_condensed(ui, w),
@@ -801,6 +813,11 @@ impl SdroxideApp {
         if self.state.sub_rx_enabled {
             chips.push(MenuChip::Sub);
         }
+        // Same rule again: only a radio that has an aerial selector or a
+        // control-link power switch carries the chip for them.
+        if self.rig_box_shown() {
+            chips.push(MenuChip::Rig);
+        }
         if tx_capable {
             chips.push(MenuChip::Tx);
         }
@@ -822,7 +839,9 @@ impl SdroxideApp {
             }),
             MenuChip::Sub => true,
             MenuChip::Tx => self.state.tx.tune,
-            MenuChip::Rx | MenuChip::Disp | MenuChip::Sys => false,
+            // Nothing here reads back: the socket is a name rather than an
+            // on/off, and a radio that is switched off answers nothing at all.
+            MenuChip::Rig | MenuChip::Rx | MenuChip::Disp | MenuChip::Sys => false,
         }
     }
 
@@ -875,6 +894,7 @@ impl SdroxideApp {
         let tx_capable = self.tx_capable();
         let sub = self.state.sub_rx_enabled;
         let div = self.has_diversity();
+        let rig = self.rig_box_shown();
         let gap = ui.spacing().item_spacing.x;
         let chip_h = crate::chrome::chip_height(ui, None);
         let fit = ReadoutFit::measure(ui, self.readout_digits());
@@ -909,6 +929,9 @@ impl SdroxideApp {
                 }
                 if sub {
                     r1.push("SUB");
+                }
+                if rig {
+                    r1.push("RIG");
                 }
                 (r1.len(), widest(&r1))
             },
@@ -1002,6 +1025,10 @@ impl SdroxideApp {
                     if sub {
                         let btn = crate::chrome::chip_sized(ui, true, "SUB", cell1);
                         self.sub_menu(ui, btn, cmds);
+                    }
+                    if rig {
+                        let btn = crate::chrome::chip_sized(ui, false, "RIG", cell1);
+                        self.rig_menu(ui, btn, cmds);
                     }
                 });
                 let cell2 = egui::vec2(plan.cell2_w, chip_h);
@@ -1097,6 +1124,7 @@ impl SdroxideApp {
                 MenuChip::Vfo => self.vfo_menu(ui, btn, cmds, tier == crate::layout::Tier::Phone),
                 MenuChip::Div => self.div_menu(ui, btn, cmds),
                 MenuChip::Sub => self.sub_menu(ui, btn, cmds),
+                MenuChip::Rig => self.rig_menu(ui, btn, cmds),
                 MenuChip::Tx => self.tx_menu(ui, btn, cmds),
                 MenuChip::Disp => self.disp_menu(ui, btn, cmds),
                 MenuChip::Sys => self.sys_menu(ui, btn, cmds),
@@ -1170,6 +1198,16 @@ impl SdroxideApp {
         crate::chrome::menu_popup(ui, &btn, |ui| {
             crate::chrome::menu_caption(ui, "Sub receiver");
             self.sub_controls(ui, cmds, true, 0.0);
+        });
+    }
+
+    /// The RIG menu, shown only on a radio with an aerial selector or a power
+    /// switch this end can reach.
+    fn rig_menu(&mut self, ui: &mut egui::Ui, btn: egui::Response, cmds: &mut Vec<Command>) {
+        let btn = btn.on_hover_text("The transceiver's own aerial socket, and its power switch");
+        crate::chrome::menu_popup(ui, &btn, |ui| {
+            crate::chrome::menu_caption(ui, "Radio");
+            self.rig_controls(ui, cmds, true);
         });
     }
 
@@ -2587,6 +2625,42 @@ impl SdroxideApp {
                     self.nr_button(ui, cmds);
                 }
             }
+            RxChip::Bin => {
+                // Binaural audio: the passband spread across the two ears, so
+                // that pitch becomes direction. The hover text says what it is
+                // for rather than what it does — an operator who has not met a
+                // binaural receiver has no reason to guess that a stereo
+                // effect is a copying aid — and it says something different in
+                // CW and SSB, because what it buys is a different thing in
+                // each.
+                let on = self.state.rx[0].binaural;
+                let sub = self.state.sub_rx_enabled;
+                let cw = self.state.rx[0].mode == Mode::Cw;
+                let chip = ui
+                    .add_enabled_ui(!sub, |ui| crate::chrome::chip(ui, on && !sub, "BIN"))
+                    .inner
+                    .on_hover_text(if sub {
+                        "Binaural audio — not while the sub receiver has the right ear"
+                    } else if on {
+                        "Binaural audio: the passband is spread across the two ears, so signals \
+                         at different pitches come from different directions and the one you \
+                         tune floats across. Click to go back to mono"
+                    } else if cw {
+                        "Binaural CW: spread the passband across the two ears, so that signals \
+                         at different pitches come from different directions — a pile-up becomes \
+                         several places instead of one crowded note, and tuning a station floats \
+                         it across. Best on headphones"
+                    } else {
+                        "Binaural audio: spread the passband across the two ears. On voice the \
+                         noise spreads over the whole image while the station stays in the \
+                         middle of it, which is easier to listen to for an hour — at the cost \
+                         of the voice itself being spread out. Best on headphones"
+                    });
+                if chip.clicked() {
+                    self.state.rx[0].binaural = !on; // optimistic echo
+                    cmds.push(Command::SetBinaural { rx: RxId::Main, on: !on });
+                }
+            }
             RxChip::Mute => {
                 let muted = self.state.rx[0].muted;
                 if crate::chrome::chip_accent(
@@ -3051,6 +3125,135 @@ impl SdroxideApp {
         });
     }
 
+    /// The sockets the radio will put its receiver on, or empty where it has
+    /// no selector to offer. Only worth a control where there is a choice.
+    fn rig_antennas(&self) -> &[String] {
+        match &self.caps {
+            Some(c) if c.antennas_rx.len() > 1 => &c.antennas_rx,
+            _ => &[],
+        }
+    }
+
+    /// Whether the radio's own power switch can be reached from here.
+    fn rig_power(&self) -> bool {
+        self.caps.as_ref().is_some_and(|c| c.commands_rig_power)
+    }
+
+    /// Whether the RIG box has anything to carry. Like DIV and SUB, it appears
+    /// only for hardware that has what it drives — a strip is too narrow to
+    /// hold controls for a radio that would ignore them.
+    fn rig_box_shown(&self) -> bool {
+        !self.rig_antennas().is_empty() || self.rig_power()
+    }
+
+    /// The RIG box's natural width: the wider of its two rows.
+    fn rig_rows_w(&self, ui: &egui::Ui) -> f32 {
+        let gap = MODULE_ROW_SPACING;
+        let body = egui::TextStyle::Body.resolve(ui.style());
+        let ants = self.rig_antennas();
+        let top = if ants.is_empty() {
+            0.0
+        } else {
+            // The chip wears whichever socket the radio is on, so the box has
+            // to be as wide as the longest of them or it would resize as the
+            // operator switched.
+            let widest =
+                ants.iter().fold(0.0f32, |a, n| a.max(crate::chrome::chip_width(ui, n, None)));
+            crate::chrome::text_width(ui, "ANT", body.clone()) + gap + widest
+        };
+        let bottom = if self.rig_power() {
+            crate::chrome::text_width(ui, "PWR", body)
+                + gap
+                + crate::chrome::chip_width(ui, "ON", None)
+                + gap
+                + crate::chrome::chip_width(ui, "OFF", None)
+        } else {
+            0.0
+        };
+        top.max(bottom) + 2.0 * crate::chrome::MODULE_MARGIN_X
+    }
+
+    /// The RIG box: the radio's aerial socket and its power switch.
+    fn rig_module(&mut self, ui: &mut egui::Ui, cmds: &mut Vec<Command>, w: f32) {
+        crate::chrome::module_bare_h(ui, w, crate::chrome::MODULE_TALL_H, |ui| {
+            ui.with_layout(egui::Layout::top_down(egui::Align::Center), |ui| {
+                ui.spacing_mut().item_spacing = egui::vec2(MODULE_ROW_SPACING, MODULE_ROW_SPACING);
+                self.rig_controls(ui, cmds, false);
+            });
+        });
+    }
+
+    /// The radio's own switches — the body of the RIG box, and of the RIG
+    /// menu. See [`crate::chrome::control_row`] for `narrow`.
+    ///
+    /// The socket is a cycling chip rather than a combo, for the same reason
+    /// the AGC and DIV chips are: a combo inside a menu opens a second popup
+    /// layer, and clicking it counts as "outside" and closes the menu it was
+    /// opened from. Two or three sockets is hardly a walk.
+    ///
+    /// The power switch is two buttons rather than a toggle, because nothing
+    /// here *reads* it: a radio that is off answers nothing, so the only thing
+    /// a toggle could show is the last thing it was told. Same reasoning as the
+    /// pair in Settings → Radio, which these do not replace.
+    fn rig_controls(&mut self, ui: &mut egui::Ui, cmds: &mut Vec<Command>, narrow: bool) {
+        let ants: Vec<String> = self.rig_antennas().to_vec();
+        if !ants.is_empty() {
+            crate::chrome::control_row(ui, narrow, |ui| {
+                ui.label("ANT").on_hover_text(
+                    "Which socket on the back the radio is receiving on — its own ANT \
+                     command, the same setting as the ANT button on the front panel. \
+                     Click to step to the next one.\n\n\
+                     The choice is remembered per band, and put back the next time the \
+                     dial crosses into that band.",
+                );
+                let here = ants.iter().position(|a| *a == self.state.antenna_rx);
+                // The socket's own name, whole: a front end that spells its
+                // ports out is entitled to be quoted — an RSPduo's "50 Ohm
+                // port" and "Hi-Z port" abbreviate to the same word, and a
+                // chip that cannot tell two sockets apart is worse than a wide
+                // one. The box was measured against the longest of them.
+                let label = match here {
+                    Some(i) => ants[i].clone(),
+                    // Before the radio has said, and after a switch to a socket
+                    // this list does not name.
+                    None => "—".to_string(),
+                };
+                if crate::chrome::chip(ui, true, label)
+                    .on_hover_text(format!("Sockets: {}", ants.join(", ")))
+                    .clicked()
+                {
+                    let next = ants[here.map_or(0, |i| (i + 1) % ants.len())].clone();
+                    self.state.antenna_rx = next.clone(); // optimistic echo
+                    cmds.push(Command::SetAntenna { dir: Direction::Rx, name: next });
+                }
+            });
+        }
+        if self.rig_power() {
+            crate::chrome::control_row(ui, narrow, |ui| {
+                ui.label("PWR").on_hover_text(
+                    "The radio's own power switch, over the control link — not \
+                     sdroxide's on/off, which closes the interface and leaves the radio \
+                     running.\n\n\
+                     For ON to reach anything the radio's control end has to stay awake \
+                     while it is off: Network Control over the LAN, or a CI-V port still \
+                     fed from the mains on a set switched off at the front.",
+                );
+                if crate::chrome::chip(ui, false, "ON")
+                    .on_hover_text("Switch the radio on")
+                    .clicked()
+                {
+                    cmds.push(Command::SetRigPower(true));
+                }
+                if crate::chrome::chip(ui, false, "OFF")
+                    .on_hover_text("Switch the radio off. The audio and the meters stop with it.")
+                    .clicked()
+                {
+                    cmds.push(Command::SetRigPower(false));
+                }
+            });
+        }
+    }
+
     /// Whether two coherent aerials are being combined into the span on
     /// screen — a LimeSDR's two chains, an RSPduo's two tuners. The source
     /// says so; nothing here has to know which board it is.
@@ -3074,6 +3277,13 @@ impl SdroxideApp {
             }
             sdroxide_types::Backend::SdrPlay => {
                 Some((cfg.sdrplay.duo.mode, cfg.sdrplay.duo.rate, cfg.sdrplay.duo.frozen))
+            }
+            // Fobos's own filter only exists on FobosPort::HfDual — every
+            // other port has nothing to combine, and `caps.diversity` (set
+            // from that same port choice) already keeps the box off screen
+            // for them, so no port check is needed here too.
+            sdroxide_types::Backend::Fobos => {
+                Some((cfg.fobos.div_mode, cfg.fobos.div_rate, cfg.fobos.div_frozen))
             }
             // Every other interface with a second receiver keeps them apart.
             _ => None,
@@ -3101,6 +3311,9 @@ impl SdroxideApp {
             sdroxide_types::Backend::SdrPlay => {
                 let d = &mut cfg.sdrplay.duo;
                 (&mut d.mode, &mut d.rate, &mut d.frozen)
+            }
+            sdroxide_types::Backend::Fobos => {
+                (&mut cfg.fobos.div_mode, &mut cfg.fobos.div_rate, &mut cfg.fobos.div_frozen)
             }
             _ => return,
         };
@@ -3265,18 +3478,24 @@ impl SdroxideApp {
             ui.label("Filter").on_hover_text("Sub receiver passband edges, in Hz");
             let mut lo = rx1.filter_lo;
             let mut hi = rx1.filter_hi;
-            let changed = ui
+            let lo_changed = ui
                 .add_sized([70.0, field_h], DragValue::new(&mut lo).speed(10).range(-max..=max))
-                .changed()
-                | ui.add_sized(
-                    [70.0, field_h],
-                    DragValue::new(&mut hi).speed(10).range(-max..=max),
-                )
                 .changed();
-            if changed {
-                // Same 50 Hz floor the waterfall grips enforce, so the
-                // passband can't be dragged shut from either route.
-                let (lo, hi) = (lo.min(hi - 50.0), hi.max(lo + 50.0));
+            let hi_changed = ui
+                .add_sized([70.0, field_h], DragValue::new(&mut hi).speed(10).range(-max..=max))
+                .changed();
+            if lo_changed || hi_changed {
+                let (lo, hi) = if rx1.mode.filter_symmetric() {
+                    // A channel about the carrier: whichever edge was typed
+                    // sets the half width and the other follows (issue #256),
+                    // the same rule the panadapter grips follow.
+                    let half = if hi_changed { hi.abs() } else { lo.abs() }.clamp(25.0, max);
+                    (-half, half)
+                } else {
+                    // Same 50 Hz floor the waterfall grips enforce, so the
+                    // passband can't be dragged shut from either route.
+                    (lo.min(hi - 50.0), hi.max(lo + 50.0))
+                };
                 (self.state.rx[1].filter_lo, self.state.rx[1].filter_hi) = (lo, hi);
                 cmds.push(Command::SetFilter { rx: RxId::Sub, lo, hi });
             }
@@ -3954,6 +4173,18 @@ impl SdroxideApp {
                  since the waterfall keeps a fixed number of lines — 73 seconds at Medium, 9 \
                  at Fastest.",
             );
+            if crate::chrome::chip(ui, self.view.decode_labels, "DECODE LABELS")
+                .on_hover_text(
+                    "Mark every decoded station on the waterfall with its callsign, at the \
+                     frequency it was heard on — FT8, FT4 and the other slotted modes. A \
+                     good opening puts thirty of them across the span twice a minute, over \
+                     the traces you are reading; switch them off and the waterfall is just \
+                     the band. The decode list beside it still has every callsign.",
+                )
+                .clicked()
+            {
+                self.view.decode_labels = !self.view.decode_labels;
+            }
             if !picks_layers {
                 self.detail_row(ui, &mut cfg);
             }
@@ -4279,7 +4510,7 @@ impl SdroxideApp {
     /// The first five window chips — the condensed System box's top row.
     /// `extra` stretches each chip past its label; the popup passes 0.
     fn system_chips_top(&mut self, ui: &mut egui::Ui, extra: f32) {
-        let [log, spots, awards, bands, sat_label, qo100_label, ism, ..] = SYSTEM_CHIPS;
+        let [log, spots, awards, bands, sat_label, ism, public_sdrs] = SYSTEM_CHIPS_TOP;
         if chip_stretched(ui, self.show_logbook, log, extra)
             .on_hover_text("Logbook — all QSOs (digital + manual)")
             .clicked()
@@ -4307,10 +4538,13 @@ impl SdroxideApp {
         {
             self.show_bands = !self.show_bands;
         }
-        // Accented while a satellite lock is running, like the scanner:
-        // Doppler is being applied whether or not the window is open, and
-        // that has to be visible.
-        let sat_chip = if self.sat_track.is_some() {
+        // Accented while a satellite lock *or* the QO-100 beacon hunt is
+        // running, like the scanner: both spend the receiver whether or not the
+        // window is open, and that has to be visible. QO-100 shares this chip
+        // because it shares the window — it is a satellite, and the only reason
+        // it ever had a chip of its own was that its calibration arrived first.
+        let qo100_running = self.state.qo100.enabled;
+        let sat_chip = if self.sat_track.is_some() || qo100_running {
             accent_chip_stretched(
                 ui,
                 true,
@@ -4323,36 +4557,16 @@ impl SdroxideApp {
             chip_stretched(ui, self.show_sat, sat_label, extra)
         };
         if sat_chip
-            .on_hover_text(match &self.sat_track {
-                Some(t) => format!("Satellite — locked on {}", t.name),
-                None => "Satellite — lock on and operate with Doppler correction".into(),
+            .on_hover_text(match (&self.sat_track, qo100_running) {
+                (Some(t), _) => format!("Satellite — locked on {}", t.name),
+                (None, true) => "Satellite — the QO-100 beacon calibration is running".into(),
+                (None, false) => {
+                    "Satellite — Doppler tracking, and the QO-100 beacon calibration".into()
+                }
             })
             .clicked()
         {
             self.show_sat = !self.show_sat;
-        }
-        // Accented while the beacon hunt is running, like the satellite lock:
-        // it is worth knowing at a glance even with the window closed.
-        let qo100_chip = if self.state.qo100.enabled {
-            accent_chip_stretched(
-                ui,
-                true,
-                qo100_label,
-                crate::theme::GREEN(),
-                crate::theme::INK_ON_BRIGHT(),
-                extra,
-            )
-        } else {
-            chip_stretched(ui, self.show_qo100, qo100_label, extra)
-        };
-        if qo100_chip
-            .on_hover_text(
-                "QO-100 beacon — calibrate the LNB/converter offset against the 10489.750 MHz \
-                 beacon",
-            )
-            .clicked()
-        {
-            self.show_qo100 = !self.show_qo100;
         }
         // Accented while the decoder is actually running, like the scanner and
         // the satellite lock: it is spending CPU on four downconverters whether
@@ -4379,11 +4593,26 @@ impl SdroxideApp {
         {
             self.show_ism = !self.show_ism;
         }
+        // Named for what it lists rather than for the WebSDR network, which is
+        // the one thing it does *not* list: PA3FWM's receivers speak a
+        // proprietary codec their author asks third-party clients to stay away
+        // from, and OpenWebRX has neither a stable protocol across its forks
+        // nor a machine-readable directory. "WEB SDR" on the chip had operators
+        // looking for websdr.org's list behind it (issue #254).
+        if chip_stretched(ui, self.show_public_sdrs, public_sdrs, extra)
+            .on_hover_text(
+                "Public SDRs on the internet — browse the KiwiSDR and SpyServer directories \
+                 and open one as a radio",
+            )
+            .clicked()
+        {
+            self.show_public_sdrs = !self.show_public_sdrs;
+        }
     }
 
     /// The remaining window chips — the condensed System box's bottom row.
     fn system_chips_bottom(&mut self, ui: &mut egui::Ui, extra: f32) {
-        let [.., mail, mem, scan_label, settings, help] = SYSTEM_CHIPS;
+        let [mail, mem, scan_label, settings, help] = SYSTEM_CHIPS_BOTTOM;
         if chip_stretched(ui, self.mail.open, mail, extra)
             .on_hover_text("Winlink radio email")
             .clicked()
@@ -4450,7 +4679,7 @@ impl SdroxideApp {
     /// chips splitting its share of the packer's stretch evenly.
     fn windows_condensed(&mut self, ui: &mut egui::Ui, w: f32) {
         let inner = w - 2.0 * crate::chrome::MODULE_MARGIN_X;
-        let (top, bottom) = (&SYSTEM_CHIPS[..SYSTEM_SPLIT], &SYSTEM_CHIPS[SYSTEM_SPLIT..]);
+        let (top, bottom): (&[&str], &[&str]) = (&SYSTEM_CHIPS_TOP, &SYSTEM_CHIPS_BOTTOM);
         let extra1 = ((inner - chip_row_w(ui, top)) / top.len() as f32).max(0.0);
         let extra2 = ((inner - chip_row_w(ui, bottom)) / bottom.len() as f32).max(0.0);
         crate::chrome::module_bare_h(ui, w, crate::chrome::MODULE_TALL_H, |ui| {
@@ -4550,37 +4779,22 @@ impl PttPress {
     }
 }
 
-/// The System box's chips, in the order they are drawn.
+/// The System box's chips, a row at a time, in the order they are drawn.
 ///
-/// One list, read by both the box that reserves the width and the rows that
-/// draw into it. `system_chips_top` and `system_chips_bottom` destructure it —
-/// the first taking [`SYSTEM_SPLIT`] labels and the second the rest — so a
-/// chip added to a row without a label added here does not compile, which is
-/// what keeps the reservation honest. A box reserved narrower than its
-/// contents does not clip them: the row simply carries on past the box, and
-/// whatever crosses the window edge is lost. That is how SCAN, SETTINGS and
-/// HELP came to vanish on the layouts where the strip put this box near the
-/// end of a row.
-const SYSTEM_CHIPS: [&str; 12] = [
-    "LOG",
-    "SPOTS",
-    "AWARDS",
-    "BANDS",
-    "SAT",
-    "QO100",
-    "ISM",
-    "MAIL",
-    "MEM",
-    "SCAN",
-    "⚙ SETTINGS",
-    "? HELP",
-];
+/// **One array per row, and `system_chips_top` / `system_chips_bottom`
+/// destructure their own exhaustively** — no `..` — so a chip added to a row
+/// without a label added here does not compile. That is what keeps the width
+/// reservation honest, and it has to be structural rather than a comment: a box
+/// reserved narrower than its contents does not clip them. The row simply
+/// carries on past the box, and whatever crosses the window edge is lost. That
+/// is how SCAN, SETTINGS and HELP came to vanish on the layouts where the strip
+/// put this box near the end of a row — and, later, how the public-SDR chip
+/// did, drawn in the top row while a single split index still counted it in the
+/// bottom one.
+const SYSTEM_CHIPS_TOP: [&str; 7] = ["LOG", "SPOTS", "AWARDS", "BANDS", "SAT", "ISM", "PUBLIC SDR"];
 
-/// Where [`SYSTEM_CHIPS`] breaks into the condensed box's two rows. Has to
-/// agree with the destructuring patterns in `system_chips_top` / `_bottom` —
-/// the array length pins both, so a chip added to the list forces all three
-/// to be revisited together.
-const SYSTEM_SPLIT: usize = 7;
+/// The rest of them. See [`SYSTEM_CHIPS_TOP`].
+const SYSTEM_CHIPS_BOTTOM: [&str; 5] = ["MAIL", "MEM", "SCAN", "⚙ SETTINGS", "? HELP"];
 
 /// The Display box's top row: the solar view, then the chips that choose what
 /// the panadapter draws — the last of those only on a front end with a
@@ -4687,6 +4901,8 @@ enum RxChip {
     Nb,
     Anc,
     Nr,
+    /// Binaural (pseudo-stereo) CW audio.
+    Bin,
     Mute,
     Rec,
     /// WFM's stereo pilot.
@@ -4708,6 +4924,7 @@ impl RxChip {
             Self::Nb => "NB",
             Self::Anc => "ANC",
             Self::Nr => "NR",
+            Self::Bin => "BIN",
             Self::Mute => "MUTE",
             Self::Rec => "REC",
             Self::Stereo => "ST",
@@ -4755,6 +4972,14 @@ fn rx_chips(mode: Mode) -> Vec<RxChip> {
     // popup (issue #217). That is also one chip fewer on a strip that has to
     // fit on a 1366-pixel screen (issue #211).
     let mut chips = vec![RxChip::Nb, RxChip::Anc, RxChip::Nr, RxChip::Mute, RxChip::Rec];
+    // Binaural audio goes where it is worth a permanent button: CW, where the
+    // signal is a tone and so placing it by pitch places the signal, and SSB,
+    // where what it buys is the decorrelated noise around the voice
+    // (Mode::binaural_audio). It rides ahead of MUTE rather than on the end,
+    // beside the other things done to the audio on its way to the ear.
+    if mode.binaural_audio() {
+        chips.insert(3, RxChip::Bin);
+    }
     match mode {
         // Only WFM has a stereo pilot to lock or an RDS subcarrier to decode.
         Mode::Wfm => chips.extend([RxChip::Stereo, RxChip::Rds]),
@@ -5042,12 +5267,12 @@ fn accent_chip_stretched(
     crate::chrome::chip_accent_sized(ui, selected, label, fill, ink, size)
 }
 
-/// Width the System box needs for [`SYSTEM_CHIPS`] over its two rows: the
+/// Width the System box needs for its chips over the two rows: the
 /// wider row plus the box's side margins. Measured against the live style
 /// rather than fixed, because a touched layout pads every chip out past its
 /// desktop width — see `the_condensed_system_box_fits_its_chips`.
 fn system_rows_w(ui: &egui::Ui) -> f32 {
-    chip_row_w(ui, &SYSTEM_CHIPS[..SYSTEM_SPLIT]).max(chip_row_w(ui, &SYSTEM_CHIPS[SYSTEM_SPLIT..]))
+    chip_row_w(ui, &SYSTEM_CHIPS_TOP).max(chip_row_w(ui, &SYSTEM_CHIPS_BOTTOM))
         + 2.0 * crate::chrome::MODULE_MARGIN_X
 }
 
@@ -5170,12 +5395,12 @@ fn band_mode_menu(
     ui.add_space(6.0);
     crate::chrome::menu_caption(ui, "Digital");
     ui.horizontal_wrapped(|ui| {
-        // ADS-B rides along at the end of this row rather than in
+        // ADS-B and VDL2 ride along at the end of this row rather than in
         // [`Mode::DIGITAL`] itself: that list is what the digi engine decodes
-        // and transmits, and ADS-B is neither — its own lane, no QSO, no TX.
-        // It is a digital signal all the same, and this is where an operator
-        // looks for one.
-        for m in Mode::DIGITAL.into_iter().chain([Mode::Adsb]) {
+        // and transmits, and neither of these is — each has its own lane, no
+        // QSO and no transmitter. They are digital signals all the same, and
+        // this is where an operator looks for one.
+        for m in Mode::DIGITAL.into_iter().chain([Mode::Adsb, Mode::Vdl2]) {
             if crate::chrome::chip(ui, mode == m, m.label()).clicked() {
                 cmds.push(Command::SetMode { rx: RxId::Main, mode: m });
             }
@@ -5842,7 +6067,7 @@ mod tests {
                     ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
                         ui.spacing_mut().item_spacing =
                             egui::vec2(MODULE_ROW_SPACING, MODULE_ROW_SPACING);
-                        for row in [&SYSTEM_CHIPS[..SYSTEM_SPLIT], &SYSTEM_CHIPS[SYSTEM_SPLIT..]] {
+                        for row in [&SYSTEM_CHIPS_TOP[..], &SYSTEM_CHIPS_BOTTOM[..]] {
                             ui.horizontal(|ui| {
                                 for label in row {
                                     let right = chip_stretched(ui, false, label, 0.0).rect.right();
@@ -6524,7 +6749,10 @@ mod tests {
         for gain in [false, true] {
             for decim in [false, true] {
                 for agc_off in [false, true] {
-                    for mode in [Mode::Usb, Mode::Nfm, Mode::Wfm, Mode::Drm] {
+                    // One mode from each shape of the chip run: the plain
+                    // five, CW's extra BIN, and the three that bring a chip of
+                    // their own.
+                    for mode in [Mode::Usb, Mode::Cw, Mode::Nfm, Mode::Wfm, Mode::Drm] {
                         let (ctx, input) = desktop_ctx();
                         ctx.run_ui(input, |ui| {
                             ui.spacing_mut().item_spacing =

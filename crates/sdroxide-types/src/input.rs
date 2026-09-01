@@ -53,6 +53,8 @@ pub enum Action {
     /// whichever engine is selected. The engine itself is picked from the UI.
     NoiseReductionCycle,
     AutoNotch,
+    /// Binaural (pseudo-stereo) audio — see [`crate::Mode::binaural_audio`].
+    Binaural,
     AgcCycle,
     SubRx,
     Split,
@@ -141,8 +143,8 @@ impl Action {
             | VfoSelect(_) | VfoToggle | SwapVfos | CopyAtoB | Split | BandUp | BandDown
             | BandSelect(_) | MemoryRecall(_) => "Tuning",
             Volume | SubVolume | Squelch | FilterWidth | FilterShift | AgcMaxGain | ManualGain
-            | Mute | NoiseBlanker | NoiseReductionCycle | AutoNotch | AgcCycle | SubRx
-            | ModeNext | ModePrev | ModeSelect(_) | RecordToggle => "Receive",
+            | Mute | NoiseBlanker | NoiseReductionCycle | AutoNotch | Binaural | AgcCycle
+            | SubRx | ModeNext | ModePrev | ModeSelect(_) | RecordToggle => "Receive",
             Ptt | TuneCarrier | TxDrive | TuneDrive | MicGain | DigiAudioFreq | AbortTx
             | VoicePlay(_) | VoiceStop | ToneBurst => "Transmit",
             SpectrumZoom | SpectrumPan | SpectrumFloorDb | SpectrumCeilDb | FitSpan | ZoomIn
@@ -182,6 +184,7 @@ impl Action {
             NoiseBlanker => "Noise blanker",
             NoiseReductionCycle => "Noise reduction (cycle)",
             AutoNotch => "Auto notch",
+            Binaural => "Binaural audio",
             AgcCycle => "AGC (cycle)",
             SubRx => "Sub receiver",
             Split => "Split",
@@ -271,6 +274,7 @@ impl Action {
             NoiseBlanker,
             NoiseReductionCycle,
             AutoNotch,
+            Binaural,
             AgcCycle,
             SubRx,
             Split,

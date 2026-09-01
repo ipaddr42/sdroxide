@@ -656,6 +656,7 @@ impl DigiController {
                     let ap = ApHints {
                         my_call: self.qso.my_call().to_string(),
                         dx_call: self.qso.dx_call().map(str::to_string),
+                        eu_vhf: self.qso.contest_selected(),
                     };
                     let _ = self.job_tx.send(DecodeJob {
                         audio,

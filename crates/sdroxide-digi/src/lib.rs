@@ -20,6 +20,7 @@ pub mod cw_controller;
 pub mod fox;
 pub mod fsq_controller;
 pub mod ft2;
+pub mod ft8_eu;
 pub mod hell_controller;
 pub mod js8;
 pub mod js8_controller;

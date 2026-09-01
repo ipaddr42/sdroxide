@@ -367,11 +367,23 @@ const REPEATER_PLAN: &[RepeaterPlan] = &[
         regions: mask::R2,
     },
     // 2 m, Region 3 (the WIA plan, which New Zealand follows; Japan's is its
-    // own and is not covered here).
+    // own and is not covered here). Two output sub-bands shifting opposite
+    // ways, like Region 2's: outputs up to 147.000 take their inputs 600 kHz
+    // down, the ones above it 600 kHz up (issue #233). The old single entry
+    // spanned 146–148 MHz on a minus shift, which put the transmitter on a
+    // 147 MHz repeater's *output* — and covered 146.500, the VK simplex
+    // calling channel, which no shift belongs on at all.
     RepeaterPlan {
-        lo: 146_000_000.0,
-        hi: 148_000_000.0,
+        lo: 146_600_000.0,
+        hi: 147_025_000.0,
         shift: Shift::Minus,
+        offset_hz: 600_000,
+        regions: mask::R3,
+    },
+    RepeaterPlan {
+        lo: 147_025_000.0,
+        hi: 147_400_000.0,
+        shift: Shift::Plus,
         offset_hz: 600_000,
         regions: mask::R3,
     },
@@ -489,6 +501,13 @@ mod tests {
                 "{region:?}",
             );
         }
+        // Region 3's 2 m plan turns over at 147 MHz the way Region 2's does
+        // (issue #233), and the simplex calling channel below both is left
+        // alone.
+        assert_eq!(standard_shift_in(147_000_000.0, Region::R3), Some((Shift::Minus, 600_000)));
+        assert_eq!(standard_shift_in(146_875_000.0, Region::R3), Some((Shift::Minus, 600_000)));
+        assert_eq!(standard_shift_in(147_275_000.0, Region::R3), Some((Shift::Plus, 600_000)));
+        assert_eq!(standard_shift_in(146_500_000.0, Region::R3), None, "VK calling channel");
         // Nothing on HF, and nothing on the 2 m SSB end.
         assert_eq!(standard_shift_in(14_070_000.0, Region::R1), None);
         assert_eq!(standard_shift_in(144_300_000.0, Region::R1), None);

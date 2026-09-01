@@ -51,7 +51,7 @@
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
-use sdroxide_cat::civ;
+use sdroxide_cat::{DUPLEX_FLOOR_HZ, civ};
 use sdroxide_dsp::Ddc;
 use sdroxide_icomnet::{IcomNetDevice, IcomNetOptions};
 use sdroxide_radio::rtrb;
@@ -119,6 +119,25 @@ const POLL_PERIOD: Duration = Duration::from_millis(200);
 /// win, or the two stay out of step for the rest of the session.
 const MODE_SETTLE: Duration = Duration::from_millis(1000);
 
+/// How long to wait at open for the radio to say what is in the Set-mode menu
+/// items this session is about to write over (issue #252).
+///
+/// Best-effort: an item that goes unanswered is simply one that will not be put
+/// back, which is where this backend stood before. Two poll periods is a
+/// generous allowance for a LAN — and for the WiFi an IC-705 is usually on —
+/// without holding the connect open for a radio that never answers.
+const MENU_READ_WAIT: Duration = Duration::from_millis(500);
+
+/// How long to keep the session up after sending the menu items back, so a
+/// restore the radio missed can still be asked for.
+///
+/// The frames are written to the socket before the shutdown that follows them
+/// — the session thread drains its queue in order — but this is UDP, and the
+/// only thing that recovers a lost datagram is the radio noticing the gap and
+/// asking for it (see `sdroxide_icomnet::stream`). That request has to find a
+/// session still standing.
+const MENU_RESTORE_SETTLE: Duration = Duration::from_millis(250);
+
 /// A scope that has sent nothing for this long has stopped. Sweeps arrive
 /// about ten times a second, so this is a silence, not a slow sweep — and it is
 /// long enough to sit through a band change or a menu the operator opened on
@@ -131,6 +150,12 @@ const SCOPE_STALL: Duration = Duration::from_secs(3);
 /// be asked twice a second forever.
 const SCOPE_RETRY: Duration = Duration::from_secs(2);
 const SCOPE_RETRY_MAX: Duration = Duration::from_secs(30);
+
+/// How long to leave between repeats of the antenna-socket read, and how many
+/// of them to send, while the radio has answered none. See where they are
+/// spent in `IcomNetSource::pump`.
+const ANTENNA_PROBE_RETRY: Duration = Duration::from_secs(2);
+const ANTENNA_PROBE_RETRIES: u8 = 3;
 
 /// The scope's amplitude scale runs from 0 to the model's own full scale, and
 /// Icom documents no dB per step for any of them. The engine's `auto_levels`
@@ -198,10 +223,29 @@ pub struct IcomNetSource {
     /// answer that crossed a command on the wire, which would otherwise put the
     /// rail back where the radio was before the operator moved it.
     squelch_set: bool,
-    /// The band this end has already put the radio's own repeater shift back
+    /// Which antenna socket the radio says it is on, and whether it has a
+    /// selector at all: empty until it has answered the read `configure` sends,
+    /// which a radio with one connector NAKs instead — see
+    /// [`civ::read_antenna_frame`].
+    antenna: Option<&'static str>,
+    /// How many more times to ask, and when the last ask went out. See where
+    /// they are spent in [`Self::pump`].
+    antenna_probes_left: u8,
+    last_antenna_probe: Instant,
+    /// The dial this end has already put the radio's own repeater shift back
     /// to simplex for — see [`civ::simplex_frame`], and [`Self::pump`] for why
-    /// it is a band rather than a one-off.
-    simplex_band: Option<Band>,
+    /// it is a dial rather than a one-off.
+    simplex_dial: Option<f64>,
+    /// The Set-mode menu items [`Self::configure`] is asking about, and the
+    /// answers as they arrive. Emptied once the reads are done with, so a
+    /// later `1A` reply — the operator reading a menu on another client — is
+    /// not mistaken for one of them.
+    menu_read: Vec<(u16, Option<Vec<u8>>)>,
+    /// What those items held before this session wrote over them, sent back
+    /// when it ends (issue #252). Only the ones actually being changed: a rig
+    /// already set to LAN has nothing to restore, which is also what keeps a
+    /// second session on the same radio from "restoring" the first one's LAN.
+    menu_restore: Vec<(u16, Vec<u8>)>,
 }
 
 impl IcomNetSource {
@@ -318,7 +362,12 @@ impl IcomNetSource {
             last_telem: None,
             transmitting: false,
             squelch_set: false,
-            simplex_band: None,
+            antenna: None,
+            antenna_probes_left: ANTENNA_PROBE_RETRIES,
+            last_antenna_probe: Instant::now(),
+            simplex_dial: None,
+            menu_read: Vec::new(),
+            menu_restore: Vec::new(),
         };
         notes.extend(src.configure(cfg));
         // Adopt the radio's current dial before returning, the way the CAT
@@ -355,11 +404,17 @@ impl IcomNetSource {
         // And where its squelch is, adopted the same way and for the same
         // reason — on AF it is the gate the operator hears (issue #192).
         self.send(civ::read_squelch_frame(self.civ_addr));
+        // Which antenna socket it is on — and, because a radio with a single
+        // connector NAKs this rather than answering it, whether there is a
+        // selector here to offer at all (issue #238).
+        self.send(civ::read_antenna_frame(self.civ_addr));
 
+        // Which Set-mode menu items this session has to put its own value in,
+        // collected before any of them is written: they are read back first,
+        // and a read has to go out ahead of every write, not just its own.
+        let mut writes: Vec<(u16, u8)> = Vec::new();
         match model.lan_afif_select {
-            Some(item) => {
-                self.send(civ::set_menu_frame(self.civ_addr, item, &[cfg.rx_source.menu_value()]));
-            }
+            Some(item) => writes.push((item, cfg.rx_source.menu_value())),
             None if cfg.rx_source == IcomRxSource::If12k => notes.push(
                 "sdroxide does not know this model's menu numbering, so it cannot switch the \
                  LAN output to IF — set SET > Connectors > LAN AF/IF Output > Output Select \
@@ -379,9 +434,7 @@ impl IcomNetSource {
                 Some((items, lan)) => {
                     // DATA-OFF and every DATA slot the radio has: two on an
                     // IC-7300MK2, four on an IC-7760.
-                    for item in items {
-                        self.send(civ::set_menu_frame(self.civ_addr, *item, &[lan]));
-                    }
+                    writes.extend(items.iter().map(|item| (*item, lan)));
                 }
                 None => notes.push(
                     "sdroxide does not know this model's menu numbering, so it cannot switch \
@@ -391,6 +444,7 @@ impl IcomNetSource {
                 ),
             }
         }
+        self.claim_menu_items(&writes);
 
         if cfg.scope {
             self.scope_wanted = true;
@@ -398,6 +452,88 @@ impl IcomNetSource {
             self.enable_scope();
         }
         notes
+    }
+
+    /// Take over the Set-mode menu items in `writes`: ask what is in each of
+    /// them, write this session's value, and remember whatever the operator had
+    /// there so it can be handed back by [`Self::restore_menu`].
+    ///
+    /// The reason the read comes first is issue #252: a radio left with its
+    /// DATA and DATA-OFF modulation inputs on LAN is deaf to its own microphone
+    /// and its own key the next time it is used standalone in the shack, and
+    /// nothing on the radio says why. sdroxide changes the setting because it
+    /// has to — transmit audio arrives over the network, and the rig only
+    /// listens to one input at a time — but that is a loan, not a keep.
+    ///
+    /// Best-effort by construction: an item the radio does not answer for is
+    /// still written, just not recorded, and the session is no worse off than
+    /// it was before this existed.
+    fn claim_menu_items(&mut self, writes: &[(u16, u8)]) {
+        if writes.is_empty() {
+            return;
+        }
+        self.menu_read = writes.iter().map(|(item, _)| (*item, None)).collect();
+        for (item, _) in writes {
+            self.send(civ::read_menu_frame(self.civ_addr, *item));
+        }
+        let deadline = Instant::now() + MENU_READ_WAIT;
+        while self.menu_read.iter().any(|(_, v)| v.is_none()) && Instant::now() < deadline {
+            self.pump();
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        for (item, value) in writes {
+            // An item the radio already had this session's value in is not one
+            // this session changed, so putting it back is not ours to do. That
+            // is also what stops a second tab on the same radio from handing
+            // the first tab's LAN setting back at the end of its own session.
+            let before = self
+                .menu_read
+                .iter()
+                .find(|(i, _)| i == item)
+                .and_then(|(_, v)| v.clone())
+                .filter(|v| v.as_slice() != [*value]);
+            if let Some(before) = before {
+                self.menu_restore.push((*item, before));
+            }
+            self.send(civ::set_menu_frame(self.civ_addr, *item, &[*value]));
+        }
+        let unanswered = self.menu_read.iter().filter(|(_, v)| v.is_none()).count();
+        if unanswered > 0 {
+            tracing::warn!(
+                unanswered,
+                "Icom LAN: the radio did not say what was in every menu item being written, \
+                 so those will not be put back when the session ends"
+            );
+        }
+        self.menu_read.clear();
+    }
+
+    /// Put the Set-mode menu items this session borrowed back the way the
+    /// operator had them (issue #252).
+    ///
+    /// Called on both ways out — [`IqSource::release`] on a reopen, and `Drop`
+    /// for a radio switched off, a tab closed or the application quitting —
+    /// and drains what it sends, so running twice sends nothing twice.
+    fn restore_menu(&mut self) {
+        let items = std::mem::take(&mut self.menu_restore);
+        // Nothing borrowed, or nothing left to hand it back over: a session
+        // that has already died — the radio unplugged, the WiFi gone — kept
+        // whatever it had at the moment the link went, and this end cannot
+        // reach it to say otherwise. Waiting on it would only slow every
+        // failed reconnect down.
+        if items.is_empty() || !self.dev.is_alive() {
+            return;
+        }
+        tracing::info!(items = items.len(), "Icom LAN: putting the radio's menu back as it was");
+        for (item, value) in &items {
+            self.send(civ::set_menu_frame(self.civ_addr, *item, value));
+        }
+        let deadline = Instant::now() + MENU_RESTORE_SETTLE;
+        while Instant::now() < deadline {
+            self.pump();
+            std::thread::sleep(Duration::from_millis(5));
+        }
     }
 
     /// Wait, briefly, for the radio to say where its dial is, and fold it in.
@@ -527,18 +663,30 @@ impl IcomNetSource {
         }
 
         // The radio's own repeater shift, put back to simplex whenever the dial
-        // has moved to another band. A band stacking register restores whatever
-        // duplex that band was last left on the moment the dial crosses into it,
-        // so clearing it once with the other offsets in `configure` is not
-        // enough — see [`civ::simplex_frame`] (issue #192). Not while keyed: the
-        // transmit frequency went out with the key-down, and mid-over the link
-        // belongs to the meters.
+        // has moved. A band stacking register restores whatever duplex that
+        // band was last left on the moment the dial crosses into it, so
+        // clearing it once with the other offsets in `configure` is not enough
+        // — see [`civ::simplex_frame`] (issue #192) — and the auto-repeater
+        // function arms on the *frequency*, so a move between two channels of
+        // one band puts it back without crossing a band edge at all (issue
+        // #233). Not while keyed: the transmit frequency went out with the
+        // key-down, and mid-over the link belongs to the meters.
         if !self.transmitting && self.dial.vfo > 0.0 {
-            let band = Band::containing(self.dial.vfo);
-            if self.simplex_band != Some(band) {
-                self.simplex_band = Some(band);
-                self.send(civ::simplex_frame(self.civ_addr));
-            }
+            self.assert_simplex(self.dial.vfo);
+        }
+
+        // Ask again for the antenna socket while the radio has not answered.
+        // The absence of a reply is how a single-connector radio says it has no
+        // selector, so a *lost* reply is indistinguishable from that and leaves
+        // the panel with no antenna control at all until the next reconnect
+        // (issue #258). A few more chances, then let it go.
+        if self.antenna.is_none()
+            && self.antenna_probes_left > 0
+            && self.last_antenna_probe.elapsed() >= ANTENNA_PROBE_RETRY
+        {
+            self.antenna_probes_left -= 1;
+            self.last_antenna_probe = Instant::now();
+            self.send(civ::read_antenna_frame(self.civ_addr));
         }
 
         if self.last_poll.elapsed() >= POLL_PERIOD {
@@ -552,6 +700,31 @@ impl IcomNetSource {
             }
         }
         self.watch_scope();
+    }
+
+    /// Put the radio's own repeater shift back to simplex for `dial_hz`, unless
+    /// that has already been done for this dial.
+    ///
+    /// The HF/VHF split is [`sdroxide_cat`]'s: below 28 MHz nothing but a band
+    /// stacking register can restore a duplex setting, so once per band is
+    /// enough and the link stays quiet while the operator tunes; above it an
+    /// auto-repeater function arms on the frequency and every move has to be
+    /// answered.
+    fn assert_simplex(&mut self, dial_hz: f64) {
+        let same = match self.simplex_dial {
+            None => false,
+            Some(prev) => {
+                prev == dial_hz
+                    || (prev < DUPLEX_FLOOR_HZ
+                        && dial_hz < DUPLEX_FLOOR_HZ
+                        && Band::containing(prev) == Band::containing(dial_hz))
+            }
+        };
+        if same {
+            return;
+        }
+        self.simplex_dial = Some(dial_hz);
+        self.send(civ::simplex_frame(self.civ_addr));
     }
 
     fn on_reply(&mut self, reply: civ::CivReply) {
@@ -587,6 +760,15 @@ impl IcomNetSource {
                     self.pending.push(ControlUpdate::Mode(m));
                 }
             }
+            // Which antenna socket the radio is on, asked for once when the
+            // session opens. Adopted, and its arrival is also what says the
+            // radio has a selector — see `Self::learned_antennas`.
+            0x12 => {
+                if let Some(name) = civ::parse_antenna_reply(&reply.data) {
+                    self.antenna = Some(name);
+                    self.pending.push(ControlUpdate::Antenna(name));
+                }
+            }
             // The transmit power the radio is set to, asked for once when the
             // session opens. Adopted into the Drive slider rather than
             // commanded back: the radio's own setting is the operator's.
@@ -609,6 +791,22 @@ impl IcomNetSource {
                 }
                 if let Some(swr) = civ::parse_swr_reply(&reply.data) {
                     self.last_telem = Some(TxTelemetry { swr: Some(swr), ..Default::default() });
+                }
+            }
+            // A Set-mode menu item, answering one of the reads `configure`
+            // sends before it writes over them (issue #252). A read carries no
+            // value, so our own question coming back off a shared bus is not
+            // mistaken for the radio's answer to it — see
+            // [`civ::parse_menu_reply`]. Only an item still being waited on is
+            // filled in, and only until `claim_menu_items` has done with them:
+            // what a menu says later in a session is the operator's business,
+            // not this session's to hand back.
+            0x1A => {
+                if let Some((item, value)) = civ::parse_menu_reply(&reply.data)
+                    && let Some(slot) =
+                        self.menu_read.iter_mut().find(|(i, v)| *i == item && v.is_none())
+                {
+                    slot.1 = Some(value.to_vec());
                 }
             }
             0x27 => {
@@ -855,12 +1053,63 @@ impl IqSource for IcomNetSource {
         self.rx_source == IcomRxSource::Af
     }
 
+    /// Put the radio on one of its antenna sockets. Icom's selector is one
+    /// relay for both directions, so there is no transmit port to pick
+    /// separately (issue #238).
+    fn set_antenna(&mut self, name: &str) -> Result<()> {
+        // A name from whatever front end was on this radio before is dropped
+        // rather than turned into a socket number by accident.
+        let Some(frame) = civ::set_antenna_frame(self.civ_addr, name) else {
+            return Ok(());
+        };
+        self.send(frame);
+        self.antenna = civ::ANTENNAS.iter().find(|a| a.eq_ignore_ascii_case(&name)).copied();
+        Ok(())
+    }
+
+    fn current_antenna(&self) -> String {
+        self.antenna.unwrap_or_default().to_string()
+    }
+
+    /// ANT1/ANT2, once the radio has answered the opening read — and nothing
+    /// at all until it has. Every Icom speaks one dialect and only some have a
+    /// selector, so the list is a question for the radio rather than a claim
+    /// about the protocol; see [`civ::ANTENNAS`].
+    /// The radio's own power switch, over the network (issue #239).
+    ///
+    /// The point of doing it here rather than over a serial cable: the radio's
+    /// network module stays awake while the set is off — that is what
+    /// **Network > Network Control** leaves running — so the control session
+    /// this rides on is still there to carry the switch back on again.
+    fn set_rig_power(&mut self, on: bool) -> Result<()> {
+        for f in civ::power_frames(self.civ_addr, on, civ::WAKE_BYTES_LAN) {
+            self.send(f);
+        }
+        Ok(())
+    }
+
+    fn commands_rig_power(&self) -> bool {
+        true
+    }
+
+    fn learned_antennas(&self) -> Option<&'static [&'static str]> {
+        Some(match self.antenna {
+            Some(_) => &civ::ANTENNAS,
+            None => &[],
+        })
+    }
+
     fn tx_begin(&mut self, center_hz: f64, _rate: f64) -> Result<f64> {
         // Split and XIT have no DDC to ride on: the radio's dial is its whole
         // frequency control, so an over that transmits away from where we
         // listen borrows the dial until unkey.
         if let Some(f) = self.dial.begin_tx(center_hz) {
             self.send(civ::set_freq_frame(self.civ_addr, f));
+            // …and the radio may have armed a shift of its own on that
+            // frequency the moment it took it (issue #233). Only on a dial the
+            // over actually moved: where transmit lands where we listen there
+            // is nothing new for an auto-repeater to have acted on.
+            self.assert_simplex(f);
         }
         self.send(civ::ptt_frame(self.civ_addr, true));
         self.transmitting = true;
@@ -939,8 +1188,23 @@ impl IqSource for IcomNetSource {
     }
 
     fn release(&mut self) {
+        // Before the session goes: the radio keeps its Set-mode menu whatever
+        // happens to this end of the link, so anything borrowed from it has to
+        // be handed back while there is still a link to hand it back over.
+        self.restore_menu();
         record_trace(&self.key, &self.dev);
         self.dev.shutdown();
+    }
+}
+
+impl Drop for IcomNetSource {
+    fn drop(&mut self) {
+        // `release` is only called on the reopen paths. A radio switched off, a
+        // tab closed, or the application quitting simply drops the source — and
+        // those are exactly the ways a session ends before the operator goes on
+        // to use the rig on its own, which is the case issue #252 is about.
+        // `restore_menu` drains itself, so the two paths cannot double up.
+        self.restore_menu();
     }
 }
 
@@ -1358,6 +1622,57 @@ mod tests {
             };
             seen(0x84) && seen(0x85)
         });
+    }
+
+    /// Issue #252: an IC-7300MK2 was left with DATA MOD and DATA OFF MOD on
+    /// LAN, so the next time it was used standalone in the shack it put out a
+    /// carrier and nothing else — no microphone, no key, and nothing on the
+    /// radio saying why. What sdroxide borrows from the Set-mode menu it has
+    /// to give back.
+    #[test]
+    fn the_menu_items_the_session_borrowed_go_back_when_it_ends() {
+        let sim = Sim::start(SimOptions { scope: false, ..Default::default() }).unwrap();
+        let src = IcomNetSource::open(&cfg(&sim)).expect("open");
+        // DATA OFF MOD and DATA MOD on LAN for the length of the session — that
+        // is what makes transmit audio heard, and it is not in dispute.
+        wait_for("the modulation-input writes", || {
+            sim.menu_item(0x0084) == 0x05 && sim.menu_item(0x0085) == 0x05
+        });
+
+        // The way every session but a reopen ends: the source is dropped —
+        // a radio switched off, its tab closed, or the application quitting.
+        drop(src);
+        assert_eq!(sim.menu_item(0x0084), 0x00, "DATA OFF MOD was left on LAN");
+        assert_eq!(sim.menu_item(0x0085), 0x00, "DATA MOD was left on LAN");
+        // The LAN output select is borrowed on the same terms.
+        assert_eq!(
+            sim.menu_item(0x0079),
+            0x00,
+            "the LAN output select was left as sdroxide set it"
+        );
+    }
+
+    #[test]
+    fn a_menu_item_the_radio_already_agreed_with_is_not_written_back() {
+        // A rig whose operator keeps it on LAN anyway — and, for the same
+        // reason, a second session on a radio the first one has already
+        // switched: there is nothing to put back, and a restore here would be
+        // this session inventing a state to leave behind.
+        let sim = Sim::start(SimOptions { scope: false, menu_default: 0x05, ..Default::default() })
+            .unwrap();
+        let src = IcomNetSource::open(&cfg(&sim)).expect("open");
+        let writes = |item: u8| {
+            sim.civ_frames()
+                .iter()
+                .filter(|f| {
+                    f.len() >= 10 && f[4] == 0x1A && f[5] == 0x05 && f[6] == 0x00 && f[7] == item
+                })
+                .count()
+        };
+        wait_for("the modulation-input writes", || writes(0x84) > 0 && writes(0x85) > 0);
+        drop(src);
+        assert_eq!(writes(0x84), 1, "DATA OFF MOD was written back to where it already was");
+        assert_eq!(writes(0x85), 1, "DATA MOD was written back to where it already was");
     }
 
     #[test]

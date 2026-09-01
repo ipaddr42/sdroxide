@@ -36,6 +36,14 @@ pub(in crate::app) struct MemoryEdit {
     /// to fix a typo, and four more rows of chips under every one of those
     /// would make the common case the awkward one.
     pub show_repeater: bool,
+    /// The antenna socket stored with the channel, by the name the front end
+    /// gives the port — `None` for "recall this channel without moving the
+    /// antenna", which is every channel on a receiver with one socket.
+    ///
+    /// Storing a memory captures whatever the radio was on at the time; this is
+    /// where an operator says otherwise, which is the whole of issue #246. It
+    /// only appears on a front end with more than one port to choose between.
+    pub antenna: Option<String>,
 }
 
 impl MemoryEdit {
@@ -49,6 +57,7 @@ impl MemoryEdit {
             // Open on a channel that has something to show, so a repeater
             // memory says what it is without being asked twice.
             show_repeater: m.repeater.is_some_and(|r| r.is_active()),
+            antenna: m.antenna.clone(),
         }
     }
 }
@@ -105,10 +114,11 @@ fn memory_row(
     m: &MemoryChannel,
     edit: &mut Option<MemoryEdit>,
     focus: &mut bool,
+    antennas: &[String],
     cmds: &mut Vec<Command>,
 ) {
     if matches!(edit, Some(e) if e.id == m.id) {
-        memory_edit_row(ui, edit, focus, cmds);
+        memory_edit_row(ui, edit, focus, antennas, cmds);
         return;
     }
     ui.horizontal(|ui| {
@@ -134,7 +144,7 @@ fn memory_row(
                 cmds.push(Command::DeleteMemory(m.id));
             }
             if crate::chrome::chip(ui, false, RichText::new("EDT").size(11.0))
-                .on_hover_text("Edit the name, frequency, mode and repeater setup")
+                .on_hover_text("Edit the name, frequency, mode, antenna and repeater setup")
                 .clicked()
             {
                 *edit = Some(MemoryEdit::of(m));
@@ -161,6 +171,12 @@ fn memory_row(
                         // memories on one dial are different channels if one
                         // shifts and the other does not.
                         let rpt = repeater_summary(m.repeater);
+                        // …and the antenna, which is a third way two channels
+                        // on one dial can be different channels. Nothing at all
+                        // for a memory that says nothing about antennas, which
+                        // is every one stored on a receiver with a single
+                        // socket.
+                        let ant = m.antenna.as_deref().map_or(String::new(), |a| format!(" [{a}]"));
                         // Laid out rather than added: the whole of what is left
                         // is the drag handle, and the text is pinned to the left
                         // of it so the columns line up down the list. `add_sized`
@@ -175,12 +191,13 @@ fn memory_row(
                                 ui.add(
                                     egui::Label::new(
                                         RichText::new(format!(
-                                            "{:<10} {:>11.6} MHz {}{}{}",
+                                            "{:<10} {:>11.6} MHz {}{}{}{}",
                                             m.name,
                                             m.freq_hz / 1e6,
                                             m.mode.label(),
                                             rtty,
-                                            rpt
+                                            rpt,
+                                            ant
                                         ))
                                         .monospace(),
                                     )
@@ -209,6 +226,7 @@ fn memory_edit_row(
     ui: &mut egui::Ui,
     edit: &mut Option<MemoryEdit>,
     focus: &mut bool,
+    antennas: &[String],
     cmds: &mut Vec<Command>,
 ) {
     let Some(e) = edit.as_mut() else { return };
@@ -258,6 +276,7 @@ fn memory_edit_row(
                     ui.selectable_value(&mut e.mode, m, m.label());
                 }
             });
+        memory_antenna_picker(ui, e, antennas);
         // The repeater setup folds out rather than always being there: most
         // memories are a name, a dial and a mode, and this is four more rows.
         let has_rpt = e.repeater.is_some_and(|r| r.is_active());
@@ -309,10 +328,43 @@ fn memory_edit_row(
             freq_hz: e.freq_hz,
             mode: e.mode,
             repeater: e.repeater,
+            antenna: e.antenna.clone(),
         });
     } else if cancel {
         *edit = None;
     }
+}
+
+/// The antenna picker in the memory editor: which socket this channel is
+/// listened to on, or `—` for "leave the antenna alone".
+///
+/// Drawn only where the front end has more than one port. On a receiver with a
+/// single antenna there is nothing to choose, every memory stores `None`
+/// anyway, and a picker with one entry beside a dash is a control that can only
+/// be set wrong.
+///
+/// The dash is not the same as the first port and is the default: an operator
+/// working down a list of channels that never mentioned antennas must not have
+/// a relay moved on every recall — see [`MemoryChannel::antenna`].
+fn memory_antenna_picker(ui: &mut egui::Ui, e: &mut MemoryEdit, antennas: &[String]) {
+    if antennas.len() < 2 {
+        return;
+    }
+    egui::ComboBox::from_id_salt(crate::layout::salted_id(ui.ctx(), "mem-edit-ant"))
+        .width(90.0)
+        .selected_text(e.antenna.as_deref().unwrap_or("—"))
+        .show_styled(ui, |ui| {
+            ui.selectable_value(&mut e.antenna, None, "—")
+                .on_hover_text("Recall this channel without moving the antenna");
+            for a in antennas {
+                ui.selectable_value(&mut e.antenna, Some(a.clone()), a);
+            }
+        })
+        .response
+        .on_hover_text(
+            "The antenna to switch to when this channel is recalled. — leaves whatever the \
+             radio is already on.",
+        );
 }
 
 /// The repeater setup under the memory editor: the shift, the tone that goes
@@ -482,6 +534,46 @@ impl SdroxideApp {
                 self.mem_folder_name.clear();
             }
         });
+        // A channel list from somewhere else. CHIRP's CSV because that is what
+        // every repeater directory hands out — RepeaterBook exports it by
+        // county, and the marine and PMR tables circulate as it — so an
+        // operator who wants their local machines in here already has the file
+        // (issue #234).
+        ui.horizontal(|ui| {
+            #[cfg(not(target_arch = "wasm32"))]
+            if crate::chrome::chip(ui, false, "IMPORT")
+                .on_hover_text(
+                    "Read a channel list from a CHIRP CSV file (.csv) — a repeater \
+                     directory export, a marine or PMR channel table, or anything \
+                     else CHIRP can write.\n\n\
+                     Each channel brings its frequency, mode, repeater shift and \
+                     CTCSS or DCS tone with it. Channels already on this list — same \
+                     frequency, same mode — are skipped, so re-importing an updated \
+                     directory adds what is new rather than doubling what is not.",
+                )
+                .clicked()
+            {
+                crate::download::load_text("CHIRP CSV", "csv", self.chirp_import_inbox.clone());
+            }
+            let have = !self.memories.is_empty();
+            ui.add_enabled_ui(have, |ui| {
+                if crate::chrome::chip(ui, false, "EXPORT")
+                    .on_hover_text(
+                        "Write this list out as a CHIRP CSV file, to load into a \
+                         handheld or to keep as a backup.",
+                    )
+                    .clicked()
+                {
+                    let csv = sdroxide_types::memories_to_chirp_csv(&self.memories);
+                    crate::download::save("sdroxide-memories.csv", csv.as_bytes());
+                }
+            });
+            ui.label(
+                RichText::new(format!("{} channel", self.memories.len()))
+                    .size(11.0)
+                    .color(crate::theme::gray(150)),
+            );
+        });
         self.memory_sort_bar(ui);
         ui.separator();
         if self.memories.is_empty() && self.mem_folders.is_empty() {
@@ -530,9 +622,15 @@ impl SdroxideApp {
                 .ui_settings
                 .memory_sort
                 .order(&self.memories, self.ui_settings.memory_sort_desc);
+            // The sockets this front end has, for the editor's antenna picker.
+            // Cloned once for the window rather than read per row: it is a
+            // handful of short strings, and the rows borrow `self` mutably for
+            // the edit in progress.
+            let antennas: Vec<String> =
+                self.caps.as_ref().map(|c| c.antennas_rx.clone()).unwrap_or_default();
             let folders = self.mem_folders.clone();
             for f in &folders {
-                self.folder_section(ui, f, &order, cmds);
+                self.folder_section(ui, f, &order, &antennas, cmds);
             }
             // The top level: everything unfiled — including anything whose
             // folder has gone from under it — and, while a drag is live, the
@@ -543,7 +641,14 @@ impl SdroxideApp {
                 for &i in &order {
                     let m = &self.memories[i];
                     if m.folder.is_none_or(|id| !known(id)) {
-                        memory_row(ui, m, &mut self.mem_edit, &mut self.mem_edit_focus, cmds);
+                        memory_row(
+                            ui,
+                            m,
+                            &mut self.mem_edit,
+                            &mut self.mem_edit_focus,
+                            &antennas,
+                            cmds,
+                        );
                         any = true;
                     }
                 }
@@ -615,6 +720,7 @@ impl SdroxideApp {
         ui: &mut egui::Ui,
         f: &MemoryFolder,
         order: &[usize],
+        antennas: &[String],
         cmds: &mut Vec<Command>,
     ) {
         let count = self.memories.iter().filter(|m| m.folder == Some(f.id)).count();
@@ -681,7 +787,14 @@ impl SdroxideApp {
                     for &i in order {
                         let m = &self.memories[i];
                         if m.folder == Some(f.id) {
-                            memory_row(ui, m, &mut self.mem_edit, &mut self.mem_edit_focus, cmds);
+                            memory_row(
+                                ui,
+                                m,
+                                &mut self.mem_edit,
+                                &mut self.mem_edit_focus,
+                                antennas,
+                                cmds,
+                            );
                         }
                     }
                 });

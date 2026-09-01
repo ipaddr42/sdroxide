@@ -22,9 +22,9 @@
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    AirspyDevice, AirspyHfDevice, EladDevice, HackRfDevice, HpsdrDevice, HydraSdrDevice,
-    IcomNetConfig, LimeDevice, PlutoDevice, RtlSdrDevice, Rx888Device, SdrPlayDevice,
-    SmartSdrDevice, SoapyDeviceInfo,
+    AirspyDevice, AirspyHfDevice, EladDevice, FobosDevice, HackRfDevice, HpsdrDevice,
+    HydraSdrDevice, IcomNetConfig, LimeDevice, PlutoDevice, PublicSdrDirectory, RtlSdrDevice,
+    Rx888Device, SdrPlayDevice, SmartSdrDevice, SoapyDeviceInfo,
 };
 
 /// A question about the machine the radio is attached to.
@@ -96,12 +96,40 @@ pub enum DeviceProbe {
     /// address, because a Pluto on the end of a USB cable often has no
     /// reachable mDNS responder.
     Pluto,
+    /// The public-SDR directories — the KiwiSDR and SpyServer listings —
+    /// fetched by the machine the radio is attached to.
+    ///
+    /// Here rather than on a route of its own because a browser client has no
+    /// HTTP client and, if it had, could not read either directory across
+    /// origins. This lane already means "ask the machine with the radio on it",
+    /// which is also the machine that will hold the connection.
+    ///
+    /// `refresh` forces the network; without it a list fetched in the last
+    /// quarter of an hour is served from disk, which is what makes opening the
+    /// window instant.
+    PublicSdrs { refresh: bool },
     /// Try an address and report what answered, without starting a stream.
     Test(ProbeTest),
     /// The last session's trace from one of the backends that has not been
     /// verified against hardware, so a fault can be reported without asking
     /// anyone to reproduce it under a log filter.
     Report(ReportKind),
+    /// The switching devices on that machine — USB HID relay boards and the
+    /// sound cards with usable GPIO pins — for the T/R switch's picker.
+    ///
+    /// Serial relay boards are not here: they are serial ports, and
+    /// [`DeviceProbe::SerialPorts`] already answers for those. Non-invasive,
+    /// like the dongle probes: nothing is opened.
+    ///
+    /// Appended last, for the usual reason.
+    Relays,
+    /// Fobos SDRs `fobos_rx_list_devices` reports, same contract as
+    /// [`DeviceProbe::RtlSdr`] — no device is opened.
+    ///
+    /// After `Relays` rather than beside the other dongle probes, for the
+    /// usual reason: appending is what leaves every surviving discriminant
+    /// where a peer already expects it.
+    Fobos,
 }
 
 /// A connection test: open, ask what is there, and hang up again.
@@ -127,6 +155,11 @@ pub enum ProbeTest {
     /// identity, so the answer states the tuning range *this* board has — a
     /// stock AD9363 and one unlocked to AD9364 differ by an octave and a half.
     Pluto(String),
+    /// A KiwiSDR, `host[:port]`. Answered over HTTP rather than by opening a
+    /// session: a receiver has only four or eight channels, and taking one to
+    /// find out whether it is worth taking would, on a busy receiver, be the
+    /// reason it was full.
+    Kiwi(String),
 }
 
 /// Which "Test connection" button an answer belongs under.
@@ -137,6 +170,7 @@ pub enum TestKind {
     IcomNet,
     SmartSdr,
     Pluto,
+    Kiwi,
 }
 
 impl ProbeTest {
@@ -149,6 +183,7 @@ impl ProbeTest {
             ProbeTest::IcomNet(_) => TestKind::IcomNet,
             ProbeTest::SmartSdr(_) => TestKind::SmartSdr,
             ProbeTest::Pluto(_) => TestKind::Pluto,
+            ProbeTest::Kiwi(_) => TestKind::Kiwi,
         }
     }
 }
@@ -165,6 +200,13 @@ pub enum ReportKind {
     Elad,
     Lime,
     HydraSdr,
+    /// The external T/R switch. Not "unverified against hardware" like the rest
+    /// of this list so much as *unverifiable from here*: the relay either
+    /// clicked or it did not, and nothing in the program can tell which — so
+    /// the trace of what it was told is the whole of the evidence.
+    ///
+    /// Appended last, for the usual reason.
+    Relay,
 }
 
 /// What the machine with the radio on it answered.
@@ -192,6 +234,12 @@ pub enum ProbeAnswer {
     Hpsdr(Vec<HpsdrDevice>),
     SmartSdr(Vec<SmartSdrDevice>),
     Pluto(Vec<PlutoDevice>),
+    /// Both public-SDR directories, however fresh they turned out to be.
+    ///
+    /// Boxed because it is by far the largest answer here — around eleven
+    /// hundred receivers — and every other variant would otherwise be padded
+    /// to its size.
+    PublicSdrs(Box<PublicSdrDirectory>),
     /// A connection test, and which button asked for it.
     Test(TestKind, Result<String, String>),
     Report(ReportKind, String),
@@ -199,4 +247,10 @@ pub enum ProbeAnswer {
     /// without them. The controls that ask are greyed out rather than left to
     /// look broken, so this is an answer and not a silence.
     Unsupported,
+    /// The switching devices that machine can see. Appended last, for the usual
+    /// reason.
+    Relays(Vec<crate::RelayDevice>),
+    /// The Fobos SDRs that machine can see. After `Relays` for the same
+    /// reason [`DeviceProbe::Fobos`] is.
+    Fobos(Vec<FobosDevice>),
 }

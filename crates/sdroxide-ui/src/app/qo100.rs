@@ -1,5 +1,10 @@
-//! The QO-100 BEACON window: calibrate the station's frequency chain against
-//! Es'hail-2's narrowband beacon.
+//! The QO-100 page of the SAT window: calibrate the station's frequency chain
+//! against Es'hail-2's narrowband beacon.
+//!
+//! A page rather than a window of its own because QO-100 is a satellite. It is
+//! the one this program can work without Doppler correction, being
+//! geostationary — so what it needs instead is its LNB measured, which is all
+//! of this. The window is [`crate::app::sat`]'s; only the body is here.
 //!
 //! The beacon this tracks — [`QO100_BEACON_HZ`] — is not a plain carrier: it
 //! is a 400 baud differential+Manchester BPSK telemetry signal (AO-40
@@ -7,7 +12,7 @@
 //! here — Manchester encoding leaves a *null* at the carrier frequency, not a
 //! peak. The actual demodulator lives engine-side, in `sdroxide_qo100`
 //! (raw IQ and real phase information, neither of which the UI has); this
-//! window is a thin front end onto [`sdroxide_types::Qo100Settings`] (ON/OFF,
+//! page is a thin front end onto [`sdroxide_types::Qo100Settings`] (ON/OFF,
 //! search width) and [`sdroxide_types::Qo100Status`] (lock, measured
 //! frequency, decoded text) — the same split the ISM window keeps with
 //! [`sdroxide_types::IsmSettings`]/[`sdroxide_types::IsmStatus`].
@@ -252,30 +257,12 @@ fn paint_strip(
 }
 
 impl SdroxideApp {
-    pub(in crate::app) fn qo100_window(&mut self, ctx: &egui::Context, cmds: &mut Vec<Command>) {
-        if !self.show_qo100 {
-            return;
-        }
-        let mut win = std::mem::take(&mut self.qo100_win);
-        let mut open = self.show_qo100;
-        let resp = egui::Window::new("QO-100 BEACON")
-            .id(crate::layout::salted_id(ctx, "Qo100"))
-            .open(&mut open)
-            .frame(crate::chrome::window_frame())
-            .resizable(true)
-            .default_width(crate::layout::window_w(ctx, 440.0))
-            .show(ctx, |ui| {
-                crate::chrome::window_body_bg(ui);
-                self.qo100_body(ui, &mut win, cmds)
-            });
-        if let Some(r) = &resp {
-            crate::chrome::paint_window_border(ctx, &r.response);
-        }
-        self.show_qo100 = open;
-        self.qo100_win = win;
-    }
-
-    fn qo100_body(&mut self, ui: &mut egui::Ui, win: &mut Qo100WinState, cmds: &mut Vec<Command>) {
+    pub(in crate::app) fn qo100_body(
+        &mut self,
+        ui: &mut egui::Ui,
+        win: &mut Qo100WinState,
+        cmds: &mut Vec<Command>,
+    ) {
         // `may_rx_hz`, not `can_rx_hz`: a driver that publishes no tuning
         // ranges (SoapySDR makes `getFrequencyRange` optional, and plenty of
         // backends skip it) has not said it *cannot* reach the beacon. Gating

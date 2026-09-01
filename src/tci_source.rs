@@ -31,6 +31,9 @@ pub struct TciSource {
     /// connection run on undisturbed.
     dev: Option<std::sync::Arc<TciDevice>>,
     rx: Option<TciRx>,
+    /// The connection's negotiated IQ rate, kept here so a released source
+    /// still answers `IqSource::sample_rate` — see that method.
+    rate: f64,
     center: f64,
     scratch: Vec<f32>,
     label: String,
@@ -39,6 +42,10 @@ pub struct TciSource {
     /// Latest SWR the rig reported while keyed, latched for the engine's meter
     /// poll. Cleared on unkey.
     last_telem: Option<TxTelemetry>,
+    /// How far behind its `dds:` commands this rig's IQ runs — see
+    /// [`IqSource::stream_delay_s`]. Read once at open; the operator changes it
+    /// by re-applying the radio settings, like every other TCI field.
+    stream_delay_s: f64,
 }
 
 impl TciSource {
@@ -51,6 +58,7 @@ impl TciSource {
         iq_rate_hz: f64,
         center_hz: f64,
         rx_index: u32,
+        stream_delay_ms: f64,
     ) -> anyhow::Result<Self> {
         let dev = registry()
             .get_or_open(DeviceKey::Tci(address.to_string()), || {
@@ -72,6 +80,7 @@ impl TciSource {
             )
         };
         Ok(TciSource {
+            rate: dev.sample_rate_hz(),
             center: center_hz,
             scratch: Vec::new(),
             label,
@@ -79,11 +88,17 @@ impl TciSource {
             rx: Some(rx),
             if_offset: 0.0,
             last_telem: None,
+            // Negative or absurd values are an edited config, not a request:
+            // clamp rather than let the panadapter's axis run backwards.
+            stream_delay_s: (stream_delay_ms / 1e3).clamp(0.0, 2.0),
         })
     }
 
+    /// The connection's negotiated IQ rate, remembered rather than asked for:
+    /// it is fixed at connect, and [`IqSource::release`] lets the connection go
+    /// while the engine is still running on this source.
     pub fn sample_rate_hz(&self) -> f64 {
-        self.dev.as_ref().map_or(0.0, |d| d.sample_rate_hz())
+        self.rate
     }
 }
 
@@ -94,6 +109,13 @@ impl IqSource for TciSource {
 
     fn center_hz(&self) -> f64 {
         self.center
+    }
+
+    /// The rig is at the end of a socket and its own pipeline: a `dds:` command
+    /// is acknowledged in well under a millisecond but the IQ takes about a
+    /// tenth of a second to follow. See `TciConfig::stream_delay_ms`.
+    fn stream_delay_s(&self) -> f64 {
+        self.stream_delay_s
     }
 
     fn set_center_hz(&mut self, hz: f64) -> Result<()> {
@@ -224,16 +246,19 @@ impl IqSource for TciSource {
         self.rx.as_ref().is_none_or(|rx| !rx.is_alive())
     }
 
-    /// Give this receiver's stream back ahead of a rebuild — and only the
-    /// stream. The connection is deliberately kept: another radio may be
-    /// streaming its own receiver over it, and even alone, an Apply with the
-    /// address unchanged should re-attach to the live WebSocket (the registry
-    /// will find it through this very `Arc`) rather than redial the rig. The
-    /// connection closes when the last source holding it is dropped, which
-    /// for a genuine backend switch happens right after the replacement is
-    /// adopted.
+    /// Give this receiver's stream back ahead of a rebuild — **and the
+    /// connection with it, unless another radio is still streaming its own
+    /// receiver over it.**
+    ///
+    /// The WebSocket used to be kept deliberately, so that an Apply with the
+    /// address unchanged re-attached to the live one rather than redialling
+    /// the rig. But the IQ rate is negotiated once, at connect, and never
+    /// again: a connection outliving its last radio made an Apply that changed
+    /// it do nothing at all. Same rule as the Pluto and HPSDR backends next
+    /// door (issue #135) and as the RSP.
     fn release(&mut self) {
         self.rx = None;
+        self.dev = None;
     }
 
     fn set_if_offset(&mut self, hz: f64) {

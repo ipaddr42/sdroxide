@@ -43,9 +43,29 @@ pub fn probe(req: DeviceProbe, radio: u32) -> ProbeAnswer {
         DeviceProbe::Hpsdr => ProbeAnswer::Hpsdr(sdroxide_hpsdr::discover_default()),
         DeviceProbe::SmartSdr => ProbeAnswer::SmartSdr(crate::smartsdr_source::discover()),
         DeviceProbe::Pluto => ProbeAnswer::Pluto(sdroxide_pluto::discover_default()),
+        // The one probe that asks about the internet rather than about this
+        // machine. It still belongs here: this is the computer that will hold
+        // the connection, so it is the one whose reachability decides whether a
+        // receiver in the list is any use.
+        DeviceProbe::PublicSdrs { refresh } => {
+            ProbeAnswer::PublicSdrs(Box::new(sdroxide_config::public_sdr_directory(refresh)))
+        }
+        DeviceProbe::Fobos => ProbeAnswer::Fobos(fobos_devices()),
         DeviceProbe::Test(t) => ProbeAnswer::Test(t.kind(), test(&t)),
         DeviceProbe::Report(k) => ProbeAnswer::Report(k, report(k, radio)),
+        DeviceProbe::Relays => ProbeAnswer::Relays(sdroxide_relay::list()),
     }
+}
+
+/// `fobos_rx_list_devices`, translated into the wasm-safe type. `libfobos`'s
+/// own `DevInfo` also carries the index `fobos_rx_open` wants, which is not
+/// here: `sdroxide-fobos::device::open` re-derives it by matching the serial
+/// again, the same lookup-by-serial every other backend's config uses.
+fn fobos_devices() -> Vec<sdroxide_types::FobosDevice> {
+    sdroxide_fobos::list()
+        .into_iter()
+        .map(|d| sdroxide_types::FobosDevice { serial: d.serial })
+        .collect()
 }
 
 /// The whole SoapySDR enumeration, pseudo-drivers included: this feeds a list
@@ -87,6 +107,9 @@ fn test(t: &ProbeTest) -> Result<String, String> {
         }
         ProbeTest::Pluto(address) => {
             sdroxide_pluto::test_connection(address, Duration::from_secs(3))
+        }
+        ProbeTest::Kiwi(address) => {
+            sdroxide_kiwisdr::test_connection(address, Duration::from_secs(3))
         }
         ProbeTest::IcomNet(cfg) => {
             sdroxide_icomnet::test_connection(sdroxide_icomnet::IcomNetOptions {
@@ -150,6 +173,11 @@ fn report(kind: ReportKind, radio: u32) -> String {
                 .to_string()
         }),
         ReportKind::Lime => lime_report(),
+        ReportKind::Relay => sdroxide_relay::diagnostics().unwrap_or_else(|| {
+            "No T/R switch has been opened yet — set one up in Settings \u{2192} T/R switch and \
+             press APPLY first."
+                .to_string()
+        }),
     }
 }
 

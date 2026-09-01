@@ -435,6 +435,9 @@ pub fn save_remote_login(login: Option<&sdroxide_types::RemoteAccess>) -> Result
     }
 }
 
+mod publicsdr;
+pub use publicsdr::public_sdr_directory;
+
 pub fn config_dir() -> Result<PathBuf, ConfigError> {
     // The override exists for the integration tests, which must not write the
     // operator's real configuration, and works as a profile switch for anyone
@@ -1024,6 +1027,11 @@ pub struct Session {
     pub squelch_db: f32,
     /// Main receiver's noise reduction (engine + strength, or off).
     pub noise_reduction: sdroxide_types::NrLevel,
+    /// Whether binaural (pseudo-stereo) audio was left switched on. Set by ear
+    /// like the noise reduction above it, and remembered for the same reason:
+    /// an operator who listens this way listens to *everything* this way, and
+    /// should not have to switch it back on every start.
+    pub binaural: bool,
     /// How far the raw IQ was being decimated (a power of two; 1 is off).
     ///
     /// Kept per radio like everything else in this file, because it is a
@@ -1061,7 +1069,29 @@ pub struct Session {
     /// rides here rather than in `config.toml` because the UI is the only thing
     /// that sets it, and the engine is what owns writing it back.
     pub recording_mono: bool,
+    /// The antenna sockets the operator last chose **on each band**, as
+    /// `(RX, TX)`.
+    ///
+    /// A station with more than one antenna does not have one preference, it
+    /// has one per band: the beam on 2 m, the vertical on 40, the Hi-Z port on
+    /// 160. Radios with an antenna selector remember it that way themselves —
+    /// an Icom's band stacking register holds the socket beside the frequency
+    /// and the mode — and an operator who has to reach for the switch on every
+    /// band change has an antenna selector that is not doing its job (issues
+    /// #235 and #238).
+    ///
+    /// Only bands the operator has actually chosen a socket on appear here, so
+    /// a band never worked opens on whatever the front end is already set to.
+    /// Absent in a session written before this existed.
+    #[serde(default)]
+    pub band_antenna: BandAntennas,
 }
+
+/// Which antenna socket was last chosen on each band — see
+/// [`Session::band_antenna`]. `(RX, TX)`; either may be `None` where that
+/// direction has no port to choose.
+pub type BandAntennas =
+    std::collections::HashMap<sdroxide_types::Band, (Option<String>, Option<String>)>;
 
 impl Default for Session {
     fn default() -> Self {
@@ -1092,11 +1122,13 @@ impl Default for Session {
             tx_eq: radio.tx.eq,
             squelch_db: radio.rx[0].squelch_db,
             noise_reduction: radio.rx[0].noise_reduction,
+            binaural: radio.rx[0].binaural,
             decimation: radio.decimation,
             repeater: radio.repeater,
             gains: Vec::new(),
             tx_gains: Vec::new(),
             recording_mono: radio.recording_mono,
+            band_antenna: BandAntennas::new(),
         }
     }
 }
@@ -1300,6 +1332,20 @@ pub fn save_adsb_config(cfg: &sdroxide_types::AdsbSettings) -> Result<(), Config
     save_json("adsb.json", cfg)
 }
 
+/// VDL Mode 2 decoder preferences.
+///
+/// Kept apart from the live `RadioState.vdl2` for the same reason the ADS-B and
+/// ISM decoders' are: a front end that hands over demodulated audio, or one too
+/// narrow to reach any of the channel plan, forces the decoder off, and that
+/// must not overwrite what the operator chose for a receiver that can run it.
+pub fn load_vdl2_config() -> sdroxide_types::Vdl2Settings {
+    load_json::<sdroxide_types::Vdl2Settings>("vdl2.json").sane()
+}
+
+pub fn save_vdl2_config(cfg: &sdroxide_types::Vdl2Settings) -> Result<(), ConfigError> {
+    save_json("vdl2.json", cfg)
+}
+
 /// Scanner settings: what to scan, how hard a signal has to be to stop it, and
 /// which memories to pass over. Restored at startup so a scan set up once is
 /// one keypress away afterwards.
@@ -1426,6 +1472,19 @@ pub fn load_rotator_config() -> sdroxide_types::RotatorConfig {
 
 pub fn save_rotator_config(cfg: &sdroxide_types::RotatorConfig) -> Result<(), ConfigError> {
     save_json("rotator.json", cfg)
+}
+
+/// The external transmit/receive switch — the relay board or contact closure
+/// that grounds the SDR's antenna while the station transmits. Owned by the
+/// engine, like the rotator above, and for the same reason: it is a fact about
+/// the machine the antenna is attached to, not about the screen in front of the
+/// operator.
+pub fn load_relay_config() -> sdroxide_types::RelayConfig {
+    load_json("relay.json")
+}
+
+pub fn save_relay_config(cfg: &sdroxide_types::RelayConfig) -> Result<(), ConfigError> {
+    save_json("relay.json", cfg)
 }
 
 // ── Broadcast station schedules ──────────────────────────────────────────────
@@ -1881,6 +1940,7 @@ mod tests {
             },
             squelch_db: -70.0,
             noise_reduction: sdroxide_types::NrLevel::RnnMed,
+            binaural: true,
             decimation: 4,
             repeater: sdroxide_types::RepeaterState {
                 shift: sdroxide_types::Shift::Minus,
@@ -1896,6 +1956,10 @@ mod tests {
             gains: vec![("LNA".into(), 24.0), ("VGA".into(), 16.0)],
             tx_gains: vec![("PAD".into(), -6.0)],
             recording_mono: true,
+            band_antenna: BandAntennas::from([
+                (sdroxide_types::Band::M40, (Some("ANT1".into()), None)),
+                (sdroxide_types::Band::M2, (Some("ANT2".into()), Some("ANT2".into()))),
+            ]),
         };
         let back: Session = serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
         assert_eq!(back, s);
@@ -1923,6 +1987,7 @@ mod tests {
         // did, and on the front end's own gains rather than on invented ones.
         assert_eq!(old.squelch_db, radio.rx[0].squelch_db);
         assert_eq!(old.noise_reduction, radio.rx[0].noise_reduction);
+        assert_eq!(old.binaural, radio.rx[0].binaural);
         assert!(old.gains.is_empty(), "no gain preference until one is expressed");
         assert!(old.tx_gains.is_empty());
         // And it names one dial, which is the one it was left on: B mirrors it,

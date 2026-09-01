@@ -308,6 +308,30 @@ pub enum RadioEvent {
     /// `IsmStatus` has one — not done yet, since every station this shipped
     /// for runs its own hardware locally.
     Qo100Status(crate::Qo100Status),
+    /// Everything the VDL Mode 2 decoder has: the message log, the station
+    /// table, and what every channel of the plan is doing. A whole snapshot, a
+    /// couple of times a second.
+    ///
+    /// One message rather than a stream of decoded frames, for the reason
+    /// [`RadioEvent::AdsbStatus`] is one: a snapshot carrying the log without
+    /// the stations, or either without the counters, would be describing two
+    /// different instants — and a dropped snapshot then costs nothing, because
+    /// the next carries the same information.
+    ///
+    /// Boxed for the same reason as well: a busy channel's log and station
+    /// table are far larger than anything else in this enum, and an enum is as
+    /// big as its largest variant everywhere it is held.
+    Vdl2Status(Box<crate::Vdl2Status>),
+    /// The station's external T/R switch: whether it is configured, whether the
+    /// hardware is answering, what it is, and whether the contacts are in their
+    /// transmit state.
+    ///
+    /// Emitted by the primary engine only — one station, one antenna line — and
+    /// only when it changes. Boxed for the usual reason: it carries two strings
+    /// and an enum is as big as its largest variant everywhere it is held.
+    ///
+    /// Appended last, for the usual reason.
+    RelayStatus(Box<crate::RelayStatus>),
 }
 
 /// Snapshot of the frontend's switchable sound devices (native clients).

@@ -1039,6 +1039,10 @@ impl SdroxideApp {
         let btn_h = crate::chrome::chip_height(ui, Some(15.0));
         let map_handle_h = 7.0;
         const CARD_RESERVE: f32 = 60.0;
+        /// Enough conversation box to be a conversation: three or four lines.
+        /// It is also what egui's own scroll area asks for, so below this the
+        /// box is being squeezed rather than merely small.
+        const TRANSCRIPT_MIN: f32 = 64.0;
         let full_h = ui.available_height();
         let avail_w = ui.available_width();
         // The map height is a user-draggable fraction of a range: from MIN_HEIGHT
@@ -1047,8 +1051,15 @@ impl SdroxideApp {
         // linearly across this range, so the divider tracks the cursor 1:1 and the
         // map genuinely grows/shrinks. Height is capped at the width (aspect ≤ 1).
         let map_lo = crate::widgets::worldmap::MIN_HEIGHT;
-        let map_hi =
-            (full_h - (map_handle_h + CARD_RESERVE + 5.0 + gap + btn_h)).min(avail_w).max(map_lo);
+        // What has to be left underneath the map: the station card, *both* rows
+        // of controls pinned to the bottom edge with the gap between them, and
+        // a transcript worth the name. The reserve used to count one button row
+        // and nothing at all for the transcript, so a map at its default share
+        // left the box a few points tall — and before the box learned to be
+        // squeezed (see [`Self::transcript`]) it overflowed downward onto the
+        // message row instead, which is how that row went missing (issue #231).
+        let below_map = map_handle_h + CARD_RESERVE + 5.0 + gap + 2.0 * btn_h + TRANSCRIPT_MIN;
+        let map_hi = (full_h - below_map).min(avail_w).max(map_lo);
         let map_budget = map_lo + (map_hi - map_lo) * self.view.digi_map_fraction;
         let my_grid = status.as_ref().map(|s| s.config.my_grid.clone()).unwrap_or_default();
         // Everything from here to the map itself is only ever read by the map,
@@ -1371,9 +1382,21 @@ impl SdroxideApp {
                 .inner_margin(egui::Margin { left: 9, right: 7, top: 6, bottom: 6 })
                 .show(ui, |ui| {
                     ui.set_width(ui.available_width());
-                    ui.set_min_height(ui.available_height());
+                    let budget = ui.available_height();
+                    ui.set_min_height(budget);
                     egui::ScrollArea::vertical()
                         .auto_shrink([false, false])
+                        // A scroll area is 64 points tall by default whatever it
+                        // is given, and this box's whole job is to take
+                        // *whatever is left* above the controls. On a short
+                        // screen that is less than 64, and the box then
+                        // overflowed its allocation and painted over the message
+                        // row pinned underneath it — so the row that chooses
+                        // what goes out next was not on the screen at all, with
+                        // nothing to say it was missing (issue #231). The floor
+                        // is the budget, so the box is squeezed rather than the
+                        // thing below it.
+                        .min_scrolled_height(budget.max(0.0).min(64.0))
                         .stick_to_bottom(true)
                         .show_themed(ui, |ui| {
                             let mut any = false;

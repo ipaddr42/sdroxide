@@ -35,20 +35,20 @@ pub const DEFAULT_PORT: u16 = 50001;
 /// How long the WebSocket upgrade itself may take, before any status is read.
 pub(crate) const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Read timeout held during the upgrade. Short enough to keep the deadline
-/// below responsive, long enough that the usual case completes in one read.
-pub(crate) const HANDSHAKE_POLL: Duration = Duration::from_millis(500);
-
 /// Perform the WebSocket upgrade on an already-connected socket, retrying until
 /// `deadline`.
 ///
-/// Both callers put a read timeout on the socket (they poll the connection
-/// afterwards), and tungstenite reports a read that timed out mid-upgrade as
-/// `Interrupted` — the server simply hasn't answered yet, which is not a
-/// failure. Resuming the handshake instead of giving up on the first
-/// `Interrupted` is what makes connecting to a busy ExpertSDR3 reliable; taking
-/// it as fatal is why a freshly started sdroxide so often needed a manual
-/// "Apply / reconnect" to attach to a rig that was running all along.
+/// The socket's read timeout must cover the whole upgrade, which is why every
+/// caller widens it to the budget here and only tightens it to its polling
+/// interval once the WebSocket exists. A read that expires mid-upgrade is
+/// `Interrupted` — the server simply hasn't answered yet — on Unix alone;
+/// Windows reports the same expiry as `WSAETIMEDOUT`, which tungstenite cannot
+/// tell from a real I/O failure and will not resume from. Resuming an
+/// `Interrupted` handshake is still what makes connecting to a busy ExpertSDR3
+/// reliable, and taking it as fatal is why a freshly started sdroxide so often
+/// needed a manual "Apply / reconnect" to attach to a rig that was running all
+/// along — but on Windows only the wide timeout keeps that from happening
+/// (see the KiwiSDR client, issue #266, where the same shape broke outright).
 pub(crate) fn ws_handshake(
     stream: TcpStream,
     url: &str,
@@ -96,11 +96,12 @@ pub fn test_connection(address: &str, timeout: Duration) -> Result<String, Strin
         .ok_or_else(|| format!("no address for {host}:{port}"))?;
     let stream = TcpStream::connect_timeout(&sockaddr, timeout.min(Duration::from_secs(3)))
         .map_err(|e| format!("connect {host}:{port}: {e}"))?;
-    stream.set_read_timeout(Some(HANDSHAKE_POLL)).ok();
 
     let url = format!("ws://{host}:{port}/");
     let deadline = Instant::now() + timeout;
     let upgrade_by = deadline.min(Instant::now() + HANDSHAKE_TIMEOUT);
+    // The upgrade's whole budget, in one read: see `ws_handshake`.
+    stream.set_read_timeout(Some(timeout.min(HANDSHAKE_TIMEOUT))).ok();
     let mut ws = ws_handshake(stream, url.as_str(), upgrade_by)?;
     // Status polling from here on: don't sit in a blocking read.
     ws.get_ref().set_read_timeout(Some(Duration::from_millis(250))).ok();

@@ -434,7 +434,34 @@ impl PlutoRig {
         // the same reason.
         phy.silence_transmitter(&mut control)?;
         phy.set_tx_gain(&mut control, cfg.tx_gain_db)?;
+        // The on-chip tone generators, silenced here rather than only at the
+        // first key-up. In FDD the transmit chain is live from this moment, so
+        // "the DDS is zeroed before anything can go out" has to mean *open*,
+        // not *key-up*; and taking it off the key-up path is part of what makes
+        // an over start promptly (issue #135). Best-effort: a firmware that
+        // publishes no tone channels has already said so in `silence_dds`, and
+        // a rejected write there must not cost the operator their receiver.
+        if let Err(e) = phy.silence_dds(&mut control) {
+            tracing::warn!("PlutoSDR: could not silence the transmit tone generators: {e}");
+        }
         phy.set_rx_lo(&mut control, PlutoConfig::apply_ppm(center_hz, cfg.ppm))?;
+        // And park the transmit synthesiser in the band the session opened on.
+        // Nothing radiates — in TDD the state machine is in receive and in FDD
+        // the attenuator is at its minimum with the tones zeroed — and it means
+        // the first key-up moves the synthesiser by kilohertz rather than
+        // across the whole tuning range from wherever the part came up.
+        let park = PlutoConfig::apply_ppm(center_hz, cfg.ppm);
+        let tx_lo = match phy.set_tx_lo(&mut control, park) {
+            // The pair is (asked for, achieved): the part quantises to its RF
+            // PLL step, so the second is not always the first, and `key_up`
+            // needs both to tell "nobody has moved it" from "it never went
+            // where we asked".
+            Ok(()) => phy.tx_lo(&mut control).ok().map(|at| (park, at)),
+            Err(e) => {
+                tracing::debug!("PlutoSDR: transmit oscillator not parked at open: {e}");
+                None
+            }
+        };
         let tx_rate = phy.tx_sample_rate(&mut control).unwrap_or(rate);
         let rx_port = phy.rx_port(&mut control).unwrap_or_default();
         let tx_port = phy.tx_port(&mut control).unwrap_or_default();
@@ -595,7 +622,7 @@ impl PlutoRig {
             spawn("sdroxide-pluto-rx", move || stream::rx_thread(rx_conn, rx_shared, rx_prod))?,
             spawn("sdroxide-pluto-tx", move || stream::tx_thread(tx_conn, tx_shared, tx_cons))?,
             spawn("sdroxide-pluto-ctl", move || {
-                control_thread(control, ctl_shared, ctrl_rx, ctl_cfg, center_hz)
+                control_thread(control, ctl_shared, ctrl_rx, ctl_cfg, center_hz, tx_lo)
             })?,
         ];
 
@@ -1217,6 +1244,7 @@ fn control_thread(
     ctrl: Receiver<Ctrl>,
     cfg: PlutoConfig,
     center_hz: f64,
+    tx_lo: Option<(f64, f64)>,
 ) {
     let phy = &shared.phy;
     let mut ppm = cfg.ppm;
@@ -1231,6 +1259,11 @@ fn control_thread(
     // the operator has touched the dial still moves it. This is the *shared*
     // LO — the AD9361's chains have one — in engine-domain hertz.
     let mut rx_hz = center_hz;
+    // What the transmit synthesiser was last asked for and what it achieved,
+    // in the same ppm-corrected hertz `key_up` asks for — seeded from where
+    // `open` parked it, and `None` if it would not park. See [`key_up`] for why
+    // an over that does not have to move it is so much quicker off the mark.
+    let mut tx_lo = tx_lo;
     while shared.alive.load(Ordering::Relaxed) {
         let msg = match ctrl.recv_timeout(Duration::from_millis(200)) {
             Ok(m) => m,
@@ -1289,7 +1322,7 @@ fn control_thread(
                     Ok(())
                 }
             }
-            Ctrl::TxOn(hz) => key_up(&mut conn, &shared, hz, ppm),
+            Ctrl::TxOn(hz) => key_up(&mut conn, &shared, hz, ppm, &mut tx_lo),
             Ctrl::TxOff => key_down(&mut conn, &shared, rx_hz, ppm),
             Ctrl::Shutdown => break,
         };
@@ -1340,34 +1373,88 @@ fn notify_lo_moved(shared: &Shared, hz: f64, origin: u8) {
     }
 }
 
-/// Tune the transmit LO, silence the DDS, take receive down unless the link can
-/// carry both, then hand the link to the transmit thread.
+/// Tune the transmit LO if it has moved, take receive down unless the link can
+/// carry both, throw the T/R switch, then hand the link to the transmit thread.
+///
+/// # The order is what the amplifier feels
+///
+/// In TDD the state-machine write is what asserts the slaved GPO pin — it *is*
+/// the PTT line an external PA, LNA or transmit-receive switch follows — so
+/// everything ahead of it is delay the operator sees as the relay lagging the
+/// key. Issue #135 measured that at two to three seconds against an unkey that
+/// was instant, and the two things in front of it are why:
+///
+/// * **The transmit oscillator.** Writing it makes the AD9361 force its state
+///   machine to ALERT, retune the synthesiser and calibrate the transmit
+///   quadrature before restoring the state — the better part of a second, and
+///   it used to be paid on *every* key-up even when the dial had not moved
+///   since the last one. So the frequency actually in force is remembered and
+///   an over that does not need it moved skips the write, which is what
+///   `LimeHandle::tx_begin` does with its own slow call next door.
+/// * **Waiting for the receive buffer to close.** Half a second at worst, and
+///   the chip does not need it: the state machine leaving receive is what
+///   silences that direction. It is the *link* that cannot carry both, and only
+///   the transmit buffer opening below cares about that — so the wait now sits
+///   behind the T/R switch instead of in front of it.
 ///
 /// The DDS step is the one that cannot be skipped: the transmit path is fed by
-/// four on-chip tone generators unless they are explicitly zeroed, and a Pluto
-/// that skips it puts out a steady carrier pair at full power instead of the
-/// modulation.
-fn key_up(conn: &mut Connection, shared: &Shared, hz: f64, ppm: f64) -> Result<()> {
+/// on-chip tone generators unless they are explicitly zeroed, and a Pluto that
+/// skips it puts out a steady carrier pair at full power instead of the
+/// modulation. `open` zeroes them too, so this is the cheap re-assertion and
+/// not the only one.
+fn key_up(
+    conn: &mut Connection,
+    shared: &Shared,
+    hz: f64,
+    ppm: f64,
+    tx_lo: &mut Option<(f64, f64)>,
+) -> Result<()> {
     let phy = &shared.phy;
-    phy.set_tx_lo(conn, PlutoConfig::apply_ppm(hz, ppm))?;
     phy.silence_dds(conn)?;
+    let want = PlutoConfig::apply_ppm(hz, ppm);
+    // Skipped only when this over is on the frequency the last write asked for
+    // *and* the synthesiser is still where that write actually left it. The
+    // second half is a read — one round trip, against the better part of a
+    // second for the write — and it is what makes this safe to skip at all:
+    // nothing here has to be sure that unkeying, a ppm trim or a retune of the
+    // other direction left the transmit oscillator alone, because it looks.
+    let settled = match *tx_lo {
+        Some((asked, at)) if (asked - want).abs() < 0.5 => {
+            phy.tx_lo(conn).is_ok_and(|now| (now - at).abs() < 0.5)
+        }
+        _ => false,
+    };
+    if !settled {
+        // Cleared first: a write that fails part way leaves the synthesiser
+        // somewhere nobody knows, and the next over must not trust the old
+        // answer.
+        *tx_lo = None;
+        phy.set_tx_lo(conn, want)?;
+        *tx_lo = phy.tx_lo(conn).ok().map(|at| (want, at));
+    }
+    // Tell the receive thread to stop *before* the state machine moves, so it
+    // is already unwinding while the relay settles; the wait for it is below.
     if !shared.full_duplex {
         shared.rx_enabled.store(false, Ordering::Relaxed);
-        // Wait for the receive thread to actually let go of its buffer.
-        // Bounded: if it has died, transmit should still work.
-        let deadline = Instant::now() + Duration::from_millis(500);
-        while shared.rx_active.load(Ordering::Relaxed) && Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(2));
-        }
     }
     // In TDD the transmit path is off until the state machine is moved, so
     // this comes before the buffer opens rather than after: a DMA buffer
     // filling a disabled transmitter is samples thrown away. It is also what
-    // asserts the slaved GPO pin, so an external amplifier is keyed a couple
-    // of milliseconds before there is anything for it to amplify — which is
-    // the order a T/R switch wants.
+    // asserts the slaved GPO pin, so an external amplifier is keyed a few
+    // milliseconds before there is anything for it to amplify — which is the
+    // order a T/R switch wants.
     if shared.tdd {
         phy.set_ensm_mode(conn, ENSM_TX)?;
+    }
+    if !shared.full_duplex {
+        // Now wait for the receive thread to actually let go of its buffer:
+        // on a USB 2.0 gadget there is only room for one of them, and the
+        // transmit buffer opens the moment the flag below is set. Bounded — if
+        // the receive thread has died, transmit should still work.
+        let deadline = Instant::now() + Duration::from_millis(500);
+        while shared.rx_active.load(Ordering::Relaxed) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(2));
+        }
     }
     shared.tx_enabled.store(true, Ordering::Relaxed);
     Ok(())

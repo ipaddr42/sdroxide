@@ -39,72 +39,170 @@ const HB_TAPS: usize = 23;
 /// prototype: indices 0, 2, 4, 6, 8, 10.
 const HB_PAIRS: usize = 6;
 
-/// Half-band decimator (factor 2).
+/// Half-band decimator (factor 2), in polyphase form.
 ///
-/// Two properties of the prototype are spent here rather than left on the
-/// table, because this is the busiest filter in the tree — a receive chain on a
-/// wide front end runs a ladder of these at the device rate, 32.4 Msps on an
-/// RX-888, and the first stage alone was measured at 5 % of a core.
+/// This is the busiest filter in the tree — a receive chain on a wide front end
+/// runs a ladder of these at the device rate, 16.2 Msps on the RX-888 geometry
+/// these numbers were taken at, and it is the largest single symbol in a
+/// profile of the running receiver. Three properties of the prototype are spent
+/// here rather than left on the table:
 ///
 /// * Every second tap is zero (that is what a half-band *is*), so half the
 ///   products never existed.
 /// * The rest are symmetric about the centre, so a pair of samples can share
 ///   one multiply: `x[a]·t + x[b]·t` is `(x[a] + x[b])·t`. That is a complex
-///   add standing in for a complex multiply, and it halves the multiplies
-///   again — seven where the straightforward loop does thirteen.
+///   add standing in for a complex multiply — seven multiplies where the
+///   straightforward loop does thirteen.
+/// * The surviving taps are all at *even* offsets, save the lone centre one at
+///   an odd offset. So the filter never mixes the two phases of its input:
+///   split `x` into `even[m] = x[2m]` and `odd[m] = x[2m+1]` and one output is
 ///
-/// Measured together at 1.7× the loop they replace.
+///   ```text
+///   y[n] = h₁₁·odd[n+5] + Σⱼ tⱼ·(even[n+j] + even[n+11−j])
+///   ```
+///
+///   which reads both arrays at unit stride.
+///
+/// That last point is the whole reason for the split, and it is worth being
+/// plain about what it buys. The direct form indexes its window with a stride
+/// of two, and a stride the compiler cannot flatten means one output at a time
+/// however wide the registers are: measured against `-C target-cpu=native`, the
+/// direct form went from 779 to 974 Msps while this one went from 893 to 1816.
+/// Under the AVX2 copy this crate actually dispatches (see [`crate::simd`]) it
+/// is 1.78× the direct form.
+///
+/// The split costs nothing extra: the direct form copied every input sample
+/// into a history buffer anyway, and this spends the same copy putting the two
+/// phases in separate arrays.
 pub struct HalfbandDecim {
-    /// The surviving taps, as `(low index, its mirror, value)`. Built from the
-    /// prototype rather than written down, so the numbers stay derived.
-    pairs: [(usize, usize, f32); HB_PAIRS],
-    /// The centre tap, which has no partner.
-    center: (usize, f32),
-    buf: Vec<Complex32>,
+    /// The six surviving tap values, `taps[j]` being the prototype's tap `2j`
+    /// and its mirror. Built from the prototype rather than written down, so
+    /// the numbers stay derived.
+    taps: [f32; HB_PAIRS],
+    /// The centre tap, which has no partner and sits on the odd phase.
+    center: f32,
+    /// Input split by phase, `even[m] = x[2m]` and `odd[m] = x[2m+1]`.
+    even: Vec<Complex32>,
+    odd: Vec<Complex32>,
+    /// Set when a block ended on an even sample, so the next one opens with
+    /// that pair's odd half. Losing this is what would slide the decimation
+    /// phase by one sample on any block of odd length.
+    odd_next: bool,
 }
+
+crate::simd::kernel! {
+    /// Split a block into its two sample phases.
+    fn split_phases / split_phases_portable / split_phases_avx2 / split_phases_avx512 (
+        even: &mut [Complex32],
+        odd: &mut [Complex32],
+        src: &[Complex32],
+    ) {
+        for ((e, o), p) in even.iter_mut().zip(odd).zip(src.chunks_exact(2)) {
+            *e = p[0];
+            *o = p[1];
+        }
+    }
+}
+
+crate::simd::kernel! {
+    /// One half-band stage's dot products, one per element of `dst`.
+    ///
+    /// Written against a `&mut [Complex32]` rather than pushing into the
+    /// caller's `Vec` so the loop has a length the compiler knows before it
+    /// starts, and against slices cut to exactly what it reads so the bounds
+    /// checks hoist out. Both are what let the AVX2 copy compute four outputs
+    /// at a time.
+    fn halfband / halfband_portable / halfband_avx2 / halfband_avx512 (
+        dst: &mut [Complex32],
+        even: &[Complex32],
+        odd: &[Complex32],
+        taps: &[f32; HB_PAIRS],
+        center: f32,
+    ) {
+        let t = *taps;
+        for (k, d) in dst.iter_mut().enumerate() {
+            // Two chains of three rather than six terms in sequence: summed in
+            // one order that is a dependency chain the length of the filter.
+            let a = (even[k] + even[k + 11]) * t[0]
+                + (even[k + 1] + even[k + 10]) * t[1]
+                + (even[k + 2] + even[k + 9]) * t[2];
+            let b = (even[k + 3] + even[k + 8]) * t[3]
+                + (even[k + 4] + even[k + 7]) * t[4]
+                + (even[k + 5] + even[k + 6]) * t[5];
+            *d = odd[k + 5] * center + (a + b);
+        }
+    }
+}
+
+/// Even-phase samples one output reads: the six pairs span `even[k ..= k+11]`.
+const HB_SPAN: usize = 2 * HB_PAIRS;
 
 impl HalfbandDecim {
     pub fn new() -> Self {
-        let taps = lowpass_taps(HB_TAPS, 0.25);
+        let proto = lowpass_taps(HB_TAPS, 0.25);
         let center = HB_TAPS / 2;
-        let mut pairs = [(0usize, 0usize, 0.0f32); HB_PAIRS];
+        let mut taps = [0.0f32; HB_PAIRS];
         let mut found = 0;
         // The zeros are what the cutoff put there; recognising them rather than
         // assuming their positions keeps this honest if the prototype is ever
-        // re-cut.
-        for (k, &tap) in taps.iter().enumerate().take(center).filter(|(_, t)| t.abs() > 1e-12) {
-            pairs[found] = (k, HB_TAPS - 1 - k, tap);
+        // re-cut. The polyphase form needs more than their count, though — it
+        // needs them at the even offsets, which is what makes the surviving
+        // taps one phase and the centre the other.
+        for (k, &tap) in proto.iter().enumerate().take(center).filter(|(_, t)| t.abs() > 1e-12) {
+            assert_eq!(k, 2 * found, "the half-band prototype's zeros moved off the odd taps");
+            taps[found] = tap;
             found += 1;
         }
         assert_eq!(found, HB_PAIRS, "the half-band prototype changed shape");
-        HalfbandDecim { pairs, center: (center, taps[center]), buf: Vec::new() }
+        assert_eq!(center % 2, 1, "the centre tap must sit on the odd phase");
+        HalfbandDecim {
+            taps,
+            center: proto[center],
+            even: Vec::new(),
+            odd: Vec::new(),
+            odd_next: false,
+        }
     }
 
     pub fn process(&mut self, input: &[Complex32], out: &mut Vec<Complex32>) {
-        self.buf.extend_from_slice(input);
-        if self.buf.len() < HB_TAPS {
+        let mut rest = input;
+        // A block that ended mid-pair: its partner opens this one.
+        if self.odd_next
+            && let Some((first, tail)) = rest.split_first()
+        {
+            self.odd.push(*first);
+            rest = tail;
+            self.odd_next = false;
+        }
+        let pairs = rest.len() / 2;
+        let (e0, o0) = (self.even.len(), self.odd.len());
+        self.even.resize(e0 + pairs, Complex32::default());
+        self.odd.resize(o0 + pairs, Complex32::default());
+        split_phases(&mut self.even[e0..], &mut self.odd[o0..], &rest[..pairs * 2]);
+        if let Some(&last) = rest.get(pairs * 2) {
+            self.even.push(last);
+            self.odd_next = true;
+        }
+
+        // One output per even-phase sample that has a whole window behind it.
+        // `odd` is the shorter of the two whenever a pair is half-arrived, so
+        // it is what bounds the count.
+        let m = self.odd.len();
+        if m < HB_SPAN {
             return;
         }
-        let count = (self.buf.len() - HB_TAPS) / 2 + 1;
-        out.reserve(count);
-        let p = self.pairs;
-        let (ci, ct) = self.center;
-        for o in 0..count {
-            // One slice, so the bounds are checked once for the whole window
-            // instead of once per tap.
-            let w = &self.buf[o * 2..o * 2 + HB_TAPS];
-            // Written out in two halves rather than looped: six terms summed
-            // in sequence is one dependency chain the length of the filter,
-            // and two chains of three run in half the time.
-            let a = (w[p[0].0] + w[p[0].1]) * p[0].2
-                + (w[p[1].0] + w[p[1].1]) * p[1].2
-                + (w[p[2].0] + w[p[2].1]) * p[2].2;
-            let b = (w[p[3].0] + w[p[3].1]) * p[3].2
-                + (w[p[4].0] + w[p[4].1]) * p[4].2
-                + (w[p[5].0] + w[p[5].1]) * p[5].2;
-            out.push(w[ci] * ct + (a + b));
-        }
-        self.buf.drain(..count * 2);
+        let count = m - (HB_SPAN - 1);
+        let start = out.len();
+        out.resize(start + count, Complex32::default());
+        halfband(
+            &mut out[start..],
+            &self.even[..count + HB_SPAN - 1],
+            &self.odd[..count + HB_PAIRS - 1],
+            &self.taps,
+            self.center,
+        );
+        self.even.drain(..count);
+        self.odd.drain(..count);
     }
 }
 
@@ -184,7 +282,13 @@ impl Decimator {
 const FIR_ACCUMULATORS: usize = 8;
 
 /// `window · taps`, walked with [`FIR_ACCUMULATORS`] independent sums.
-#[inline]
+///
+/// `inline(always)`, not `inline`: this is called from inside a dispatched
+/// kernel, and a copy left standing on its own would be compiled once for the
+/// baseline and then *called* by the AVX2 copy — which is how the whole dot
+/// product silently stayed on 128-bit registers while the loop around it went
+/// wide. It showed up in a profile as a `decim::dot` with no `_avx2` suffix.
+#[inline(always)]
 fn dot(window: &[Complex32], taps: &[f32]) -> Complex32 {
     let mut acc = [Complex32::default(); FIR_ACCUMULATORS];
     let mut w = window.chunks_exact(FIR_ACCUMULATORS);
@@ -212,6 +316,22 @@ pub struct FirDecim {
     buf: Vec<Complex32>,
 }
 
+crate::simd::kernel! {
+    /// [`dot`] once per kept output — see [`FirDecim`].
+    fn fir_decim / fir_decim_portable / fir_decim_avx2 / fir_decim_avx512 (
+        dst: &mut [Complex32],
+        buf: &[Complex32],
+        taps: &[f32],
+        factor: usize,
+    ) {
+        let n = taps.len();
+        for (o, d) in dst.iter_mut().enumerate() {
+            let base = o * factor;
+            *d = dot(&buf[base..base + n], taps);
+        }
+    }
+}
+
 impl FirDecim {
     pub fn new(factor: usize) -> Self {
         assert!(factor >= 1);
@@ -227,17 +347,16 @@ impl FirDecim {
             return;
         }
         let count = (self.buf.len() - n) / self.factor + 1;
-        out.reserve(count);
-        for o in 0..count {
-            let base = o * self.factor;
-            out.push(dot(&self.buf[base..base + n], &self.taps));
-        }
+        let start = out.len();
+        out.resize(start + count, Complex32::default());
+        fir_decim(&mut out[start..], &self.buf, &self.taps, self.factor);
         self.buf.drain(..count * self.factor);
     }
 }
 
-/// [`dot`] for a real-valued window — the audio counterpart.
-#[inline]
+/// [`dot`] for a real-valued window — the audio counterpart. `inline(always)`
+/// for the reason [`dot`] is.
+#[inline(always)]
 fn real_dot(window: &[f32], taps: &[f32]) -> f32 {
     let mut acc = [0.0f32; FIR_ACCUMULATORS];
     let mut w = window.chunks_exact(FIR_ACCUMULATORS);
@@ -272,6 +391,22 @@ pub struct RealFirDecim {
     buf: Vec<f32>,
 }
 
+crate::simd::kernel! {
+    /// [`fir_decim`]'s real-valued counterpart.
+    fn real_fir_decim / real_fir_decim_portable / real_fir_decim_avx2 / real_fir_decim_avx512 (
+        dst: &mut [f32],
+        buf: &[f32],
+        taps: &[f32],
+        factor: usize,
+    ) {
+        let n = taps.len();
+        for (o, d) in dst.iter_mut().enumerate() {
+            let base = o * factor;
+            *d = real_dot(&buf[base..base + n], taps);
+        }
+    }
+}
+
 impl RealFirDecim {
     pub fn new(ntaps: usize, cutoff_hz: f64, sample_rate: f64, factor: usize) -> Self {
         assert!(factor >= 1);
@@ -290,11 +425,9 @@ impl RealFirDecim {
             return;
         }
         let count = (self.buf.len() - n) / self.factor + 1;
-        out.reserve(count);
-        for o in 0..count {
-            let base = o * self.factor;
-            out.push(real_dot(&self.buf[base..base + n], &self.taps));
-        }
+        let start = out.len();
+        out.resize(start + count, 0.0);
+        real_fir_decim(&mut out[start..], &self.buf, &self.taps, self.factor);
         self.buf.drain(..count * self.factor);
     }
 }
@@ -334,6 +467,50 @@ mod tests {
             d.process(block, &mut out);
         }
         out.split_off(1024)
+    }
+
+    /// The polyphase stage must compute exactly what the textbook direct form
+    /// does, whatever lengths the blocks arrive in.
+    ///
+    /// The reference is written from the definition — `y[n] = Σ h[k]·x[2n−k]`
+    /// over the full 23-tap prototype, no zeros skipped and no symmetry
+    /// exploited — so it cannot agree with the implementation by sharing its
+    /// reasoning. The ragged block patterns are the other half: every output
+    /// consumes exactly two input samples, and a block of odd length is where a
+    /// decimator silently slips a phase and mirrors the spectrum from then on.
+    #[test]
+    fn the_polyphase_stage_is_the_direct_form_it_replaces() {
+        let taps = lowpass_taps(HB_TAPS, 0.25);
+        let x = tone(1 << 15, 0.037);
+        // Direct form over the whole stream at once.
+        let mut want = Vec::new();
+        let mut o = 0;
+        while o * 2 + HB_TAPS <= x.len() {
+            let mut acc = Complex32::default();
+            for (k, &h) in taps.iter().enumerate() {
+                acc += x[o * 2 + k] * h;
+            }
+            want.push(acc);
+            o += 1;
+        }
+
+        for pattern in
+            [&[4096usize][..], &[1, 2, 3, 5, 7, 11, 13][..], &[23, 1, 46, 2, 1000, 3][..]]
+        {
+            let mut hb = HalfbandDecim::new();
+            let mut got = Vec::new();
+            let (mut at, mut i) = (0usize, 0usize);
+            while at < x.len() {
+                let n = pattern[i % pattern.len()].min(x.len() - at);
+                hb.process(&x[at..at + n], &mut got);
+                at += n;
+                i += 1;
+            }
+            assert_eq!(got.len(), want.len(), "block pattern {pattern:?}: wrong output count");
+            for (k, (g, w)) in got.iter().zip(&want).enumerate() {
+                assert!((g - w).norm() < 1e-5, "block pattern {pattern:?}, sample {k}: {g} vs {w}");
+            }
+        }
     }
 
     #[test]

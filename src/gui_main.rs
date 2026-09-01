@@ -4,7 +4,7 @@
 use anyhow::Result;
 use sdroxide_config::Settings;
 use sdroxide_radio::{
-    AudioParams, EngineConfig, IqSource, RadeWatch, StoreSync, TxGate, start_engine,
+    AudioParams, EngineConfig, IqSource, RadeWatch, StoreSync, TrSwitch, TxGate, start_engine,
 };
 use std::sync::Arc;
 use tracing::warn;
@@ -24,6 +24,7 @@ fn build_controller(
     gate: &Arc<TxGate>,
     sync: &Arc<StoreSync>,
     rade: &Arc<RadeWatch>,
+    tr: &Arc<TrSwitch>,
 ) -> LocalController {
     let (audio_out, audio_params) =
         match sdroxide_audio::start_output(settings.audio_output.as_deref(), 48_000) {
@@ -65,6 +66,7 @@ fn build_controller(
         tx_gate: Some(gate.clone()),
         store_sync: Some(sync.clone()),
         rade_watch: Some(rade.clone()),
+        tr_switch: Some(tr.clone()),
         record_iq: boot.record_iq.clone(),
     };
     let handles = start_engine(boot.source, boot.caps, cfg);
@@ -91,13 +93,17 @@ pub fn run_multi(
     let gate = Arc::new(TxGate::new());
     let sync = Arc::new(StoreSync::new());
     let rade = Arc::new(RadeWatch::new());
+    // The external T/R switch is one box in the antenna line, whichever radio
+    // is keying — so it is shared like the interlock above rather than opened
+    // once per radio.
+    let tr = Arc::new(TrSwitch::new());
 
     let mut tabs = Vec::new();
     for (i, boot) in radios.into_iter().enumerate() {
         let id = boot.id;
         let name = boot.name.clone();
         let enabled = boot.enabled;
-        let ctrl = build_controller(boot, settings, tx_ham_only, i == 0, &gate, &sync, &rade);
+        let ctrl = build_controller(boot, settings, tx_ham_only, i == 0, &gate, &sync, &rade, &tr);
         tabs.push(sdroxide_ui::RadioTab { id, name, enabled, ctrl: Box::new(ctrl) });
     }
 
@@ -107,6 +113,7 @@ pub fn run_multi(
     let factory_gate = gate.clone();
     let factory_sync = sync.clone();
     let factory_rade = rade.clone();
+    let factory_tr = tr.clone();
     let factory: sdroxide_ui::RadioFactory = Box::new(move || {
         let slot = sdroxide_config::create_radio("").map_err(|e| e.to_string())?;
         let settings = Settings::load();
@@ -147,6 +154,7 @@ pub fn run_multi(
             &factory_gate,
             &factory_sync,
             &factory_rade,
+            &factory_tr,
         );
         Ok(sdroxide_ui::RadioTab {
             id: slot.id,
@@ -171,6 +179,17 @@ pub fn run_multi(
             .with_app_id("sdroxide")
             .with_icon(sdroxide_ui::app_icon())
             .with_title("sdroxide"),
+        // On a first start there is no saved geometry, and where the window
+        // manager puts a window then is its own business — Windows cascades
+        // them, which on a screen barely wider than the window pushes the
+        // right-hand edge, and the Setup gear on it, off the display. Centred,
+        // the window is on the screen from the first frame;
+        // `MultiApp::fit_window` then deals with one that is bigger than the
+        // screen altogether (issue #234). Dropped once a position has been
+        // remembered — eframe applies this *after* restoring one, so
+        // `sdroxide_ui::event_loop::run` is what makes "first start" mean it
+        // (issue #256).
+        centered: true,
         ..Default::default()
     };
     // Engine threads are joined by each controller's `shutdown()` — on tab
@@ -383,6 +402,9 @@ pub fn run_remote(url: &str) -> Result<()> {
             .with_app_id("sdroxide")
             .with_icon(sdroxide_ui::app_icon())
             .with_title(format!("sdroxide — remote {url}")),
+        // Centred on a first start, for the reason the local window is — see
+        // `run` above (issues #234 and #256).
+        centered: true,
         ..Default::default()
     };
     // Connect inside the creator so the socket can wake the UI (repaint) the

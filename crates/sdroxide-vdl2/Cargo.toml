@@ -1,0 +1,38 @@
+[package]
+name = "sdroxide-vdl2"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# Native-only: the VDL Mode 2 decoder — the VHF datalink airliners exchange
+# ACARS over, on seven 25 kHz channels around 136.8 MHz. Not linked by the wasm
+# client — it runs server-side in the engine, off the raw I/Q, like the ADS-B
+# and ISM decoders. The types the panel draws live in `sdroxide-types`.
+#
+# No third-party VDL2 crate exists, and none of the Reed-Solomon crates on
+# crates.io take the parameters this needs: GF(256) with a first consecutive
+# root of 120, which is unusual enough that the popular ones hard-code 0 or 1.
+# So, like every other decoder in this tree, the whole stack is written from the
+# published standard -- ETSI EN 301 841-1 (the VDL Mode 2 SARPs, published as
+# ICAO Annex 10 Volume III Part I Chapter 6) for the physical and link layers,
+# ARINC 618 for the ACARS structure carried over them. Sources are cited per
+# module.
+#
+# Cross-checked against `szpajder/dumpvdl2`'s behaviour, but no code came from
+# it: dumpvdl2 is GPL-3.0 and a port would have been a licence event needing a
+# PROVENANCE.md.
+#
+# `sdroxide-ax25` is a dependency for one function. The AVLC frame check
+# sequence is CRC-16/X.25 -- reflected 0x8408, initialised 0xFFFF, residue
+# 0xF0B8 -- which is bit for bit what that crate already implements and tests
+# against catalogue values and a captured frame. Nothing else in it carries
+# over: AVLC has no flags, no bit stuffing, no NRZI, and an address format that
+# shares nothing with AX.25's.
+
+[dependencies]
+sdroxide-types.workspace = true
+sdroxide-dsp.workspace = true
+sdroxide-ax25.workspace = true
+num-complex.workspace = true
+crossbeam-channel.workspace = true
+tracing.workspace = true

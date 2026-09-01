@@ -37,6 +37,9 @@ pub struct HpsdrSource {
     /// connection run on undisturbed.
     board: Option<std::sync::Arc<HpsdrBoard>>,
     rx: Option<HpsdrRx>,
+    /// The connection's sample rate, kept here so a released source still
+    /// answers `IqSource::sample_rate` — see that method.
+    rate: f64,
     center: f64,
     /// See [`sdroxide_types::HpsdrConfig::ppm`].
     ppm: f64,
@@ -94,6 +97,7 @@ impl HpsdrSource {
             board.protocol()
         );
         Ok(HpsdrSource {
+            rate: board.sample_rate_hz(),
             center: center_hz,
             ppm: cfg.ppm,
             rx_scratch: Vec::new(),
@@ -115,8 +119,11 @@ impl HpsdrSource {
         })
     }
 
+    /// The connection's rate, remembered rather than asked for: it is fixed
+    /// when the board is opened, and [`IqSource::release`] lets the connection
+    /// go while the engine is still running on this source.
     pub fn sample_rate_hz(&self) -> f64 {
-        self.board.as_ref().map_or(0.0, |b| b.sample_rate_hz())
+        self.rate
     }
 
     pub fn board(&self) -> &str {
@@ -213,15 +220,29 @@ impl IqSource for HpsdrSource {
         self.rx.as_ref().is_none_or(|rx| rx.silent_for() >= SILENCE_BEFORE_REOPEN)
     }
 
-    /// Give this DDC's stream back ahead of a rebuild — and only the stream.
-    /// The connection is deliberately kept: another radio may be streaming its
-    /// own DDC over it, and even alone, an Apply with the address unchanged
-    /// should re-attach over the live connection (the registry will find it
-    /// through this very `Arc`) rather than re-open the board. The connection
-    /// stops when the last source holding it is dropped, which for a genuine
-    /// backend switch happens right after the replacement is adopted.
+    /// Give this DDC's stream back ahead of a rebuild — **and the connection
+    /// with it, unless another radio is still streaming its own DDC over it.**
+    ///
+    /// The connection used to be kept deliberately, so that an Apply with the
+    /// address unchanged re-attached over the live link rather than re-opening
+    /// the board. That saved a moment and cost the operator every setting they
+    /// had just changed: the sample rate, the front-end gain the board starts
+    /// at, the J16 filter board, the spectrum inversion, the PA switch and the
+    /// IO board's receive input are all connection-level — chosen in
+    /// `HpsdrBoard::open` and never revisited — so a live connection outliving
+    /// its last radio made an Apply that changed any of them do nothing at
+    /// all. That is the half of issue #135 the reporter saw on a Hermes-Lite 2:
+    /// a new sample rate only took effect after restarting sdroxide.
+    ///
+    /// Dropping the last `Arc` runs the connection's teardown before this
+    /// returns, so the replacement opens against a board that has already been
+    /// let go. A second radio holding its own `Arc` keeps the link up, and the
+    /// registry hands the replacement straight back to it — at the settings
+    /// that radio established, which is the documented rule for a shared
+    /// board.
     fn release(&mut self) {
         self.rx = None;
+        self.board = None;
     }
 
     /// Hand on the radio's own PTT line — a foot switch, a mic button, or

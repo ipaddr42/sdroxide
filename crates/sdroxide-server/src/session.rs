@@ -179,7 +179,9 @@ async fn run_session(
         ism_reports,
         ism_status,
         adsb_status,
+        vdl2_status,
         drm,
+        relay,
     ) = {
         let latest = shared.latest.lock().unwrap();
         (
@@ -200,7 +202,9 @@ async fn run_session(
             latest.ism_reports.clone(),
             latest.ism_status.clone(),
             latest.adsb_status.clone(),
+            latest.vdl2_status.clone(),
             latest.drm.clone(),
+            latest.relay.clone(),
         )
     };
     let ack = ServerMsg::HelloAck { proto: PROTO_VERSION, caps, state, rx_codec, tx_codec };
@@ -253,6 +257,11 @@ async fn run_session(
     if let Some(st) = adsb_status {
         let _ = socket.send(msg(&ServerMsg::AdsbStatus(st))).await;
     }
+    // ...and the VDL2 log, for the same reason: what has been said is a record,
+    // not an event that has already happened to somebody else.
+    if let Some(st) = vdl2_status {
+        let _ = socket.send(msg(&ServerMsg::Vdl2Status(st))).await;
+    }
     // And the transmit-image presets, for the same reason. The received
     // galleries are not replayed: a panel lists its store when it opens, which
     // is both authoritative and the only view that can be paged.
@@ -278,6 +287,12 @@ async fn run_session(
     // to see it immediately, and must not offer to start one that is running.
     if sat_track.is_some() {
         let _ = socket.send(msg(&ServerMsg::SatTrack(sat_track))).await;
+    }
+    // And the T/R switch, for the strongest version of the same reason: a relay
+    // that is not answering is the one standing condition here that a client
+    // needs to know about *before* it touches the PTT button.
+    if let Some(r) = relay {
+        let _ = socket.send(msg(&ServerMsg::RelayStatus(r))).await;
     }
     // A standing condition rather than an event: whoever attaches next has to
     // know the radio is refusing tunes or reconnecting, not just whoever

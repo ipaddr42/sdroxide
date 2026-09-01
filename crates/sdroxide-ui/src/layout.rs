@@ -265,6 +265,53 @@ pub fn salted_id(ctx: &egui::Context, name: &str) -> egui::Id {
     }
 }
 
+/// How much of a screen's height to leave for whatever the desktop puts along
+/// its edge — a Windows taskbar, a dock, a panel.
+///
+/// The window manager reports the monitor, not the *work area*: winit has no
+/// portable way to ask for the second, so the allowance is a figure rather than
+/// a measurement. 48 points is the Windows taskbar at 100% scaling and about
+/// what a GNOME top bar plus a dock comes to; a desktop with nothing along its
+/// edges loses 48 points of a window it could have had, which is a good deal
+/// less than a desktop with a taskbar loses when the bottom of the window is
+/// underneath it.
+const DESKTOP_CHROME_H: f32 = 48.0;
+
+/// The inner size to shrink a window to so that the whole of it — title bar,
+/// borders and all — fits on the screen it is on, or `None` when it already
+/// does.
+///
+/// `monitor` is the screen in points, `outer` what the window occupies on it
+/// including its frame, and `inner` the drawing area inside that frame. All
+/// three are in the same units, which on a scaled display is the point: this is
+/// exactly the case it exists for. A first start on Windows asks for a
+/// 1280×800 window, and at 150% scaling the desktop is only 1280×720 points —
+/// so the window comes up wider and taller than the whole screen and the
+/// controls along its right-hand edge are simply not on the display (issue
+/// #234).
+///
+/// Never *grows* a window: an operator who has sized their window is not asking
+/// for it back. And never below `floor`, which is the window's own minimum —
+/// a screen too small for that is one where something has to be cut off, and
+/// cutting the window down to a stump would be worse than the overflow.
+pub fn fit_inner_size(
+    monitor: egui::Vec2,
+    outer: egui::Vec2,
+    inner: egui::Vec2,
+    floor: egui::Vec2,
+) -> Option<egui::Vec2> {
+    // What the window manager puts around the drawing area. Measured rather
+    // than assumed — it is a title bar on one desktop and nothing at all on
+    // another — and floored at zero, because a report where the outer rect is
+    // somehow the smaller of the two is not one to do arithmetic on.
+    let chrome = (outer - inner).max(egui::Vec2::ZERO);
+    let room = monitor - chrome - egui::vec2(0.0, DESKTOP_CHROME_H);
+    let want = egui::vec2(inner.x.min(room.x).max(floor.x), inner.y.min(room.y).max(floor.y));
+    // A point either way is a rounding difference, not a window that does not
+    // fit; resizing on one would put the window in a loop with its own report.
+    ((inner.x - want.x).abs() > 1.0 || (inner.y - want.y).abs() > 1.0).then_some(want)
+}
+
 /// A window width that fits the viewport, with a margin so the cut-corner
 /// border stays visible. egui persists window sizes, so without this a keyer
 /// opened at 600 pt on a desktop stays 600 pt wide on the phone that later
@@ -282,6 +329,43 @@ pub fn window_h(ctx: &egui::Context, want: f32) -> f32 {
 mod tests {
     use super::*;
     use eframe::egui::vec2;
+
+    /// Issue #234: on Windows a first start came up bigger than the screen and
+    /// the controls along the right-hand edge — the Setup gear among them —
+    /// were off the display.
+    #[test]
+    fn a_window_bigger_than_its_screen_is_brought_back_onto_it() {
+        let floor = vec2(800.0, 500.0);
+        // A 1280x800 window on a 1920x1080 screen at 150% scaling: the desktop
+        // is 1280x720 points, so the window is exactly as wide as the whole
+        // screen and 80 points taller than it — plus a title bar.
+        let got =
+            fit_inner_size(vec2(1280.0, 720.0), vec2(1288.0, 831.0), vec2(1280.0, 800.0), floor);
+        assert_eq!(got, Some(vec2(1272.0, 641.0)), "chrome and the taskbar both come off");
+        // A window that already fits is left exactly as the operator sized it.
+        assert_eq!(
+            fit_inner_size(vec2(1920.0, 1080.0), vec2(1288.0, 831.0), vec2(1280.0, 800.0), floor),
+            None
+        );
+        // …including one that fits with nothing to spare.
+        assert_eq!(
+            fit_inner_size(vec2(1288.0, 879.0), vec2(1288.0, 831.0), vec2(1280.0, 800.0), floor),
+            None
+        );
+        // Never below the window's own minimum: a screen too small for that is
+        // one where something has to be cut off either way, and a stump of a
+        // window is the worse of the two.
+        assert_eq!(
+            fit_inner_size(vec2(640.0, 480.0), vec2(1288.0, 831.0), vec2(1280.0, 800.0), floor),
+            Some(floor)
+        );
+        // A desktop with no window frame at all (a tiling compositor, a
+        // borderless window) still has the edge allowance taken off.
+        assert_eq!(
+            fit_inner_size(vec2(1366.0, 768.0), vec2(1280.0, 800.0), vec2(1280.0, 800.0), floor),
+            Some(vec2(1280.0, 720.0))
+        );
+    }
 
     #[test]
     fn viewports_land_in_the_tier_they_were_measured_for() {

@@ -1,11 +1,12 @@
 //! The persisted configuration that belongs to the *station* rather than to
 //! the screen in front of it.
 //!
-//! Six files, all written next to each other in the config directory and all
+//! Seven files, all written next to each other in the config directory and all
 //! owned by the engine: the network cockpit (`net.json`), the two built-in
 //! control servers (`rigctld.json`, `tciserver.json`), the WSJT-X UDP
 //! broadcast (`wsjtx.json`), the operator's satellite additions
-//! (`satellites.json`) and the antenna-rotator client (`rotator.json`).
+//! (`satellites.json`), the antenna-rotator client (`rotator.json`) and the
+//! external transmit/receive switch (`relay.json`).
 //!
 //! They are bundled into one announcement because they answer one question —
 //! "what is this station set up to do?" — and because a remote client has to
@@ -22,7 +23,8 @@
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    NetworkConfig, Region, RigctldConfig, RotatorConfig, SatConfig, TciServerConfig, WsjtxConfig,
+    NetworkConfig, Region, RelayConfig, RigctldConfig, RotatorConfig, SatConfig, TciServerConfig,
+    WsjtxConfig,
 };
 
 /// Everything the engine host persists on the station's behalf, as one
@@ -65,4 +67,15 @@ pub struct StationConfig {
     /// that disagrees with the radio. The largest field in this bundle by some
     /// way, but the bundle is sent on connect and on change, not in a loop.
     pub band_plan: crate::BandPlan,
+    /// The external T/R switch: the relay board or contact closure that gets
+    /// the SDR out of the way while the station transmits.
+    ///
+    /// Here rather than in `radio.json` because it is one box for the whole
+    /// station, in front of whatever this program happens to be receiving with
+    /// — the same argument the LimeRFE makes for being its own crate. On a
+    /// multi-radio station every engine reports whether it is on the air and
+    /// the switch follows all of them.
+    ///
+    /// Appended last, for the usual reason.
+    pub relay: RelayConfig,
 }

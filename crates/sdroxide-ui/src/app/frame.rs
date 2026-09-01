@@ -37,9 +37,25 @@ const STREAM_STALE_S: f64 = 1.0;
 /// did, and hang that far off the bottom of the window: ten points on a desktop,
 /// which the transcript quietly absorbed, and fourteen on a touched layout,
 /// which took the action buttons with it.
-fn digi_split(total: f32, divider_h: f32, fraction: f32) -> (f32, f32) {
+///
+/// `row_h` is the layout's own row height (`interact_size.y`), and it is what
+/// the panel's floor is built from. Every part of the panel that cannot be done
+/// without — its header, the station card, the two rows pinned to its bottom
+/// edge — is a chip, a button or a text field sized from that, and the touched
+/// layouts make each of them half again as tall. The 190 points this used to be
+/// was measured on a desktop, so on a 1366×768 screen (which is the tablet tier,
+/// touch metrics and all) the panel came up about fifty points short: the
+/// transcript's scroll area hit its own minimum, overflowed the allocation it
+/// had been given, and painted over the message row underneath — so the row
+/// that chooses what goes out next was simply not on the screen, with nothing
+/// to say it was missing (issue #231).
+fn digi_split(total: f32, divider_h: f32, fraction: f32, row_h: f32) -> (f32, f32) {
     let usable = (total - divider_h).max(0.0);
-    let min_panel = 190.0_f32.min(usable * 0.5);
+    // 170 points of fixed furniture plus four rows: measured against a 1290×724
+    // window, where 296 points is where the transcript stops being squeezed
+    // into less than its own scroll area will accept. Capped at 60% of the
+    // area so a floor can never leave the waterfall a sliver.
+    let min_panel = (170.0 + 4.0 * row_h.max(18.0)).min(usable * 0.6);
     let min_wf = 80.0_f32.min(usable * 0.5);
     let panel_h = (usable * fraction).clamp(min_panel, (usable - min_wf).max(min_panel));
     (usable - panel_h, panel_h)
@@ -191,6 +207,9 @@ impl eframe::App for SdroxideApp {
         }
 
         let mut cmds = Vec::new();
+        // A channel list chosen in the memories window: parsed here and sent
+        // to the engine, which owns the list and the numbering in it.
+        self.poll_chirp_import(&mut cmds);
         // The keyboard, the mouse buttons and the control surface belong to
         // the focused radio alone. In a split view every visible radio runs
         // this frame loop, and without the gate one arrow key would tune all
@@ -383,7 +402,12 @@ impl eframe::App for SdroxideApp {
             // are large enough to read on the waterfall. RIFP straddles the
             // dial rather than sitting above it, so its window is symmetric
             // and as wide as the profile's channel.
-            let (sub_lo, sub_hi) = if mode.is_adsb() {
+            let (sub_lo, sub_hi) = if mode.is_vdl2() {
+                // The whole datalink group, not a sub-band: seven channels
+                // spread over 325 kHz are all being read at once, and framing
+                // one of them would be a view of a sixth of what is happening.
+                (dial - 250_000.0, dial + 250_000.0)
+            } else if mode.is_adsb() {
                 // ADS-B is not worked inside a sub-band at all: a Mode S reply
                 // is megahertz wide and the decoder reads the whole receiver
                 // window. Framing it like a digital mode would zoom the
@@ -528,7 +552,12 @@ impl eframe::App for SdroxideApp {
             } else {
                 // The handle plus the gap the layout inserts on each side of it.
                 let divider = handle_h + 2.0 * ui.spacing().item_spacing.y;
-                digi_split(total, divider, self.view.digi_panel_fraction)
+                digi_split(
+                    total,
+                    divider,
+                    self.view.digi_panel_fraction,
+                    ui.spacing().interact_size.y,
+                )
             };
 
             // Scroll only while frames are actually arriving. The last frame is
@@ -541,7 +570,8 @@ impl eframe::App for SdroxideApp {
             if show_wf {
                 ui.allocate_ui(egui::vec2(width, wf_h), |ui| {
                     let pan =
-                        spectrum_view::WindowPan::of(self.caps.as_ref(), self.state.center_hz);
+                        spectrum_view::WindowPan::of(self.caps.as_ref(), self.state.center_hz)
+                            .with_outer(Some(self.zoom_out_window()), self.state.sample_rate);
                     spectrum_view::show_ext(
                         ui,
                         &mut self.view,
@@ -638,6 +668,8 @@ impl eframe::App for SdroxideApp {
                                     self.rf_paint_panel(ui, &mut cmds, panel_h);
                                 } else if mode.is_adsb() {
                                     self.adsb_panel(ui, &mut cmds, panel_h);
+                                } else if mode.is_vdl2() {
+                                    self.vdl2_panel(ui, &mut cmds, panel_h);
                                 } else if mode.is_aprs() {
                                     self.aprs_panel(ui, &mut cmds, panel_h);
                                 } else if mode.is_packet() {
@@ -720,7 +752,12 @@ impl eframe::App for SdroxideApp {
             } else {
                 let total = ui.available_height();
                 let divider = 7.0 + 2.0 * ui.spacing().item_spacing.y;
-                let (w, p) = digi_split(total, divider, self.view.digi_panel_fraction);
+                let (w, p) = digi_split(
+                    total,
+                    divider,
+                    self.view.digi_panel_fraction,
+                    ui.spacing().interact_size.y,
+                );
                 (w, p, true, true)
             };
             let width = ui.available_width();
@@ -732,7 +769,8 @@ impl eframe::App for SdroxideApp {
             if show_wf {
                 ui.allocate_ui(egui::vec2(width, wf_h), |ui| {
                     let pan =
-                        spectrum_view::WindowPan::of(self.caps.as_ref(), self.state.center_hz);
+                        spectrum_view::WindowPan::of(self.caps.as_ref(), self.state.center_hz)
+                            .with_outer(Some(self.zoom_out_window()), self.state.sample_rate);
                     spectrum_view::show_ext(
                         ui,
                         &mut self.view,
@@ -805,6 +843,7 @@ impl eframe::App for SdroxideApp {
         self.scanner_window(&ctx, &mut cmds);
         self.ism_window(&ctx, &mut cmds);
         self.adsb_setup_window(&ctx, &mut cmds);
+        self.vdl2_setup_window(&ctx, &mut cmds);
         self.rds_window(&ctx);
         self.drm_window(&ctx, &mut cmds);
         self.voice_window(&ctx, &mut cmds);
@@ -814,10 +853,10 @@ impl eframe::App for SdroxideApp {
         self.mail_window(&ctx, &mut cmds);
         self.mail_log_window(&ctx);
         self.spots_window(&ctx, &mut cmds);
+        self.public_sdrs_window(&ctx, &mut cmds);
         self.awards_window(&ctx);
         self.bands_window(&ctx);
         self.sat_window(&ctx, &mut cmds);
-        self.qo100_window(&ctx, &mut cmds);
         self.help.ui(&ctx);
         // Last, so it lands on top of everything else that opened this frame.
         self.oob_tx_window(&ctx);
@@ -1024,6 +1063,15 @@ impl SdroxideApp {
                             c.label
                         )));
                     }
+                    // A different interface on this radio: the stored zoom
+                    // was taken in another span and means nothing in this one.
+                    if self.view.adopt_driver(&c.driver) {
+                        tracing::debug!(
+                            target: "sdroxide::panadapter",
+                            driver = %c.driver,
+                            "new front end — refitting the panadapter window"
+                        );
+                    }
                     self.caps = Some(c);
                     // A session the far end accepted: whatever the link was
                     // doing, it is doing it again, so the next drop starts its
@@ -1229,6 +1277,7 @@ impl SdroxideApp {
                 RadioEvent::IsmReports(r) => self.ism_reports = r,
                 RadioEvent::IsmStatus(st) => self.ism_status = Some(st),
                 RadioEvent::AdsbStatus(st) => self.adsb_status = Some(st),
+                RadioEvent::Vdl2Status(st) => self.vdl2_status = Some(st),
                 RadioEvent::Qo100Status(st) => self.qo100_status = Some(st),
                 RadioEvent::SstvStatus(s) => {
                     // Adopt a *newly* detected RX mode for the next transmit, but
@@ -1322,6 +1371,10 @@ impl SdroxideApp {
                         self.rot_cfg_edit = c.rotator.clone();
                         self.rot_cfg_seeded = true;
                     }
+                    if !self.relay_seeded {
+                        self.relay_edit = c.relay.clone();
+                        self.relay_seeded = true;
+                    }
                     // Adopted on every announcement rather than seeded once:
                     // these are not dialog buffers the operator types into but
                     // the band plan the whole client draws with, and the
@@ -1343,6 +1396,7 @@ impl SdroxideApp {
                 RadioEvent::RotatorStatus { connected, az_deg, el_deg, error } => {
                     self.rotator_status = Some((connected, az_deg, el_deg, error));
                 }
+                RadioEvent::RelayStatus(st) => self.relay_status = *st,
                 RadioEvent::ImageSaved(e) => match e.kind {
                     sdroxide_types::ImageKind::Sstv => self.sstv.on_saved(e, &ctx),
                     sdroxide_types::ImageKind::Wefax => self.wefax.on_saved(e, &ctx),
@@ -1504,10 +1558,21 @@ impl SdroxideApp {
             show_memories,
             show_voice,
             caps,
+            wide_frame,
             ..
         } = self;
         // Read before the borrow below, which takes `self` apart.
         let rig_squelch = caps.as_ref().is_some_and(|c| c.commands_squelch);
+        // How far a bound zoom-out may go: the full-band lane where the front
+        // end has one, else its passband. Read here for the same reason
+        // `rig_squelch` is — after this the borrow has taken `self` apart.
+        let stated = caps.as_ref().map_or(0.0, |c| c.wide_span_hz);
+        let seen = wide_frame.as_ref().map(|f| (f.center_hz, f.span_hz));
+        let zoom_out = match (seen, stated > state.sample_rate) {
+            (Some((c, span)), _) if span.max(stated) > state.sample_rate => (c, span.max(stated)),
+            (None, true) => (state.center_hz, stated),
+            _ => (state.center_hz, state.sample_rate),
+        };
         let mut sink = crate::input::UiSink {
             view,
             help: &mut help.open,
@@ -1518,6 +1583,7 @@ impl SdroxideApp {
             voice: show_voice,
             speech: &mut speech_acts,
             rig_squelch,
+            zoom_out,
         };
         input.poll_pointer_and_keys(ctx, state, &mut sink, cmds);
         #[cfg(not(target_arch = "wasm32"))]
@@ -1580,6 +1646,8 @@ impl SdroxideApp {
             voice: show_voice,
             speech: &mut Vec::new(),
             rig_squelch,
+            // Releasing held keys never pans or zooms, so the passband will do.
+            zoom_out: (state.center_hz, state.sample_rate),
         };
         input.release_all(state, &mut sink, cmds);
     }
@@ -1637,13 +1705,16 @@ mod tests {
         for divider in [7.0f32, 17.0, 21.0] {
             for total in [120.0f32, 180.0, 200.0, 250.0, 277.0, 400.0, 900.0] {
                 for fraction in [0.2f32, 0.5, 0.82] {
-                    let (wf, panel) = digi_split(total, divider, fraction);
-                    assert!(wf >= 0.0 && panel >= 0.0, "negative split at {total}/{fraction}");
-                    let used = wf + panel + divider;
-                    assert!(
-                        used <= total + 0.01,
-                        "{total} pt tall, {fraction} panel, {divider} divider: asked for {used}"
-                    );
+                    for row_h in [18.0f32, 34.0] {
+                        let (wf, panel) = digi_split(total, divider, fraction, row_h);
+                        assert!(wf >= 0.0 && panel >= 0.0, "negative split at {total}/{fraction}");
+                        let used = wf + panel + divider;
+                        assert!(
+                            used <= total + 0.01,
+                            "{total} pt tall, {fraction} panel, {divider} divider, {row_h} rows: \
+                             asked for {used}"
+                        );
+                    }
                 }
             }
         }
@@ -1651,12 +1722,37 @@ mod tests {
 
     #[test]
     fn a_roomy_window_still_honours_the_fraction_and_the_floors() {
-        let (wf, panel) = digi_split(900.0, 7.0, 0.5);
+        let (wf, panel) = digi_split(900.0, 7.0, 0.5, 18.0);
         assert!((panel - (893.0 * 0.5)).abs() < 0.01, "panel {panel} ignored the fraction");
         assert!(wf >= 80.0, "waterfall {wf} below its floor");
         // Dragged all the way down, the waterfall keeps its 80 pt minimum.
-        let (wf, panel) = digi_split(900.0, 7.0, 0.99);
+        let (wf, panel) = digi_split(900.0, 7.0, 0.99, 18.0);
         assert!(wf >= 80.0, "waterfall {wf} squeezed out");
-        assert!(panel >= 190.0, "panel {panel} below its floor");
+        assert!(panel >= 242.0, "panel {panel} below its floor");
+    }
+
+    /// Issue #231: a 1366×768 screen is the *tablet* tier — touch metrics, rows
+    /// half again as tall — and the panel's floor was a figure measured on a
+    /// desktop. Fifty points short is all it takes: the transcript is handed
+    /// less than its own scroll area will accept, overflows what it was given,
+    /// and paints over the message row underneath.
+    #[test]
+    fn a_touched_layout_gets_a_taller_floor_under_the_panel() {
+        // The window in the report: 1290×724, of which the digital area is 609
+        // and the divider 21.
+        let (_, desktop) = digi_split(609.0, 21.0, 0.46, 18.0);
+        let (wf, touch) = digi_split(609.0, 21.0, 0.46, 34.0);
+        assert!(touch > desktop, "the touched layout needs the taller floor");
+        assert!(touch >= 295.0, "{touch} still squeezes the transcript out of its own minimum");
+        assert!(wf >= 80.0, "waterfall {wf} squeezed out to pay for it");
+        // A window with room to spare is untouched: the floor is a floor, not a
+        // share.
+        let (_, roomy) = digi_split(900.0, 21.0, 0.46, 34.0);
+        assert!((roomy - (879.0 * 0.46)).abs() < 0.01, "the fraction still decides {roomy}");
+        // And the floor can never take more than three fifths of the area,
+        // however tall the rows: a waterfall is what the operator is watching.
+        let (wf, panel) = digi_split(300.0, 21.0, 0.2, 34.0);
+        assert!(panel <= 0.6 * 279.0 + 0.01, "floor {panel} ate the waterfall");
+        assert!(wf > 0.0);
     }
 }

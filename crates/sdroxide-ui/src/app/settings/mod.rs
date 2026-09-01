@@ -19,6 +19,7 @@ pub(in crate::app) mod controls;
 pub(in crate::app) mod general;
 pub(in crate::app) mod net;
 pub(in crate::app) mod radio;
+pub(in crate::app) mod relay;
 #[cfg(not(target_arch = "wasm32"))]
 pub(in crate::app) mod remote;
 pub(in crate::app) mod servers;
@@ -36,10 +37,11 @@ use self::net::{
 };
 use self::radio::{
     settings_airspy_tab, settings_airspyhf_tab, settings_cat_tab, settings_elad_tab,
-    settings_hackrf_tab, settings_hpsdr_tab, settings_hydrasdr_tab, settings_icomnet_tab,
-    settings_lime_tab, settings_pluto_tab, settings_rtlsdr_tab, settings_rtltcp_tab,
-    settings_rx888_tab, settings_sdrplay_tab, settings_smartsdr_tab, settings_soapy_devices,
-    settings_soapy_tab, settings_spyserver_tab, settings_tci_tab,
+    settings_fobos_tab, settings_hackrf_tab, settings_hpsdr_tab, settings_hydrasdr_tab,
+    settings_icomnet_tab, settings_kiwisdr_tab, settings_lime_tab, settings_pluto_tab,
+    settings_rtlsdr_tab, settings_rtltcp_tab, settings_rx888_tab, settings_sdrplay_tab,
+    settings_smartsdr_tab, settings_soapy_devices, settings_soapy_tab, settings_spyserver_tab,
+    settings_tci_tab,
 };
 #[cfg(not(target_arch = "wasm32"))]
 use self::remote::settings_remote_tab;
@@ -70,6 +72,14 @@ pub(in crate::app) enum SettingsTab {
     Uploads,
     Winlink,
     Servers,
+    /// The external transmit/receive switch: the relay that grounds the SDR's
+    /// antenna while the station transmits.
+    ///
+    /// A tab of its own rather than another section under `Servers`, where the
+    /// rotator lives. Two reasons: the panel is large — a channel table, the
+    /// sequencer's timings and a test button apiece — and this is the one page
+    /// in here whose being hard to find could cost somebody a front end.
+    TrSwitch,
     /// Dial another station. Native only: a browser client is already attached
     /// to the server that served it and has nowhere to put a second one.
     #[cfg(not(target_arch = "wasm32"))]
@@ -182,6 +192,8 @@ pub(in crate::app) struct SettingsIo<'a> {
     /// Ask the SDRplay API service for its device list. Brief and
     /// non-invasive, so it cannot disturb a running stream.
     sdrplay_rescan: &'a mut bool,
+    /// Re-enumerate the USB bus for Fobos SDRs. Opens nothing.
+    fobos_rescan: &'a mut bool,
     /// Re-run the SoapySDR enumeration. Opens nothing, but loads every
     /// installed module and asks each to scan, so it is not instant.
     soapy_rescan: &'a mut bool,
@@ -189,6 +201,7 @@ pub(in crate::app) struct SettingsIo<'a> {
     /// Connect to the Icom, report what it is, and disconnect (blocking).
     icomnet_test: &'a mut bool,
     spyserver_test: &'a mut bool,
+    kiwi_test: &'a mut bool,
     /// Copy the last Icom LAN session's trace to the clipboard.
     icomnet_copy_report: &'a mut bool,
     /// Listen for FlexRadio discovery broadcasts (a couple of seconds, blocking).
@@ -245,6 +258,10 @@ pub(in crate::app) struct SettingsIo<'a> {
     /// The rotctld *client* — the satellite lock steering a motorized antenna.
     rot_edit: &'a mut sdroxide_types::RotatorConfig,
     rot_apply: &'a mut bool,
+    relay_edit: &'a mut sdroxide_types::RelayConfig,
+    relay_apply: &'a mut bool,
+    /// Which contact the operator asked to hear, if any.
+    relay_test: &'a mut Option<u8>,
     /// Control-input bindings, plus the row (if any) waiting to capture a
     /// keypress. Persisted on close, since a rebind has no APPLY step.
     input_edit: &'a mut sdroxide_types::InputSettings,
@@ -385,6 +402,90 @@ pub(in crate::app) fn enum_combo<T: PartialEq + Copy>(
     });
 }
 
+/// The concrete interface types the user chooses between in the picker.
+/// SoapySDR only appears when compiled in; there is no auto-detect (an
+/// unavailable interface falls back to a null source so the user can
+/// reconfigure).
+///
+/// Built in whatever order the reasoning below groups them and sorted by
+/// label at the end: the list is long enough now that an operator looks
+/// for their radio by name rather than reading it through, and sorting
+/// means a backend added here needs no thought about where to put it. A
+/// free function (not inlined into the settings UI) so
+/// [`every_backend_but_auto_and_none_is_offered_in_the_picker`] can check it
+/// stays complete without going through the whole `egui` render path.
+fn iface_opts(soapy_supported: bool) -> Vec<sdroxide_types::Backend> {
+    let mut opts: Vec<sdroxide_types::Backend> = Vec::new();
+    if soapy_supported {
+        opts.push(sdroxide_types::Backend::Soapy);
+    }
+    opts.push(sdroxide_types::Backend::Hpsdr);
+    opts.push(sdroxide_types::Backend::Cat);
+    opts.push(sdroxide_types::Backend::Tci);
+    // Pure-Rust UDP, no system library — in every build variant, as TCI is.
+    opts.push(sdroxide_types::Backend::IcomNet);
+    opts.push(sdroxide_types::Backend::SmartSdr);
+    // Pure-Rust IIOD over TCP — no libiio, no libusb — so like the two USB
+    // backends below it is in every build variant.
+    opts.push(sdroxide_types::Backend::Pluto);
+    // Ungated, unlike SoapySDR: the RTL-SDR driver is pure Rust and needs
+    // no system library, so it is compiled into every build variant.
+    opts.push(sdroxide_types::Backend::RtlSdr);
+    // The same driver over a socket instead of the USB bus — pure Rust and
+    // std::net, so it is in every build variant too.
+    opts.push(sdroxide_types::Backend::RtlTcp);
+    // Pure Rust over std::net as well: any receiver somebody has published
+    // with spyserver, in either of the two shapes it can send.
+    opts.push(sdroxide_types::Backend::SpyServer);
+    opts.push(sdroxide_types::Backend::SpyServerVfo);
+    // Pure Rust over `ws://`, no TLS and no system library: the ~900
+    // public KiwiSDRs and Web-888s, and any private one on the same
+    // firmware.
+    opts.push(sdroxide_types::Backend::KiwiSdr);
+    // Same reasoning as the RTL-SDR: pure Rust over `nusb`, no system
+    // library, so it is in every build variant.
+    opts.push(sdroxide_types::Backend::Rx888);
+    // Same reasoning again: pure Rust over `nusb`, no libairspyhf and no
+    // system library, so it is in every build variant.
+    opts.push(sdroxide_types::Backend::AirspyHf);
+    // Same again, and a different radio from the HF+ above despite the
+    // name: an R2/Mini is other silicon behind another protocol.
+    opts.push(sdroxide_types::Backend::Airspy);
+    // A fork of the Airspy R2 rather than a relative of it, and its own
+    // interface for the same reason the two crates are separate: neither
+    // driver tunes the other's hardware correctly.
+    opts.push(sdroxide_types::Backend::HydraSdr);
+    // And again — pure Rust over `nusb`, no libhackrf. The only one of
+    // these USB backends that transmits, which is why it is the only one
+    // whose settings tab has a switch to arm before it will.
+    opts.push(sdroxide_types::Backend::HackRf);
+    // Also in every build variant, but for a different reason: nothing is
+    // linked at build time — the vendor's sdrplay_api library is found
+    // with dlopen at runtime, and opening explains what to install when
+    // it is absent.
+    opts.push(sdroxide_types::Backend::SdrPlay);
+    // Pure Rust over `nusb` again, so it is in every build variant. On an
+    // FDM-DUO this one interface covers the whole radio — the USB receiver,
+    // the CAT serial link and the transmit sound card — which is why it is
+    // here rather than under CAT / Audio.
+    opts.push(sdroxide_types::Backend::Elad);
+    // The one interface here that needs a library installed rather than
+    // shipping its own driver — LimeSuite, found by dlopen at runtime, so
+    // this still builds and runs everywhere and merely finds nothing where
+    // the library is absent. Offered unconditionally for that reason: a
+    // greyed-out entry would not say what to install.
+    opts.push(sdroxide_types::Backend::Lime);
+    // Also in every build variant, and for the same reason as SdrPlay
+    // above: libfobos is LGPL and open source, but still found with
+    // dlopen at runtime rather than linked, so nothing here needs it
+    // installed to build or to see this entry — only to open it.
+    opts.push(sdroxide_types::Backend::Fobos);
+    // Case-folded so HackRF lands under H beside HPSDR rather than after
+    // it, which a byte-order sort would do.
+    opts.sort_by_key(|b| b.label().to_ascii_lowercase());
+    opts
+}
+
 /// The device list an interface draws itself from, where asking for it is
 /// free: a USB enumeration that opens nothing, a sound-card list, or the
 /// SDRplay service's own device table.
@@ -406,6 +507,7 @@ fn free_device_probe(backend: sdroxide_types::Backend) -> Option<sdroxide_types:
         B::HackRf => P::HackRf,
         B::SdrPlay => P::SdrPlay,
         B::Elad => P::Elad,
+        B::Fobos => P::Fobos,
         _ => return None,
     })
 }
@@ -455,6 +557,7 @@ impl SdroxideApp {
             A::HydraSdr(d) => self.hydrasdr_devices = d,
             A::HackRf(d) => self.hackrf_devices = d,
             A::SdrPlay(d) => self.sdrplay_devices = d,
+            A::Fobos(d) => self.fobos_devices = d,
             A::Elad(d) => self.elad_devices = d,
             A::Lime(d) => self.lime_devices = d,
             // `Some` even when empty: "enumerated and found nothing" is a
@@ -464,6 +567,12 @@ impl SdroxideApp {
             A::Hpsdr(d) => self.hpsdr_devices = d,
             A::SmartSdr(d) => self.smartsdr_devices = d,
             A::Pluto(d) => self.pluto_devices = d,
+            A::Relays(d) => self.relay_devices = d,
+            // Not a device on this machine but a list from the internet,
+            // fetched by it — see `DeviceProbe::PublicSdrs`. Kept whole rather
+            // than merged so a refresh that came back short replaces the list
+            // instead of leaving stale receivers in it.
+            A::PublicSdrs(d) => self.public_sdrs = Some(*d),
             A::Test(kind, result) => self.set_test_outcome(kind, TestOutcome::Done(result)),
             // Straight to the clipboard, which is what the button that asked
             // for it promised — from here it goes into a bug report.
@@ -486,6 +595,7 @@ impl SdroxideApp {
             K::IcomNet => &mut self.icomnet_test_result,
             K::SmartSdr => &mut self.smartsdr_test_result,
             K::Pluto => &mut self.pluto_test_result,
+            K::Kiwi => &mut self.kiwi_test_result,
         };
         *slot = Some(outcome);
     }
@@ -519,6 +629,10 @@ impl SdroxideApp {
             // list below is built rather than when somebody reaches for it.
             self.ask_device(ctx, sdroxide_types::DeviceProbe::Host);
             self.ask_device(ctx, sdroxide_types::DeviceProbe::SerialPorts);
+            // The switching hardware, for the T/R switch's picker. Non-invasive
+            // — nothing is opened — and asked here rather than when the tab is
+            // opened so the list is already there when it is.
+            self.ask_device(ctx, sdroxide_types::DeviceProbe::Relays);
             // Everything the *station* is set to — the network cockpit, the two
             // built-in servers, the WSJT-X broadcast and the satellites — was
             // seeded from `RadioEvent::StationConfig` and needs no query here:
@@ -602,10 +716,12 @@ impl SdroxideApp {
         let mut hydrasdr_rescan = false;
         let mut hydrasdr_copy_report = false;
         let mut sdrplay_rescan = false;
+        let mut fobos_rescan = false;
         let mut soapy_rescan = false;
         let mut tci_test = false;
         let mut icomnet_test = false;
         let mut spyserver_test = false;
+        let mut kiwi_test = false;
         let mut icomnet_copy_report = false;
         let mut smartsdr_discover = false;
         let mut smartsdr_test = false;
@@ -642,6 +758,9 @@ impl SdroxideApp {
         let mut wsjtx_apply = false;
         let mut rot_edit = self.rot_cfg_edit.clone();
         let mut rot_apply = false;
+        let mut relay_edit = self.relay_edit.clone();
+        let mut relay_apply = false;
+        let mut relay_test: Option<u8> = None;
         let mut input_edit = self.input.cfg.clone();
         let mut key_capture = self.input.key_capture;
         let mut midi_learn = self.input.midi_learn;
@@ -653,73 +772,8 @@ impl SdroxideApp {
         let mut bc_reload = false;
         let mut bc_refetch = false;
 
-        // The concrete interface types the user chooses between. SoapySDR only
-        // appears when compiled in; there is no auto-detect (an unavailable
-        // interface falls back to a null source so the user can reconfigure).
-        //
-        // Built in whatever order the reasoning below groups them and sorted by
-        // label at the end: the list is long enough now that an operator looks
-        // for their radio by name rather than reading it through, and sorting
-        // means a backend added here needs no thought about where to put it.
-        let mut iface_opts: Vec<sdroxide_types::Backend> = Vec::new();
-        if self.soapy_supported {
-            iface_opts.push(sdroxide_types::Backend::Soapy);
-        }
-        iface_opts.push(sdroxide_types::Backend::Hpsdr);
-        iface_opts.push(sdroxide_types::Backend::Cat);
-        iface_opts.push(sdroxide_types::Backend::Tci);
-        // Pure-Rust UDP, no system library — in every build variant, as TCI is.
-        iface_opts.push(sdroxide_types::Backend::IcomNet);
-        iface_opts.push(sdroxide_types::Backend::SmartSdr);
-        // Pure-Rust IIOD over TCP — no libiio, no libusb — so like the two USB
-        // backends below it is in every build variant.
-        iface_opts.push(sdroxide_types::Backend::Pluto);
-        // Ungated, unlike SoapySDR: the RTL-SDR driver is pure Rust and needs
-        // no system library, so it is compiled into every build variant.
-        iface_opts.push(sdroxide_types::Backend::RtlSdr);
-        // The same driver over a socket instead of the USB bus — pure Rust and
-        // std::net, so it is in every build variant too.
-        iface_opts.push(sdroxide_types::Backend::RtlTcp);
-        // Pure Rust over std::net as well: any receiver somebody has published
-        // with spyserver, in either of the two shapes it can send.
-        iface_opts.push(sdroxide_types::Backend::SpyServer);
-        iface_opts.push(sdroxide_types::Backend::SpyServerVfo);
-        // Same reasoning as the RTL-SDR: pure Rust over `nusb`, no system
-        // library, so it is in every build variant.
-        iface_opts.push(sdroxide_types::Backend::Rx888);
-        // Same reasoning again: pure Rust over `nusb`, no libairspyhf and no
-        // system library, so it is in every build variant.
-        iface_opts.push(sdroxide_types::Backend::AirspyHf);
-        // Same again, and a different radio from the HF+ above despite the
-        // name: an R2/Mini is other silicon behind another protocol.
-        iface_opts.push(sdroxide_types::Backend::Airspy);
-        // A fork of the Airspy R2 rather than a relative of it, and its own
-        // interface for the same reason the two crates are separate: neither
-        // driver tunes the other's hardware correctly.
-        iface_opts.push(sdroxide_types::Backend::HydraSdr);
-        // And again — pure Rust over `nusb`, no libhackrf. The only one of
-        // these USB backends that transmits, which is why it is the only one
-        // whose settings tab has a switch to arm before it will.
-        iface_opts.push(sdroxide_types::Backend::HackRf);
-        // Also in every build variant, but for a different reason: nothing is
-        // linked at build time — the vendor's sdrplay_api library is found
-        // with dlopen at runtime, and opening explains what to install when
-        // it is absent.
-        iface_opts.push(sdroxide_types::Backend::SdrPlay);
-        // Pure Rust over `nusb` again, so it is in every build variant. On an
-        // FDM-DUO this one interface covers the whole radio — the USB receiver,
-        // the CAT serial link and the transmit sound card — which is why it is
-        // here rather than under CAT / Audio.
-        iface_opts.push(sdroxide_types::Backend::Elad);
-        // The one interface here that needs a library installed rather than
-        // shipping its own driver — LimeSuite, found by dlopen at runtime, so
-        // this still builds and runs everywhere and merely finds nothing where
-        // the library is absent. Offered unconditionally for that reason: a
-        // greyed-out entry would not say what to install.
-        iface_opts.push(sdroxide_types::Backend::Lime);
-        // Case-folded so HackRF lands under H beside HPSDR rather than after
-        // it, which a byte-order sort would do.
-        iface_opts.sort_by_key(|b| b.label().to_ascii_lowercase());
+        // The concrete interface types the user chooses between.
+        let iface_opts = iface_opts(self.soapy_supported);
 
         let mut tab = self.settings_tab;
         let mut upload_tab = self.settings_upload_tab;
@@ -821,12 +875,14 @@ impl SdroxideApp {
                             hydrasdr_rescan: &mut hydrasdr_rescan,
                             hydrasdr_copy_report: &mut hydrasdr_copy_report,
                             sdrplay_rescan: &mut sdrplay_rescan,
+                            fobos_rescan: &mut fobos_rescan,
                             soapy_rescan: &mut soapy_rescan,
                             tci_test: &mut tci_test,
                             smartsdr_discover: &mut smartsdr_discover,
                             smartsdr_test: &mut smartsdr_test,
                             icomnet_test: &mut icomnet_test,
                             spyserver_test: &mut spyserver_test,
+                            kiwi_test: &mut kiwi_test,
                             icomnet_copy_report: &mut icomnet_copy_report,
                             smartsdr_copy_report: &mut smartsdr_copy_report,
                             pluto_discover: &mut pluto_discover,
@@ -863,6 +919,9 @@ impl SdroxideApp {
                             wsjtx_apply: &mut wsjtx_apply,
                             rot_edit: &mut rot_edit,
                             rot_apply: &mut rot_apply,
+                            relay_edit: &mut relay_edit,
+                            relay_apply: &mut relay_apply,
+                            relay_test: &mut relay_test,
                             input_edit: &mut input_edit,
                             key_capture: &mut key_capture,
                             midi_learn: &mut midi_learn,
@@ -952,6 +1011,16 @@ impl SdroxideApp {
             // The engine persists rotator.json when it (re)starts the client.
             cmds.push(Command::SetRotatorConfig(self.rot_cfg_edit.clone()));
         }
+        self.relay_edit = relay_edit;
+        if relay_apply {
+            // The engine persists relay.json when it (re)opens the switch — and
+            // refuses to reopen it mid-over, which is why this is an APPLY and
+            // not a write-through.
+            cmds.push(Command::SetRelayConfig(Box::new(self.relay_edit.clone())));
+        }
+        if let Some(channel) = relay_test {
+            cmds.push(Command::TestRelay { channel });
+        }
         self.sat_ui = sat_ui;
         if self.sat_cfg_seeded && sat_edit != self.sat_cfg_edit {
             // Written straight out, like the input bindings: there is no APPLY
@@ -998,6 +1067,9 @@ impl SdroxideApp {
         }
         if sdrplay_rescan {
             self.ask_device(ctx, P::SdrPlay);
+        }
+        if fobos_rescan {
+            self.ask_device(ctx, P::Fobos);
         }
         if soapy_rescan {
             // Loads every installed SoapySDR module and asks each to scan, so
@@ -1078,6 +1150,24 @@ impl SdroxideApp {
             } else {
                 let endpoint = block.endpoint();
                 self.ask_device(ctx, P::Test(T::SpyServer(endpoint)));
+            }
+        }
+        // The address typed in the dialog, like every other test here. A
+        // receiver behind the project's proxy answers on port 80 rather than
+        // 8073, so the endpoint is built from the config's own rule rather than
+        // by appending a default here.
+        if let (true, Some(cfg)) = (kiwi_test, &radio_edit) {
+            if cfg.kiwi.address.trim().is_empty() {
+                self.set_test_outcome(
+                    sdroxide_types::TestKind::Kiwi,
+                    TestOutcome::Done(Err(
+                        "enter the receiver's address first, or pick one from Public SDRs"
+                            .to_string(),
+                    )),
+                );
+            } else {
+                let endpoint = cfg.kiwi.endpoint();
+                self.ask_device(ctx, P::Test(T::Kiwi(endpoint)));
             }
         }
         if smartsdr_discover {
@@ -1321,6 +1411,7 @@ impl SdroxideApp {
             (SettingsTab::Uploads, "Uploads"),
             (SettingsTab::Winlink, "Winlink"),
             (SettingsTab::Servers, "Servers"),
+            (SettingsTab::TrSwitch, "T/R switch"),
         ];
         // Next to Servers: the two are the same subject from opposite ends —
         // what this station offers others, and where this screen goes.
@@ -1550,7 +1641,27 @@ impl SdroxideApp {
                     // lists — with nothing to choose from there is nothing to
                     // choose, so the row is a label until they can be had.
                     if io.can_probe {
-                        enum_combo(ui, "iface", &mut cfg.backend, io.iface_opts, Backend::label);
+                        // Chosen into a copy and applied through `set_backend`,
+                        // never straight into the field: the stated tuning
+                        // ranges belong to the interface they were typed for,
+                        // and moving a tab to another device has to leave them
+                        // behind with it. Issue #254 is what the field
+                        // assignment cost — a public SpyServer's 200-350 MHz
+                        // still clamping the dial after the tab was switched
+                        // back to an IC-9700 over the LAN.
+                        let mut chosen = cfg.backend;
+                        enum_combo(ui, "iface", &mut chosen, io.iface_opts, Backend::label);
+                        if chosen != cfg.backend {
+                            cfg.set_backend(chosen);
+                            // The two boxes below are showing what was typed
+                            // for the interface that has just been left. Reseed
+                            // them from the one now selected, or Apply would
+                            // write one radio's ranges onto another.
+                            *ranges = (
+                                sdroxide_types::format_freq_ranges(&cfg.freq_ranges_rx),
+                                sdroxide_types::format_freq_ranges(&cfg.freq_ranges_tx),
+                            );
+                        }
                     } else {
                         ui.label(backend.label()).on_hover_text(
                             "Waiting for the machine the radio is attached to. Its interface \
@@ -1860,6 +1971,7 @@ impl SdroxideApp {
                         ui,
                         &self.serial_ports,
                         io.radio_edit,
+                        self.caps.as_ref(),
                         &self.state.antenna_rx,
                         io.can_probe,
                         cmds,
@@ -1874,10 +1986,13 @@ impl SdroxideApp {
                     Backend::IcomNet => settings_icomnet_tab(
                         ui,
                         io.radio_edit,
+                        self.caps.as_ref(),
+                        &self.state.antenna_rx,
                         io.icomnet_test,
                         io.icomnet_copy_report,
                         &self.icomnet_test_result,
                         io.can_probe,
+                        cmds,
                     ),
                     Backend::SmartSdr => settings_smartsdr_tab(
                         ui,
@@ -1924,6 +2039,14 @@ impl SdroxideApp {
                         io.can_probe,
                         cmds,
                     ),
+                    Backend::KiwiSdr => settings_kiwisdr_tab(
+                        ui,
+                        io.radio_edit,
+                        io.kiwi_test,
+                        &self.kiwi_test_result,
+                        io.can_probe,
+                        cmds,
+                    ),
                     Backend::Rx888 => settings_rx888_tab(
                         ui,
                         &self.rx888_devices,
@@ -1931,6 +2054,7 @@ impl SdroxideApp {
                         io.rx888_rescan,
                         io.apply_iface,
                         io.can_probe,
+                        self.state.rx_freq_hz(),
                         cmds,
                     ),
                     Backend::Elad => settings_elad_tab(
@@ -2005,6 +2129,16 @@ impl SdroxideApp {
                         self.caps.as_ref(),
                         io.radio_edit,
                         io.sdrplay_rescan,
+                        io.apply_iface,
+                        io.can_probe,
+                        cmds,
+                    ),
+                    Backend::Fobos => settings_fobos_tab(
+                        ui,
+                        &self.fobos_devices,
+                        self.caps.as_ref(),
+                        io.radio_edit,
+                        io.fobos_rescan,
                         io.apply_iface,
                         io.can_probe,
                         cmds,
@@ -2724,6 +2858,18 @@ impl SdroxideApp {
                     io.rot_apply,
                 );
             }
+            SettingsTab::TrSwitch => {
+                relay::settings_relay_tab(
+                    ui,
+                    io.relay_edit,
+                    self.relay_seeded,
+                    &self.relay_status,
+                    &self.serial_ports,
+                    &self.relay_devices,
+                    io.relay_apply,
+                    io.relay_test,
+                );
+            }
             #[cfg(not(target_arch = "wasm32"))]
             SettingsTab::Remote => settings_remote_tab(
                 ui,
@@ -2961,7 +3107,9 @@ impl SdroxideApp {
             crate::chrome::checkbox(ui, &mut pan.mute_on_tx, "").on_hover_text(
                 "Silence receive audio while this radio is transmitting. On by default: with \
                  the receiver on the same antenna, or on this radio's I.F., what it hears \
-                 during an over is your own transmitter.",
+                 during an over is your own transmitter. Overs keyed at the radio itself — \
+                 the microphone's PTT, a foot switch, MOX — count too, as soon as the CAT \
+                 link says the rig has gone to transmit.",
             );
             ui.end_row();
 
@@ -2970,7 +3118,9 @@ impl SdroxideApp {
                 "Stop the panadapter and waterfall while this radio is transmitting. On by \
                  default: a transmitter painted across the whole span erases the band behind \
                  it. Turn it off to watch the band — or your own signal — through an over, \
-                 which is worth having with the receiver on a separate antenna.",
+                 which is worth having with the receiver on a separate antenna. Applies to \
+                 overs sdroxide keys: one keyed at the radio is received right through, so \
+                 the picture keeps running whatever this says.",
             );
             ui.end_row();
         });
@@ -3229,12 +3379,16 @@ impl SdroxideApp {
                 // its station to do that. Not offered for a radio lent out as
                 // somebody's panadapter, whose front end is the borrower's to
                 // hold — nor by a station that does not take the request.
+                //
+                // Lit while the radio is on, as the strip's copy of the switch
+                // is: the chip says which state the radio is in, and a chip
+                // wears the accent when what it says is in force (issue #253).
                 if chip.switchable
                     && chip.attached_to.is_none()
                     && self.radio_roster.len() > 1
                     && crate::chrome::chip(
                         ui,
-                        !chip.enabled,
+                        chip.enabled,
                         RichText::new(if chip.enabled { "ON" } else { "OFF" }).size(11.0),
                     )
                     .on_hover_text(if chip.enabled {
@@ -3306,8 +3460,10 @@ impl SdroxideApp {
                         .on_hover_text(only.hint())
                         .clicked()
                     {
-                        requests
-                            .push(crate::app::RadioTabRequest::Add { station: only.key.clone() });
+                        requests.push(crate::app::RadioTabRequest::Add {
+                            station: only.key.clone(),
+                            preset: None,
+                        });
                     }
                 }
                 // One destination, and it is somebody else's station — which is
@@ -3333,6 +3489,7 @@ impl SdroxideApp {
                             if ui.button(t.label()).on_hover_text(t.hint()).clicked() {
                                 requests.push(crate::app::RadioTabRequest::Add {
                                     station: t.key.clone(),
+                                    preset: None,
                                 });
                                 ui.close();
                             }
@@ -3506,5 +3663,38 @@ mod roster_order_tests {
         assert_eq!(reordered(&ids, 3, Some(0)), vec![3, 0, 1, 2], "to the front");
         assert_eq!(reordered(&ids, 0, None), vec![1, 2, 3, 0], "to the end");
         assert_eq!(reordered(&ids, 0, Some(3)), vec![1, 2, 0, 3], "into the middle");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::iface_opts;
+
+    /// A backend registered everywhere else (`Backend::ALL`, the `open_*`
+    /// dispatch in `src/main.rs`, its own settings tab) but never pushed
+    /// into this picker's own list is invisible in the UI despite every
+    /// other touchpoint being wired up — exactly what happened to Fobos:
+    /// `Backend::ALL.contains(&Backend::Fobos)` was true the whole time,
+    /// which is a different list, and asserting against it (as the
+    /// `sdroxide-types` test for `HydraSdr` does) gives no real coverage of
+    /// what the operator actually sees. This checks the list `iface_opts`
+    /// itself, the same slice `enum_combo` renders from.
+    #[test]
+    fn every_backend_but_auto_and_none_is_offered_in_the_picker() {
+        let opts = iface_opts(true);
+        for b in sdroxide_types::Backend::ALL {
+            if matches!(b, sdroxide_types::Backend::Auto | sdroxide_types::Backend::None) {
+                continue;
+            }
+            assert!(opts.contains(&b), "{b:?} is in Backend::ALL but missing from iface_opts");
+        }
+    }
+
+    /// SoapySDR is the one entry gated on compile-time support — dropped,
+    /// not just greyed out, when it isn't there to try.
+    #[test]
+    fn soapy_only_appears_when_supported() {
+        assert!(iface_opts(true).contains(&sdroxide_types::Backend::Soapy));
+        assert!(!iface_opts(false).contains(&sdroxide_types::Backend::Soapy));
     }
 }

@@ -16,7 +16,7 @@ or connects to a remote sdroxide server.
 1. [Feature overview](#1-feature-overview)
 2. [Basic operation](#2-basic-operation)
     - [2.21 QO-100 beacon calibration](#221-qo-100-beacon-calibration)
-3. [Digital modes (FT8, FT4, FT2, PSK31, RTTY, Olivia, THOR, FSQ, Hellschreiber, SSTV, RIFP, weather fax, JS8, RF Paint, WSPR, packet, APRS, ADS-B, NAVTEX)](#3-digital-modes)
+3. [Digital modes (FT8, FT4, FT2, PSK31, RTTY, Olivia, THOR, FSQ, Hellschreiber, SSTV, RIFP, weather fax, JS8, RF Paint, WSPR, packet, APRS, ADS-B, NAVTEX, VDL2)](#3-digital-modes)
 4. [Skimmers (CW, PSK, RTTY)](#4-skimmers)
 5. [ISM band decoder (315 / 345 / 433 / 868 / 915 MHz devices)](#5-ism-band-decoder)
 6. [Settings](#6-settings)
@@ -113,13 +113,18 @@ or connects to a remote sdroxide server.
 - **ISM band decoder** — reads the unattended 868 MHz traffic around you and
   lists each device with its readings in real units. See
   [ISM band decoder](#5-ism-band-decoder).
+- **Zoom out past the I/Q** — on a receiver that publishes a full-band
+  spectrum as well as its I/Q (a KiwiSDR, a SpyServer, an RX-888), the main
+  panadapter keeps widening past the streamed passband and draws those spans
+  from the full-band bins. See [§2.8](#28-the-display-and-fft-controls).
 - **QO-100 beacon calibration** — decodes the 10489.750 MHz narrowband beacon,
   measures how far your LNB has drifted, and writes the converter offset for
-  you. See [§2.21](#221-qo-100-beacon-calibration).
+  you. In the **SAT** window's QO-100 tab; see [§2.21](#221-qo-100-beacon-calibration).
 - **Many radio backends:** SoapySDR devices, OpenHPSDR (Hermes/Metis) Ethernet
   SDRs, a TCI server (ExpertSDR3/Thetis), a SmartSDR radio (FlexRadio
   FLEX-6000/8000), RTL-SDR, RX-888, Airspy HF+ and SDRplay RSP receivers over
-  USB, an Airspy R2 or Mini over USB, a HydraSDR RFOne over USB, a HackRF
+  USB, an Airspy R2 or Mini over USB, a HydraSDR RFOne over USB, a RigExpert
+  Fobos SDR over USB, a HackRF
   transceiver over USB, an RTL-SDR
   published over the network by
   `rtl_tcp`, a PlutoSDR, or a CAT-controlled radio with audio over a USB sound
@@ -184,7 +189,8 @@ window is shared with the digital operating panel.
 ![The top control bar modules](images/02-top-bar.jpg)
 
 The control-bar modules, left to right, are: Frequency, S-meter, Band/Mode,
-VFO, RIT/XIT, Receiver + Filter/Noise, Transmit (TX-capable rigs only), Display,
+VFO, RIT/XIT, Receiver + Filter/Noise, Rig (only on a radio with an aerial
+selector or a remote power switch), Transmit (TX-capable rigs only), Display,
 FFT, and System.
 
 ### 2.3 Tuning
@@ -494,6 +500,34 @@ mode. What is in the box never changes; only where the two rows are cut does.
   only what you hear; the FT8/FT4/FT2/PSK/RTTY decoders still receive the untouched
   signal, and a steady unmodulated carrier — a heterodyne — is treated as noise
   and suppressed. Any NR engine also forces WFM to mono — see **ST** below.)
+- **BIN** (CW and SSB) — **binaural** audio: the receive passband spread across
+  the two ears, so that a signal's *pitch* becomes a *direction*. Whatever sits
+  at the middle of the filter is in the middle of your head, anything above it
+  moves to the right, anything below it to the left, and tuning a station floats
+  it across from one ear to the other. Wear headphones: most of the effect is
+  the difference in arrival time between your two ears, which a pair of speakers
+  largely throws away.
+
+  In **CW** that separates a pile-up into several places you can attend to one
+  at a time, instead of one crowded note. In **SSB** a voice fills the passband
+  rather than sitting at a point in it, so stations do not separate that way —
+  but the noise still spreads across the image while the station stays in the
+  middle of it, which makes a long listen on a noisy band less tiring. The cost
+  is that the voice itself is spread out, low notes towards one ear and
+  sibilance towards the other; try it on a long session and see whether you like
+  it.
+
+  The image follows the *filter*, not the mode, so narrowing the passband
+  spreads the same left-to-right image across less of the band — and the same
+  note lands in a different ear in CW and in SSB, because the middle of a 500 Hz
+  CW filter and the middle of a 2.7 kHz voice filter are not the same frequency.
+  Nothing downstream can tell it is on: the decoders read the audio before this
+  stage, recordings are written from the same tap, and a remote client is sent
+  the mono downmix, which binaural leaves untouched.
+
+  The button greys out while the **sub receiver** is running, which claims the
+  right ear for a second receiver — an explicit second signal outranks an effect
+  on the first.
 - **ST** (WFM only) — broadcast **stereo**. It lights when the station's 19 kHz
   stereo pilot is locked, and needs nothing from you: mono and stereo stations
   are handled automatically, at the same volume, so there is no jump when one
@@ -623,12 +657,46 @@ panadapter: two vertical grip lines mark the filter's low and high edges (they
 brighten to orange when you can grab them). Drag an edge to widen or narrow the
 passband. The grips work on both the spectrum and the waterfall.
 
+In **AM, SAM, DSB and the FM modes** the two edges move together: the passband
+is a channel carved out about the carrier, both halves carry the same signal,
+and narrowing one alone would throw away half the audio while letting the
+interference on the other side straight through. So whichever grip you take
+sets the half width and the other edge mirrors it — which is also why every
+filter preset these modes offer is symmetric. In SSB, CW and the data modes the
+passband sits to one side of the carrier by definition and each edge stays
+yours to place on its own.
+
 The volume, AGC mode and manual gain, the squelch, the noise reduction and the
 decimation are remembered in `session.json` and restored the next time you
 start, along with the front end's own gain stages
 ([§6.2.1](#621-soapysdr-devices)). They are
 settings you arrive at by ear against your own antenna and noise floor, so
 sdroxide brings the receiver back up where you left it rather than on defaults.
+
+#### The RIG box: the radio's own aerial and power switches
+
+A transceiver with an aerial selector, or with a power switch sdroxide can
+reach over the control link, gets a **RIG** box of its own on the control bar —
+next to the receive controls on a desktop layout, and behind a **RIG** button in
+the menu strip on a narrow window. Like **DIV** and **SUB**, it appears only for
+hardware that has what it drives; a radio with one socket and no remote power
+never sees it.
+
+- **ANT** — the socket the radio is receiving on, as a button you click to step
+  to the next one: `ANT1` → `ANT2` → `ANT1` on an Icom, and round the ports of
+  an RSPdx or a LimeSDR in the same way. It is the radio's own setting, the same
+  one as the **ANT** button on its front panel, and it is remembered per band
+  like every other antenna choice in sdroxide — so this is the control for
+  *changing your mind*, and the band memory is what saves you from having to.
+- **PWR** — **ON** and **OFF** switch the radio itself, over the control link.
+  Not sdroxide's own on/off in the tab strip, which closes the interface and
+  leaves the radio running. Two buttons rather than a switch, because a radio
+  that is off answers nothing and there is no position to read back.
+
+Both are the same controls that live under **Settings → Radio**
+([§6.2.2](#622-cat-radios-serial-control--usb-audio)), where the longer explanation of
+what each one needs from the radio is; they are here so that changing bands and
+reaching for the other aerial do not mean opening a dialog.
 
 ### 2.8 The display and FFT controls
 
@@ -669,6 +737,13 @@ sdroxide brings the receiver back up where you left it rather than on defaults.
     the spectrum line.
   - **scroll** — how fast it scrolls. See
     [Waterfall scroll speed](#waterfall-scroll-speed) below.
+  - **DECODE LABELS** — mark every decoded station on the waterfall with its
+    callsign, at the frequency it was heard on, in FT8, FT4 and the other
+    slotted modes. On by default. A good opening puts thirty boxes across the
+    span twice a minute, over the very traces you are reading; switching them
+    off leaves the waterfall as the band alone, and the decode list beside it
+    still has every callsign. The CW skimmer's own boxes are separate — they
+    are switched under **SKIM**.
 
   The two SHOW switches are independent, so all four displays are available —
   spectrum only, waterfall only, both, or neither.
@@ -697,8 +772,30 @@ sdroxide brings the receiver back up where you left it rather than on defaults.
   crosshair and the frequency under the cursor, and **shift+drag** measures a
   span across it, both exactly as on the main waterfall. The button appears
   only on receivers that produce a full-band view — a direct-sampling front end
-  such as the RX-888; on an RTL-SDR, HPSDR or TCI radio the panadapter span is
-  all the hardware delivers — and the setting is remembered between sessions.
+  such as the RX-888, a KiwiSDR, a SpyServer; on an RTL-SDR, HPSDR or TCI radio
+  the panadapter span is all the hardware delivers — and the setting is
+  remembered between sessions.
+
+  On such a receiver the **main panadapter can be zoomed out into the strip's
+  window too**, past the I/Q the front end is streaming: keep zooming and it
+  goes on widening until it covers everything the strip does, drawing those
+  spans from the same full-band bins. That matters most where the I/Q is a
+  narrow window onto a wide band — a KiwiSDR sends about 12 kHz of I/Q and a
+  picture of the whole 0–30 MHz, and without this the panadapter could only ever
+  show the 12 kHz. The picture coarsens at the moment it crosses over, because
+  the full-band bins are all there is out there; zoom back in and the I/Q's own
+  resolution returns. A window too narrow for those bins to resolve is never
+  drawn from them — a KiwiSDR's are 29 kHz apiece, and a few kilohertz pooled
+  out of one of them would be a flat line — so the I/Q keeps the picture
+  wherever it has anything to say.
+
+  Zooming back in **somewhere else** brings the receiver with you. On these
+  front ends the panadapter is the receiver — there is no looking without
+  listening — so a zoom onto a signal you spotted while zoomed out is read as a
+  request to hear it, exactly as clicking the strip would be. Without that the
+  panadapter would go on drawing from the coarse full-band bins however far in
+  you zoomed, because out there those really are the only bins covering what you
+  are looking at. Panning about while still zoomed out never retunes anything.
   The strip is not shown in the digital modes, whose layout gives the height to
   the operating panel instead.
 - **FIT** — keep the waterfall floor and ceiling set for the best contrast.
@@ -982,6 +1079,13 @@ the receiver measures the signal in its own passband, calibrated to dBm by
 > then on. It is one number for the station, so where two radios differ, set it
 > for the one you judge signals on. Changing the front end's gain moves the
 > reading with it, exactly as an attenuator ahead of a real receiver would.
+>
+> The same applies with a knob more in the way when the I/Q arrives over a
+> virtual audio cable from another program (PowerSDR, HDSDR): what the meter
+> measures is the level that program is writing into the cable, which it has
+> already put through its own gain and AGC. A reading tens of dB above the S
+> meter in the program feeding it is that offset and not a fault — set
+> `cal_offset_db` to the difference and the two agree.
 
 A **CAT rig on a sound card** sends audio it
 has already demodulated and levelled, so there is nothing left on this side to
@@ -1209,6 +1313,16 @@ frequency. The filter follows the mode: change the mode and the channel takes
 the new mode's default passband, leave the mode alone and a filter you chose
 yourself is kept.
 
+On a receiver with more than one antenna port the editor has an **antenna**
+drop-down as well: which socket this channel is listened to on. Storing a memory
+captures whichever socket the radio was on at the time, and this is where you
+say it should have been another — the wire for a 40 m net, the beam for a 2 m
+repeater. The dash (**—**) is not the first port: it means *leave the antenna
+alone*, and it is what every channel stored on a single-socket receiver holds,
+so working down a list that never mentioned antennas never moves a relay. The
+socket is shown in square brackets at the end of the row. A receiver with one
+antenna has nothing to choose and gets no drop-down.
+
 The editor also carries a **RPT** button, which folds out the repeater set-up
 stored with the channel: the shift and its offset, the CTCSS tone or DCS code
 to transmit, and whether every over opens on the 1750 Hz burst. A channel that
@@ -1222,6 +1336,34 @@ are read as plain simplex with no tone, because that is what the list is
 showing you. The list shows what is stored beside the mode, so two memories on
 one dial read as the different channels they are. See
 [2.18 Repeater operation](#218-repeater-operation-duplex-and-tone).
+
+#### Importing and exporting a channel list
+
+**IMPORT** reads a channel list from a **CHIRP CSV** file (`.csv`) — the format
+CHIRP writes and the one every repeater directory hands out. RepeaterBook
+exports it by county, most national societies publish their machine lists in it,
+and the marine, PMR and aviation channel tables circulate as it too, so a list of
+local repeaters is usually one download away rather than four hundred stores.
+
+Each channel brings its frequency, its mode, the repeater shift and offset, and
+the CTCSS tone or DCS code to transmit. A channel already on the list — same
+frequency, same mode — is skipped, so re-importing an updated directory adds what
+is new instead of doubling what is not; the names of the channels you already
+have are left alone. A line the file's own format cannot account for (a blank
+row, a trailing note, a frequency that is not a number) is skipped and counted
+rather than failing the import, and the network log at the bottom of the window
+says how many channels were read and how many lines were not.
+
+The columns are matched by *name*, from the file's header row, so a file that
+carries only some of them or carries them in another order still reads. A file
+with no header row is refused — its first line would be a real channel, and
+mistaking one for a heading would silently lose it.
+
+**EXPORT** writes the list back out in the same format, to load into a handheld
+or to keep as a backup. Not everything survives the trip: CHIRP's format has no
+place for a folder, an RTTY modem setup or an antenna socket, and its `Mode`
+column is the *modulation*, so a channel stored in a digital mode exports as the
+sideband it rides on. The frequency, the name, the shift and the tone all do.
 
 The **Sort** row above the list says what order it is drawn in — **Stored** (as
 stored, the historic order), **Name** (ignoring case), **Freq**, or **Band**
@@ -1268,6 +1410,51 @@ megahertz at once, so the radio moves one span at a time and reads every channel
 in that span together — the whole of 2 m in well under a second. A CAT rig
 feeding demodulated audio has no such span, so it falls back to visiting
 channels one at a time, and behaves like the handheld.
+
+**A memory scan stops on each channel in its own set-up.** Stopping on a
+channel sets the mode, the filter and the **DUPLEX and TONE** stored with it, so
+a scan across a mixed list leaves you on a repeater channel with its shift and
+tone on and on a simplex one with both off. That matters more here than on a
+recall, because a scan hands you whichever channel called and you answer it by
+reaching straight for the PTT — a shift left standing from the last stop would
+put the over 600 kHz away from the station calling you. A channel stored before
+the set-up existed counts as plain simplex with no tone, exactly as a recall
+reads it ([2.12](#212-memory-channels)). The antenna is the one thing a stop
+does not touch, unlike a recall: a scan is not worth a relay per channel.
+
+**A memory scan can be pointed at chosen folders.** With folders in use
+([2.12](#212-memory-channels)) a **Folders** row appears above the channel list:
+**ALL**, then one button per folder with the number of channels in it, and
+**Unfiled** for the top level. Pick one or several and the scan runs over those
+alone — the marine channels while you are on the water, the local repeaters
+while you are not — and the list below narrows to the channels it will actually
+visit, so what you are looking at is what the scan will do. **ALL** is not every
+button lit: it means *no selection*, which is also where a folder you make
+tomorrow lands, so a new folder is scanned rather than silently left out. A
+folder you delete drops out of the selection with it, since its channels are
+back at the top level by then. The row is not drawn at all until there is a
+folder to choose.
+
+**FAST reads the list off the spectrum.** A memory scan normally does what a
+handheld does: tune to each channel, listen, move on — a settling time apiece,
+so a hundred channels is fifteen seconds a lap. Press **FAST** and a receiver
+with I/Q of its own instead puts every channel that falls inside one window on
+the same transform the panadapter is already made from, and only tunes to the
+ones something is on. A list that fits in one window then costs *one* tune a
+lap however long it is, and a list spread over four bands costs four. The scan
+still listens on each candidate before it stops, so what makes it stop is
+unchanged.
+
+It is off by default and worth knowing why. The sweep measures a channel
+through the FFT rather than through the receiver's own filter and AGC, so a
+**Stops at** level that was right for the slow scan is not automatically right
+for this one — if a fast scan stops on nothing, raise it; if it stops
+everywhere, lower it. Two kinds of channel are never judged from the sweep at
+all and always get a listen: one out at the edge of the window, where the
+anti-alias filter makes everything read low, and one sitting exactly on the
+receiver's centre, where a zero-IF front end's own local oscillator is. A CAT
+rig feeding demodulated audio has no spectrum to read, so the button is greyed
+there and its memory scan visits every channel as before.
 
 **Stops at** is how loud a channel has to be. Either give a level directly, or
 press **SQL** to use the receiver's own squelch, which makes the scan stop
@@ -1484,6 +1671,13 @@ lock on, and every voice and digital mode works through it with Doppler
 corrected continuously. The button glows green while a lock is running, because
 the correction keeps being applied whether or not the window is open.
 
+The window has two tabs. **SATELLITES** is the picker and the live lock
+described below. **QO-100** is the beacon calibration
+([2.21](#221-qo-100-beacon-calibration)) — a geostationary bird needs no
+Doppler, but it does need its LNB offset measured, and that is the whole of
+working it. Either tab carries a dot while its own work is running, and the
+**SAT** button glows for both.
+
 **The picker** lists every satellite the station tracks — the amateur group
 subscription, anything you pasted into the TLE tab
 ([6.10](#610-tle-satellites-and-their-frequencies)), and the curated set — with
@@ -1664,19 +1858,20 @@ scanning. Besides its name, each tab carries:
   background radio still fills its FT8 list and still spots.
 - **⊞** — open this radio in a split view of its own, or close the one it
   has (see below).
-- **ON / OFF** — switch the radio itself on or off (see below).
+- **ON / OFF** — switch the radio itself on or off (see below). The chip is lit
+  while the radio is on, like every other chip in the program.
 
 Closing a radio is deliberately *not* on the strip — that lives in
 **Settings → Radio**, behind a dialog rather than one stray click away.
 
 **Switching a radio off.** A station does not always have every radio it is set
 up for plugged in. Each tab carries a switch that says which state its radio is
-in — **ON** or **OFF** — and pressing it changes that state. Switched off, the
-radio's interface is closed: no device claimed, no CAT port held, no network rig
-dialled, and no reconnecting in the background. Everything it is configured as
-stays exactly where it is. The tab stays too, with its name greyed, and its
-whole Settings → Radio page is still there to be read and edited. Press the
-switch again and the radio opens where it left off.
+in — **ON**, lit, or **OFF**, dark — and pressing it changes that state.
+Switched off, the radio's interface is closed: no device claimed, no CAT port
+held, no network rig dialled, and no reconnecting in the background. Everything
+it is configured as stays exactly where it is. The tab stays too, with its name
+greyed, and its whole Settings → Radio page is still there to be read and
+edited. Press the switch again and the radio opens where it left off.
 
 It is *sdroxide's* switch rather than the radio's, and the difference matters
 on a station with more than one rig on it. What it lets go of is this end of
@@ -1852,7 +2047,8 @@ not, which on 70 cm (a 7.6 MHz shift in Region 1) it never is.
 > **NOTE:** The built-in shifts are transcribed from published band plans and
 > have not been checked against a repeater. They cover the sub-bands whose
 > shift is settled across a whole region — 10 m, 6 m and 4 m in Region 1, 2 m
-> and 70 cm in all three, 1.25 m and 33 cm in Region 2, 23 cm — and say nothing
+> and 70 cm in all three (in Regions 2 and 3 alike, outputs above 147 MHz take
+> their inputs 600 kHz *up*), 1.25 m and 33 cm in Region 2, 23 cm — and say nothing
 > anywhere else, deliberately: a missing entry leaves you simplex, which is
 > obvious the moment nobody comes back, while a wrong one transmits confidently
 > onto somebody else's channel. Set the region under
@@ -1864,13 +2060,17 @@ moving the radio's dial for the length of the over — the same way RIT, XIT and
 split do on a rig whose VFO is its whole frequency control — so the radio's own
 duplex setting has to be off, or the two would be added together and the over
 would go out a shift away from where you asked for it. sdroxide therefore puts
-an Icom back to simplex whenever the dial moves to another band.
+an Icom back to simplex whenever the dial moves — on HF once per band, and on
+VHF and up every time the dial moves at all, including into the transmit
+frequency at the start of an over.
 
-That matters on a radio that remembers a duplex setting per band, which an
-IC-9700 does: switching to 70 cm or 23 cm recalls whatever that band was last
-left on, normally DUP−, and before this the SIMPLEX button on screen could not
-take it off again. Set the shift here rather than on the radio; the radio's own
-DUP button will be overridden the next time you change band.
+That matters on a radio that puts a duplex setting back by itself. An IC-9700
+remembers one per band, so switching to 70 cm or 23 cm recalls whatever that
+band was last left on, normally DUP−; and the auto-repeater function fitted to
+several regional versions arms on the *frequency*, so simply tuning from one
+2 m channel to the next puts a shift back without ever crossing a band edge.
+Set the shift here rather than on the radio; the radio's own DUP button will be
+overridden the next time the dial moves.
 
 #### The tone — TONE
 
@@ -2201,10 +2401,12 @@ edge, at **10489.750 MHz**, that transmits AO-40 telemetry as 400 baud
 Manchester BPSK. Every ground station receives that beacon through an LNB, whose
 local oscillator is only roughly on frequency and drifts with temperature — so
 the dial and the signal disagree by a few kHz, and by different amounts on a
-cold morning and a warm afternoon. The **QO100** button in the System module
-opens a window that decodes the beacon, measures exactly how far it is from
-10489.750 MHz, and offers to write that figure into the converter/LNB offset in
-one click.
+cold morning and a warm afternoon. The **QO-100** tab of the **SAT** window
+([2.16](#216-satellite-operation-sat)) decodes the beacon, measures exactly how
+far it is from 10489.750 MHz, and offers to write that figure into the
+converter/LNB offset in one click. It lives there because QO-100 is a
+satellite — a geostationary one, which is why it needs no Doppler correction
+and why its calibration is the only thing it does need.
 
 **In brief.** With an LNB or converter offset set up in the receiver for the
 QO-100 (Es'hail-2) geostationary satellite, the decoder searches a few kHz
@@ -2219,13 +2421,15 @@ in SDR Console.
 > It needs a true IQ source and is unavailable when a CAT radio is feeding
 > demodulated audio.
 
-#### What the window shows
+#### What the page shows
 
 - **ON / OFF** starts the decoder. It reads the raw IQ straight from the
   hardware, so it works regardless of where the main dial is pointed, as long as
   the beacon is inside the span the receiver is delivering — turning it on also
-  tunes VFO A to 10489.750 MHz as a convenience, nothing more. Like SCAN and
-  SAT, the button stays lit whenever the decoder is running, window open or not.
+  tunes VFO A to 10489.750 MHz as a convenience, nothing more. Like SCAN and a
+  satellite lock, the **SAT** chip stays lit whenever the decoder is running,
+  window open or not, and the QO-100 tab carries a dot — so a hunt in progress
+  is visible from the other tab as well as from outside the window.
   It is greyed out only if the receiver's own configuration says 10489.750 MHz
   is unreachable — the usual cause is that no converter/LNB offset has been set
   up yet (**Settings ▸ Radio ▸ Converter**).
@@ -2774,6 +2978,18 @@ are the two RS values that went over the air rather than the signal-to-noise
 ratios behind them, the serial numbers land in ADIF's `STX` and `SRX`, and the
 exchanges whole in `STX_STRING` and `SRX_STRING`. The six-character locator
 becomes the station's grid, so the map and the distance get the better answer.
+
+> **The FT8 exchange takes a second decoding pass, so it only runs with the
+> contest selected.** The 77-bit layout the exchange rides in is one the FT8
+> decoder underneath sdroxide does not know how to write out, and it discards
+> what it cannot write — so the exchange used to decode correctly and then be
+> thrown away before anything could see it, in FT8 and only in FT8 (FT4 and FT2
+> take a different path and were never affected). sdroxide now runs a second
+> pass over each slot that keeps exactly that layout and nothing else. It costs
+> about what the ordinary decode costs, which is why it runs only while
+> **Contest** is set to **EU VHF Contest**: switch the contest on to *hear*
+> contest exchanges, not only to send them. A four-character grid is no
+> obstacle to hearing them — it only stops you sending the exchange.
 
 > Only EU VHF is implemented. WSJT-X offers five other special operating
 > activities — ARRL Field Day, the RTTY Roundup, NA VHF, WW Digi and ARRL Digi —
@@ -4185,6 +4401,183 @@ than hidden, because half a gale warning has to look like half a gale warning.
 sideband. Off is upper sideband on the channel, which is what every published
 tuning instruction for the service says.
 
+---
+
+### 3.15 VDL2 (what the aircraft are saying)
+
+Choose **VDL2** from the end of the **DIGITAL** row. VHF Data Link Mode 2 is the
+datalink airliners and ground stations exchange ACARS over — company messages,
+position reports, weather requests, fuel and arrival figures, and the link
+management that carries them — on seven 25 kHz channels around 136.8 MHz.
+
+**Receive only.** These are commercial aeronautical channels. There is no
+transmit half of this panel and no callsign to set.
+
+**The frequency is chosen for you.** Selecting the mode tunes to 136.825 MHz,
+the middle of the group, and the decoder places its own window from there to
+take in as many of the seven channels as your receiver can reach. The
+**136.825** button in the panel header puts it back if you wander off.
+
+![SDRoxide in VDL2: the whole datalink group on the waterfall, the message log and the stations sending it](images/vdl2-panel.jpg)
+
+The waterfall above the panel is the whole group at once, so the transmissions
+are visible as short bright dashes on whichever channel carried them — which is
+worth a glance before reading a single counter, because a band with no dashes in
+it has nothing for any decoder to find.
+
+#### What you need
+
+**An antenna for the air band, outdoors and with a view.** This matters more
+than anything else on this page. VDL2 is line-of-sight VHF: an aircraft at
+cruise is receivable a couple of hundred kilometres away, and a ground station
+only as far as the horizon. An indoor wire will hear the FM broadcast band
+perfectly well and nothing at all up here — the two facts are not related, and
+the first is not evidence for the second. A quarter wave at 136.8 MHz is 55 cm.
+
+Turn any input attenuation **off**, and be careful with gain: the FM broadcast
+band 40 MHz below is enormous by comparison, and a tuner wound up to its limit
+will be overloaded by it rather than made more sensitive. If the whole air band
+rises together as you add gain, that is what has happened.
+
+**A stream of at least about 440 kHz.** The plan is 325 kHz wide, and a
+receiver's outer edges are where its own filter is rolling off, so a window has
+to be about a third wider than the plan to hold all of it:
+
+| Stream | What happens |
+| --- | --- |
+| below 34 kHz | Refused. There is not room for one channel. |
+| 34 – 440 kHz | Runs, and says which channels it cannot reach. The window slides to take in as many as it can. |
+| 440 kHz and up | All seven channels. |
+
+Almost any receiver clears the last row: an RTL-SDR at its default 2.4 Msps, an
+Airspy, a HackRF, an RX-888, a Pluto, an SDRplay. What matters far more is the
+aerial.
+
+#### The message log
+
+One line per frame decoded, newest at the bottom, the way a conversation is
+read.
+
+| Column | What it is |
+| --- | --- |
+| Time | When the frame was decoded, UTC. |
+| MHz | Which of the seven channels it arrived on. |
+| From → To | The two 24-bit addresses. For an aircraft this is its ICAO address — the same number its ADS-B squitters carry, so an aeroplane heard on both bands is recognisably one aeroplane. |
+| Type | The link control field: `I` for information (with its sequence numbers), `RR`/`REJ` and friends for flow control, `UI` for a broadcast, `XID` for link management. |
+| Message | The ACARS label and text, the kind of XID exchange, or — for a payload SDRoxide does not read — what it appears to be and how long. |
+
+Click a line to open the full card below it: every field, the signal figures,
+and the frame as hex. The filter box searches an address, a registration, a
+flight identification, an ACARS label or the message text, and it filters the
+station list beside it at the same time.
+
+**Colour says what kind of traffic it is.** Yellow is ACARS — the messages with
+words in them. Cyan is XID, which is aircraft and ground stations arranging
+links. Grey is a frame this pass does not read, or a supervisory frame with no
+payload at all.
+
+#### The station list
+
+One row per address heard, which is who is out there — a scrolling log makes
+that surprisingly hard to see on a busy channel.
+
+| Column | What it is |
+| --- | --- |
+| NAME | The flight identification, or the registration, or the address. The first two arrive only when the station sends an ACARS block, so a row showing an address is normal rather than broken. |
+| ADDR | The 24-bit address in hex. |
+| TYPE | `AIR` for an aircraft, `GND` for a ground station, `ALL` for a broadcast address. |
+| MSGS | Frames from this station this session. |
+| SIG | Signal-to-noise of the last one, dB. |
+| AGE | How long since anything was heard from it. |
+
+Clicking a row filters the log to that station.
+
+#### The channel strip and the counters
+
+The row under the header is the seven channels. Green means frames have come out
+of it, yellow means transmissions have been detected and none has decoded, and
+grey means it is not being listened to — hovering says which of the two reasons
+that is. The counters beside them are arranged in the order the decoder fails
+in, and the first one that stops counting names the problem:
+
+| Reading | What it means |
+| --- | --- |
+| no **bursts** | Nothing is rising above the noise. The aerial, or a receiver that is not looking here. |
+| bursts but no **sync** | Something is on these channels and it is not VDL2. |
+| sync but no frames, with **bad FCS** low | Real VDL2 arriving too damaged to repair — a weak signal or the wrong aerial. |
+| **bad FCS** climbing with frames | The error correction is working and something above it is not. That is SDRoxide's fault rather than the band's, and worth reporting. |
+| **RS fix** climbing | How many symbols the error correction is having to repair. A handful is healthy; a channel repairing several per frame is at the edge. |
+
+#### Setup
+
+**SETUP** in the panel header opens the decoder's own settings.
+
+| Setting | Default | What it does |
+| --- | --- | --- |
+| Channels | all seven | One downconverter each. Switching one off saves a little processor time; it does not make the others more sensitive. |
+| Burst threshold | 9 dB | How far above each channel's own learned noise floor a transmission has to rise before the decoder looks at it. Lower catches weaker signals and costs time spent on noise. |
+| Keep in the log | 500 messages | The oldest go first. |
+| Track at most | 300 stations | Likewise, longest-silent first. |
+| Forget a station after | 30 min | Aircraft can be quiet for a long cruise, so this is deliberately generous. |
+| Show unread payloads | on | See below. |
+
+#### What is decoded, and what is not
+
+**The link layer, in full.** Every AVLC frame that arrives is checked, repaired
+where the Reed-Solomon coding can, and shown with its addresses and type.
+
+**ACARS, in full.** The registration, flight identification, label, block,
+sequence number and text. This is where nearly all the readable content is.
+
+**XID, in summary.** What kind of exchange it is — a ground station's beacon, a
+link establishment, a handoff — and the parameters SDRoxide knows: connection
+management, sequencing, modulation support, alternate ground stations, aircraft
+and ground-station positions, and the frequency lists a station advertises.
+Parameters it does not know are shown with their identifier and their bytes and
+counted, so you can see how much of an exchange is going unread rather than
+being told a comfortable half-truth.
+
+**Not decoded: X.25, CLNP, and the applications above them** — including CPDLC
+(controller-pilot datalink) and ADS-C. Those are ISO network layers carrying
+ASN.1 message sets, and reading them is a larger job than everything else on
+this page put together. Frames carrying them are listed with their addresses,
+named as far as their first bytes allow (`CLNP, 84 octets`), and shown as hex.
+That is the honest picture: turning them off would hide how much of the traffic
+they are.
+
+#### Trying it without an aerial
+
+There is a signal generator in the source tree that synthesises a band:
+
+```
+cargo run --release -p sdroxide-vdl2 --example vdl2_iq -- /tmp/vdl2.iq
+sdroxide --file /tmp/vdl2.iq --rate 2400000 --freq 136825000 --mode VDL2
+```
+
+Ground stations beaconing, aircraft exchanging ACARS on four channels at
+descending signal levels, a link being established, two stations colliding, and
+one message long enough to need more than one block of error correction. Each
+station is given a carrier offset, a symbol clock error and a fractional arrival
+time of its own, because a transmitter that is exactly right is the one case
+that proves nothing.
+
+It proves the whole chain works. It does not prove the decoder works on the air,
+because the transmitter and the receiver were written by the same hand.
+
+#### If nothing is decoding
+
+Record a minute and look at what the receiver actually heard:
+
+```
+sdroxide --server --freq 136825000 --mode VDL2 --record-iq /var/tmp/air.iq
+cargo run --release -p sdroxide-vdl2 --example vdl2_replay -- /var/tmp/air.iq <rate> 136825000
+```
+
+The replay prints the counters per channel and one sentence saying what to do
+next. **The channel to watch is 136.975**, the Common Signalling Channel: every
+ground station beacons on it and every link starts there, so if that one is
+silent while the others show bursts, what the others are showing is not VDL2.
+
 ## 4. Skimmers
 
 The skimmers decode many signals at once across a wide (~192 kHz) window and
@@ -4221,13 +4614,19 @@ part you are tuned into.
   PSK or RTTY for a digimode spot (which also opens the messaging panel,
   [3.3](#33-psk31-and-rtty)).
 
-**Band-aware gating.** To avoid noise and false decodes, each skimmer only runs
-where its mode is used: the CW skimmer in CW sub-bands, and the PSK and RTTY
-skimmers in each band's PSK/RTTY calling sub-bands — with the FT8, FT4, FT2, WSPR, and
-QRSS watering-holes excluded so their signals aren't mistaken for PSK or RTTY
+**Band-aware gating.** To avoid noise and false decodes — and to avoid paying
+for either — each skimmer only runs where its mode is used: the CW skimmer in CW
+sub-bands, and the PSK and RTTY skimmers in each band's PSK/RTTY calling
+sub-bands — with the FT8, FT4, FT2, WSPR, and QRSS watering-holes excluded so
+their signals aren't mistaken for PSK or RTTY
 (the WSPR window and the slow-CW/QRSS beacons just below it sit inside the RTTY
-sub-band on several bands, so they're carved out explicitly). The skimmer-decoded
-text is a coarse best-effort copy; switch to the mode (click a box) for a clean
+sub-band on several bands, so they're carved out explicitly). A skimmer whose
+window holds none of its own sub-bands stands down completely and costs nothing
+until you tune back onto one — so an SDR parked on the broadcast FM band, the air
+band or any other non-amateur allocation is not running a neural CW decoder over
+it. Which frequencies count is the band plan's to say
+([`bandplan.json`](#the-band-plan-file)), and it ships with the HF allocations
+only. The skimmer-decoded text is a coarse best-effort copy; switch to the mode (click a box) for a clean
 decode — the CW skimmer runs the same decoder as the CW panel, but over hundreds
 of signals at once and re-reading each one only twice a second, so a signal you
 care about is always better copied on the panel.
@@ -4728,7 +5127,7 @@ look like.
 
 Everything that configures sdroxide lives in one window, opened with the
 **⚙ SETTINGS** button in the System module (the **⚙ SETUP** button in the SPOTS
-window opens the same dialog on its Spots tab). Eleven tabs run across the top:
+window opens the same dialog on its Spots tab). Twelve tabs run across the top:
 
 | Tab | What it holds |
 | --- | --- |
@@ -4741,6 +5140,7 @@ window opens the same dialog on its Spots tab). Eleven tabs run across the top:
 | **Uploads** | Callsign lookup, QSL upload, confirmation download. [6.7](#67-uploads-callsign-lookup-and-qsl-services) |
 | **Winlink** | The radio-email account, and whether it forwards over the internet or on the air. [6.8](#68-winlink-radio-email-account) |
 | **Servers** | Hamlib rigctld, the built-in TCI server, and the WSJT-X UDP broadcast. [6.9](#69-servers-letting-other-programs-drive-the-radio) |
+| **T/R switch** | The relay that grounds the SDR's antenna while the station transmits, and the sequencer around it. [6.11](#611-tr-switch-protecting-the-receiver-on-transmit) |
 | **Remote** | The address of an sdroxide server elsewhere, and the button that connects to it. [8.2](#82-connect-a-native-remote-client) |
 | **TLE** | Satellites to track beyond the amateur set, and their frequencies. [6.10](#610-tle-satellites-and-their-frequencies) |
 
@@ -4753,15 +5153,18 @@ forwarding session rather than the moment you type it. Nothing here needs a rest
 Settings are written to the per-user config directory ([§13](#13-configuration-files)):
 display preferences to `config.toml`, the radio to `radio.json`, key/mouse/MIDI
 bindings to `input.json`, feeds and credentials to `net.json`, the two servers
-to `rigctld.json`, `tciserver.json` and `wsjtx.json`, and the satellite
-additions to `satellites.json`.
+to `rigctld.json`, `tciserver.json` and `wsjtx.json`, the satellite
+additions to `satellites.json`, and the transmit/receive switch to `relay.json`.
 
 Most of those files describe the *station*, not the screen: the feeds it
 connects to, the servers it offers, the satellites it tracks, the radio it has.
 They live on the machine the radio engine runs on, and the engine tells every
 client what they say — so the **Radio**, **Spots**, **FreeDV**, **Uploads**,
 **Winlink**, **Servers** and **TLE** tabs show, and change, the real thing
-whether you are at the shack machine, on a native remote client or in a browser tab. (The Radio tab
+whether you are at the shack machine, on a native remote client or in a browser tab. The **T/R switch**
+tab is the same kind of thing — the relay is bolted to the antenna, not to your
+desk — with one difference worth knowing before you use it from away: its
+**TEST** buttons operate real hardware in a room you are not in. (The Radio tab
 keeps back the parts that are about a *machine* rather than about the radio:
 which interface to open, and the buttons that scan a bus or test an address. See
 [8.4](#84-what-to-know).) `input.json` and the `[ui]` half of
@@ -5041,6 +5444,12 @@ radio. Everything below the selector changes to match the choice:
   that fits down a WiFi or cellular link: a narrow I/Q stream that follows the
   dial, plus the server's own FFT of the whole band for the full-band strip.
   See [6.2.14](#6214-spyserver-network-receivers).
+- **KiwiSDR / Web-888 (network)** — one of the ~870 receivers published on
+  `rx.kiwisdr.com`, or a private one on the same firmware. A ~12 kHz I/Q window
+  that follows the dial, plus the receiver's own 0–30 MHz waterfall for the
+  full-band strip. Receive only. Browse the public ones with **PUBLIC SDR** and
+  open one as a radio: see
+  [15.21](#1521-public-sdrs-on-the-internet-kiwisdr--web-888-spyserver).
 - **RX-888 (USB)** — an RX-888 / RX-888 Mk2 direct-sampling receiver, likewise
   driven directly over USB, with its firmware bundled and uploaded for it. On a
   Mk2 the built-in R828D tuner is driven too, so the receiver covers VHF and UHF
@@ -5077,6 +5486,12 @@ radio. Everything below the selector changes to match the choice:
   On a two-chain board the second receiver can carry a second aerial, nulling a
   local noise source or filling in fades.
   See [6.2.17](#6217-limesdr-family--limerfe-limesuite).
+- **RigExpert Fobos SDR (USB)** — a Fobos SDR, through RigExpert's own libfobos.
+  Three inputs that behave as different radios: an RF port through the tuner,
+  and two HF ports that direct-sample with no local oscillator at all and are
+  tuned entirely in software. Both HF ports at once are combined by the same
+  adaptive filter the RSPduo and LimeSDR use.
+  See [6.2.20](#6220-rigexpert-fobos-sdr-usb).
 
 There is no auto-detect: you pick the interface, and an interface that cannot be
 opened falls back to a silent source rather than guessing at another one.
@@ -5231,6 +5646,15 @@ are shifted onto the dial along with everything else — the receive range by th
 receive offset and the transmit range by whatever the **Transmit** row says, so
 each ends up in the numbers you will actually be reading.
 
+They also belong to the **interface** they were typed for, not to the tab. Change
+**Radio interface** and the two boxes reload with whatever you had stated for the
+one you have just moved to — empty, on an interface you have never stated
+anything for. What you typed for the interface you left is kept and comes back
+with it. That matters most when a tab is pointed at a public receiver
+([15.21](#1521-public-sdrs-on-the-internet-kiwisdr--web-888-spyserver)), which
+brings a range of its own: the transceiver that was in the tab gets its own
+ranges back when you switch the interface back to it.
+
 #### 6.2.1 SoapySDR devices
 
 ![The Radio tab with the SoapySDR interface selected](images/settings-radio-soapysdr.jpg)
@@ -5246,6 +5670,17 @@ exposes, and nothing it does not:
   port, and a **TX** one when it has more than one transmit port. A LimeSDR
   receives on `LNAH`/`LNAL`/`LNAW` and transmits on `BAND1`/`BAND2`; a HackRF
   has a single `TX/RX` port and gets no drop-down at all.
+
+> **The antenna is remembered per band, everywhere it can be chosen.** Whichever
+> front end you are on — an Icom's ANT1/ANT2, an RSPdx's A/B/Hi-Z, a LimeSDR's
+> LNA ports — the socket you pick is remembered against the band you picked it
+> on, and put back the next time the dial crosses into that band. It survives a
+> restart, and a memory channel stored while the radio is on a socket carries
+> that socket with it and selects it again on recall — and **EDT** on the
+> channel is where you change your mind about which one that should be
+> ([2.12](#212-memory-channels)). A band you have never chosen a socket on is
+> left exactly where the radio already is, so nothing moves a relay for you
+> until you have said what belongs on that band.
 - **Stream** — **Sample rate** and **Baseband filter**, listing the values this
   device says it accepts. Both default to leaving things as they were: the rate
   falls back to the app-wide `sample_rate`, and the filter to whatever the
@@ -5697,6 +6132,38 @@ only.
   is the only safe answer for a radio this list has never been told about. The
   IC-7000 is listed but has no such command either: its data input is selected
   at the radio.
+- **Antenna** (Icom only) — `ANT1` / `ANT2`, the radio's own antenna selector:
+  the same setting as the **ANT** button on its front panel. The row only
+  appears on a radio that *has* a selector, because that is not something CI-V
+  states: every Icom speaks one dialect, an IC-7610 answers the antenna read and
+  an IC-705 refuses it, so sdroxide asks when the port opens and draws the row
+  only if an answer comes back. The socket it is on is read back at the same
+  time, so the control opens showing the truth rather than a remembered guess,
+  and the choice is remembered per band like every other antenna in sdroxide.
+  A radio with four sockets (the IC-785x line) is offered the first two; select
+  ANT3 or ANT4 at the radio, and sdroxide shows no socket rather than claiming
+  the wrong one.
+
+  The same control is on the main window's **RIG** box, as **ANT** — see
+  [2.7](#27-receiver-controls). You do not have to come here to change socket.
+- **Radio power** (Icom only) — **On** and **Off** switch *the radio* over the
+  CI-V link, the way RS-BA1 and wfview do. This is not sdroxide's own on/off in
+  the tab strip, which closes the interface and leaves the radio running: this
+  one leaves the interface open and switches the radio off, which is the way
+  round that matters, because the link has to survive for the switch back on to
+  reach anything. Over the network that is what **Network Control** keeps
+  awake; over a serial cable it is the radio's CI-V port, which stays powered
+  on a set switched off at the front rather than unplugged. Powering on sends
+  the run of wake-up bytes Icom's own documentation asks for, sized to the port's
+  baud rate, because a sleeping radio's control receiver loses the first bytes
+  of anything sent to it.
+
+  Two buttons rather than a switch, deliberately: a radio that is off answers
+  nothing, so there is no position to read back, and a toggle could only ever
+  show you your own last click.
+
+  These two are on the main window's **RIG** box as well, as **PWR ON** / **OFF**
+  — see [2.7](#27-receiver-controls).
 - **Radio ID (hex)** — the CI-V address, for Icom and Xiegu radios.
 - **Show the radio's spectrum scope** (Icom only) — stream the radio's own
   scope sweep over the CI-V link and draw it as the panadapter, the same way
@@ -6093,10 +6560,21 @@ involved:
   header. Leave this at **None** unless one really is fitted. Those seven pins
   are general-purpose open-collector outputs, and operators also use them for
   amplifier PTT, antenna relays and transverter switching; driving them from
-  band data would start operating whatever is connected. With the **N2ADR filter
+  band data would start operating whatever is connected. (If what you want is
+  an antenna relay that follows *transmit* rather than the band, that is the
+  **T/R switch** tab — see [6.11](#611-tr-switch-protecting-the-receiver-on-transmit)
+  — which drives one over USB and sequences an amplifier with it.) With the **N2ADR filter
   board** selected, the low-pass filter follows the band you are on (the
   transmit band while keyed) and the board's 3 MHz receive high-pass is switched
-  in above 3 MHz.
+  in above 3 MHz. **Alex / Hermes band code** is the other convention: the band
+  goes out as a four-bit number on outputs 1–4 (160 m = 1, 80 m = 2, 60 m = 0,
+  40 m = 3, 30 m = 4, 20 m = 5, 17 m = 6, 15 m = 7, 12 m = 8, 10 m = 9, 6 m =
+  10), which is what an ANAN's Alex board, a Zeus SDR, a HiQSDR and Quisk all
+  expect. Outputs 5–7 stay off on that preset — they carry no part of the band
+  code, and on those boards they are the spare pins operators wire to a
+  preamplifier, an attenuator or a transverter. Either preset follows the
+  transmit frequency while keyed and the receive frequency otherwise, and both
+  take effect on **Apply / reconnect**.
 - **Transmit buffer** — how far ahead of real time transmit audio is fed toward
   the board, 10 to 500 ms, before sdroxide slows down to feed it at exactly the
   rate the board consumes it. That head start is the only thing covering a
@@ -6329,7 +6807,12 @@ radio modulates.
   or a VPN never broadcast to you, so those have to be entered by hand.
 - **IQ sample rate** — 24, 48, 96 or 192 kHz. **192 kHz is the radio's maximum
   for a DAX IQ stream**, and therefore the widest span this interface can show;
-  it is not a limit sdroxide imposes.
+  it is not a limit sdroxide imposes. Nor is there a setting that gets round it:
+  binding a DAX IQ channel to a panadapter makes the radio set that panadapter's
+  span *to the DAX IQ rate*, so the two are one number. A wider view of the band
+  has to come from the radio's own panadapter picture, which is what SmartSDR
+  draws — run it alongside if you want one; the two clients coexist (see **Two
+  clients, one identity** below).
 - **DAX IQ channel** — the radio has four. Change this only if something else on
   the network already holds channel 1; the radio refuses the same channel twice.
 - **Station name** — shown against this session in the radio's client list. The
@@ -6616,9 +7099,17 @@ pins** setting does:
   key line directly unless its datasheet says that level is enough.
 - Nothing else changes: PTT, VOX, the digital modes and the tune button all key
   the radio the way they always did, and the pins follow. sdroxide moves the
-  state machine to transmit a couple of milliseconds *before* the signal starts
-  and back to receive *after* the last sample has gone out, so the amplifier is
+  state machine to transmit a few milliseconds *before* the signal starts and
+  back to receive *after* the last sample has gone out, so the amplifier is
   switched in ahead of the RF and out behind it rather than hot-switched.
+- **The pins switch within milliseconds of the key, not seconds.** The one thing
+  that used to sit in front of them was the transmit oscillator: writing it makes
+  the AD9361 force its state machine to ALERT, retune and calibrate, which is the
+  better part of a second, and it was being paid on every over even when the dial
+  had not moved. sdroxide now reads where the synthesiser actually is and only
+  writes it when this over needs it somewhere else, so an over on the same
+  frequency as the last one throws the relay straight away. The first over after
+  a band change still pays for the retune once.
 - On the way out sdroxide puts the state machine back to receive, so closing it
   does not leave your amplifier keyed. If the radio is pulled off the network
   mid-over that cannot be delivered — the pin stays high until the Pluto is
@@ -6631,7 +7122,10 @@ The settings are written as the AD9361 driver's device-tree properties
 sequence the Analog Devices note gives for `iio_attr`. They **persist in the
 radio** until it is rebooted or something writes them again, so sdroxide both
 writes and unwrites them: it rewrites the whole set every time it connects with
-a pair selected, and setting **PTT pins** back to *Off* puts the radio back into
+a pair selected — including on **Apply / reconnect**, which really does redial
+the board now rather than re-attaching to the connection that was already open,
+so a changed pair (or sample rate, or duplex) takes effect without restarting
+sdroxide — and setting **PTT pins** back to *Off* puts the radio back into
 FDD and un-slaves all four pins on the next connect. A radio that has never had
 these settings touched is left exactly as it booted, and so is one you have put
 in TDD yourself with no pin slaved to it — sdroxide undoes its own arrangement,
@@ -7018,7 +7512,10 @@ protocol, not the one on the controller.
 One connection carries three things:
 
 - **Control** — the whole CI-V command set, tunnelled over the network. Dial,
-  mode, PTT, the S-meter, SWR and the radio's own CW keyer.
+  mode, PTT, the S-meter, SWR, the antenna selector (`ANT1`/`ANT2`, on a radio
+  that has one), the radio's own CW keyer, and its **power switch** — the radio
+  can be switched off and on again from here, since its network module stays
+  awake while the set is off.
 - **Audio**, both ways, at up to 48 kHz.
 - **The radio's spectrum scope** — its own sweep, 475 points on most models and
   689 on an IC-7610 or IC-7760, up to ±500 kHz wide. On the AF path this is the *main*
@@ -7039,6 +7536,17 @@ Three settings, all under **MENU » SET**:
    and on any other it says so in the status line and leaves the menu alone. Not
    on a receiver: an **IC-R8600** has no modulation input to set, so neither the
    write nor the warning appears.
+
+   It is a loan, not a keep: sdroxide reads what these items hold before it
+   writes anything, and puts them back the way it found them when the session
+   ends — the radio switched off in sdroxide, its tab closed, the interface
+   changed, or the program quit. A rig left on LAN is deaf to its own
+   microphone and its own key the next time it is used on its own in the shack,
+   with nothing on the radio saying why (issue #252). The same goes for the
+   **LAN AF/IF Output > Output Select** item sdroxide sets for the 12 kHz IF.
+   Two things it cannot put back: an item the radio never answered a read for,
+   and a session that ends because the link *died* — a radio unplugged or a
+   WiFi that went away keeps whatever it had at that moment.
 
    On an **IC-7851/IC-7850** the first two live under **SET » OTHERS** rather
    than a **Network** submenu, and the third is **CONNECTORS » DATA OFF MOD**
@@ -7227,7 +7735,7 @@ sdroxide follows it back after about a second.
   waterfall.
 - **Scope span** — how wide to sweep it; see above.
 - **Switch modulation input to LAN** — do step 3 above automatically, where the
-  model is known.
+  model is known, and put the radio's own setting back when the session ends.
 - **Test connection** — connect, report what the radio said it is, and
   disconnect.
 - **Copy diagnostic report** — the last session's handshake and CI-V trace, as
@@ -7847,6 +8355,15 @@ waterfall pauses and picks up on unkey. Turn *both* off only with the receiver
 on a separate antenna, where watching the band through an over is worth having;
 turn off blanking alone to watch your own signal while still not hearing it.
 
+Mute on transmit also covers an over you key **at the radio** — the microphone's
+own PTT, a foot switch, or MOX — as long as the CAT link reports the rig's
+transmit state, which every dialect here does (including flrig and Hamlib's
+`rigctld`). Blanking does not: nothing on this side is driving that over, so the
+receiver is read right through it, and the picture goes on showing the band —
+which is the panadapter doing what it was paired for while you talk. So an over
+from the microphone sounds like one keyed on screen and looks like one you asked
+to watch.
+
 **Things worth knowing.**
 
 - The receiver must be a radio on this machine — the transceiver's engine opens
@@ -8285,10 +8802,24 @@ and the log says so at every key-down. Raise it into a dummy load first and
 measure; the useful setting is a property of your board, your band and whatever
 is in front of it, not a number this program can pick.
 
+**Transmit port** — `BAND1`, `BAND2`, or **Automatic**. The two are **different
+matching networks on the board, not two jacks onto the same one**: LimeSuite's
+own table gives `BAND1` (`TX1_1`) as 30 MHz–1.9 GHz and `BAND2` (`TX1_2`) as
+2–2.6 GHz. So every band below 23 cm goes out of `BAND1`, and keying one of them
+out of `BAND2` puts the over into a 13 cm filter that passes almost none of it —
+the synthesiser is on frequency, the drive is at whatever you set, the stream
+runs, every setting reads correct, and the power meter reads zero. Leave this on
+*Automatic*, which follows the dial and moves the port when you cross into 13 cm.
+If you do pick one by hand and it does not cover the band you are on, the panel
+says so under the interface and the log says so at every key-down.
+
 Every over prints one line naming what it went out through — the frequency, the
 socket, the drive and the analog filter — and prints it again whenever any of
-those changes. That line, and the LimeRFE's own beside it, is what to read
-first when a transmission does not appear where it should.
+those changes; at unkey it prints what the transmitter was actually given, so a
+key-down that put nothing on the air says whether the modulator sent no samples,
+sent nothing but silence, or sent samples the board would not take. That line,
+and the LimeRFE's own beside it, is what to read first when a transmission does
+not appear where it should.
 
 ##### The LimeRFE
 
@@ -8519,6 +9050,133 @@ the spur goes when you do.
 > raw 12-bit values and decoded as I/Q pairs.
 > `cargo run -p sdroxide-hydrasdr --example probe` does the same from a terminal.
 
+#### 6.2.19 KiwiSDR / Web-888 (network receivers)
+
+A **KiwiSDR**, or the Web-888 board its listing calls a KiwiSDR 2 — the ~870
+0–30 MHz receivers published on `rx.kiwisdr.com`, and any private one running
+the same firmware. Receive only.
+
+Give it an address and press **Apply / reconnect**. The port defaults to 8073,
+but a receiver reached through the project's own proxy — at a
+`something.proxy.kiwisdr.com` address, which is nearly half the public ones —
+answers on **80** instead, so give the port explicitly.
+
+- **Password** is the receiver's *user* password where its operator set one.
+  Blank on almost every public receiver, and not the admin password.
+- **Announce as** is the name the receiver's owner and its other listeners see.
+  Blank means your station callsign; identifying is what the network expects.
+- **Band view** asks for the receiver's own waterfall as well as its I/Q, for
+  the full-band strip. Worth having — without it the only band view is the
+  ~12 kHz the I/Q covers, which is not enough to tune by — and it costs about
+  20 kB/s against the I/Q's 44.
+- **Receiver AGC** is the receiver's own, on the far side of the link and ahead
+  of the I/Q. On by default, which is unlike every other interface here; see
+  [15.21](#1521-public-sdrs-on-the-internet-kiwisdr--web-888-spyserver) for the
+  measurement behind that and for what it means for the S-meter.
+
+**Test connection** reads the receiver's status page over HTTP — it does not
+open a session, so it takes none of the receiver's channels — and says what it
+is, what it covers, how many channels are free, and whether its operator allows
+connections from apps other than a browser at all.
+
+To find a receiver rather than type one in, use **PUBLIC SDR** in the System box:
+[15.21](#1521-public-sdrs-on-the-internet-kiwisdr--web-888-spyserver).
+
+#### 6.2.20 RigExpert Fobos SDR (USB)
+
+A **Fobos SDR**, driven through RigExpert's own **libfobos**. Receive only.
+
+**The library is found at runtime, not linked.** libfobos is LGPL-2.1 and open
+source ([github.com/rigexpert/libfobos](https://github.com/rigexpert/libfobos)),
+but sdroxide loads it the same way it loads the SDRplay API and LimeSuite —
+by name, when you open the interface. The reason is build portability rather
+than licensing: this interface is in every build variant on every platform,
+nobody needs libfobos installed to compile sdroxide, and a machine without it
+simply lists no receivers and says what to install. Build and install it from
+that repository, then press **Rescan**.
+
+**Receiver.** Rescan lists what is on the bus; the list is built from
+`fobos_rx_list_devices`, which opens nothing, so it is safe to press while
+receiving. Receivers are named by serial, and leaving the picker on *first one
+found* is right for a one-radio shack.
+
+**Input: three genuinely different radios in one box.** The **RF** port goes
+through the tuner — a mixer, an LNA and a VGA — and covers roughly
+25 MHz–5.4 GHz. **HF1** and **HF2** bypass the tuner entirely for direct
+sampling. **HF1 + HF2** runs both at once and combines them.
+
+That split matters more than a socket choice usually does, because the HF ports
+have **no local oscillator at all**. The receiver hands back two independent
+*real* ADC channels — HF1 in one, HF2 in the other — and sdroxide makes complex
+baseband from them itself, with the same wideband channelizer the RX-888 uses
+for the identical problem. Two consequences follow:
+
+- **Tuning on HF1/HF2 is pure software.** Nothing is commanded at the radio when
+  you move the dial; the downconverter moves instead.
+- **The LNA and VGA sliders do nothing there.** The front end they belong to is
+  powered down while direct sampling runs. The panel greys them out and the
+  status line says so, rather than leaving two controls that look live and are
+  not.
+
+Changing the input reopens the receiver: RF and the HF ports are different
+hardware paths, and the HF ports build their downconverter at open time.
+
+**Sample rate, and why it decides how low you can tune.** On **RF** this is the
+ADC's own I/Q rate, picked from the list the receiver reports. Below about
+8 Msps the hardware snaps the request up to 8 Msps whatever you asked for; the
+rate it actually landed on is what sdroxide reports and works from, so the span
+on screen stays honest.
+
+On the **HF** ports the figure is a *target* for the software downconverter,
+which lands on the nearest power-of-two bin count — so the achieved rate can
+differ from the one you picked, and again the achieved one is what is reported.
+The number matters for a second reason: the downconverter selects a band out of
+a real spectrum, so **it can never centre closer to DC than half its own output
+rate**. At 2.5 Msps that floor is 1.25 MHz, which puts the entire AM/mediumwave
+broadcast band out of reach. The default is **625 kHz** for exactly that reason
+— a floor of 312.5 kHz, below every mediumwave channel.
+
+Ask for a dial below the current floor and sdroxide does *not* quietly receive
+something else and label it with the frequency you asked for: the log says the
+request was below the floor, and the frequency the receiver really landed on is
+reported back so the panadapter's own scale agrees with the spectrum under it.
+A wider view means a higher floor, so if you want both, change the rate rather
+than fighting the dial.
+
+Changing the rate reopens the receiver, like the input.
+
+**HF1 + HF2: cancelling a noise source, or combining two aerials.** Selecting
+this input runs both real channels and puts them through the same adaptive
+filter the RSPduo's second tuner and the LimeSDR's second receive chain use.
+*Cancel* is the DSP form of a noise-cancelling phaser: it finds the gain, phase
+and delay that make a local noise source line up on both aerials and subtracts
+it. *Combine* is diversity reception: it adds the two in the phase that
+reinforces and weights each by how well it hears, which fills in HF fades. The
+filter is multi-tap, so a null holds across the span rather than at one
+frequency.
+
+Mode, adaptation rate and **HOLD** are on the main window's DIV strip, where you
+can reach them while listening; **Diversity taps** is on this tab, with a note
+of what the length costs. **RESTART** zeroes the filter and lets it find the
+null again — it also releases HOLD, because a filter zeroed and left held is
+parked at zero and stops cancelling anything, which looks exactly like Combine
+mode and says nothing about why.
+
+Both channels come off **one ADC on one clock**, so unlike two independent
+tuners the phase between them is reproducible across a restart.
+
+**Clock source.** *External reference* switches the receiver to an external
+clock; it applies immediately, without a reopen.
+
+**What has been verified.** All three inputs were checked against a real Fobos
+SDR by the contributor who wrote the backend, including 38.6 dB of measured
+cancellation on real aerials. Two ADC rates turned out to be unusable for
+*streaming* on that unit even though the receiver accepts them — 40 Msps never
+streams at all, and 50 Msps streams but distorts audibly — and the rate
+selection steers around both. The cost is a practical ceiling around 10 MHz for
+the widest HF views; wider targets need a faster ADC than the safe rates
+provide.
+
 ### 6.3 UI: display preferences and voice announcements
 
 ![The UI tab: frame rate, scroll/spectrum speed, palette, and spectrum background](images/settings-ui.jpg)
@@ -8530,7 +9188,7 @@ spoken announcements below them under `[speech]`:
   window size and is what you want; **Desktop**, **Tablet**, **Small screen**
   and **Phone** force it, to see how the compact strips look without a phone to
   hand, or to keep the menus in a small desktop window rather than a strip
-  wrapped over three rows. See [9.4](#94-phones-and-tablets) for what each one
+  wrapped over three rows. See [9.5](#95-phones-and-tablets) for what each one
   shows.
 
   **Small screen** is Tablet with everything pulled in — the single-row strip
@@ -8542,6 +9200,16 @@ spoken announcements below them under `[speech]`:
   tall, so a small laptop gets most of this without being told; the setting is
   for the rest of it, and for anyone who wants the tighter panels in a window
   on a large screen.
+
+  **Whatever the layout, no control is ever off the bottom of an operating
+  panel.** The panel keeps a floor under its own height — taken from the
+  waterfall above it, which is the thing that can shrink — sized to the rows
+  that layout actually draws, so a touched layout's taller chips get the extra
+  points they need. Where a panel still holds more than it can show at once
+  (the WSPR beacon's controls, the SSTV compositor), it scrolls rather than
+  running off the edge. The divider between the waterfall and the panel is
+  draggable in every mode: put the pointer on the `— — —` handle between them
+  and drag to give either one more of the window.
 - **Theme** — the colour scheme for the whole UI: **Default** (the navy, cyan
   and hot pink every screenshot in this manual shows), **Light** (white panels
   and near-black text, for a bright shack or a screen read in daylight),
@@ -8615,7 +9283,7 @@ spoken announcements below them under `[speech]`:
   so a Large interface with a Small waterfall font still has larger frequency
   labels than a Medium one. Bear in mind that **Large** leaves the window fewer
   points to lay out in, so a small window may drop to the tablet control strip
-  ([9.4](#94-phones-and-tablets)) — force **Layout: Desktop** above if you would
+  ([9.5](#95-phones-and-tablets)) — force **Layout: Desktop** above if you would
   rather keep the full strip.
 - **Check for updates at startup** — asks sdroxide.com once per start whether a
   newer release has been published, and if so says which in a dismissable banner
@@ -9378,6 +10046,174 @@ every link in an entry and it disappears, and the built-in table shows through
 again.
 
 ---
+
+### 6.11 T/R switch: protecting the receiver on transmit
+
+An SDR sharing an antenna system with a transmitter has to be disconnected 
+before the transmit RF appears. A receiver that is fine on a microvolt does not survive
+a hundred watts of it.
+
+The usual answer is a relay: a coax relay that disconnects the SDR and grounds
+its input, an outboard T/R switch, or the receive-antenna port on an amplifier.
+This tab drives one — and sequences an amplifier or a second relay with it — so
+the contacts always close *before* your transmitter comes up and open *after* it
+has stopped.
+
+Read [6.11.5](#6115-what-this-cannot-do) before relying on this feature.
+
+#### 6.11.1 What it can drive
+
+| Hardware | What it is |
+| --- | --- |
+| **USB relay board (serial)** | The cheap boards sold everywhere: **LCUS-1/2/4/8** (a CH340 in front of a microcontroller), **KMtronic**, and **Numato Lab**. They appear as a serial port; pick the port and the make. |
+| **Serial RTS/DTR line** | A contact closure on any USB-serial adapter, a DigiRig, or a home-made opto-isolator. What every outboard sequencer with a PTT input wants — W6PQL, DX Engineering, Array Solutions. Contact 1 is RTS, contact 2 is DTR. |
+| **USB relay board (HID)** | The "free-driver USB control switch" family, sold under MagiDeal and a dozen other names, 1 to 8 channels. No driver on any platform. |
+| **CM108/CM119 sound-card GPIO** | The pins on a cheap USB "rig interface" — DRA boards, the RB-USB RIM, the AIOC. Pin 3, the one every design brings out. The audio the card is carrying for your radio is on a different interface and is not disturbed. |
+| **Linux GPIO line** | A Raspberry Pi header, or any board with a `/dev/gpiochip*`. |
+| **External command** | Runs a program on key-down and another on key-up. For everything with a command-line tool and no protocol worth building in: Denkovi's boards, microHAM, `usbrelay`, a script of your own. |
+
+On Linux the two USB kinds need permissions the distribution does not grant.
+Install the packaged rule and replug:
+
+```
+sudo cp packaging/linux/60-sdroxide-relay.rules /usr/lib/udev/rules.d/
+sudo udevadm control --reload
+```
+
+Serial relay boards need nothing from that file — they are serial ports, so add
+yourself to `dialout` as you would for a CAT cable.
+
+#### 6.11.2 Contacts and the sequencer
+
+Each row in the **Contacts** table is one switched contact:
+
+- **No.** — which contact on the board, numbered as its silkscreen numbers them,
+  from 1.
+- **GPIO** — shown only for a Linux GPIO line: the line's offset on the chip,
+  which on a Raspberry Pi is the BCM number and not the physical pin number.
+- **Name** — yours. It appears in the status line and the log, so "IC-7300
+  antenna" beats "channel 1".
+- **Job** — grounding the SDR antenna, keying an amplifier or T/R relay, or
+  auxiliary. It only chooses the default timings and what the log calls it.
+- **TX closes** — whether *transmitting* energises the coil. This is a wiring
+  decision, not a preference; see [6.11.4](#6114-wire-it-so-that-a-dead-relay-is-the-safe-one).
+- **Lead** — how long before RF the contact closes.
+- **Hold** — how long after RF stops it opens. Zero is a real answer, and the
+  right one for an amplifier's key line.
+- **TEST** — closes that contact for half a second so you can hear the relay and
+  check the wiring with the transmitter cold. Refused while anything is on the
+  air.
+
+**The order is the timings.** There is no ordering column because there does not
+need to be one: at key-down every contact closes at *its own lead before the RF*,
+so the longest lead goes first; at key-up every contact opens at its own hold
+after the RF, so the shortest hold goes first. Give the antenna relay the longer
+lead and the longer hold and the amplifier the shorter of each, and you have a
+sequencer:
+
+```
+  antenna relay   ────────█████████████████████████████──────
+  amplifier key   ─────────────█████████████████──────────────
+  RF              ──────────────████████████████─────────────
+                        ↑     ↑                ↑     ↑
+                   antenna  amp key         amp off  antenna
+                   throws                            returns
+```
+
+The panel spells the resulting sequence out in one line under the table, so you
+can see what you have bought without working it out.
+
+Choosing a **Job** fills both in with numbers that sequence correctly: 10 ms and
+20 ms for the antenna, 5 ms and 0 for an amplifier. A small coax relay throws in
+5 to 15 ms. Longer than it needs to be costs you something real: transmit
+*waits* for the longest lead, so a large value is an audible gap at the end of
+the receive audio and a delay between your thumb and your own transmitter.
+Anything over 250 ms is ignored. The hold is free by comparison — letting the
+antenna back a moment late costs nothing, and letting it back early costs a
+front end — so when in doubt, lengthen the hold rather than the lead.
+
+**If it will not answer** decides what happens when the hardware stops
+responding. *Refuse to transmit* is the default, and it behaves like the SWR
+guard: the over is refused with a notice rather than sent into an unprotected
+receiver. *Transmit anyway, warn* is for a station running a few watts into a
+preamp bypass, where a loose USB cable ending a contest is the worse outcome.
+
+#### 6.11.3 The transmit sense input
+
+When you key a transceiver *at the radio* — its own microphone button, a foot
+switch, VOX, or its keyer — sdroxide does not know until it next asks over CAT.
+That question rides the meter poll, so the answer arrives a few hundred
+milliseconds into the over, and the relay throws then.
+
+The fix is a wire. Bring the rig's SEND / PTT / accessory key line, through an
+opto-isolator, into a handshake input on the same serial port that drives the
+relay, and set **Line** to CTS, DSR or DCD. sdroxide watches it every five
+milliseconds, so the over is seen almost at once — and not only by the relay:
+the meter switches to transmit, and the interlock that stops sdroxide keying on
+top of you starts working, at the same speed.
+
+Most opto-isolated interfaces pull the line *down* when the rig keys, so leave
+**Transmitting is a high line** off unless yours does the opposite. On a station
+with more than one radio, **Belongs to radio** says which tab the sensed
+transceiver is.
+
+#### 6.11.4 Wire it so that a dead relay is the safe one
+
+This is the only fail-safe that survives sdroxide not running, the USB cable
+being pulled, or the computer being off — and no setting can substitute for it.
+
+Choose **TX closes** so that the **de-energised** contact is the state you want
+when nothing is running:
+
+- **De-energised = SDR grounded.** Protective. The coil is held energised the
+  whole time you are receiving, and a dead relay leaves the SDR deaf — annoying,
+  and safe.
+- **De-energised = SDR connected.** Convenient. A dead relay plus one
+  transmission is a dead front end.
+
+With a real amplifier behind it, take the first.
+
+#### 6.11.5 What this cannot do
+
+It cannot protect from transmissions initiated at the radio itself.
+
+Keying from sdroxide is the arrangement this was designed for: the contacts lead
+the RF by construction, because the transmit path waits for them. Set your rig's
+PTT method on the **Radio** tab and press PTT here rather than on the microphone,
+and the guarantee holds every time.
+
+A transmission initiated at the radio is different. Without the sense input above,
+sdroxide learns of it a few hundred milliseconds late; with the sense input, in a
+few milliseconds — but even then the relay itself still has to throw, *after* the
+RF has started. No program on a computer can make that zero.
+
+For a receiver genuinely worth protecting, use an **RF-sensed hardware T/R
+switch** as well. It costs a fraction of the SDR and it does not depend on a
+computer being awake. What this tab gives you is sequencing, an amplifier
+interlock, and protection on every over sdroxide keys — which on a digital-modes
+or remote station is all of them.
+
+An HPSDR operator already has a hardware-timed version of the same thing in the
+J16 open-collector outputs; see [6.2.3](#623-hpsdr-network-radios).
+
+#### 6.11.6 If it does not click
+
+- **The device is not in the list.** On Linux, install the udev rule above and
+  replug. `cargo run -p sdroxide-relay --example relay -- --list --all` prints
+  every HID device the machine can see, which separates "not permitted" from
+  "not recognised".
+- **A CM108 card that is listed and does nothing.** Several clones carry a
+  genuine C-Media id and ignore the GPIO report entirely. Nothing but listening
+  for the click tells them apart.
+- **The relay clicks and nothing switches.** The board's contacts are the other
+  way round: change **TX closes**, and re-read
+  [6.11.4](#6114-wire-it-so-that-a-dead-relay-is-the-safe-one) before you settle
+  on which way.
+- **A Numato board operating the wrong relay.** It numbers relays from zero on
+  the wire; sdroxide converts, so use the number on the silkscreen.
+- **Reporting a fault.** Settings → Radio → the diagnostic report includes what
+  the switch was told and what it answered. On these boards there is no other
+  record of anything, anywhere.
 
 ## 7. Solar system 3D view
 
@@ -10351,6 +11187,13 @@ typed and said no.
 The same server serves a browser client, so you can operate from any device with
 a web browser.
 
+Browsing the public SDRs
+([15.21](#1521-public-sdrs-on-the-internet-kiwisdr--web-888-spyserver)) works
+here too, and works the same way: the lists are fetched by the station, not by
+the browser, and the station is what holds the connection to the receiver. So a
+browser tab can find a receiver on the other side of the world and add it to the
+station's roster, where every other client sees it as one more radio.
+
 ![The web client in a browser](images/13-web-client.png)
 
 ### 9.1 Serve the web client
@@ -10368,8 +11211,10 @@ Then open a browser at:
 http://HOST:4950/
 ```
 
-The page connects back to the server over a WebSocket at `/ws` automatically —
-the station's first radio. To open one of its other radios, add the roster id
+The page connects back to the server over a WebSocket at `ws` beside itself —
+the station's first radio, at `/ws` when the page is served from the root and
+under the same prefix when it is not
+([9.4](#94-behind-a-reverse-proxy-on-a-subpath)). To open one of its other radios, add the roster id
 to the page address:
 
 ```
@@ -10444,7 +11289,41 @@ The native remote client (`sdroxide --connect`) has no such restriction — it
 uses your local sound devices directly and carries audio over the same
 WebSocket.
 
-### 9.4 Phones and tablets
+### 9.4 Behind a reverse proxy on a subpath
+
+The web client works from any path, not only the root. Behind a reverse proxy
+that gives it a prefix — `https://shack.example/sdroxide/` — everything hangs
+off the page's own address rather than the top of the host: the WebSocket, the
+radio listing, the wasm bundle and the scripts beside it. So the two ways a
+proxy can be configured both work, and neither needs anything from you:
+
+- **The prefix is stripped before forwarding** (Caddy's `handle_path
+  /sdroxide/*`, nginx's `proxy_pass` with a trailing slash). The server sees
+  ordinary root-level requests; the page's own links are relative, so the
+  browser puts the prefix back on its own.
+- **The prefix is forwarded intact** (Caddy's plain `reverse_proxy`, nginx
+  without the trailing slash). The server takes it off itself — every endpoint
+  it serves is recognised at the end of a longer path, and the client's files
+  are a flat directory, so anything above the file name can only be somebody's
+  routing.
+
+A Caddyfile for the second, which is the shorter one to write:
+
+```
+shack.example {
+    reverse_proxy /sdroxide/* localhost:4950
+}
+```
+
+The address works with or without the trailing slash. Sockets have to be
+allowed through — most proxies do that by default, and Caddy needs nothing
+said; anything that filters `Upgrade` and `Connection` headers has to pass them
+or the page will load and then fail to connect.
+
+Serving through HTTPS this way is also what gets the browser to hand over audio
+and the microphone ([9.3](#93-audio-needs-a-secure-context)).
+
+### 9.5 Phones and tablets
 
 The control strip is eight boxes of a fixed width. On a desktop they sit in a
 row; on a narrow screen they cannot shrink, only wrap, so the strip would eat
@@ -10464,12 +11343,12 @@ row of menu buttons:
 | Button | What it holds |
 | --- | --- |
 | **PTT** | Keys the transmitter. Hold it down to talk, or click it with a mouse to latch it on. |
-| **RX** | Volume, front-end gain, AGC, squelch, NB, ANC, NR |
+| **RX** | Volume, front-end gain, AGC, squelch, NB, ANC, NR, BIN |
 | **VFO** | A↔B, A→B, SPLIT, SUB, and the RIT/XIT offsets |
 | **SUB** | The second receiver's frequency, mode, filter and level (only while it is running) |
 | **TX** | TUNE, the voice keyer, and the drive, tune and mic levels |
 | **DISP** | ☀ 3D, WIDE, FIT, CTR, the panadapter boxes (the spectrum and waterfall switches, peak hold, their speeds and the detail), the skimmers, and the spectrum floor/ceiling and FFT size |
-| **SYS** | LOG, SPOTS, AWARDS, BANDS, MEM, SETTINGS, HELP |
+| **SYS** | LOG, SPOTS, AWARDS, BANDS, SAT, ISM, PUBLIC SDR, MAIL, MEM, SCAN, SETTINGS, HELP |
 
 A menu stays open until you tap outside it or tap its button again — the top-bar
 popups do not fade away on a touch screen the way they do under a mouse, because
@@ -11090,7 +11969,7 @@ sends them.
 | `--freq <HZ>` | Center frequency in Hz (default: where the last session was left, or 14,200,000 on a first run). |
 | `--rate <HZ>` | Sample rate in Hz (default: from config). |
 | `--gain <DB>` | Overall RX gain in dB (default: hardware AGC or a moderate value). |
-| `--mode <MODE>` | Initial mode (USB, LSB, CW, AM, SAM, NFM, WFM, DIGU, DIGL, DSB, SPEC, FT8, FT4, FT2, PSK, RTTY, OLIVIA, THOR, FSQ, SSTV, RIFP, WEFAX, RFPAINT, RADE, DRM, ADS-B). Default: the mode the last session was left in. |
+| `--mode <MODE>` | Initial mode (USB, LSB, CW, AM, SAM, NFM, WFM, DIGU, DIGL, DSB, SPEC, FT8, FT4, FT2, PSK, RTTY, OLIVIA, THOR, FSQ, SSTV, RIFP, WEFAX, RFPAINT, RADE, DRM, ADS-B, VDL2). Default: the mode the last session was left in. |
 | `--antenna <NAME>` | RX antenna port, as the device names it (LNAH, TX/RX — `--probe` lists them). Default: the port the last session was left on, and failing that whatever the driver selects. |
 | `--tx-antenna <NAME>` | TX antenna port, likewise (BAND1, BAND2). |
 | `--server` | Run as a server (web client + WebSocket streaming backend). |
@@ -11178,11 +12057,13 @@ sdroxide stores its settings under the per-user config directory:
 | `renderer-fallback.txt` | text | Written only when a panic came from the graphics driver: the next start renders through OpenGL and says so. Delete it to go back to the default renderer ([14](#14-troubleshooting)). |
 | `skimmer.json` | JSON | Skimmers: which of CW / PSK / RTTY run, and each one's spot squelch in dB. Restored at startup; a narrowband (audio-mode) radio still forces them off without disturbing what you picked. |
 | `adsb.json` | JSON | ADS-B decoder ([§3.13](#313-ads-b-aircraft-on-1090-mhz)): the two timeouts, how many history dots to keep, how far ahead the speed vectors reach, and the ceiling on the aircraft table. Restored at startup, and — like `ism.json` — a receiver that cannot feed the decoder forces it off without disturbing what you picked. |
+| `vdl2.json` | JSON | VDL2 decoder ([§3.15](#315-vdl2-what-the-aircraft-are-saying)): which of the seven channels to listen on, the burst threshold in dB, how much log and how many stations to keep, and how long a silent station stays on the list. Restored at startup, and — like `adsb.json` — a receiver that cannot feed the decoder forces it off without disturbing what you picked. |
 | `ism.json` | JSON | ISM decoder: whether it runs, which device families it listens for, the burst threshold in dB, and whether the rtl_433 decoders are on, which band they watch and how wide a window they get. Restored at startup, and — like `skimmer.json` — a narrowband (audio-mode) radio forces it off without disturbing what you picked. |
 | `rtl433_flex.conf` | text | Your own ISM decoders, in rtl_433's "flex" syntax ([§5.5](#55-adding-your-own-decoders-flex-specs)). Written with a commented example the first time the ISM decoder runs, and never rewritten afterwards — like `bandplan.json`, it is yours to edit. A specification that does not pass its check is listed in the ISM window and skipped; the rest still load. **RELOAD DECODERS** in the ISM window applies an edit without a restart. |
 | `input.json` | JSON | Control inputs: keyboard bindings, panadapter mouse behaviour, mouse-button bindings, and the MIDI controller mapping. Belongs to the machine running the user interface, not the engine. |
 | `remote_login.json` | JSON | A sign-in to *somebody else's* server that you asked this client to remember ([§8.3](#83-sign-in-who-may-operate-the-station)). Written only when the **Remember on this device** box is ticked, holds the password in plaintext, and deleted when you untick it or the server refuses it. Belongs to the user interface, like `input.json`; the browser client keeps the same thing in local storage instead. |
 | `satellites.json` | JSON | Satellite additions for the 3D tracker: subscribed element-set listings, element sets pasted in by hand, and frequency entries that override the built-in table. Belongs to the engine, like `net.json`: the listings are fetched and cached where the radio is, so remote and browser clients track the same satellites. |
+| `relay.json` | JSON | The station's external transmit/receive switch ([§6.11](#611-tr-switch-protecting-the-receiver-on-transmit)): which relay board or contact closure, the contact table, the sequencer's lead and hold times, what to do if it stops answering, and the transmit sense input. Belongs to the engine — the relay is bolted to the antenna — so remote and browser clients set up the real one. |
 | `broadcast_stations.json` | JSON | *Your own* broadcast stations and corrections, merged over the downloaded schedule ([§10.6](#106-broadcast-stations-on-longwave-and-shortwave)). Never written by sdroxide, and absent until you create it. |
 | `broadcast/` | CSV | The broadcasting season's schedule as downloaded from eibispace.de, one file per season. Managed by sdroxide: refetched when the season changes, and safe to delete. |
 | `sstv_messages.json` | JSON | The overlay message stored for each of the five SSTV transmit slots. |
@@ -11372,6 +12253,32 @@ the over; **Blank on transmit**, on by default, is what stops it being read.
 Turn that off and the receiver keeps being read through the over, in which case
 anything dropped really was dropped.
 
+**The T/R switch relay does not click.**
+On Linux, the USB HID relay boards and the CM108 sound cards need a udev rule
+that no distribution ships. Install it and replug the device — see
+[6.11.1](#6111-what-it-can-drive). If the device does not appear in the picker
+at all, `cargo run -p sdroxide-relay --example relay -- --list --all` prints
+every HID device the machine can see, which tells "not permitted" apart from
+"not recognised". Several CM108 *clones* carry a genuine C-Media id and ignore
+the GPIO report entirely; nothing but listening for the click separates those.
+
+**Every transmit is refused, saying the T/R switch is not answering.**
+That is the switch's fail-safe doing its job: the relay that protects the
+receiver has stopped responding, so the over is refused rather than sent into an
+unprotected front end. Check the cable and press **APPLY** on the **T/R switch**
+tab to try again. If you would rather transmit anyway, set **If it will not
+answer** to *Transmit anyway, warn* — but read
+[6.11.4](#6114-wire-it-so-that-a-dead-relay-is-the-safe-one) first.
+
+**The SDR still gets blasted when I key the rig at the microphone.**
+Expected, and the one thing this cannot fix from software: sdroxide learns of an
+over you start *at the radio* by asking over CAT, a few hundred milliseconds in.
+Wire the rig's SEND line into the transmit sense input
+([6.11.3](#6113-the-transmit-sense-input)) to cut that to milliseconds, key from
+sdroxide instead of the microphone where you can, and use an RF-sensed hardware
+T/R switch for a front end genuinely worth protecting.
+See [6.11.5](#6115-what-this-cannot-do).
+
 **Transmit was cut off, and now every key-up is refused.**
 The SWR guard has tripped ([§2.10](#210-transmit)): the radio reported an SWR at
 or above the limit, so the over was stopped and transmit is latched out until
@@ -11553,8 +12460,25 @@ WGPU_BACKEND=vulkan sdroxide
 ```
 
 `WGPU_BACKEND` (`vulkan`, `gl`, `metal`, `dx12`) pins the renderer on any
-machine, and pinning it also turns the check above off — so `WGPU_BACKEND=gl`
-is how to force the steady path on a GPU sdroxide does not know about.
+machine, and pinning it also turns the check above off — and the Windows one
+below with it — so `WGPU_BACKEND=gl` is how to force the steady path on a GPU
+sdroxide does not know about.
+
+**On Windows, sdroxide closes the moment it starts, and Event Viewer names
+`igvk64.dll` with exception code `0xc0000005`.**
+That module is Intel's Vulkan driver, and the exception is an access violation
+inside it — a crash in the graphics driver, before sdroxide has drawn anything.
+Nothing on this side can catch it. From 1.6.2 sdroxide does not load Vulkan on
+Windows at all: the window opens on **Direct3D 12**, with OpenGL behind it,
+which between them cover every Windows machine going back further than Vulkan
+does and are what a Windows driver is written against first. If your Vulkan
+driver is sound and you would rather use it, say
+
+```
+WGPU_BACKEND=vulkan
+```
+
+before starting sdroxide — in PowerShell, `$Env:WGPU_BACKEND = "vulkan"`.
 
 **TUNE makes full power and FT8 makes full power, but speaking into the
 microphone makes milliwatts.**
@@ -11700,7 +12624,9 @@ All in [§6.2.10](#6210-icom-lan-network-radios):
   sdroxide), and **Connectors > MOD Input**: `DATA OFF MOD` and `DATA MOD` =
   `LAN` (`WLAN` on an IC-705). sdroxide writes the third one for you on every
   transceiver named above; on a model whose menu numbering it does not know it
-  says so and leaves the menu alone.
+  says so and leaves the menu alone. What it writes there it puts back when the
+  session ends, so a rig used standalone afterwards still hears its own
+  microphone (issue #252).
 - No discovery — read the IP off the radio's **Network** screen. Port 50001
   unless changed there.
 - **No Icom outputs I/Q over the network.** The full-band view is the radio's
@@ -11887,7 +12813,9 @@ All in [§6.2.3](#623-hpsdr-network-radios):
 - **Filter board:** leave at `None` unless one really is fitted — the J16
   pins are general-purpose outputs that operators also wire to amp PTT and
   antenna relays, and driving them from band data would operate whatever is
-  connected.
+  connected. `N2ADR` is one relay per band; `Alex / Hermes band code` is the
+  four-bit band number on outputs 1–4 that an ANAN, a Zeus SDR, a HiQSDR or
+  Quisk expects.
 - Over WiFi or a VPN raise **Transmit buffer** to 100–200 ms.
 - Protocol 1 boards (the HL2 among them) top out at 384 kHz and have DDC1
   only; a Protocol 2 board gives a second band to a second radio tab on
@@ -12064,8 +12992,13 @@ All in [§6.2.17](#6217-limesdr-family--limerfe-limesuite):
     interface publishes no transmit channel at all, and the refusal appears
     wherever you keyed from rather than on the meter.
   - **The transmit port on the board itself**, `BAND1` or `BAND2` — the SMA the
-    LimeRFE's transmit input is cabled to. *Automatic* picks `BAND1`, which is
-    `TX1_1`.
+    LimeRFE's transmit input is cabled to. These are **two different matching
+    networks, not two jacks onto the same one**: `BAND1` (`TX1_1`) carries
+    30 MHz to 1.9 GHz and `BAND2` (`TX1_2`) is the 13 cm port. Transmitting an
+    amateur band below 23 cm out of `BAND2` puts the over into a microwave
+    filter that passes almost none of it — every setting reads correct, the
+    drive is whatever you set, and the meter stays at zero. *Automatic* follows
+    the dial and is what you want.
 - **A LimeRFE that answers but passes nothing** has two usual causes, and the
   log line the board's every accepted command produces tells them apart — it
   names the channel, both connectors and the relay state the board agreed to.
@@ -12136,6 +13069,160 @@ All in [§6.2.17](#6217-limesdr-family--limerfe-limesuite):
   longer centre itself on the IF — the window parks as close as it can and
   the tuned frequency simply rides off-centre in it, the same way it does at
   the edges of HF. Every width keeps the full VHF/UHF range.
+
+### 15.21 Public SDRs on the internet (KiwiSDR / Web-888, SpyServer)
+
+About eleven hundred receivers are published for anyone to listen on, and
+sdroxide can open one as an ordinary radio — same panadapter, same
+demodulators, same digital modes, same logbook. Two networks are covered.
+
+**KiwiSDR and Web-888** (the board its own listing calls "KiwiSDR 2") are the
+0–30 MHz receivers, about 870 of them online. **SpyServer** is Airspy's own
+server and the several that speak its protocol, about 230 online, mostly
+VHF/UHF dongles.
+
+Everything here is **receive only**, and not because of a missing feature.
+These are other people's antennas.
+
+Two networks you may be looking for are deliberately absent, which is why the
+chip says **PUBLIC SDR** rather than "WebSDR". PA3FWM's WebSDR — the receivers
+listed at `websdr.org` — sends audio in a proprietary codec whose author asks
+third-party clients to stay away, and **OpenWebRX** delivers demodulated audio
+only, over a protocol that has diverged between its forks and has no
+machine-readable directory to read in the first place. Neither is a
+"not yet"; use their web pages.
+
+#### Browsing
+
+**PUBLIC SDR** in the System box opens the list. The buttons across the top filter
+it by network, by whether a receiver can actually be used right now, and by
+whether it covers the frequency you are on; the search box matches on the
+name, the place, the antenna and the band, so `40m denmark` or `7000` both
+work. Hovering a row shows its address, its hardware and its antenna.
+
+Each row offers two things. **USE** points the radio you are on at that
+receiver, keeping everything else about it — converter offset, audio devices,
+the lot. **+ TAB** opens it as another radio in a tab of its own, leaving the
+one you were on alone.
+
+**USE** replaces a radio, so on a tab that already has an interface it asks
+first, across the top of the list: which radio is about to become which
+receiver, and **REPLACE** / **+ TAB INSTEAD** / **CANCEL**. Going ahead also
+**renames the tab** after the receiver — a tab still calling itself "IC-9700"
+while it is really a dongle in another country, refusing your 2 m calling
+frequency as out of range, is a puzzle nobody should have to solve.
+
+Nothing is lost by taking a receiver in a tab you had set up. Every interface
+keeps its own settings, and the tuning ranges you stated go with the interface
+they were stated for ([6.2](#62-radio-choosing-and-configuring-the-rig)),
+so switching **Radio interface** back in Settings → Radio brings the transceiver
+back as it was — its address, its sound cards and its ranges. What it does not
+bring back is the tab's name; type it again in the **Name** box on that page.
+
+The lists are fetched by the machine the radio is attached to, not by the
+screen you are sitting at — so this works the same in the browser client, and
+a receiver is judged reachable from where it will actually be connected to.
+They are cached for a quarter of an hour; **⟳ REFRESH** goes to the network.
+
+#### Being a guest
+
+Every one of these receivers has a hard limit on how many people can listen at
+once, and somebody pays for its antenna, its power and its uplink.
+
+- A receiver that is **full** is shown greyed with the reason rather than
+  hidden, so you can see there is one where you wanted one and come back.
+- A KiwiSDR whose operator has **not opened any channels to non-browser apps**
+  is greyed too. sdroxide is a non-browser app, so such a receiver will refuse
+  it however many channels are free — this is the one refusal you cannot see
+  coming from the outside, which is why it is called out.
+- sdroxide **identifies itself**, as the network expects: your station
+  callsign, or plain `sdroxide` where none is set. Settings → Radio can
+  override it.
+- When a receiver ends the session itself — its inactivity timeout, its
+  24-hour per-address limit, a wrong password, or its operator pressing the
+  kick button — sdroxide reports what it said and **stops**. It does not
+  reconnect. A dropped network link still reconnects normally.
+- Closing the radio frees the channel at once rather than at the receiver's
+  own timeout.
+
+#### What a KiwiSDR actually gives you
+
+A KiwiSDR has no wideband I/Q and never has. It has eight (or four) *user
+channels*, each about 12 kHz wide, which it normally demodulates for you — and
+one of its modes hands the channel over as complex baseband instead. That is
+what sdroxide opens.
+
+So the panadapter is about 12 kHz, and honest about it. Alongside it, on a
+second connection, the receiver sends the waterfall its own web page draws:
+1024 finished bins across the whole 0–30 MHz, in the strip above the
+panadapter. Tuning across that strip retunes the receiver. It is the same
+shape as the SpyServer VFO+FFT interface, and for the same reason — it is what
+a receiver at the far end of a network link can actually deliver.
+
+That is enough for everything sdroxide decodes: SSB, AM and the synchronous
+detectors, CW, RTTY, NAVTEX, WSPR, FT8 and FT4, and the rest. It is not enough
+for anything wider than the window, and there is no way to ask for more.
+
+The link costs about 64 kB/s: 44 for the I/Q and 20 for the waterfall. Turn
+the band view off, or slow it down, in Settings → Radio if that matters.
+
+The main panadapter is not stuck at those 12 kHz, though: keep zooming out and
+it widens past them and goes on to cover the whole 0–30 MHz, drawn from the same
+waterfall bins the strip uses ([§2.8](#28-the-display-and-fft-controls)). It
+coarsens where it crosses over — those bins are all there is out there — and
+zooming back in returns the I/Q's own resolution.
+
+#### Gain and the S-meter
+
+Unusually for a receiver here, the **AGC is left on at the far end** by
+default. It sits ahead of the I/Q, so it acts before anything sdroxide does —
+but the alternative measured worse: on a live receiver the manual gain was not
+monotonic across its range and its top end clipped the I/Q at full scale,
+while the AGC held about −24 dBFS with 7 dB of headroom.
+
+The consequence is that the sample amplitude is not a signal level, so the
+S-meter is read from the figure the receiver puts in every audio frame
+instead. That reading is already in dBm on its own operator's calibration —
+which is worth rather more than sdroxide's own uncalibrated scale, and comes
+with one caveat: it is for the receiver's ±6 kHz channel, not for whatever
+filter you have in front of the demodulator. A narrow CW filter here still
+reads the wideband level.
+
+#### SpyServer, and which shape to take
+
+A SpyServer will send either a wideband stream — an ordinary SDR, as much of
+the band as its ladder offers — or a narrow window that follows the dial plus
+its own band view. The browse window's **LOW BW** button picks the second, which
+is the one for a link that cannot carry megabits. It makes no difference to a
+KiwiSDR, which has only the one shape.
+
+A server whose receiver another client already owns still works; tuning is
+then limited to the slice that client is receiving, and the gain is theirs. That
+is the usual reason a SpyServer's band view looks stuck on a stretch of
+spectrum you did not choose — the notice at the top of the window names the
+range you are held to. Nothing this end can do will move it until that client
+does; pick another server, or come back later.
+
+Its **width** is your choice, though: the band view is one stage of the server's
+own decimation ladder, and **I/Q bandwidth**'s neighbour in Settings → Radio
+picks which. Stage 0 is the widest the server offers, and is the default. As
+with a KiwiSDR, the main panadapter can be zoomed out to cover the whole of it
+([§2.8](#28-the-display-and-fft-controls)).
+
+#### Adding one by hand
+
+A receiver that is not listed — your own, or one behind a name you were given
+— goes in under Settings → Radio, interface **KiwiSDR / Web-888 (network)** or
+**SpyServer (network)**, as an address. **Test connection** reads the
+receiver's status page without taking one of its channels and says what it is,
+what it covers, how many channels are free and whether non-browser apps are
+allowed at all.
+
+One trap worth knowing: nearly half the public KiwiSDRs are reached through
+the project's own reverse proxy, at a `something.proxy.kiwisdr.com` address,
+and those answer on **port 80** rather than on a Kiwi's usual 8073. Give the
+port explicitly. Picking a receiver from the browse window always gets this
+right.
 
 ---
 
@@ -12232,6 +13319,7 @@ using. Bind them under **Speech** on the Controls tab:
 | PACKET / PACKET-HF | AX.25 packet radio: 1200 baud Bell 202 or 9600 baud G3RUH on VHF/UHF FM, 300 baud AFSK on HF sideband. Carries Winlink sessions and offers the modem as a KISS TNC. See [11](#11-winlink-radio-email). |
 | APRS | Automatic Packet Reporting System — 1200 baud AX.25 on the region's shared channel, with a live map of every station heard, its own symbol per station, and messages you can send and answer. See [3.12](#312-aprs). |
 | ADS-B | Aircraft surveillance on 1090 MHz: a target list and a radar picture with history dots, speed vectors and data blocks. Receive only, and needs a receiver streaming at least 2 Msps. See [3.13](#313-ads-b-aircraft-on-1090-mhz). |
+| VDL2 | The VHF datalink aircraft exchange ACARS over, on seven channels around 136.8 MHz at once: a message log and the stations sending them. Receive only. See [3.15](#315-vdl2-what-the-aircraft-are-saying). |
 
 ### Bands
 

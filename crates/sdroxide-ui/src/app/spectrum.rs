@@ -238,6 +238,45 @@ fn slack_viewport(center_hz: f64, full_span: f64, (view_lo, view_hi): (f64, f64)
 }
 
 impl SdroxideApp {
+    /// The full-band window this front end publishes beside its I/Q, `(centre,
+    /// span)` — what the main panadapter may be zoomed out into.
+    ///
+    /// `None` where there is no such lane, or where it has stopped arriving:
+    /// a window built on a spectrum that is no longer being sent would let the
+    /// operator zoom out into a frozen picture. The engine applies the same
+    /// staleness rule on its side before it will draw one.
+    pub(in crate::app) fn wide_window(&self) -> Option<(f64, f64)> {
+        let f = self.wide_frame.as_ref()?;
+        (f.span_hz > 0.0).then_some((f.center_hz, f.span_hz))
+    }
+
+    /// The widest window the view may cover: the full-band lane where there is
+    /// one and it beats the passband, else the passband itself.
+    ///
+    /// The *width* comes from the capabilities rather than from the last frame,
+    /// so it is known from the moment the front end opens. Waiting for a
+    /// picture would spend the first frames of every session believing the
+    /// passband was the limit — long enough to shrink a restored window to it
+    /// and lose the operator's zoom on every restart.
+    ///
+    /// Where it sits still comes from the frame, because that moves with the
+    /// receiver; until one arrives the passband's centre is the best guess and
+    /// is right whenever the lane is centred on the receiver, which is the
+    /// usual case.
+    pub(in crate::app) fn zoom_out_window(&self) -> (f64, f64) {
+        let dev_span = self.state.sample_rate;
+        let stated = self.caps.as_ref().map_or(0.0, |c| c.wide_span_hz);
+        let span = match self.wide_window() {
+            Some((_, seen)) => seen.max(stated),
+            None => stated,
+        };
+        if span <= dev_span {
+            return (self.state.center_hz, dev_span);
+        }
+        let center = self.wide_window().map_or(self.state.center_hz, |(c, _)| c);
+        (center, span)
+    }
+
     /// Desired engine-side spectrum config. The requested viewport gets 2×
     /// slack around the visible span so panning inside it needs no
     /// reconfiguration (which would clear the waterfall history); the FFT
@@ -322,9 +361,26 @@ impl SdroxideApp {
 
     pub(in crate::app) fn desired_spectrum_cfg(&self) -> SpectrumConfig {
         let full_span = self.state.sample_rate;
+        // The window the *view* lives in, which past the passband is the
+        // full-band lane's — slack clamped to the I/Q there would ask the
+        // engine for a window the operator is not looking at, and it is the
+        // wide bins that answer once the view leaves the passband.
+        let (out_center, out_span) = self.zoom_out_window();
         let (viewport, zoom) = if !self.view.is_unset() && full_span > 0.0 {
             let ratio = (full_span / self.view.span()).max(1.0);
-            if ratio > 1.05 {
+            // Zoomed out past the passband: the whole view is the request, and
+            // there is no zoom factor to grow the transform by — the wide lane
+            // has whatever resolution it has.
+            if self.view.span() > full_span * WIDER_THAN_PASSBAND {
+                (
+                    Some(slack_viewport(
+                        out_center,
+                        out_span,
+                        (self.view.view_lo_hz, self.view.view_hi_hz),
+                    )),
+                    1.0,
+                )
+            } else if ratio > 1.05 {
                 let vp = slack_viewport(
                     self.state.center_hz,
                     full_span,
@@ -532,9 +588,17 @@ impl SdroxideApp {
     /// Reuse the skimmer overlay to mark FT8/FT4 stations: one box per decoded
     /// callsign at its audio frequency (`dial + audio_hz`). The newest slot is
     /// solid; the previous slot is dimmed. Clicking a box sets the audio offset.
+    ///
+    /// Nothing at all with the labels switched off in the SPEC popup: the
+    /// decode list beside the waterfall says the same callsigns, so an operator
+    /// who finds a busy band unreadable through thirty boxes loses nothing by
+    /// clearing them (issue #248).
     pub(in crate::app) fn ft8_overlay(&self) -> (Vec<SkimmerSpot>, Vec<f32>) {
         let mut spots = Vec::new();
         let mut alpha = Vec::new();
+        if !self.view.decode_labels {
+            return (spots, alpha);
+        }
         let Some(latest) = self.digi_decodes.first().map(|d| d.slot_utc) else {
             return (spots, alpha);
         };
@@ -818,8 +882,15 @@ impl SdroxideApp {
         // comparison, and the window is only ever *narrowed* to a span that is
         // really there. Only the width is settled here; where it sits is
         // settled just below.
-        if self.state.sample_rate > 0.0 && self.view.span() > self.state.sample_rate {
-            self.view.fit(self.state.center_hz, self.state.sample_rate);
+        // Only once the front end has said what it offers. The first `State`
+        // can arrive ahead of the first `Capabilities`, and until it has there
+        // is no way to tell a front end with a full-band lane from one without
+        // — so narrowing here would shrink a restored window to the passband on
+        // the strength of an answer that had not come yet, which is exactly how
+        // a zoomed-out KiwiSDR session came back up at 12 kHz.
+        let (out_center, out_span) = self.zoom_out_window();
+        if self.caps.is_some() && out_span > 0.0 && self.view.span() > out_span {
+            self.view.fit(out_center, out_span);
         }
         let moved = (vfo - prev_vfo).abs() > 0.5;
         let outside = !(self.view.view_lo_hz..=self.view.view_hi_hz).contains(&vfo);
@@ -874,6 +945,21 @@ fn base_fft_for_rate(chip: u32, rate_hz: f64) -> u32 {
     chip.min(afford).max(1024)
 }
 
+/// How much wider than the passband a view has to be before it counts as
+/// zoomed out past it.
+///
+/// Not a bare `>`. A front end restates its sample rate as it measures it, and
+/// a GPS-disciplined one restates it *differently every session*: a KiwiSDR
+/// reported 11998.876241, .876277, .876288, .876369, .876561 and .876576 across
+/// six connections to the same receiver. A view fitted to one of those and
+/// restored against another is a ten-thousandth of a hertz wider — enough for a
+/// bare comparison to declare it zoomed out, whereupon the client asks for
+/// twice the passband, the engine answers from the full-band lane, and a
+/// 12 kHz window pooled from 29 kHz bins draws as a flat line across the
+/// panadapter. A tenth of a percent is far below any zoom step and far above
+/// that.
+const WIDER_THAN_PASSBAND: f64 = 1.001;
+
 /// Whether a jump in the device window should re-fit the view to it.
 ///
 /// True only for an audio-mode front end whose window grew by a large factor
@@ -887,11 +973,40 @@ fn refit_on_window_growth(audio_mode: bool, prev_rate: f64, new_rate: f64, view_
 
 #[cfg(test)]
 mod tests {
+    use super::WIDER_THAN_PASSBAND;
     use super::{
         AutoFit, FIT_ARRIVED_DB, FIT_MIN_GAP_S, FIT_SETTLE_S, FIT_STEP_S, average_in,
         base_fft_for_rate, fit_due, glide_step, levels_drifted, pick_levels,
         refit_on_window_growth, slack_viewport,
     };
+
+    /// The six sample rates one KiwiSDR reported across six connections. A view
+    /// fitted to any of them must still read as "the whole passband" against
+    /// any other, or the panadapter falls onto the full-band lane and draws a
+    /// flat line — see [`WIDER_THAN_PASSBAND`].
+    #[test]
+    fn a_view_fitted_to_one_session_is_not_zoomed_out_in_the_next() {
+        const SEEN: [f64; 6] =
+            [11998.876241, 11998.876277, 11998.876288, 11998.876369, 11998.876561, 11998.876576];
+        for fitted in SEEN {
+            for now in SEEN {
+                assert!(
+                    !(fitted > now * WIDER_THAN_PASSBAND),
+                    "a view fitted at {fitted} reads as zoomed out against {now}"
+                );
+            }
+        }
+    }
+
+    /// It still has to notice a real zoom-out. One step of the wheel is a few
+    /// percent, and the smallest thing anyone would call zoomed out is well
+    /// past that.
+    #[test]
+    fn a_real_zoom_out_is_still_recognised() {
+        let rate = 11998.876241;
+        assert!(rate * 1.02 > rate * WIDER_THAN_PASSBAND, "one wheel step must count");
+        assert!(30e6 > rate * WIDER_THAN_PASSBAND, "the whole band certainly counts");
+    }
 
     /// The crash this replaced: an RX-888 scrolled to the top of its band, at a
     /// zoom where the 2× slack covers the whole device window. `dev_hi - slack`

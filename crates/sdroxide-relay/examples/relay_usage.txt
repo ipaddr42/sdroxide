@@ -1,0 +1,13 @@
+sdroxide T/R switch prober
+
+  --list                       USB HID relay boards and GPIO-capable sound cards
+
+  --serial PATH --board NAME   a serial relay board: lcus (default), kmtronic, numato
+  --lines PATH                 RTS (contact 1) and DTR (contact 2) on a serial port
+  --hid KEY                    a dcttech USB HID relay board, by the key --list printed
+  --cm108 KEY [--pin N]        a CM108-family sound card's GPIO, pin 3 by default
+
+  --set N [off]                close contact N for a second, then release it
+  --sense cts|dsr|dcd          watch a handshake input for ten seconds
+
+Everything is released again before this exits.

@@ -129,6 +129,21 @@ fn cfg(span_hz: Option<f64>) -> Command {
     cfg_at(span_hz, 2048)
 }
 
+/// A `span_hz` window centred wherever the operator has dragged it to, rather
+/// than on the tones.
+fn cfg_window(center_hz: f64, span_hz: f64) -> Command {
+    Command::SetSpectrumCfg(SpectrumConfig {
+        fft_size: 4096,
+        display_bins: 2048,
+        rows_per_sec: 28,
+        db_floor: -140.0,
+        db_ceil: 0.0,
+        viewport: Some((center_hz - span_hz / 2.0, center_hz + span_hz / 2.0)),
+        fps: 30,
+        avg_tc: 0.0,
+    })
+}
+
 /// Collect frames for `secs` and return the last one whose span matches what
 /// was asked for, so a frame still in flight from the previous config cannot be
 /// mistaken for the answer.
@@ -437,6 +452,53 @@ fn every_row_is_a_picture_of_the_band() {
         std::thread::sleep(Duration::from_millis(2));
     }
     assert!(checked >= 10, "only {checked} rows arrived to check");
+
+    drop(h.cmd_tx);
+    if let Some(t) = thread {
+        let _ = t.join();
+    }
+}
+
+/// A window dragged across the band keeps its lane, and the lane keeps up.
+///
+/// The window is where the NCO is pointed, and nothing else about the lane
+/// depends on it — so a pan re-points it and the filters, the averaging and the
+/// waterfall all carry on. Rebuilding instead cost a lane with no spectrum in
+/// it at every step of the drag, which is what put a black band across the
+/// whole width of the waterfall for as long as the operator held the mouse
+/// down.
+///
+/// The proof that it really moved: the pair is out of view at the start and
+/// resolved, at the frequency it really sits on, at the end. A lane left
+/// pointed where it was built would show the empty band it started on.
+#[test]
+fn a_dragged_window_keeps_its_lane_and_still_shows_the_band() {
+    let mut h = engine();
+    let thread = h.thread.take();
+
+    // Well clear of the pair — four windows away, so nothing of it is in view.
+    let start_hz = TONE_MID_HZ - VIEW_HZ * 4.0;
+    h.cmd_tx.send(cfg_window(start_hz, VIEW_HZ)).unwrap();
+    let away = frame_of_span(&mut h, VIEW_HZ, 3.0);
+    assert!(!resolves_the_pair(&away), "the pair should be out of view to start with");
+
+    // The drag: a tenth of the window per displayed frame, as a client sends it.
+    for step in 1..=40 {
+        let at = start_hz + step as f64 * VIEW_HZ / 10.0;
+        h.cmd_tx.send(cfg_window(at.min(TONE_MID_HZ), VIEW_HZ)).unwrap();
+        std::thread::sleep(Duration::from_millis(16));
+        while h.spectrum_out.update() {}
+        while h.event_rx.try_recv().is_ok() {}
+    }
+
+    let onto = frame_of_span(&mut h, VIEW_HZ, 2.0);
+    assert!(resolves_the_pair(&onto), "the dragged window should resolve the pair it landed on");
+    let (top, _) = onto.bins.iter().enumerate().max_by_key(|(_, v)| **v).expect("a frame has bins");
+    let hz = onto.freq_at_bin(top);
+    assert!(
+        (hz - TONE_MID_HZ).abs() < TONE_GAP_HZ,
+        "the pair read at {hz}, expected {TONE_MID_HZ} ± {TONE_GAP_HZ:.0}"
+    );
 
     drop(h.cmd_tx);
     if let Some(t) = thread {

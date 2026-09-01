@@ -13,6 +13,7 @@ mod bandplan;
 pub mod broadcast;
 mod callsign;
 mod caps;
+mod chirp;
 mod command;
 mod contacts;
 mod controller;
@@ -33,10 +34,12 @@ mod pictures;
 mod probe;
 mod prop_store;
 mod propagation;
+pub mod publicsdr;
 mod qo100;
 mod radio;
 mod rds;
 pub mod region;
+mod relay;
 mod repeater;
 mod rifp;
 mod rigctld;
@@ -55,6 +58,7 @@ mod tciserver;
 pub mod text;
 mod tone;
 mod ui;
+mod vdl2;
 mod voice;
 mod wefax;
 mod winlink;
@@ -91,6 +95,7 @@ pub use bandplan::{BandPlan, BandPlanError, RegionPlan, band_plan, set_band_plan
 pub use broadcast::{BroadcastStation, BroadcastStations};
 pub use callsign::{CallsignInfo, LoginTarget, LoginTestResult, UploadResult, UploadTarget};
 pub use caps::{DeviceCaps, DeviceSetting, Direction, GainElement, SettingKind};
+pub use chirp::{chirp_csv_to_memories, memories_to_chirp_csv};
 pub use command::Command;
 pub use contacts::FsqContact;
 pub use controller::{AudioDevices, PeerRadio, RadioController, RadioEvent};
@@ -156,6 +161,7 @@ pub use propagation::{
     SPLAT_SIGMA_KM, cell_center, cell_of, fof2_floor_mhz, margin_db, muf3000_floor_mhz,
     obliquity_factor,
 };
+pub use publicsdr::{PublicSdrDirectory, PublicSdrEntry, PublicSdrNetwork};
 pub use qo100::{QO100_BEACON_HZ, Qo100Settings, Qo100Status};
 pub use radio::{
     AirspyConfig, AirspyDevice, AirspyGain, AirspyHfConfig, AirspyHfDevice, AirspyHfModel, Backend,
@@ -164,24 +170,28 @@ pub use radio::{
     DIV_MODE_ELEMENT, DIV_RATE_ELEMENT, DIV_RESET_ELEMENT, DIV_TAPS_ELEMENT, DIVERSITY_MAX_TAPS,
     DigiMode, DiversityMode, ELAD_ATTENUATOR_DB, ELAD_CAT_BAUDS, ELAD_DEFAULT_CAT_BAUD,
     ELAD_DEFAULT_RATE_HZ, ELAD_SAMPLE_RATES, EladAntenna, EladConfig, EladDevice, EladTxInput,
-    FREQ_RANGE_MAX_HZ, HackRfConfig, HackRfDevice, HpsdrConfig, HpsdrDevice, HpsdrFilterBoard,
-    HpsdrIoRxInput, HydraSdrConfig, HydraSdrDevice, HydraSdrGain, HydraSdrPort, IcomModel,
-    IcomNetConfig, IcomRxSource, IcomScopeSpan, IfModeClass, KenwoodSend, LimeAuxConfig,
-    LimeAuxRole, LimeConfig, LimeDevice, LineState, ModeControl, PANADAPTER_OFFSET_MAX_HZ,
-    PanadapterAudio, PanadapterConfig, PanadapterTap, Parity, PlutoAgc, PlutoConfig, PlutoDevice,
-    PlutoDuplex, PlutoPtt, PttMethod, QMX_IQ_OFFSET_HZ, QMX_IQ_RATE_HZ, RadioConfig, RtlSdrAgc,
-    RtlSdrConfig, RtlSdrDevice, RtlSdrHfMode, RtlTcpConfig, Rx888Config, Rx888Device, SdrPlayAgc,
-    SdrPlayConfig, SdrPlayDevice, SdrPlayDuo, SdrPlayDuoRole, SdrPlayDuoTuner, SdrPlayModel,
-    SerialConfig, SmartSdrConfig, SmartSdrDevice, SoapyConfig, SoapyDeviceInfo, SoundFormat,
-    SpyServerConfig, SpyServerFormat, StopBits, TciConfig, cat_iq_offset_max_hz,
-    converter_preset_name, diversity_cost_note, elad_cat_baud, format_freq_ranges,
-    hackrf_serial_matches, parse_freq_ranges,
+    FREQ_RANGE_MAX_HZ, FobosConfig, FobosDevice, FobosPort, HackRfConfig, HackRfDevice,
+    HpsdrConfig, HpsdrDevice, HpsdrFilterBoard, HpsdrIoRxInput, HydraSdrConfig, HydraSdrDevice,
+    HydraSdrGain, HydraSdrPort, IcomModel, IcomNetConfig, IcomRxSource, IcomScopeSpan, IfModeClass,
+    KenwoodSend, KiwiConfig, LimeAuxConfig, LimeAuxRole, LimeConfig, LimeDevice, LineState,
+    ModeControl, PANADAPTER_OFFSET_MAX_HZ, PanadapterAudio, PanadapterConfig, PanadapterTap,
+    Parity, PlutoAgc, PlutoConfig, PlutoDevice, PlutoDuplex, PlutoPtt, PttMethod, QMX_IQ_OFFSET_HZ,
+    QMX_IQ_RATE_HZ, RadioConfig, RtlSdrAgc, RtlSdrConfig, RtlSdrDevice, RtlSdrHfMode, RtlTcpConfig,
+    Rx888Config, Rx888Device, SdrPlayAgc, SdrPlayConfig, SdrPlayDevice, SdrPlayDuo, SdrPlayDuoRole,
+    SdrPlayDuoTuner, SdrPlayModel, SerialConfig, SmartSdrConfig, SmartSdrDevice, SoapyConfig,
+    SoapyDeviceInfo, SoundFormat, SpyServerConfig, SpyServerFormat, StopBits, TciConfig,
+    cat_iq_offset_max_hz, converter_preset_name, diversity_cost_note, elad_cat_baud,
+    format_freq_ranges, hackrf_serial_matches, parse_freq_ranges,
 };
 pub use rds::{
     RdsClock, RdsData, RdsGroupLog, RdsStandard, RdsStats, RtPlus, af_code_hz, pi_callsign,
     pty_name, rt_plus_class,
 };
 pub use region::{Region, region, set_region};
+pub use relay::{
+    DEFAULT_HOLD_MS, DEFAULT_LEAD_MS, FailSafe, MAX_CHANNEL, RelayChannel, RelayConfig,
+    RelayDevice, RelayFamily, RelayLink, RelayRole, RelayStatus, SenseConfig, SenseLine,
+};
 pub use repeater::{
     BURST_MS_RANGE, DCS_CODES, MAX_OFFSET_HZ, RepeaterState, Shift, TONE_BURST_HZ, ToneMode,
     TxSubTone, dcs_bits, standard_shift, standard_shift_in,
@@ -225,6 +235,13 @@ pub use tone::{CTCSS_TONES, SubTone};
 pub use ui::{
     BandplanKind, ChromeStyle, FontSize, LayoutMode, SmeterStyle, SpectrumDetail, Speed,
     UiSettings, UiTheme,
+};
+pub use vdl2::{
+    VDL2_ALL_CHANNELS, VDL2_CHANNEL_SPACING_HZ, VDL2_CHANNELS_HZ, VDL2_CSC_HZ, VDL2_DROP_LIST_S,
+    VDL2_GOOD_SPS, VDL2_MESSAGE_MAX, VDL2_MESSAGES, VDL2_MIN_RATE_HZ, VDL2_PLAN_CENTER_HZ,
+    VDL2_PLAN_RATE_HZ, VDL2_STATION_MAX, VDL2_STATIONS, VDL2_SYMBOL_RATE, VDL2_THRESHOLD_DB,
+    Vdl2Acars, Vdl2AddrKind, Vdl2ChannelStatus, Vdl2Frame, Vdl2Message, Vdl2Payload, Vdl2Settings,
+    Vdl2Station, Vdl2Status, Vdl2Xid,
 };
 pub use voice::{VOICE_MAX_LEN_S, VOICE_SLOTS, VoiceSlotInfo, VoiceStatus, slot_label};
 pub use wefax::{WEFAX_STATIONS, WefaxChartMeta, WefaxIoc, WefaxLpm, WefaxStation, WefaxStatus};

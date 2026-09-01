@@ -120,6 +120,23 @@ pub struct LimeHandle {
     /// every fifteen seconds says it once rather than four times a minute. Any
     /// change — band, port, drive — says it again.
     last_tx_summary: String,
+    /// What this over actually handed the transmitter: samples offered, samples
+    /// LimeSuite took, and the loudest one of them. Reset at every key-down and
+    /// reported at unkey — see [`LimeHandle::tx_end`] for why a transmitter
+    /// that answers every command still needs to say this.
+    tx_offered: u64,
+    tx_sent: u64,
+    tx_peak: f32,
+    /// Set while the selected transmit socket does not cover the dial. Its own
+    /// field rather than folded into `note`, for the same reason `cal_note`
+    /// has one: it is a standing condition with a standing answer, and it is
+    /// the whole explanation for a transmitter that reads correct everywhere
+    /// and makes no power. See [`LimeHandle::refresh_tx_port_note`].
+    tx_port_note: Option<String>,
+    /// The frequency `tx_port_note` was written for, so a retune that stays on
+    /// the wrong side of the boundary does not rebuild the sentence on every
+    /// frame of a panadapter drag.
+    tx_port_note_hz: f64,
 }
 
 impl LimeHandle {
@@ -231,7 +248,7 @@ impl LimeHandle {
                 tx_lpf_applied = tx_bw;
             }
             antenna_tx = if cfg.antenna_tx.trim().is_empty() {
-                device::auto_antenna_tx(&antennas_tx).unwrap_or_default()
+                device::auto_antenna_tx(center_hz, &antennas_tx).unwrap_or_default()
             } else {
                 cfg.antenna_tx.clone()
             };
@@ -425,7 +442,7 @@ impl LimeHandle {
             if want_tx { ", transmitter armed" } else { "" }
         );
 
-        Ok(LimeHandle {
+        let mut handle = LimeHandle {
             ctl: Arc::new(Mutex::new(ctl)),
             api: Arc::clone(&api),
             rx,
@@ -460,7 +477,51 @@ impl LimeHandle {
             closed: false,
             trace,
             last_tx_summary: String::new(),
-        })
+            tx_offered: 0,
+            tx_sent: 0,
+            tx_peak: 0.0,
+            tx_port_note: None,
+            tx_port_note_hz: f64::NAN,
+        };
+        handle.refresh_tx_port_note(center_hz);
+        Ok(handle)
+    }
+
+    /// Keep the standing "this over cannot leave the board" note in step with
+    /// the dial.
+    ///
+    /// The two transmit sockets are two matching networks — see
+    /// [`LimeConfig::tx_port_band`] — and a board on the wrong one transmits
+    /// into a filter that passes almost none of the band. Nothing else in the
+    /// session notices: the synthesiser is on frequency, the drive is whatever
+    /// was asked for, the stream runs, every call answers `ok`, and the power
+    /// meter reads zero. That is issue #94, and it took three releases to find
+    /// because the only place the socket appeared was a log line that stated it
+    /// without judging it.
+    ///
+    /// Only touched when the answer changes, because this runs on every retune
+    /// — which on a panadapter drag is every frame.
+    fn refresh_tx_port_note(&mut self, hz: f64) {
+        let bad = self.tx.is_some() && !LimeConfig::tx_port_covers(&self.antenna_tx, hz);
+        if !bad {
+            self.tx_port_note = None;
+            return;
+        }
+        if self.tx_port_note.is_some() && (hz - self.tx_port_note_hz).abs() < 1.0 {
+            return;
+        }
+        self.tx_port_note_hz = hz;
+        let (lo, hi) = LimeConfig::tx_port_band(&self.antenna_tx).unwrap_or_default();
+        self.tx_port_note = Some(format!(
+            "the transmit port is {}, which this board matches for {:.0}–{:.0} MHz — \
+             {:.3} MHz is outside it, so an over here will read as nothing on a power meter \
+             however much drive is set. Set Transmit port to Automatic in Settings → Radio, \
+             or pick the socket that covers this band.",
+            LimeConfig::port_label(self.cfg.channel, &self.antenna_tx, true),
+            lo / 1e6,
+            hi / 1e6,
+            hz / 1e6,
+        ));
     }
 
     /// Configure the board's other receive chain and create its stream.
@@ -625,6 +686,33 @@ impl LimeHandle {
             self.ctl().set_antenna_named(false, &want)?;
             self.antenna_rx = want;
         }
+        // The transmit port follows the dial for the same reason, and this is
+        // where it has to happen: it used to be chosen once at open and then
+        // left, so a session that started on 2 m and moved to 13 cm went on
+        // transmitting into the low-band matching network — and one that
+        // started on 13 cm kept the microwave port for every band below it.
+        // The two sockets are two matching networks, not two jacks onto one;
+        // see `device::tx_port_band`. Only while no port has been named, the
+        // same rule the receive side follows.
+        if self.tx.is_some()
+            && self.cfg.antenna_tx.trim().is_empty()
+            && let Some(want) = device::auto_antenna_tx(hz, &self.antennas_tx)
+            && want != self.antenna_tx
+        {
+            // The guard is dropped before the field is written: the device
+            // lock and a borrow of `self` must not overlap.
+            let moved = self.ctl().set_antenna_named(true, &want);
+            match moved {
+                Ok(()) => {
+                    tracing::info!("LimeSDR transmit port following the dial to {want}");
+                    self.antenna_tx = want;
+                }
+                // Not fatal to a retune: the operator is tuning, and the next
+                // key-down says loudly what socket the over is going out of.
+                Err(e) => tracing::warn!("the LimeSDR transmit port did not follow the tune: {e}"),
+            }
+        }
+        self.refresh_tx_port_note(hz);
         // Crossing 30 MHz changes which side of the NCO trick the filter has
         // to serve (see `device::effective_lpf_bw`). The answer is constant on
         // each side, so this slow call fires only on the crossing itself —
@@ -678,6 +766,12 @@ impl LimeHandle {
         if tx {
             self.antenna_tx = name.to_string();
             self.cfg.antenna_tx = name.to_string();
+            // A port picked by hand is exactly where this goes wrong, so the
+            // note is answered at the moment it is chosen rather than at the
+            // next key-down.
+            self.tx_port_note = None;
+            let center = self.center;
+            self.refresh_tx_port_note(center);
         } else {
             self.antenna_rx = name.to_string();
             self.cfg.antenna_rx = name.to_string();
@@ -1025,12 +1119,12 @@ impl LimeHandle {
 
     /// Standing conditions worth telling the operator about.
     pub fn status_note(&self) -> Option<String> {
-        match (&self.note, &self.cal_note) {
-            (Some(a), Some(b)) => Some(format!("{a}\n{b}")),
-            (Some(a), None) => Some(a.clone()),
-            (None, Some(b)) => Some(b.clone()),
-            (None, None) => None,
-        }
+        let lines: Vec<&str> = [&self.note, &self.cal_note, &self.tx_port_note]
+            .into_iter()
+            .flatten()
+            .map(String::as_str)
+            .collect();
+        (!lines.is_empty()).then(|| lines.join("\n"))
     }
 
     /// Start transmitting on `center_hz`. Returns the transmit sample rate.
@@ -1082,10 +1176,42 @@ impl LimeHandle {
                 self.trace.call("LMS_StartStream", "transmit", format!("FAILED: {text}"));
                 return Err(Error::api("LMS_StartStream", text));
             }
+            // Traced when it *works*, not only when it fails. This is the one
+            // call that decides whether the transmitter exists at all, and a
+            // trace that says nothing about it leaves "no output on the meter"
+            // with no way to tell a stream that never started from one that
+            // started and was handed nothing (issue #94).
+            self.trace.call("LMS_StartStream", "transmit", "ok");
             self.tx_running = true;
         }
+        // A fresh set of books for this over.
+        self.tx_offered = 0;
+        self.tx_sent = 0;
+        self.tx_peak = 0.0;
         self.announce_tx(center_hz);
-        Ok(self.ctl().sample_rate(true).unwrap_or(self.rate))
+        // The engine builds its upconverter from this number, so a nonsense
+        // answer here is a transmitter that emits nothing with no error
+        // anywhere: an interpolator built for 0 Hz produces no samples, and
+        // every layer above would go on reporting a healthy over. LimeSuite
+        // reads it back off the chip's own registers, which is exactly the
+        // read that can come back as zero on a part that is mid-reconfigure —
+        // so it is only believed when it is plausible, and the rate this
+        // session opened at stands in when it is not.
+        let asked = self.ctl().sample_rate(true).unwrap_or(self.rate);
+        if !(asked.is_finite() && asked > 0.0) {
+            tracing::warn!(
+                "the LimeSDR reported a transmit sample rate of {asked}; transmitting at the \
+                 session's {:.3} Msps instead",
+                self.rate / 1e6
+            );
+            self.trace.call(
+                "LMS_GetSampleRate",
+                format!("transmit answered {asked}"),
+                format!("using {:.3} Msps", self.rate / 1e6),
+            );
+            return Ok(self.rate);
+        }
+        Ok(asked)
     }
 
     /// Say what this over is actually going out through.
@@ -1109,12 +1235,28 @@ impl LimeHandle {
             self.tx_lpf_applied / 1e6
         );
         self.trace.call("transmit", &summary, "keyed");
+        // Ahead of the repeat-suppression below, and deliberately: an over that
+        // cannot leave the board should say so *every* time, not once per
+        // distinct transmit path. A station keying every fifteen seconds into
+        // the wrong socket is putting nothing on the air every fifteen seconds.
+        self.warn_if_port_is_wrong(center_hz);
         if summary == self.last_tx_summary {
             tracing::debug!("LimeSDR transmitting: {summary}");
             return;
         }
         self.last_tx_summary = summary.clone();
         tracing::info!("LimeSDR transmitting: {summary}");
+        //
+        // A LimeSDR's two transmit sockets are two matching networks — BAND1
+        // is 30 MHz to 1.9 GHz, BAND2 is 2 to 2.6 GHz — and keying an amateur
+        // band out of BAND2 puts the over into a microwave matching network
+        // that passes essentially none of it. Nothing else in the session
+        // notices: the synthesiser is on frequency, the drive is at maximum,
+        // the stream is running, every call answers `ok`, and the power meter
+        // reads zero. That is issue #94, and the line above had been printing
+        // the socket in plain sight for three releases without anyone being
+        // able to see that it was the wrong one.
+
         // The drive is a real setting with a real default, and the default is
         // the bottom of the range — deliberately, so an armed transmitter
         // cannot surprise anybody. What it must not do is stay there silently:
@@ -1132,6 +1274,22 @@ impl LimeHandle {
         }
     }
 
+    /// Say — loudly, and in the trace — when this over is going out of a socket
+    /// the board does not match for this band.
+    ///
+    /// The four things that decide whether any RF leaves a LimeSDR are the
+    /// frequency, the socket, the drive and the filter, and `announce_tx` above
+    /// prints all four. Three of them are checked somewhere: the frequency
+    /// against the synthesiser's range, the drive against the bottom of its
+    /// own, the filter against the 30 MHz crossing. The socket was only ever
+    /// *stated* — and it is the one that silently costs the whole over.
+    fn warn_if_port_is_wrong(&mut self, center_hz: f64) {
+        self.refresh_tx_port_note(center_hz);
+        let Some(note) = self.tx_port_note.clone() else { return };
+        self.trace.call("transmit", &note, "WRONG PORT");
+        tracing::warn!("LimeSDR: {note}");
+    }
+
     /// Write one block of modulated baseband.
     pub fn tx_write(&mut self, samples: &[Complex32]) -> Result<()> {
         let Some(tx) = self.tx.as_mut() else {
@@ -1147,6 +1305,12 @@ impl LimeHandle {
             wait_for_timestamp: false,
             flush_partial_packet: false,
         };
+        // What is actually being handed to the transmitter, before any of it
+        // reaches LimeSuite. A key-down that puts nothing on the air is either
+        // the radio's fault or the signal's, and these two numbers are what
+        // tells the two apart — see [`LimeHandle::tx_end`].
+        self.tx_offered += samples.len() as u64;
+        self.tx_peak = samples.iter().fold(self.tx_peak, |m, z| m.max(z.norm()));
         let mut sent = 0usize;
         while sent < samples.len() {
             let n = unsafe {
@@ -1172,6 +1336,7 @@ impl LimeHandle {
             }
             sent += n as usize;
         }
+        self.tx_sent += sent as u64;
         Ok(())
     }
 
@@ -1196,12 +1361,47 @@ impl LimeHandle {
         };
     }
 
-    /// Stop transmitting.
+    /// Stop transmitting, and say what the over actually put into the radio.
+    ///
+    /// # Why an over is accounted for at all
+    ///
+    /// "No output on the power meter" is the report a LimeSDR gives when every
+    /// single call in this file has answered `ok` — the synthesiser is on
+    /// frequency, the socket is selected, the drive is at maximum, the stream
+    /// started — and it has been reported more than once against exactly that
+    /// trace (issue #94). Everything the trace held was about *commands*, and
+    /// commands were never the problem: what it could not say was whether any
+    /// modulated sample ever reached the transmitter, which is the one link in
+    /// the chain nothing else observes.
+    ///
+    /// So three numbers go in the trace at every unkey, and each one names a
+    /// different culprit:
+    ///
+    /// * **nothing offered** — the radio was keyed and the engine never sent a
+    ///   block. The transmitter is innocent; the modulator upstream of it made
+    ///   no samples.
+    /// * **offered, peak zero** — blocks arrived and every sample in them was
+    ///   silence. That is drive or microphone gain at zero, or a digital mode
+    ///   keying with nothing to say — again not the radio.
+    /// * **offered but not taken** — LimeSuite's FIFO refused them, which is
+    ///   the transmitter's own fault and the case where its stream status
+    ///   matters.
     pub fn tx_end(&mut self) -> Result<()> {
         self.tx_drain();
         if let Some(tx) = self.tx.as_mut()
             && self.tx_running
         {
+            // Read before the stream is stopped: a stopped stream has no
+            // status worth having.
+            let mut st = ffi::StreamStatusT::default();
+            let status = (unsafe { (self.api.get_stream_status)(tx, &mut st) } == ffi::OK)
+                .then(|| {
+                    format!(
+                        ", {} underrun(s), FIFO {}/{}",
+                        st.underrun, st.fifo_filled_count, st.fifo_size
+                    )
+                })
+                .unwrap_or_default();
             let rc = unsafe { (self.api.stop_stream)(tx) };
             self.tx_running = false;
             if rc != ffi::OK {
@@ -1209,9 +1409,47 @@ impl LimeHandle {
                 self.trace.call("LMS_StopStream", "transmit", format!("FAILED: {text}"));
                 return Err(Error::api("LMS_StopStream", text));
             }
-            self.trace.call("transmit", "", "unkeyed");
+            let (offered, sent, peak) = (self.tx_offered, self.tx_sent, self.tx_peak);
+            self.trace.call(
+                "transmit",
+                format!("{sent} of {offered} samples taken, peak {peak:.3} of full scale{status}"),
+                "unkeyed",
+            );
+            self.report_over(offered, sent, peak);
         }
         Ok(())
+    }
+
+    /// The same three numbers as a sentence in the log, and only when one of
+    /// them is wrong. A healthy over says nothing at info level — an FT8
+    /// station keying every fifteen seconds would otherwise fill the log with
+    /// its own good news.
+    fn report_over(&self, offered: u64, sent: u64, peak: f32) {
+        if offered == 0 {
+            tracing::warn!(
+                "the LimeSDR was keyed and no modulated samples were ever handed to it, so \
+                 nothing went on the air. The transmitter is not the problem here: check that \
+                 a microphone or digital mode is actually feeding this over."
+            );
+        } else if peak <= 0.0 {
+            tracing::warn!(
+                "the LimeSDR transmitted {offered} samples of pure silence, which is no RF \
+                 whatever the drive on the board is set to. Raise Drive (and Mic gain for a \
+                 voice over) — the LimeSDR's own Transmit gain cannot amplify a signal that \
+                 is not there."
+            );
+        } else if sent < offered {
+            let short = offered - sent;
+            tracing::warn!(
+                "the LimeSDR's transmit FIFO would not take {short} of {offered} samples this \
+                 over ({:.0}% of it), so what went out was chopped. Try a lower sample rate.",
+                100.0 * short as f64 / offered as f64
+            );
+        } else {
+            tracing::debug!(
+                "LimeSDR over finished: {sent} samples out, peak {peak:.3} of full scale"
+            );
+        }
     }
 
     pub fn tx_active(&self) -> bool {

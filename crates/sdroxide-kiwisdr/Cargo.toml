@@ -1,0 +1,24 @@
+[package]
+name = "sdroxide-kiwisdr"
+version.workspace = true
+edition.workspace = true
+
+# Native-only KiwiSDR / Web-888 client. Two WebSockets carrying a ~12 kHz I/Q
+# window and the receiver's own 0-30 MHz waterfall. Pure Rust; `ws://` only, no
+# TLS, because 855 of the 856 public receivers are plain HTTP. Must never be a
+# dependency of any wasm-targeted crate.
+[dependencies]
+sdroxide-types.workspace = true
+crossbeam-channel.workspace = true
+rtrb.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+# The receiver's `/status` page, for the settings tab's Test button. Same
+# version every other HTTP caller here uses, so it adds no build time.
+ureq = "3.4"
+# Blocking WebSocket client, `ws://` only — the same shape and the same feature
+# set the TCI client uses.
+tungstenite = { version = "0.30", default-features = false, features = ["handshake"] }
+
+[dev-dependencies]
+tracing-subscriber.workspace = true

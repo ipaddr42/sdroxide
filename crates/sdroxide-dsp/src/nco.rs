@@ -39,6 +39,49 @@ pub struct Nco {
 /// simply fewer of them.
 const RENORM_SAMPLES: u32 = 1 << 16;
 
+crate::simd::kernel! {
+    /// The whole-block half of [`Nco::mix`].
+    ///
+    /// `dst` and `src` are both a whole number of [`LANES`]-sample blocks. The
+    /// f64 phasor is carried across blocks — that recurrence is what keeps the
+    /// mixer's phase exact over hours — while the samples inside a block are
+    /// reached from the precomputed lane table and so are independent of one
+    /// another, which is what lets this widen.
+    fn mix_run / mix_run_portable / mix_run_avx2 / mix_run_avx512 (
+        dst: &mut [Complex32],
+        src: &[Complex32],
+        phasor: &mut num_complex::Complex<f64>,
+        block_step: num_complex::Complex<f64>,
+        lanes: &[Complex32; LANES],
+    ) {
+        for (ys, xs) in dst.chunks_exact_mut(LANES).zip(src.chunks_exact(LANES)) {
+            let base = Complex32::new(phasor.re as f32, phasor.im as f32);
+            for ((y, &x), &lane) in ys.iter_mut().zip(xs).zip(lanes) {
+                *y = x * (base * lane);
+            }
+            *phasor *= block_step;
+        }
+    }
+}
+
+crate::simd::kernel! {
+    /// [`mix_run`] for a caller that already owns the buffer being shifted.
+    fn mix_in_place_run / mix_in_place_run_portable / mix_in_place_run_avx2 / mix_in_place_run_avx512 (
+        samples: &mut [Complex32],
+        phasor: &mut num_complex::Complex<f64>,
+        block_step: num_complex::Complex<f64>,
+        lanes: &[Complex32; LANES],
+    ) {
+        for xs in samples.chunks_exact_mut(LANES) {
+            let base = Complex32::new(phasor.re as f32, phasor.im as f32);
+            for (x, &lane) in xs.iter_mut().zip(lanes) {
+                *x *= base * lane;
+            }
+            *phasor *= block_step;
+        }
+    }
+}
+
 impl Nco {
     /// `freq_hz` may be negative. Positive shifts the signal up in frequency.
     pub fn new(freq_hz: f64, sample_rate: f64) -> Self {
@@ -73,15 +116,11 @@ impl Nco {
     /// Same recurrence as [`Nco::mix`], for callers that already own the buffer
     /// they want shifted and would otherwise copy it just to mix it.
     pub fn mix_in_place(&mut self, samples: &mut [Complex32]) {
-        let mut blocks = samples.chunks_exact_mut(LANES);
-        for xs in &mut blocks {
-            let base = Complex32::new(self.phasor.re as f32, self.phasor.im as f32);
-            for (x, &lane) in xs.iter_mut().zip(&self.lanes) {
-                *x *= base * lane;
-            }
-            self.advance_block();
-        }
-        for x in blocks.into_remainder() {
+        let whole = samples.len() - samples.len() % LANES;
+        mix_in_place_run(&mut samples[..whole], &mut self.phasor, self.block_step, &self.lanes);
+        self.renorm += whole as u32;
+        self.maybe_renorm();
+        for x in &mut samples[whole..] {
             let p = Complex32::new(self.phasor.re as f32, self.phasor.im as f32);
             *x *= p;
             self.advance_sample();
@@ -94,28 +133,15 @@ impl Nco {
         out.resize(start + input.len(), Complex32::new(0.0, 0.0));
         let dst = &mut out[start..];
 
-        let mut src = input.chunks_exact(LANES);
-        let mut dest = dst.chunks_exact_mut(LANES);
-        for (xs, ys) in (&mut src).zip(&mut dest) {
-            let base = Complex32::new(self.phasor.re as f32, self.phasor.im as f32);
-            for ((y, &x), &lane) in ys.iter_mut().zip(xs).zip(&self.lanes) {
-                *y = x * (base * lane);
-            }
-            self.advance_block();
-        }
-        for (y, &x) in dest.into_remainder().iter_mut().zip(src.remainder()) {
+        let whole = input.len() - input.len() % LANES;
+        mix_run(&mut dst[..whole], &input[..whole], &mut self.phasor, self.block_step, &self.lanes);
+        self.renorm += whole as u32;
+        self.maybe_renorm();
+        for (y, &x) in dst[whole..].iter_mut().zip(&input[whole..]) {
             let p = Complex32::new(self.phasor.re as f32, self.phasor.im as f32);
             *y = x * p;
             self.advance_sample();
         }
-    }
-
-    /// Move the phasor on by a whole block.
-    #[inline]
-    fn advance_block(&mut self) {
-        self.phasor *= self.block_step;
-        self.renorm += LANES as u32;
-        self.maybe_renorm();
     }
 
     /// Move it on by a single sample — the tail of a block that did not divide

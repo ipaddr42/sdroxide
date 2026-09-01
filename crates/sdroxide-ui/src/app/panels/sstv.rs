@@ -949,254 +949,267 @@ impl SdroxideApp {
             if pane.is_none_or(|p| p != 0) {
             ui.allocate_ui(egui::vec2(tx_w, full_h), |ui| {
                 sstv_section(ui, "TRANSMIT", egui::vec2(tx_w, full_h), |ui| {
-                    let inner_w = tx_w - 16.0;
+                    // The compositor is a fixed stack — the five slots, the
+                    // load buttons, the preview, the message box and the
+                    // transmit controls — and none of it can be dropped
+                    // without dropping a control. On a screen with less height
+                    // than the stack needs it used to run off the bottom edge
+                    // and simply not be there (issue #231). Scrolled, the whole
+                    // stack stays reachable, and where there is room the bar
+                    // never appears.
+                    egui::ScrollArea::vertical()
+                        .id_salt("sstv-transmit")
+                        .auto_shrink([false, false])
+                        .show_themed(ui, |ui| {
+                        let inner_w = tx_w - 16.0;
 
-                    ui.horizontal(|ui| {
-                        ui.spacing_mut().item_spacing.x = 5.0;
-                        for i in 0..IMAGE_SLOTS {
-                            let sel = self.sstv.selected_slot == i;
-                            let size = egui::vec2(70.0, 54.0);
-                            let resp = if let Some(tex) =
-                                self.sstv.slot_thumbs.get(i).and_then(|t| t.as_ref())
-                            {
-                                ui.add(
-                                    egui::Image::new(tex)
-                                        .fit_to_exact_size(size)
-                                        .corner_radius(2.0)
-                                        .sense(egui::Sense::click()),
-                                )
-                            } else {
-                                let (rect, resp) =
-                                    ui.allocate_exact_size(size, egui::Sense::click());
-                                ui.painter().rect_stroke(
-                                    rect,
-                                    2.0,
-                                    egui::Stroke::new(1.0, crate::theme::gray(70)),
-                                    egui::StrokeKind::Inside,
-                                );
-                                ui.painter().text(
-                                    rect.center(),
-                                    egui::Align2::CENTER_CENTER,
-                                    "+",
-                                    egui::FontId::proportional(22.0),
-                                    crate::theme::gray(110),
-                                );
-                                resp
-                            };
-                            // Active-tab highlight: a cyan wash + heavier border so
-                            // it is obvious which slot the message box targets.
-                            if sel {
-                                ui.painter().rect_filled(
-                                    resp.rect,
-                                    2.0,
-                                    Color32::from_rgba_unmultiplied(0x00, 0xd0, 0xf4, 34),
-                                );
-                                ui.painter().rect_stroke(
-                                    resp.rect,
-                                    2.0,
-                                    egui::Stroke::new(2.5, crate::theme::CYAN()),
-                                    egui::StrokeKind::Outside,
-                                );
-                            }
-                            // Slot number badge (1..5), like a tab label.
-                            let badge = egui::Rect::from_min_size(
-                                resp.rect.left_top() + egui::vec2(2.0, 2.0),
-                                egui::vec2(15.0, 13.0),
-                            );
-                            ui.painter().rect_filled(badge, 2.0, Color32::from_black_alpha(150));
-                            ui.painter().text(
-                                badge.center(),
-                                egui::Align2::CENTER_CENTER,
-                                format!("{}", i + 1),
-                                egui::FontId::proportional(10.0),
-                                if sel { crate::theme::CYAN() } else { crate::theme::gray(170) },
-                            );
-                            let resp = resp.on_hover_text(
-                                "Click to edit this slot's message · double-click to load an image",
-                            );
-                            if resp.double_clicked() {
-                                self.sstv.pick_target = Some(i);
-                                pick_image(self.sstv.inbox.clone());
-                            } else if resp.clicked() && !sel {
-                                // Hand the slot we are leaving back to the
-                                // engine before moving on, so an edit is never
-                                // lost to a click.
-                                cmds.extend(crate::sstv::claim_message(
-                                    &mut self.sstv.msg_edit,
-                                    &self.sstv.presets,
-                                    i,
-                                ));
-                                self.sstv.selected_slot = i;
-                                self.sstv.preview_dirty = true;
-                            }
-                        }
-                    });
-                    ui.add_space(5.0);
-
-                    // Load/replace/clear the active slot's picture.
-                    ui.horizontal(|ui| {
-                        let sel = self.sstv.selected_slot;
-                        let has_img = self.sstv.presets.slot(sel).has_picture();
-                        let label = if has_img { "Change image…" } else { "Load image…" };
-                        if crate::chrome::chip(ui, false, label).clicked() {
-                            self.sstv.pick_target = Some(sel);
-                            pick_image(self.sstv.inbox.clone());
-                        }
-                        if has_img
-                            && crate::chrome::chip(ui, false, "Clear")
-                                .on_hover_text("Empty this slot's picture (the message stays)")
-                                .clicked()
-                        {
-                            cmds.push(Command::ImageClearSlot(sel as u8));
-                        }
-                        // The banner belongs to the station, not to the slot:
-                        // one editor, reached from whichever slot is in front.
-                        if crate::chrome::chip(ui, self.sstv.banner_open, "Banner…")
-                            .on_hover_text(
-                                "What is printed across the top of every picture this station \
-                                 sends",
-                            )
-                            .clicked()
-                        {
-                            self.sstv.banner_open = !self.sstv.banner_open;
-                        }
-                    });
-                    if let Some(err) = &self.sstv.pick_error {
-                        ui.label(RichText::new(err).size(10.0).color(crate::theme::YELLOW()));
-                    }
-                    ui.add_space(6.0);
-
-                    // Preview gets a capped share of the height; the message box
-                    // grows to fill whatever's left above the buttons.
-                    let btn_h = 42.0;
-                    let gap = 6.0;
-                    let preview_h = (ui.available_height() * 0.45).clamp(80.0, 260.0);
-                    egui::Frame::new()
-                        .fill(crate::theme::gray(6))
-                        .stroke(egui::Stroke::new(1.0, crate::theme::LINE_LIT()))
-                        .inner_margin(2.0)
-                        .show(ui, |ui| {
-                            ui.set_min_size(egui::vec2(inner_w, preview_h));
-                            ui.set_max_size(egui::vec2(inner_w, preview_h));
-                            ui.centered_and_justified(|ui| {
-                                if let Some(tex) = &self.sstv.preview_tex {
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = 5.0;
+                            for i in 0..IMAGE_SLOTS {
+                                let sel = self.sstv.selected_slot == i;
+                                let size = egui::vec2(70.0, 54.0);
+                                let resp = if let Some(tex) =
+                                    self.sstv.slot_thumbs.get(i).and_then(|t| t.as_ref())
+                                {
                                     ui.add(
                                         egui::Image::new(tex)
-                                            .max_height(preview_h - 4.0)
-                                            .max_width(inner_w - 4.0),
-                                    );
+                                            .fit_to_exact_size(size)
+                                            .corner_radius(2.0)
+                                            .sense(egui::Sense::click()),
+                                    )
                                 } else {
-                                    let waiting =
-                                        self.sstv.presets.slot(self.sstv.selected_slot).has_picture();
-                                    ui.label(
-                                        RichText::new(if waiting {
-                                            "Fetching this slot's picture…"
-                                        } else {
-                                            "Load an image into this slot →"
-                                        })
-                                        .size(11.0)
-                                        .weak(),
+                                    let (rect, resp) =
+                                        ui.allocate_exact_size(size, egui::Sense::click());
+                                    ui.painter().rect_stroke(
+                                        rect,
+                                        2.0,
+                                        egui::Stroke::new(1.0, crate::theme::gray(70)),
+                                        egui::StrokeKind::Inside,
+                                    );
+                                    ui.painter().text(
+                                        rect.center(),
+                                        egui::Align2::CENTER_CENTER,
+                                        "+",
+                                        egui::FontId::proportional(22.0),
+                                        crate::theme::gray(110),
+                                    );
+                                    resp
+                                };
+                                // Active-tab highlight: a cyan wash + heavier border so
+                                // it is obvious which slot the message box targets.
+                                if sel {
+                                    ui.painter().rect_filled(
+                                        resp.rect,
+                                        2.0,
+                                        Color32::from_rgba_unmultiplied(0x00, 0xd0, 0xf4, 34),
+                                    );
+                                    ui.painter().rect_stroke(
+                                        resp.rect,
+                                        2.0,
+                                        egui::Stroke::new(2.5, crate::theme::CYAN()),
+                                        egui::StrokeKind::Outside,
                                     );
                                 }
-                            });
+                                // Slot number badge (1..5), like a tab label.
+                                let badge = egui::Rect::from_min_size(
+                                    resp.rect.left_top() + egui::vec2(2.0, 2.0),
+                                    egui::vec2(15.0, 13.0),
+                                );
+                                ui.painter().rect_filled(badge, 2.0, Color32::from_black_alpha(150));
+                                ui.painter().text(
+                                    badge.center(),
+                                    egui::Align2::CENTER_CENTER,
+                                    format!("{}", i + 1),
+                                    egui::FontId::proportional(10.0),
+                                    if sel { crate::theme::CYAN() } else { crate::theme::gray(170) },
+                                );
+                                let resp = resp.on_hover_text(
+                                    "Click to edit this slot's message · double-click to load an image",
+                                );
+                                if resp.double_clicked() {
+                                    self.sstv.pick_target = Some(i);
+                                    pick_image(self.sstv.inbox.clone());
+                                } else if resp.clicked() && !sel {
+                                    // Hand the slot we are leaving back to the
+                                    // engine before moving on, so an edit is never
+                                    // lost to a click.
+                                    cmds.extend(crate::sstv::claim_message(
+                                        &mut self.sstv.msg_edit,
+                                        &self.sstv.presets,
+                                        i,
+                                    ));
+                                    self.sstv.selected_slot = i;
+                                    self.sstv.preview_dirty = true;
+                                }
+                            }
                         });
-                    ui.add_space(gap);
+                        ui.add_space(5.0);
 
-                    // Overlay message for the active slot — fills the height
-                    // above the buttons. The engine owns the text; this box
-                    // claims the slot while the cursor is in it and hands it
-                    // back when focus leaves, so an edit made on another screen
-                    // still reaches every slot but this one.
-                    let sel = self.sstv.selected_slot;
-                    let msg_h = (ui.available_height() - btn_h - gap).max(48.0);
-                    let mut buf = self.sstv.current_message().to_string();
-                    let resp = ui
-                        .push_id(sel, |ui| {
-                            crate::chrome::field_sized(ui, egui::vec2(inner_w, msg_h),
-                                egui::TextEdit::multiline(&mut buf)
-                                    .hint_text("Drawn on this slot's image"),
-                            )
-                        })
-                        .inner;
-                    if resp.changed() {
-                        self.sstv.msg_edit = Some((sel, buf));
-                        self.sstv.preview_dirty = true;
-                    } else if resp.gained_focus() {
-                        cmds.extend(crate::sstv::claim_message(
-                            &mut self.sstv.msg_edit,
-                            &self.sstv.presets,
-                            sel,
-                        ));
-                    }
-                    if resp.lost_focus() {
-                        cmds.extend(crate::sstv::commit_message(
-                            &mut self.sstv.msg_edit,
-                            &self.sstv.presets,
-                        ));
-                    }
-                    ui.add_space(gap);
+                        // Load/replace/clear the active slot's picture.
+                        ui.horizontal(|ui| {
+                            let sel = self.sstv.selected_slot;
+                            let has_img = self.sstv.presets.slot(sel).has_picture();
+                            let label = if has_img { "Change image…" } else { "Load image…" };
+                            if crate::chrome::chip(ui, false, label).clicked() {
+                                self.sstv.pick_target = Some(sel);
+                                pick_image(self.sstv.inbox.clone());
+                            }
+                            if has_img
+                                && crate::chrome::chip(ui, false, "Clear")
+                                    .on_hover_text("Empty this slot's picture (the message stays)")
+                                    .clicked()
+                            {
+                                cmds.push(Command::ImageClearSlot(sel as u8));
+                            }
+                            // The banner belongs to the station, not to the slot:
+                            // one editor, reached from whichever slot is in front.
+                            if crate::chrome::chip(ui, self.sstv.banner_open, "Banner…")
+                                .on_hover_text(
+                                    "What is printed across the top of every picture this station \
+                                     sends",
+                                )
+                                .clicked()
+                            {
+                                self.sstv.banner_open = !self.sstv.banner_open;
+                            }
+                        });
+                        if let Some(err) = &self.sstv.pick_error {
+                            ui.label(RichText::new(err).size(10.0).color(crate::theme::YELLOW()));
+                        }
+                        ui.add_space(6.0);
 
-                    // Large cut-corner TX / ABORT buttons.
-                    ui.horizontal(|ui| {
-                        // The source has to have arrived as well as be stored:
-                        // pressing TX while it is still on its way would compose
-                        // nothing and look like the button was broken. The radio
-                        // has to have a transmitter too — composing a picture is
-                        // worth doing on a receiver, sending it is not.
-                        let tx_ok = self.tx_capable();
-                        let can_tx = tx_ok
-                            && self
-                                .sstv
-                                .slots
-                                .get(self.sstv.selected_slot)
-                                .is_some_and(|s| s.is_some())
-                            && !tx_active;
-                        let tx = ui
-                            .add_enabled_ui(can_tx, |ui| {
-                                rx_only_hint(
-                                    crate::chrome::chip_accent(
-                                        ui,
-                                        can_tx,
-                                        RichText::new("   TX   ").size(16.0).strong(),
-                                        crate::theme::ALERT(),
-                                        Color32::WHITE,
-                                    ),
-                                    tx_ok,
+                        // Preview gets a capped share of the height; the message box
+                        // grows to fill whatever's left above the buttons.
+                        let btn_h = 42.0;
+                        let gap = 6.0;
+                        let preview_h = (ui.available_height() * 0.45).clamp(80.0, 260.0);
+                        egui::Frame::new()
+                            .fill(crate::theme::gray(6))
+                            .stroke(egui::Stroke::new(1.0, crate::theme::LINE_LIT()))
+                            .inner_margin(2.0)
+                            .show(ui, |ui| {
+                                ui.set_min_size(egui::vec2(inner_w, preview_h));
+                                ui.set_max_size(egui::vec2(inner_w, preview_h));
+                                ui.centered_and_justified(|ui| {
+                                    if let Some(tex) = &self.sstv.preview_tex {
+                                        ui.add(
+                                            egui::Image::new(tex)
+                                                .max_height(preview_h - 4.0)
+                                                .max_width(inner_w - 4.0),
+                                        );
+                                    } else {
+                                        let waiting =
+                                            self.sstv.presets.slot(self.sstv.selected_slot).has_picture();
+                                        ui.label(
+                                            RichText::new(if waiting {
+                                                "Fetching this slot's picture…"
+                                            } else {
+                                                "Load an image into this slot →"
+                                            })
+                                            .size(11.0)
+                                            .weak(),
+                                        );
+                                    }
+                                });
+                            });
+                        ui.add_space(gap);
+
+                        // Overlay message for the active slot — fills the height
+                        // above the buttons. The engine owns the text; this box
+                        // claims the slot while the cursor is in it and hands it
+                        // back when focus leaves, so an edit made on another screen
+                        // still reaches every slot but this one.
+                        let sel = self.sstv.selected_slot;
+                        let msg_h = (ui.available_height() - btn_h - gap).max(48.0);
+                        let mut buf = self.sstv.current_message().to_string();
+                        let resp = ui
+                            .push_id(sel, |ui| {
+                                crate::chrome::field_sized(ui, egui::vec2(inner_w, msg_h),
+                                    egui::TextEdit::multiline(&mut buf)
+                                        .hint_text("Drawn on this slot's image"),
                                 )
                             })
                             .inner;
-                        if tx.clicked() {
-                            // Compose before committing: what goes on the air is
-                            // what is on screen, including an edit the operator
-                            // never clicked out of. The commit follows so the
-                            // engine stores it too.
-                            let png = self.sstv.compose_png(dims);
+                        if resp.changed() {
+                            self.sstv.msg_edit = Some((sel, buf));
+                            self.sstv.preview_dirty = true;
+                        } else if resp.gained_focus() {
+                            cmds.extend(crate::sstv::claim_message(
+                                &mut self.sstv.msg_edit,
+                                &self.sstv.presets,
+                                sel,
+                            ));
+                        }
+                        if resp.lost_focus() {
                             cmds.extend(crate::sstv::commit_message(
                                 &mut self.sstv.msg_edit,
                                 &self.sstv.presets,
                             ));
-                            if let Some(png) = png {
-                                cmds.push(if rifp {
-                                    Command::RifpTx { png }
-                                } else {
-                                    Command::SstvTx { mode: self.sstv.tx_mode, png }
-                                });
+                        }
+                        ui.add_space(gap);
+
+                        // Large cut-corner TX / ABORT buttons.
+                        ui.horizontal(|ui| {
+                            // The source has to have arrived as well as be stored:
+                            // pressing TX while it is still on its way would compose
+                            // nothing and look like the button was broken. The radio
+                            // has to have a transmitter too — composing a picture is
+                            // worth doing on a receiver, sending it is not.
+                            let tx_ok = self.tx_capable();
+                            let can_tx = tx_ok
+                                && self
+                                    .sstv
+                                    .slots
+                                    .get(self.sstv.selected_slot)
+                                    .is_some_and(|s| s.is_some())
+                                && !tx_active;
+                            let tx = ui
+                                .add_enabled_ui(can_tx, |ui| {
+                                    rx_only_hint(
+                                        crate::chrome::chip_accent(
+                                            ui,
+                                            can_tx,
+                                            RichText::new("   TX   ").size(16.0).strong(),
+                                            crate::theme::ALERT(),
+                                            Color32::WHITE,
+                                        ),
+                                        tx_ok,
+                                    )
+                                })
+                                .inner;
+                            if tx.clicked() {
+                                // Compose before committing: what goes on the air is
+                                // what is on screen, including an edit the operator
+                                // never clicked out of. The commit follows so the
+                                // engine stores it too.
+                                let png = self.sstv.compose_png(dims);
+                                cmds.extend(crate::sstv::commit_message(
+                                    &mut self.sstv.msg_edit,
+                                    &self.sstv.presets,
+                                ));
+                                if let Some(png) = png {
+                                    cmds.push(if rifp {
+                                        Command::RifpTx { png }
+                                    } else {
+                                        Command::SstvTx { mode: self.sstv.tx_mode, png }
+                                    });
+                                }
                             }
-                        }
-                        ui.add_space(8.0);
-                        let abort = ui
-                            .add_enabled_ui(tx_active, |ui| {
-                                crate::chrome::chip(
-                                    ui,
-                                    false,
-                                    RichText::new(" ABORT TX ").size(15.0).strong(),
-                                )
-                            })
-                            .inner;
-                        if abort.clicked() {
-                            cmds.push(Command::DigiAbortTx);
-                        }
-                    });
+                            ui.add_space(8.0);
+                            let abort = ui
+                                .add_enabled_ui(tx_active, |ui| {
+                                    crate::chrome::chip(
+                                        ui,
+                                        false,
+                                        RichText::new(" ABORT TX ").size(15.0).strong(),
+                                    )
+                                })
+                                .inner;
+                            if abort.clicked() {
+                                cmds.push(Command::DigiAbortTx);
+                            }
+                        });
+                        });
                 });
             });
             }

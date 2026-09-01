@@ -146,11 +146,13 @@ impl TciDevice {
             .ok_or_else(|| TciError::Msg(format!("no address for {host}:{port}")))?;
         let stream = TcpStream::connect_timeout(&sockaddr, Duration::from_secs(3))
             .map_err(|e| TciError::Msg(format!("connect {host}:{port}: {e}")))?;
-        // A generous timeout for the upgrade — the rig can take tens of
-        // milliseconds to answer while it is busy with its own DSP — then the
-        // short streaming timeout once the socket is a WebSocket.
+        // The upgrade's whole budget in one read — the rig can take tens of
+        // milliseconds to answer while it is busy with its own DSP, and on
+        // Windows a read that expires mid-upgrade cannot be resumed from (see
+        // `ws_handshake`) — then the short streaming timeout once the socket
+        // is a WebSocket.
         stream
-            .set_read_timeout(Some(crate::HANDSHAKE_POLL))
+            .set_read_timeout(Some(crate::HANDSHAKE_TIMEOUT))
             .map_err(|e| TciError::Msg(e.to_string()))?;
         let url = format!("ws://{host}:{port}/");
         let mut ws =

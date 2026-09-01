@@ -46,6 +46,111 @@ pub fn slice_centers(lo: f64, hi: f64, span_hz: f64) -> Vec<f64> {
     out
 }
 
+/// Hardware centres that cover `freqs` with a front end that sees `span_hz` at
+/// a time, each with the indices of the frequencies it covers.
+///
+/// The memory-scan twin of [`slice_centers`], and a different problem: a range
+/// scan has to search a continuous band, so its slices tile it and overlap; a
+/// memory scan has a *list*, and the whole point is to look at nothing else. So
+/// the frequencies are grouped greedily in order — everything that fits inside
+/// one usable window with the lowest one still uncovered — and each group's
+/// centre is put in the middle of what it holds, which leaves the members as
+/// far from the roll-off as they can be.
+///
+/// Two hundred marine, airband and repeater channels on a receiver that sees
+/// 2 MHz at a time therefore come down to a handful of tunes, each answered by
+/// one transform, instead of two hundred visits of a settling time each
+/// (issue #228). A list spread across three bands still costs three, which is
+/// what it must: the receiver cannot be in two places at once.
+///
+/// Frequencies that are not finite are dropped. The groups come out in
+/// ascending order, and every index appears exactly once.
+pub fn memory_slices(freqs: &[f64], span_hz: f64) -> Vec<(f64, Vec<usize>)> {
+    if !(span_hz > 0.0) {
+        return Vec::new();
+    }
+    let width = span_hz * USABLE_HALF * 2.0;
+    let mut order: Vec<usize> = (0..freqs.len()).filter(|&i| freqs[i].is_finite()).collect();
+    order.sort_by(|&a, &b| freqs[a].total_cmp(&freqs[b]));
+
+    let mut out: Vec<(f64, Vec<usize>)> = Vec::new();
+    let mut group: Vec<usize> = Vec::new();
+    let mut first = 0.0f64;
+    for i in order {
+        // `<=` so a list whose spread is exactly one window is one slice.
+        if !group.is_empty() && freqs[i] - first > width {
+            let last = freqs[*group.last().expect("non-empty")];
+            out.push(((first + last) / 2.0, std::mem::take(&mut group)));
+        }
+        if group.is_empty() {
+            first = freqs[i];
+        }
+        group.push(i);
+    }
+    if !group.is_empty() {
+        let last = freqs[*group.last().expect("non-empty")];
+        out.push(((first + last) / 2.0, group));
+    }
+    out
+}
+
+/// Which of `freqs` the spectrum says are busy, as indices into it.
+///
+/// The memory-scan twin of [`busy_channels`], and the simpler half of the pair:
+/// there is nothing to search for and nothing to snap to a grid, because the
+/// channels are already known. Each one is measured the way `busy_channels`
+/// measures a candidate — the total power across a channel's worth of bins,
+/// which is what the receiver's own squelch measures — so one threshold means
+/// the same thing to the sweep, to the dwell that confirms it and to the audio
+/// gate.
+///
+/// `bandwidths_hz` is per frequency: a memory carries the passband it was
+/// stored with, and 16 kHz of NFM and 300 Hz of CW are not the same channel.
+///
+/// Two frequencies are reported busy without being measured at all. One outside
+/// the usable window is in the anti-alias roll-off, where a real signal reads
+/// low — but unlike a range scan, which has a neighbouring slice to catch it,
+/// this is a channel somebody asked for by name, so it is passed to the dwell
+/// rather than dropped. One sitting on the span's centre is on a zero-IF front
+/// end's own LO leakage, which is loud and is not a station: there the
+/// measurement is worthless in the other direction, and the dwell — which
+/// listens through the receiver, DC block and all — is the honest answer.
+///
+/// The cost of either is one settling time on a channel that turns out to be
+/// quiet. The cost of guessing wrong the other way is a channel the operator
+/// stored and the scanner never stops on.
+pub fn busy_memories(
+    bins: &[f32],
+    center_hz: f64,
+    span_hz: f64,
+    freqs: &[f64],
+    bandwidths_hz: &[f64],
+    threshold_db: f32,
+) -> Vec<usize> {
+    if bins.is_empty() || !(span_hz > 0.0) {
+        return (0..freqs.len()).collect();
+    }
+    let usable = span_hz * USABLE_HALF;
+    let bin_hz = span_hz / bins.len() as f64;
+    let mut out = Vec::new();
+    for (i, &f) in freqs.iter().enumerate() {
+        if !f.is_finite() {
+            continue;
+        }
+        let off = f - center_hz;
+        let bw = bandwidths_hz.get(i).copied().unwrap_or(0.0).abs().max(bin_hz);
+        // Either guard: listen rather than measure.
+        if off.abs() > usable || off.abs() <= (DC_GUARD_BINS as f64 + bw / bin_hz / 2.0) * bin_hz {
+            out.push(i);
+            continue;
+        }
+        if channel_power_db(bins, center_hz, span_hz, f, bw).is_some_and(|db| db >= threshold_db) {
+            out.push(i);
+        }
+    }
+    out
+}
+
 /// Frequencies inside `lo..hi` where the spectrum says something is on the air.
 ///
 /// `bins` are dBFS, frequency-ascending, covering `center_hz ± span_hz/2`. The
@@ -269,6 +374,93 @@ mod tests {
         let bins = spectrum(n, -110.0, at, 20, -60.0);
         let found = busy_channels(&bins, 145e6, SPAN, 100e6, 200e6, 12_500.0, 12_500.0, -70.0);
         assert!(found.is_empty(), "{found:?}");
+    }
+
+    /// A channel list on one band is one tune and one transform, however many
+    /// channels it holds — the whole point of scanning memories off the FFT
+    /// (issue #228).
+    #[test]
+    fn a_list_inside_one_window_is_a_single_tune() {
+        // The 2 m repeater outputs, 25 kHz apart: 800 kHz of list inside a
+        // 1.536 MHz window.
+        let freqs: Vec<f64> = (0..33).map(|i| 145_600_000.0 + i as f64 * 25_000.0).collect();
+        let slices = memory_slices(&freqs, SPAN);
+        assert_eq!(slices.len(), 1, "{} tunes for one band's worth", slices.len());
+        assert_eq!(slices[0].1.len(), freqs.len(), "every channel is in it");
+        // And centred on what it holds, so nothing sits in the roll-off.
+        let (lo, hi) = (freqs[0], freqs[freqs.len() - 1]);
+        assert!((slices[0].0 - (lo + hi) / 2.0).abs() < 1.0, "centre {}", slices[0].0);
+    }
+
+    /// A list spread across bands costs one tune per band, which is what it
+    /// must: the receiver cannot be in two places at once. Every channel ends
+    /// up in exactly one slice, and inside its usable window.
+    #[test]
+    fn every_channel_lands_in_one_slice_and_inside_it() {
+        let freqs = vec![
+            121_500_000.0, // airband
+            145_500_000.0, // 2 m
+            145_600_000.0,
+            156_800_000.0, // marine 16
+            156_825_000.0,
+            433_500_000.0, // 70 cm
+        ];
+        let slices = memory_slices(&freqs, SPAN);
+        let mut seen: Vec<usize> = slices.iter().flat_map(|(_, g)| g.iter().copied()).collect();
+        seen.sort_unstable();
+        assert_eq!(seen, (0..freqs.len()).collect::<Vec<_>>(), "{slices:?}");
+        let usable = SPAN * USABLE_HALF;
+        for (c, group) in &slices {
+            for &i in group {
+                assert!((freqs[i] - c).abs() <= usable, "{} is in the roll-off of {c}", freqs[i]);
+            }
+        }
+        // Four bands, four tunes — not six visits.
+        assert_eq!(slices.len(), 4, "{slices:?}");
+    }
+
+    #[test]
+    fn nothing_to_cover_is_no_slices() {
+        assert!(memory_slices(&[], SPAN).is_empty());
+        assert!(memory_slices(&[145e6], 0.0).is_empty());
+        assert!(memory_slices(&[f64::NAN], SPAN).is_empty());
+    }
+
+    /// The sweep's own test: of a list read off one transform, only the
+    /// channels that are actually on the air are worth a dwell.
+    #[test]
+    fn only_the_busy_channels_come_back() {
+        let n = 4096;
+        let bin_hz = SPAN / n as f64;
+        // A carrier 100 bins above the centre, 20 bins wide.
+        let bins = spectrum(n, -110.0, n / 2 + 100, 20, -60.0);
+        let busy_hz = 145e6 + 100.0 * bin_hz;
+        let freqs = vec![busy_hz, 145e6 + 300.0 * bin_hz, 145e6 - 250.0 * bin_hz];
+        let bw = vec![16_000.0; 3];
+        assert_eq!(busy_memories(&bins, 145e6, SPAN, &freqs, &bw, -70.0), vec![0]);
+        // Raise the bar past the carrier and nothing is worth stopping for.
+        assert!(busy_memories(&bins, 145e6, SPAN, &freqs, &bw, -20.0).is_empty());
+    }
+
+    /// The two channels the transform cannot answer for — one out in the
+    /// anti-alias roll-off, one sitting on a zero-IF front end's LO leakage —
+    /// go to the dwell rather than being judged from a reading that means
+    /// nothing. A wasted settling time is the right price for never missing a
+    /// channel the operator stored by name.
+    #[test]
+    fn a_reading_that_means_nothing_is_left_to_the_receiver() {
+        let n = 4096;
+        let bin_hz = SPAN / n as f64;
+        let quiet = vec![-140.0f32; n];
+        // Past the 40% of the span the sweep trusts.
+        let far = 145e6 + SPAN * 0.45;
+        // And one right on the centre, where the LO leakage lives.
+        let dc = 145e6 + bin_hz;
+        let freqs = vec![far, dc, 145e6 + 300.0 * bin_hz];
+        let bw = vec![16_000.0; 3];
+        assert_eq!(busy_memories(&quiet, 145e6, SPAN, &freqs, &bw, -70.0), vec![0, 1]);
+        // With no spectrum at all to read, every channel is still a channel.
+        assert_eq!(busy_memories(&[], 145e6, SPAN, &freqs, &bw, -70.0), vec![0, 1, 2]);
     }
 
     #[test]

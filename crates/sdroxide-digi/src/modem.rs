@@ -71,6 +71,14 @@ pub struct ApHints {
     pub my_call: String,
     /// The station we are working, if any.
     pub dx_call: Option<String>,
+    /// The operator has the EU VHF contest selected, so the slot is worth a
+    /// second pass for the `i3 = 5` exchange mfsk-core's FT8 decoder cannot
+    /// return — see [`crate::ft8_eu`] (issue #223).
+    ///
+    /// Here rather than in the modem's own state because it belongs to the
+    /// slot: the decode worker is handed one of these per slot and holds
+    /// nothing else about how the station is set up.
+    pub eu_vhf: bool,
 }
 
 impl ApHints {
@@ -258,6 +266,33 @@ impl Ft8Modem {
                         .filter(|d| !decodes.iter().any(|o| same_signal(o, d)))
                         .collect::<Vec<_>>();
                 decodes.extend(extra);
+            }
+        }
+        // The EU VHF contest exchange, which mfsk-core's FT8 decoder drops
+        // inside itself — see [`crate::ft8_eu`] for why there is nothing to
+        // filter and no hook to catch it with (issue #223). A second pass over
+        // the same slot, run only with the contest selected because it costs
+        // about what the first one does, and one that can only ever return the
+        // `i3 = 5` layout the first pass is structurally unable to produce.
+        //
+        // FT8 alone. FT4 and FT2 go through a pipeline that never unpacks and
+        // so never drops the layout; that is exactly why the exchange was
+        // reported working there and nowhere else.
+        if ap.eu_vhf && !matches!(mode, Mode::Ft4 | Mode::Ft2) {
+            let rescued = crate::ft8_eu::decode_slot(
+                audio_12k,
+                AUDIO_MIN_HZ,
+                AUDIO_MAX_HZ,
+                SYNC_MIN,
+                MAX_CAND,
+            );
+            for r in rescued {
+                if let Some(d) =
+                    build_decode(&r.msg77, r.snr_db, r.dt_sec, r.freq_hz, slot_utc, ht, eu)
+                    && !decodes.iter().any(|o| same_signal(o, &d))
+                {
+                    decodes.push(d);
+                }
             }
         }
         // Remember who we heard, for the next slot's hashed messages.
@@ -1104,14 +1139,18 @@ mod tests {
     #[test]
     fn a_priori_hints_name_the_message_we_are_waiting_for() {
         // Our call is the addressee, the DX's the sender: "AB1CD W9XYZ R-13".
-        let ap = ApHints { my_call: "AB1CD".into(), dx_call: Some("W9XYZ".into()) };
+        let ap = ApHints {
+            my_call: "AB1CD".into(),
+            dx_call: Some("W9XYZ".into()),
+            ..Default::default()
+        };
         let h = ap.ft8().expect("a hint");
         assert_eq!(h.call1.as_deref(), Some("AB1CD"));
         assert_eq!(h.call2.as_deref(), Some("W9XYZ"));
         assert_eq!(ap.calls(), ["AB1CD", "W9XYZ"]);
 
         // Calling CQ we still know the addressee — anyone answering names us.
-        let ap = ApHints { my_call: "AB1CD".into(), dx_call: None };
+        let ap = ApHints { my_call: "AB1CD".into(), dx_call: None, ..Default::default() };
         let h = ap.ft8().expect("a hint");
         assert_eq!(h.call1.as_deref(), Some("AB1CD"));
         assert_eq!(h.call2, None);
@@ -1119,7 +1158,11 @@ mod tests {
         // An unconfigured station knows nothing to hint with.
         assert!(ApHints::default().ft8().is_none());
         assert!(ApHints::default().ft4().is_none());
-        assert!(ApHints { my_call: "  ".into(), dx_call: Some("W9XYZ".into()) }.ft8().is_none());
+        assert!(
+            ApHints { my_call: "  ".into(), dx_call: Some("W9XYZ".into()), ..Default::default() }
+                .ft8()
+                .is_none()
+        );
     }
 
     #[test]
@@ -1128,7 +1171,11 @@ mod tests {
         // decode has already failed, and the result still has to pass CRC-14.
         // So at any noise level the hinted pass finds everything the plain one
         // does — which is what makes it safe to leave on all the time.
-        let ap = ApHints { my_call: "AB1CD".into(), dx_call: Some("W9XYZ".into()) };
+        let ap = ApHints {
+            my_call: "AB1CD".into(),
+            dx_call: Some("W9XYZ".into()),
+            ..Default::default()
+        };
         let mut rng: u32 = 0x1234_5678;
         let mut noise = || {
             // xorshift32, so the comparison runs on identical audio each time.
@@ -1158,6 +1205,82 @@ mod tests {
         }
     }
 
+    /// The exchange has to survive the air in FT8, not merely a round trip
+    /// through the packer (issue #223).
+    ///
+    /// This is the regression the reporter found on room audio: mfsk-core's FT8
+    /// decoder finishes every candidate with an `unpack77` that has no `i3 = 5`
+    /// arm, so a contest exchange that decoded perfectly well was thrown away
+    /// *inside* the decoder and no exchange ever reached the QSO machine. FT4
+    /// and FT2 go through a pipeline that never unpacks, which is why they
+    /// worked. So the assertion is specifically about FT8, and specifically
+    /// about a modulated slot rather than a bitstream.
+    #[test]
+    fn an_ft8_contest_exchange_survives_being_transmitted() {
+        let modem = Ft8Modem::new(Mode::Ft8);
+        let sent = "<PA9XYZ> <G4ABC/P> R 590003 IO91NP";
+        let (burst, as_sent) = modem.encode_burst_12k(sent, 1500.0, 0.5).expect("packs");
+        assert_eq!(as_sent, sent, "the exchange goes out as written");
+        let mut slot = vec![0.0f32; 6_000];
+        slot.extend_from_slice(&burst);
+        slot.resize(15 * 12_000, 0.0);
+        let buf: Vec<i16> = slot.iter().map(|&s| (s * 12_000.0) as i16).collect();
+
+        // Both callsigns spelled out already, as the two ordinary messages
+        // ahead of a real exchange would have done: the layout carries hashes,
+        // so without them the decode reads `<...>` however well it worked.
+        let mut rx = Ft8Modem::new(Mode::Ft8);
+        rx.seed_hashes(&["PA9XYZ".into(), "G4ABC/P".into()]);
+
+        // Without the contest selected, this is what the report describes:
+        // nothing at all comes back, because the decoder discards the layout.
+        let off = rx.decode_slot(&buf, 0, &ApHints::default(), 1500.0);
+        assert!(
+            !off.iter().any(|d| d.message.contains("590003")),
+            "mfsk-core's FT8 decoder is expected to drop i3 = 5 — if this ever \
+             stops being true the rescue pass can go",
+        );
+
+        // With it, the exchange arrives, whole.
+        let ap = ApHints { eu_vhf: true, ..Default::default() };
+        let got = rx.decode_slot(&buf, 0, &ap, 1500.0);
+        let d = got
+            .iter()
+            .find(|d| d.message.contains("590003"))
+            .unwrap_or_else(|| panic!("the exchange did not decode; got {got:?}"));
+        assert_eq!(d.message, "<PA9XYZ> <G4ABC/P> R 590003 IO91NP");
+        assert_eq!(d.to.as_deref(), Some("PA9XYZ"), "and it is addressed to the right station");
+        assert_eq!(d.from.as_deref(), Some("G4ABC/P"));
+        assert!((d.audio_hz - 1500.0).abs() < 5.0, "at the offset it was sent on");
+    }
+
+    /// The rescue pass may only ever *add* the one layout the primary decode
+    /// cannot return. An ordinary message must come back exactly once, and
+    /// come back whether or not the contest is selected.
+    #[test]
+    fn the_contest_pass_does_not_disturb_ordinary_decodes() {
+        let modem = Ft8Modem::new(Mode::Ft8);
+        let (burst, _) = modem.encode_burst_12k("AB1CD W9XYZ -13", 1500.0, 0.5).unwrap();
+        let mut slot = vec![0.0f32; 6_000];
+        slot.extend_from_slice(&burst);
+        slot.resize(15 * 12_000, 0.0);
+        let buf: Vec<i16> = slot.iter().map(|&s| (s * 12_000.0) as i16).collect();
+
+        let plain = Ft8Modem::new(Mode::Ft8).decode_slot(&buf, 0, &ApHints::default(), 1500.0);
+        let ap = ApHints { eu_vhf: true, ..Default::default() };
+        let contest = Ft8Modem::new(Mode::Ft8).decode_slot(&buf, 0, &ap, 1500.0);
+        assert_eq!(
+            plain.iter().filter(|d| d.message == "AB1CD W9XYZ -13").count(),
+            1,
+            "got {plain:?}",
+        );
+        assert_eq!(
+            contest.iter().filter(|d| d.message == "AB1CD W9XYZ -13").count(),
+            1,
+            "the second pass must not report an ordinary message a second time",
+        );
+    }
+
     /// FT4's hint takes the other path — a targeted sniper decode aimed where
     /// we are listening, run *after* the wide pass and merged into it. Same
     /// guarantee as FT8's, and the one that would break silently if the sniper
@@ -1165,7 +1288,11 @@ mod tests {
     /// decodes must all survive.
     #[test]
     fn an_ft4_a_priori_hint_only_ever_adds_decodes() {
-        let ap = ApHints { my_call: "AB1CD".into(), dx_call: Some("W9XYZ".into()) };
+        let ap = ApHints {
+            my_call: "AB1CD".into(),
+            dx_call: Some("W9XYZ".into()),
+            ..Default::default()
+        };
         let mut rng: u32 = 0x1234_5678;
         let mut noise = || {
             rng ^= rng << 13;

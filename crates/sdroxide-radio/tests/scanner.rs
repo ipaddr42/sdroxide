@@ -6,7 +6,8 @@ use std::time::{Duration, Instant};
 
 use sdroxide_radio::{Complex32, EngineConfig, IqSource, Result, rtrb, start_engine};
 use sdroxide_types::{
-    Command, DeviceCaps, MemoryChannel, Mode, RadioEvent, ScanKind, ScanResume, ScannerConfig, Vfo,
+    Command, DeviceCaps, MemoryChannel, Mode, RadioEvent, RepeaterState, ScanKind, ScanResume,
+    ScannerConfig, Shift, ToneMode, Vfo,
 };
 
 const RATE: f64 = 1_536_000.0;
@@ -133,6 +134,9 @@ struct Watch {
     running: bool,
     holding: bool,
     held_at: Option<f64>,
+    /// The repeater setup the engine was in when it stopped — the shift and the
+    /// tone that would go out if the operator answered the call.
+    held_repeater: Option<sdroxide_types::RepeaterState>,
     notices: Vec<String>,
     /// The settings as the engine last persisted them — which is where a skip
     /// taken during a scan has to end up if it is to survive the next run.
@@ -141,6 +145,11 @@ struct Watch {
     /// said anything at all, which is how "no memories" is told apart from
     /// "not asked yet".
     memories: Option<Vec<MemoryChannel>>,
+    /// The folders, announced the same way and read the same way.
+    folders: Vec<sdroxide_types::MemoryFolder>,
+    /// Every dial the engine has announced since the last `forget_seen`. What a
+    /// scan *did not* tune to is only checkable against the whole trail.
+    dials: Vec<f64>,
 }
 
 struct Rig {
@@ -182,16 +191,24 @@ impl Rig {
         while let Ok(ev) = self.h.event_rx.try_recv() {
             match ev {
                 RadioEvent::State(s) => {
+                    if self.w.dials.last() != Some(&s.active_freq_hz()) {
+                        self.w.dials.push(s.active_freq_hz());
+                    }
                     self.w.dial = s.active_freq_hz();
                     self.w.running = s.scan.running;
                     self.w.holding = s.scan.holding;
                     if s.scan.holding && self.w.held_at.is_none() {
                         self.w.held_at = Some(s.active_freq_hz());
+                        // Captured with the frequency rather than read off the
+                        // last state seen: what matters is the setup in force on
+                        // the channel the scan stopped on.
+                        self.w.held_repeater = Some(s.repeater);
                     }
                 }
                 RadioEvent::Notice(Some(n)) => self.w.notices.push(n),
                 RadioEvent::Scanner(c) => self.w.scanner = Some(c),
                 RadioEvent::Memories(m) => self.w.memories = Some(m),
+                RadioEvent::MemoryFolders(f) => self.w.folders = f,
                 _ => {}
             }
         }
@@ -219,7 +236,9 @@ impl Rig {
     /// what `clear_memories` is for.
     fn forget_seen(&mut self) {
         self.w.held_at = None;
+        self.w.held_repeater = None;
         self.w.notices.clear();
+        self.w.dials.clear();
     }
 
     /// The stored channels, once the engine has at least `want` of them.
@@ -237,6 +256,26 @@ impl Rig {
                 }
                 _ => std::thread::sleep(Duration::from_millis(10)),
             }
+        }
+    }
+
+    /// Every dial the engine has been on since the last `forget_seen`.
+    fn dials(&mut self) -> Vec<f64> {
+        self.drain();
+        self.w.dials.clone()
+    }
+
+    /// The folders, once the engine has at least `want` of them. Same bargain
+    /// as [`Rig::memories`]: making one is a command, and the answer is only
+    /// right once it has been acted on.
+    fn folders(&mut self, want: usize) -> Vec<sdroxide_types::MemoryFolder> {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            self.drain();
+            if self.w.folders.len() >= want || Instant::now() >= deadline {
+                return self.w.folders.clone();
+            }
+            std::thread::sleep(Duration::from_millis(10));
         }
     }
 
@@ -411,6 +450,199 @@ fn a_memory_scan_passes_over_skipped_channels() {
     rig.forget_seen();
     rig.send(Command::SetScanning(true));
     assert_eq!(rig.pump(2.5, true).held_at, None, "it stopped on a channel it was told to skip");
+}
+
+/// A memory scan carries each channel's stored repeater setup with it, in both
+/// directions: stopping on a repeater channel puts the shift and the tone on,
+/// and stopping on a simplex one takes them off again (issue #264).
+///
+/// This matters more in a scan than in a recall. A recall is a channel the
+/// operator picked; a scan hands them whichever channel called, and they answer
+/// it by reaching straight for the PTT — so a shift left standing from the last
+/// stop transmits 600 kHz away from the station that is calling them.
+#[test]
+fn a_memory_scan_carries_each_channels_repeater_setup() {
+    const RPTR: f64 = 145_600_000.0;
+    const SIMPLEX: f64 = 145_500_000.0;
+    let mut rig = Rig::new(Some(RPTR));
+    rig.clear_memories();
+
+    // One repeater channel and one simplex one, each stored with the setup it
+    // is worked on — which is what every memory stores nowadays.
+    let shifted = RepeaterState {
+        shift: Shift::Minus,
+        offset_hz: 600_000,
+        tone: ToneMode::Ctcss,
+        ..RepeaterState::default()
+    };
+    rig.send(Command::SetRepeater(shifted));
+    rig.send(Command::SetVfo { vfo: Vfo::A, hz: RPTR });
+    rig.send(Command::StoreMemory { name: "repeater".into() });
+    rig.send(Command::SetRepeater(RepeaterState::default()));
+    rig.send(Command::SetVfo { vfo: Vfo::A, hz: SIMPLEX });
+    rig.send(Command::StoreMemory { name: "simplex".into() });
+    assert_eq!(rig.memories(2).len(), 2, "both memories should have been stored");
+
+    let cfg = ScannerConfig {
+        kind: ScanKind::Memories,
+        threshold_db: -60.0,
+        dwell_ms: 60,
+        resume: ScanResume::Manual,
+        ..range_cfg()
+    };
+    rig.send(Command::SetScannerConfig(cfg));
+    rig.send(Command::SetScanning(true));
+    let w = rig.pump(5.0, true);
+    let held = w.held_at.expect("should have stopped on the repeater channel");
+    assert!((held - RPTR).abs() < 1.0, "stopped on {held} rather than {RPTR}");
+    let r = w.held_repeater.expect("a state came with the stop");
+    assert_eq!(
+        (r.shift, r.tone),
+        (Shift::Minus, ToneMode::Ctcss),
+        "the repeater channel was not put into its stored setup: {r:?}"
+    );
+
+    // And now the way round the bug was reported: the radio is sitting in that
+    // repeater's shift with its tone on, and the channel that calls next is a
+    // simplex one.
+    rig.send(Command::SetScanning(false));
+    *rig.signal.lock().unwrap() = Some(SIMPLEX);
+    rig.forget_seen();
+    rig.send(Command::SetScanning(true));
+    let w = rig.pump(5.0, true);
+    let held = w.held_at.expect("should have stopped on the simplex channel");
+    assert!((held - SIMPLEX).abs() < 1.0, "stopped on {held} rather than {SIMPLEX}");
+    let r = w.held_repeater.expect("a state came with the stop");
+    assert_eq!(
+        (r.shift, r.tone),
+        (Shift::Simplex, ToneMode::Off),
+        "the simplex channel was left in the last repeater's setup: {r:?}"
+    );
+}
+
+/// A fast memory scan reads its channels off the wideband spectrum instead of
+/// visiting each one (issue #228): a whole band's worth of memories is one tune
+/// a lap, and only the channel something is on is ever listened to.
+///
+/// What is asserted is both halves — that it still finds the carrier, and that
+/// it got there without visiting the quiet channels, which is the entire point.
+#[test]
+fn a_fast_memory_scan_finds_the_carrier_without_visiting_the_rest() {
+    const SIGNAL: f64 = 145_400_000.0;
+    let mut rig = Rig::new(Some(SIGNAL));
+    rig.clear_memories();
+    // Twenty channels 25 kHz apart, all inside one 1.536 MHz window, with the
+    // carrier on one of them.
+    let base = 145_000_000.0;
+    let busy_at = ((SIGNAL - base) / 25_000.0).round() as usize;
+    for i in 0..20 {
+        rig.send(Command::SetVfo { vfo: Vfo::A, hz: base + i as f64 * 25_000.0 });
+        rig.send(Command::StoreMemory { name: format!("ch{i}") });
+    }
+    assert_eq!(rig.memories(20).len(), 20, "all twenty should have been stored");
+
+    let cfg = ScannerConfig {
+        kind: ScanKind::Memories,
+        mem_fast: true,
+        threshold_db: -60.0,
+        dwell_ms: 60,
+        resume: ScanResume::Manual,
+        ..range_cfg()
+    };
+    rig.send(Command::SetScannerConfig(cfg.clone()));
+    // Off the list before the trail starts, so the dial the scan *inherits* —
+    // the last channel stored — is not mistaken for one it went to.
+    rig.send(Command::SetVfo { vfo: Vfo::A, hz: 144_500_000.0 });
+    // Drained before the trail is cleared: the announcements of the stores
+    // above are still in the channel, and they name the channels they stored.
+    rig.pump(0.5, false);
+    rig.forget_seen();
+    rig.send(Command::SetScanning(true));
+    let held = rig.pump(5.0, true).held_at.expect("should have stopped on the busy channel");
+    assert!((held - SIGNAL).abs() < 1.0, "stopped on {held} rather than {SIGNAL}");
+    rig.send(Command::SetScanning(false));
+
+    // …and the nineteen quiet ones were never tuned to. The dial visits the
+    // window's centre and then the one channel worth listening to; a scan that
+    // walked the list would have been on every one of them.
+    let dials = rig.dials();
+    let quiet: Vec<f64> = (0..20)
+        .filter(|&i| i != busy_at)
+        .map(|i| base + i as f64 * 25_000.0)
+        .filter(|hz| dials.iter().any(|d| (d - hz).abs() < 1.0))
+        .collect();
+    assert!(quiet.is_empty(), "the sweep tuned to quiet channels: {quiet:?}");
+}
+
+/// A memory scan can be pointed at chosen folders (issue #236). A station's
+/// memories are filed by service — marine, airband, the local repeaters — and a
+/// scan of all of them at once spends most of its time somewhere nobody is
+/// listening.
+///
+/// No selection is still every folder, which is what every setting written
+/// before this existed means and what a folder made tomorrow falls into.
+#[test]
+fn a_memory_scan_runs_over_the_folders_it_was_given() {
+    const SIGNAL: f64 = 145_700_000.0;
+    let mut rig = Rig::new(Some(SIGNAL));
+    rig.clear_memories();
+    // Two channels in two folders: the carrier is on the one in "busy folder".
+    rig.send(Command::CreateMemoryFolder { name: "quiet folder".into() });
+    rig.send(Command::CreateMemoryFolder { name: "busy folder".into() });
+    let folders = rig.folders(2);
+    let folder = |name: &str| folders.iter().find(|f| f.name == name).expect(name).id;
+
+    rig.send(Command::SetVfo { vfo: Vfo::A, hz: 145_250_000.0 });
+    rig.send(Command::StoreMemory { name: "quiet".into() });
+    rig.send(Command::SetVfo { vfo: Vfo::A, hz: SIGNAL });
+    rig.send(Command::StoreMemory { name: "busy".into() });
+    let mems = rig.memories(2);
+    let id = |name: &str| mems.iter().find(|m| m.name == name).expect(name).id;
+    rig.send(Command::MoveMemoryToFolder { id: id("quiet"), folder: Some(folder("quiet folder")) });
+    rig.send(Command::MoveMemoryToFolder { id: id("busy"), folder: Some(folder("busy folder")) });
+
+    let base = ScannerConfig {
+        kind: ScanKind::Memories,
+        threshold_db: -60.0,
+        dwell_ms: 60,
+        resume: ScanResume::Manual,
+        ..range_cfg()
+    };
+
+    // The quiet folder alone: the carrier is in the other one, so nothing to
+    // stop on — even though the scan can plainly hear it, which is the whole
+    // assertion.
+    rig.send(Command::SetScannerConfig(ScannerConfig {
+        folders: vec![Some(folder("quiet folder"))],
+        ..base.clone()
+    }));
+    rig.forget_seen();
+    rig.send(Command::SetScanning(true));
+    assert_eq!(
+        rig.pump(2.5, true).held_at,
+        None,
+        "it stopped on a channel filed under a folder it was not given"
+    );
+
+    // The busy one, and it finds it.
+    rig.send(Command::SetScanning(false));
+    rig.send(Command::SetScannerConfig(ScannerConfig {
+        folders: vec![Some(folder("busy folder"))],
+        ..base.clone()
+    }));
+    rig.forget_seen();
+    rig.send(Command::SetScanning(true));
+    let held = rig.pump(5.0, true).held_at.expect("the chosen folder's busy channel");
+    assert!((held - SIGNAL).abs() < 1.0, "stopped on {held} rather than {SIGNAL}");
+
+    // And an empty selection is every folder, as it always was.
+    rig.send(Command::SetScanning(false));
+    rig.send(Command::SetScannerConfig(base));
+    rig.forget_seen();
+    rig.send(Command::SetScanning(true));
+    let held = rig.pump(5.0, true).held_at.expect("no selection should scan everything");
+    assert!((held - SIGNAL).abs() < 1.0, "stopped on {held} rather than {SIGNAL}");
+    rig.send(Command::SetScanning(false));
 }
 
 /// SKIP on a range scan means the same as SKIP on a memory scan: not this one,

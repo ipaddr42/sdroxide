@@ -28,6 +28,7 @@ pub(in crate::app) mod logbook;
 pub(in crate::app) mod net;
 pub(in crate::app) mod panels;
 pub(crate) mod persist;
+pub(in crate::app) mod publicsdr;
 pub(in crate::app) mod qo100;
 pub(in crate::app) mod rds;
 pub(in crate::app) mod sat;
@@ -300,6 +301,8 @@ pub struct SdroxideApp {
     hackrf_devices: Vec<sdroxide_types::HackRfDevice>,
     /// RSPs the SDRplay API service reported on the last Rescan.
     sdrplay_devices: Vec<sdroxide_types::SdrPlayDevice>,
+    /// Fobos SDRs found on the last Rescan.
+    fobos_devices: Vec<sdroxide_types::FobosDevice>,
     /// The interface whose device list was last asked for, so switching to
     /// another one inside the open dialog asks for that one's — once, not
     /// every frame. `None` while the dialog is shut.
@@ -314,6 +317,33 @@ pub struct SdroxideApp {
     tci_test_result: Option<TestOutcome>,
     icomnet_test_result: Option<TestOutcome>,
     spyserver_test_result: Option<TestOutcome>,
+    kiwi_test_result: Option<TestOutcome>,
+    /// The public-SDR directories, once the machine with the radio on it has
+    /// answered. `None` until then, which is what the browse window shows a
+    /// "fetching" line for; `Some` but empty means the fetch really did come
+    /// back with nothing.
+    public_sdrs: Option<sdroxide_types::PublicSdrDirectory>,
+    show_public_sdrs: bool,
+    /// Asked once per opening of the window, so reopening it after an hour does
+    /// not go on showing an hour-old list.
+    public_sdrs_asked: bool,
+    public_sdr_search: String,
+    /// Indexed by `PublicSdrNetwork::ALL`, positionally.
+    public_sdr_nets_shown: [bool; 2],
+    public_sdr_free_only: bool,
+    public_sdr_in_band: bool,
+    /// Take a SpyServer in its VFO+FFT shape rather than wideband. No effect on
+    /// a KiwiSDR, which has only one shape.
+    public_sdr_low_bw: bool,
+    /// The receiver whose **USE** is waiting to be confirmed.
+    ///
+    /// USE replaces the radio the operator is on, and a radio is a station's
+    /// worth of setting up — issue #254 is somebody losing an IC-9700 to a
+    /// SpyServer on one click, with the tab still carrying the Icom's name
+    /// afterwards. So the row's button arms this instead of acting, and the
+    /// window puts the choice, and the way out of it, in front of the list.
+    /// `None` is the ordinary state.
+    public_sdr_confirm: Option<Box<sdroxide_types::PublicSdrEntry>>,
     /// FlexRadios found by the last SmartSDR "Discover" listen.
     smartsdr_devices: Vec<sdroxide_types::SmartSdrDevice>,
     /// Result of the last SmartSDR "Test connection".
@@ -516,6 +546,19 @@ pub struct SdroxideApp {
     show_adsb_setup: bool,
     adsb_sort: panels::adsb::AdsbSort,
     adsb_sort_desc: bool,
+    /// VDL2: everything the decoder has, as the engine last sent it. Boxed
+    /// because it carries a whole message log and is far larger than anything
+    /// else held here.
+    vdl2_status: Option<Box<sdroxide_types::Vdl2Status>>,
+    /// VDL2: filter for both panes at once — an address typed in one is the
+    /// same question asked of the other.
+    vdl2_filter: String,
+    /// VDL2: index into the log of the message whose card is open.
+    vdl2_selected: Option<usize>,
+    /// VDL2: the decoder's own settings window is open.
+    show_vdl2_setup: bool,
+    vdl2_sort: panels::vdl2::Vdl2Sort,
+    vdl2_sort_desc: bool,
     /// APRS: who the message box is addressed to.
     aprs_target: String,
     /// APRS: what is typed in the message box but not yet sent.
@@ -666,6 +709,10 @@ pub struct SdroxideApp {
     /// Inbox for an ADIF file chosen via the native "Import" dialog (a picker
     /// thread writes; the UI drains it each frame).
     adif_import_inbox: crate::download::LoadInbox,
+    /// Inbox for a CHIRP CSV channel list chosen via the memories window's
+    /// "Import" button — its own, beside the ADIF one, so a log import and a
+    /// channel import cannot land in each other's parser.
+    chirp_import_inbox: crate::download::LoadInbox,
     /// Callsigns queued for lookup, drained into commands each frame.
     pending_lookups: Vec<String>,
     /// Everything callsign lookup has resolved this session, by callsign. Kept
@@ -723,8 +770,10 @@ pub struct SdroxideApp {
     /// The SAT window and everything it remembers between frames.
     show_sat: bool,
     sat_win: sat::SatWinState,
-    /// The QO-100 BEACON window and everything it remembers between frames.
-    show_qo100: bool,
+    /// Which page of the SAT window is showing. QO-100 is one of them — it is
+    /// a satellite, and it has no window of its own.
+    sat_tab: sat::SatTab,
+    /// What the QO-100 page remembers between frames.
     qo100_win: qo100::Qo100WinState,
     /// The rotctld client's health, mirrored from
     /// [`RadioEvent::RotatorStatus`].
@@ -733,6 +782,18 @@ pub struct SdroxideApp {
     /// server configs.
     rot_cfg_edit: sdroxide_types::RotatorConfig,
     rot_cfg_seeded: bool,
+    /// The external T/R switch's health, mirrored from
+    /// [`RadioEvent::RelayStatus`]. Replayed on connect by the server, so a
+    /// remote client is told about a relay that is not answering before it
+    /// touches PTT rather than after.
+    relay_status: sdroxide_types::RelayStatus,
+    /// The T/R switch settings dialog's working copy, seeded once like the
+    /// server configs.
+    relay_edit: sdroxide_types::RelayConfig,
+    relay_seeded: bool,
+    /// The switching devices the engine's machine can see, from
+    /// [`sdroxide_types::DeviceProbe::Relays`].
+    relay_devices: Vec<sdroxide_types::RelayDevice>,
     /// The station's IARU region, as the General tab's dropdown last showed it.
     ///
     /// Unlike the config buffers around it this is not seeded-once-then-owned
@@ -896,8 +957,14 @@ pub(crate) enum RadioTabRequest {
     /// its own dongle and a remote station has two rosters in one tab strip,
     /// and "add a radio" means nothing until it says which. A browser has only
     /// the station's.
+    ///
+    /// `preset` is what "Public SDRs" uses: the new radio comes up already
+    /// pointed at the receiver that was picked, rather than arriving blank with
+    /// its settings page open for an address to be typed into. `None` is the
+    /// plain "+" chip, which does exactly that.
     Add {
         station: String,
+        preset: Option<Box<sdroxide_types::RadioConfig>>,
     },
     /// Open somebody else's station as a tab of its own: dial this WebSocket
     /// URL and, if it answers, show it under `name`. Queued by the **Remote**
@@ -1091,11 +1158,25 @@ impl SdroxideApp {
             hydrasdr_devices: Vec::new(),
             hackrf_devices: Vec::new(),
             sdrplay_devices: Vec::new(),
+            fobos_devices: Vec::new(),
             iface_probed: None,
             soapy_devices: None,
             tci_test_result: None,
             icomnet_test_result: None,
             spyserver_test_result: None,
+            kiwi_test_result: None,
+            public_sdrs: None,
+            show_public_sdrs: false,
+            public_sdrs_asked: false,
+            public_sdr_search: String::new(),
+            // Both on: the point of the window is to show what is out there.
+            public_sdr_nets_shown: [true, true],
+            // On, because a full receiver is not a receiver an operator can
+            // use, and the reason is still shown for the ones this hides.
+            public_sdr_free_only: true,
+            public_sdr_in_band: false,
+            public_sdr_low_bw: false,
+            public_sdr_confirm: None,
             smartsdr_devices: Vec::new(),
             smartsdr_test_result: None,
             pluto_devices: Vec::new(),
@@ -1174,6 +1255,12 @@ impl SdroxideApp {
             show_adsb_setup: false,
             adsb_sort: panels::adsb::AdsbSort::default(),
             adsb_sort_desc: true,
+            vdl2_status: None,
+            vdl2_filter: String::new(),
+            vdl2_selected: None,
+            show_vdl2_setup: false,
+            vdl2_sort: panels::vdl2::Vdl2Sort::default(),
+            vdl2_sort_desc: true,
             aprs_target: String::new(),
             aprs_draft: String::new(),
             packet_target: String::new(),
@@ -1249,6 +1336,7 @@ impl SdroxideApp {
             login_tests: std::collections::HashMap::new(),
             login_tests_pending: std::collections::HashSet::new(),
             adif_import_inbox: Arc::new(Mutex::new(None)),
+            chirp_import_inbox: Arc::new(Mutex::new(None)),
             pending_lookups: Vec::new(),
             callsign_cache: Default::default(),
             pending_uploads: Vec::new(),
@@ -1272,10 +1360,14 @@ impl SdroxideApp {
             sat_track: None,
             show_sat: false,
             sat_win: Default::default(),
-            show_qo100: false,
+            sat_tab: sat::SatTab::default(),
             qo100_win: Default::default(),
             rotator_status: None,
             rot_cfg_edit: Default::default(),
+            relay_status: Default::default(),
+            relay_edit: Default::default(),
+            relay_seeded: false,
+            relay_devices: Vec::new(),
             rot_cfg_seeded: false,
             // Whatever this process is already on: the binary applies the
             // station's setting before the app is built, and a remote client
@@ -1616,6 +1708,18 @@ impl SdroxideApp {
 
     /// Open the Settings dialog on the Radio tab — where a freshly added
     /// radio, which has no interface yet, is configured.
+    /// Point this radio at a configuration and reopen its interface.
+    ///
+    /// The same two calls Settings → Radio's "Apply / reconnect" makes, and for
+    /// the same reason they are two: the configuration is what gets persisted,
+    /// and the reopen is what makes it take effect without a restart. Works
+    /// unchanged over a connection — the remote controller sends the whole
+    /// block and asks for the reopen with it.
+    pub(crate) fn apply_radio_config(&mut self, cfg: sdroxide_types::RadioConfig) {
+        self.ctrl.set_radio_config(cfg);
+        self.ctrl.reopen_source();
+    }
+
     pub(crate) fn open_radio_settings(&mut self) {
         self.show_settings = true;
         self.settings_tab = SettingsTab::Radio;

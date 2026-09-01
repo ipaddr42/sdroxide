@@ -6,11 +6,13 @@ mod device_registry;
 mod devices;
 mod dial;
 mod elad_source;
+mod fobos_source;
 mod gui_main;
 mod hackrf_source;
 mod hpsdr_source;
 mod hydrasdr_source;
 mod icomnet_source;
+mod kiwisdr_source;
 mod lime_source;
 mod local_controller;
 mod null_source;
@@ -33,7 +35,7 @@ use sdroxide_radio::{
 };
 #[cfg(feature = "soapy")]
 use sdroxide_radio::{DeviceInfo, SoapyDevice, enumerate_devices};
-use sdroxide_types::{Backend, DeviceCaps, IcomNetConfig, RadioConfig};
+use sdroxide_types::{Backend, DeviceCaps, FobosPort, IcomNetConfig, RadioConfig};
 
 #[derive(Parser, Debug, Clone)]
 #[command(version, about)]
@@ -80,7 +82,7 @@ struct Cli {
     gain: Option<f64>,
 
     /// Initial mode (USB, LSB, CW, AM, SAM, NFM, WFM, DIGU, DIGL, DSB, SPEC, FT8,
-    /// FT4, FT2, PSK, RTTY, PACKET, APRS, ADS-B, SSTV, RIFP, OLIVIA, THOR, FSQ)
+    /// FT4, FT2, PSK, RTTY, PACKET, APRS, ADS-B, VDL2, SSTV, RIFP, OLIVIA, THOR, FSQ)
     ///
     /// Default: the mode the last session was left in.
     #[arg(long)]
@@ -1389,6 +1391,7 @@ fn open_configured_source(
         Backend::RtlTcp => open_rtltcp_source(radio, cli.center_hz()),
         Backend::SpyServer => open_spyserver_source(radio, cli.center_hz()),
         Backend::SpyServerVfo => open_spyserver_vfo_source(radio, cli.center_hz()),
+        Backend::KiwiSdr => open_kiwisdr_source(radio, cli.center_hz()),
         Backend::Rx888 => open_rx888_source(radio, cli.center_hz()),
         Backend::AirspyHf => open_airspyhf_source(radio, cli.center_hz()),
         Backend::Airspy => open_airspy_source(radio, cli.center_hz()),
@@ -1397,6 +1400,7 @@ fn open_configured_source(
         Backend::SdrPlay => open_sdrplay_source(radio, cli.center_hz()),
         Backend::Elad => open_elad_source(radio, cli.center_hz()),
         Backend::Lime => open_lime_source(radio, cli.center_hz(), cli.rate),
+        Backend::Fobos => open_fobos_source(radio, cli.center_hz()),
         Backend::Soapy => open_soapy_source(cli, settings, radio),
         Backend::Auto => {
             #[cfg(feature = "soapy")]
@@ -1933,6 +1937,103 @@ fn hydrasdr_caps(src: &hydrasdr_source::HydraSdrSource) -> DeviceCaps {
     }
 }
 
+/// Build the Fobos SDR source from radio.json. The receiver is picked by its
+/// serial, or the first one found when none is configured.
+fn open_fobos_source(
+    radio: &RadioConfig,
+    center_hz: f64,
+) -> anyhow::Result<(Box<dyn IqSource>, DeviceCaps)> {
+    let src =
+        fobos_source::FobosSource::open(&radio.fobos, center_hz).context("opening Fobos SDR")?;
+    let caps = fobos_caps(&src, radio.fobos.port);
+    Ok((Box::new(src), caps))
+}
+
+/// Capabilities for a Fobos SDR: wideband I/Q, receive only.
+///
+/// The tuning range depends on which port is open. On [`FobosPort::Rf`] it's
+/// the RFFC507x wideband synthesiser's own documented range (25 MHz –
+/// 5.4 GHz, from `libfobos`'s header comment on the low-level chip-tuning
+/// call this backend never makes directly) — the chip's bound, not a
+/// measured receiver-wide figure, so treated as approximate rather than
+/// pinned. **Partially confirmed live**: sdroxide's own default startup
+/// frequency (14.2 MHz, nothing to do with this backend) landed below this
+/// floor on a real run, and `fobos_rx_set_frequency` genuinely refused it
+/// (`FOBOS_ERR_UNSUPPORTED`) rather than silently mistuning — consistent
+/// with the 25 MHz floor rather than just citing the same header comment
+/// again. On the HF ports it's `0..adc_rate/2`, computed from what the
+/// device actually reported at open (80 Msps on the unit this was verified
+/// against) rather than a constant.
+///
+/// The **sample rates come off the device** on `Rf`; the HF ports don't have
+/// a comparable discrete list (`sdroxide_dsp::WbDdc` snaps to the nearest
+/// power-of-two bin count instead — see `sdroxide-fobos::stream::pick_bins`),
+/// so the same device-reported list is offered there too as reasonable
+/// targets, understanding the achieved rate can differ.
+///
+/// Two real gain elements, `Rf` only — see [`FobosPort`]'s own doc comment
+/// for why they do nothing on the HF ports. The clock-source switch, and —
+/// on [`FobosPort::HfDual`] — the diversity filter's mode/rate/hold, ride
+/// pseudo-elements that are deliberately not listed here: the clock switch
+/// so only the Fobos panel renders it, the diversity ones because
+/// `diversity: true` below is what puts them on the main window's own
+/// shared DIV strip instead (`sdroxide_types::DIV_MODE_ELEMENT`'s own doc
+/// comment).
+fn fobos_caps(src: &fobos_source::FobosSource, port: FobosPort) -> DeviceCaps {
+    use sdroxide_types::{Direction, FobosConfig, GainElement};
+    let rates = src.model_rates().to_vec();
+    let freq_range = match port {
+        FobosPort::Rf => (25_000_000.0, 5_400_000_000.0),
+        // The full Nyquist span the wideband stream actually carries, not
+        // just the narrower set of frequencies the downconverter's own
+        // centre can land on (see sdroxide_dsp::reachable_range_hz's own
+        // doc comment) — the same convention sdroxide-rx888's own
+        // freq_ranges uses for the identical WbDdc clamp. A dial anywhere
+        // in this range is genuinely receivable without a retune as long as
+        // it stays inside the current span; only a request that would need
+        // the *centre* to move somewhere unreachable needs the narrower
+        // range, and that case is what achieved_center_hz/poll_control
+        // corrects after the fact rather than what this range exists to
+        // pre-empt. Publishing the narrower range here instead looked
+        // right for a drag past the low end (refused outright, no flash)
+        // but broke the much more common case: clicking anywhere still
+        // inside the current passband, below the centre's own floor, was
+        // refused too, even though nothing needed to retune for it at all.
+        FobosPort::Hf1 | FobosPort::Hf2 | FobosPort::HfDual => (0.0, src.adc_rate_hz() / 2.0),
+    };
+    DeviceCaps {
+        driver: "fobos".into(),
+        label: src.describe(),
+        rx_channels: 1,
+        tx_channels: 0,
+        audio_mode: false,
+        freq_ranges_rx: vec![freq_range],
+        sample_rates: rates,
+        gains: if port == FobosPort::Rf {
+            vec![
+                GainElement {
+                    name: FobosConfig::LNA_GAIN_ELEMENT.into(),
+                    direction: Direction::Rx,
+                    min_db: 0.0,
+                    max_db: f64::from(FobosConfig::LNA_GAIN_MAX),
+                    step_db: 1.0,
+                },
+                GainElement {
+                    name: FobosConfig::VGA_GAIN_ELEMENT.into(),
+                    direction: Direction::Rx,
+                    min_db: 0.0,
+                    max_db: f64::from(FobosConfig::VGA_GAIN_MAX),
+                    step_db: 1.0,
+                },
+            ]
+        } else {
+            Vec::new()
+        },
+        diversity: port == FobosPort::HfDual,
+        ..DeviceCaps::default()
+    }
+}
+
 /// Build the HackRF source from radio.json. The radio is picked by the suffix
 /// of its USB serial, or the first one found when none is configured.
 fn open_hackrf_source(
@@ -2408,6 +2509,70 @@ fn spyserver_caps(src: &spyserver_source::SpyServerSource, driver: &str) -> Devi
     }
 }
 
+/// Build the KiwiSDR source: a ~12 kHz I/Q window that follows the dial, plus
+/// the receiver's own 0-30 MHz waterfall for the full-band strip.
+fn open_kiwisdr_source(
+    radio: &RadioConfig,
+    center_hz: f64,
+) -> anyhow::Result<(Box<dyn IqSource>, DeviceCaps)> {
+    // Who to announce ourselves as. Resolved here rather than in the driver
+    // crate, which has no business reading the station configuration — and it
+    // is the station callsign rather than the radio's, because it is the
+    // operator the receiver's owner sees.
+    let ident = radio.kiwi.ident_or(&sdroxide_config::load_digi_config().my_call);
+    let src = kiwisdr_source::KiwiSdrSource::connect(&radio.kiwi, &ident, center_hz)
+        .with_context(|| format!("connecting to the KiwiSDR at {}", radio.kiwi.endpoint()))?;
+    let caps = kiwisdr_caps(&src);
+    Ok((Box::new(src), caps))
+}
+
+/// Capabilities for a KiwiSDR: one narrow I/Q channel, receive only.
+///
+/// The tuning range comes from the receiver's own opening burst rather than
+/// from the directory listing, because a privately-run Kiwi is in no listing —
+/// and because the two disagree often enough to matter: the listing carries
+/// what its operator typed, the receiver carries what it is actually set to.
+///
+/// One sample rate, and it is not a round number. The receiver states its own
+/// (11998.876765 Hz on the one this was measured against) and there is nothing
+/// to choose: a Kiwi's user channel is the width it is.
+///
+/// The gain elements are the receiver's AGC and its manual gain. Both are on
+/// the far side of the link and ahead of the I/Q, which is why the S-meter is
+/// read from the frames instead — see `kiwisdr_source`.
+fn kiwisdr_caps(src: &kiwisdr_source::KiwiSdrSource) -> DeviceCaps {
+    let (lo, hi) = src.tuning_range();
+    DeviceCaps {
+        driver: "kiwisdr".into(),
+        label: src.describe(),
+        rx_channels: 1,
+        tx_channels: 0,
+        audio_mode: false,
+        freq_ranges_rx: vec![(lo, hi)],
+        sample_rates: vec![src.sample_rate()],
+        gains: vec![
+            sdroxide_types::GainElement {
+                name: sdroxide_types::KiwiConfig::AGC_ELEMENT.into(),
+                direction: sdroxide_types::Direction::Rx,
+                min_db: 0.0,
+                max_db: 1.0,
+                step_db: 1.0,
+            },
+            sdroxide_types::GainElement {
+                name: sdroxide_types::KiwiConfig::MAN_GAIN_ELEMENT.into(),
+                direction: sdroxide_types::Direction::Rx,
+                // The receiver's own scale, carried in a field named for
+                // decibels because `GainElement` has no other - the same thing
+                // the SpyServer's gain index and the SDRplay's LNA state do.
+                min_db: 0.0,
+                max_db: 90.0,
+                step_db: 1.0,
+            },
+        ],
+        ..DeviceCaps::default()
+    }
+}
+
 /// Build the TCI (WebSocket) source from radio.json: wideband IQ receive +
 /// audio transmit.
 fn open_tci_source(
@@ -2419,6 +2584,7 @@ fn open_tci_source(
         radio.tci.iq_sample_rate_hz,
         center_hz,
         radio.tci.rx,
+        radio.tci.stream_delay_ms,
     )
     .context("connecting to TCI server")?;
     let caps = tci_caps(&radio.tci.address, src.sample_rate_hz(), radio.tci.rx);

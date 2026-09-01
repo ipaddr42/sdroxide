@@ -67,6 +67,7 @@ fn embedded_image(path: &str) -> Option<&'static [u8]> {
             &include_bytes!("../../../docs/images/bw_measurement.jpg")[..]
         }
         "adsb-panel.jpg" => &include_bytes!("../../../docs/images/adsb-panel.jpg")[..],
+        "vdl2-panel.jpg" => &include_bytes!("../../../docs/images/vdl2-panel.jpg")[..],
         "aprs-panel.jpg" => &include_bytes!("../../../docs/images/aprs-panel.jpg")[..],
         "cw.jpg" => &include_bytes!("../../../docs/images/cw.jpg")[..],
         "rit_xit.jpg" => &include_bytes!("../../../docs/images/rit_xit.jpg")[..],

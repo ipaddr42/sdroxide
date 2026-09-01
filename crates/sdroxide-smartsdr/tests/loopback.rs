@@ -85,6 +85,12 @@ fn dax_iq_flows_and_carries_the_synthetic_scene() {
     // ≈ 0 here rather than an error, which is exactly the failure this catches.
     let power: f64 = iq.iter().map(|&v| (v as f64) * (v as f64)).sum::<f64>() / iq.len() as f64;
     assert!(power > 1e-4, "IQ power {power:e} is at the noise floor — byte order?");
+    // …and the other end of the same rail. A FLEX puts its DAX IQ floats on the
+    // wire at 2^15 full scale, so a client that forgets to divide them down is
+    // 90 dB hot: everything clips, the waterfall saturates and the S-meter pins
+    // (issue #184). The scene is well under full scale, so anything at or past
+    // it is that mistake rather than a loud band.
+    assert!(power < 1.0, "IQ power {power:e} is past full scale — DAX IQ scaling?");
     assert!(iq.iter().all(|v| v.is_finite()));
 }
 

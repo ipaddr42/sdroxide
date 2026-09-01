@@ -1,0 +1,64 @@
+# The station's transmit/receive switch — the relay that grounds the SDR's
+# antenna while the transmitter is on the air.
+#
+# Two kinds of device need permissions here, and neither is granted by default
+# on any distribution.
+#
+# TAG+="uaccess" hands an ACL to whoever is logged in at the active seat. That is
+# better than adding the user to a group, which needs the group to exist, the
+# user to be added to it, and a full re-login before it takes effect.
+#
+# Install:
+#   sudo cp 60-sdroxide-relay.rules /usr/lib/udev/rules.d/
+#   sudo udevadm control --reload
+# then unplug and replug the device.
+#
+# Serial relay boards (LCUS, KMtronic, Numato) need nothing from this file: they
+# are USB serial ports, and every distribution already owns those with root and
+# the `dialout` group. Add yourself to `dialout` for those, as for any CAT
+# cable.
+
+# ── USB HID relay boards ─────────────────────────────────────────────────────
+#
+# The dcttech family — the "free-driver USB control switch" sold under MagiDeal
+# and a dozen other names, 1 to 8 channels.
+#
+# ⚠️ 16c0:05df is a *V-USB hobby id*: a range Objective Development hands out to
+# anyone using their software USB stack, and shared with other people's
+# home-made keyboards, LED controllers and thermometers. This rule therefore
+# loosens permissions on any such device on the machine — the same trade every
+# distribution's own generic FTDI rules already make, and the reason sdroxide's
+# own device list additionally filters on the product string ("USBRelay…")
+# rather than offering everything that answers to these ids.
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="16c0", ATTRS{idProduct}=="05df", MODE="0660", TAG+="uaccess"
+
+# ── CM108/CM119-family sound-card GPIO ───────────────────────────────────────
+#
+# The pins on a cheap USB "rig interface" — DRA boards, the RB-USB RIM, the
+# AIOC, and a great many home-made ones with a wire tacked to pin 13. sdroxide
+# writes an output report to the card's HID interface; the audio it is carrying
+# for the radio is on a different interface and is not disturbed.
+#
+# These hidraw nodes are commonly root-owned with no ACL, which is why a card
+# that plainly works for audio still cannot switch anything until this is
+# installed. Note also that several clones carry a genuine C-Media id and ignore
+# the GPIO report entirely: if the relay still does not click after this rule is
+# in place, the chip is one of those.
+
+# C-Media's own parts: CM108, CM108B, CM119, CM119A, CM108AH.
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="0d8c", MODE="0660", TAG+="uaccess"
+
+# SSS1621/SSS1623 and relatives, which clone them.
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="0c76", ATTRS{idProduct}=="1605", MODE="0660", TAG+="uaccess"
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="0c76", ATTRS{idProduct}=="1607", MODE="0660", TAG+="uaccess"
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="0c76", ATTRS{idProduct}=="160b", MODE="0660", TAG+="uaccess"
+
+# The AIOC (All-In-One-Cable), which emulates a CM108 in a microcontroller.
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="1209", ATTRS{idProduct}=="7388", MODE="0660", TAG+="uaccess"
+
+# ── GPIO lines ───────────────────────────────────────────────────────────────
+#
+# For a Raspberry Pi header or any other board with a GPIO character device.
+# Best-effort: many distributions ship their own rule giving these to a `gpio`
+# group, and where they do this one simply agrees with it.
+SUBSYSTEM=="gpio", KERNEL=="gpiochip*", MODE="0660", TAG+="uaccess"

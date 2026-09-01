@@ -104,6 +104,8 @@ pub fn wgpu_options() -> egui_wgpu::WgpuConfiguration {
     #[cfg(not(target_arch = "wasm32"))]
     if let Some(backends) = fallback_backends(setup.instance_descriptor.backends) {
         setup.instance_descriptor.backends = backends;
+    } else if let Some(backends) = windows_backends(setup.instance_descriptor.backends) {
+        setup.instance_descriptor.backends = backends;
     } else if let Some(backends) = v3dv_backends(setup.instance_descriptor.backends) {
         setup.instance_descriptor.backends = backends;
     }
@@ -289,6 +291,55 @@ fn fallback_backends(configured: egui_wgpu::wgpu::Backends) -> Option<egui_wgpu:
     Some(wgpu::Backends::GL)
 }
 
+/// The backends to open the window with on Windows: everything but Vulkan.
+///
+/// Windows has a first-party graphics API, every driver on it is written
+/// against that API first, and wgpu drives it as well as it drives Vulkan. What
+/// Vulkan adds there is a second, thinner-tested path through the vendor's
+/// installable client driver — and on Intel's (`igvk64.dll`) that path faults
+/// on sight of the window: an access violation inside the driver, before
+/// sdroxide has drawn anything, killing the process rather than failing an
+/// adapter request the way a refusal would (issue #242, reported on 1.6.1 by
+/// two operators after eframe moved from wgpu 26 to wgpu 30 — the same machine
+/// was steady on 1.6.0). A crash in a driver is not something this side can
+/// catch or work around; the only answer is not to load it.
+///
+/// So D3D12 leads and OpenGL stays behind it as the fallback, which together
+/// cover every Windows machine going back further than Vulkan does. Both were
+/// confirmed to start on the reporter's machine, and dropping Vulkan from the
+/// *instance* is what keeps the ICD out of the process entirely — an adapter
+/// that is merely not chosen has still been enumerated, and the enumeration is
+/// where an ICD like that one is free to fault.
+///
+/// `WGPU_BACKEND` remains the override in both directions, exactly as on the
+/// Pi below: `WGPU_BACKEND=vulkan` puts a Windows machine with a sound Vulkan
+/// driver back on it.
+#[cfg(not(target_arch = "wasm32"))]
+fn windows_backends(configured: egui_wgpu::wgpu::Backends) -> Option<egui_wgpu::wgpu::Backends> {
+    use egui_wgpu::wgpu;
+
+    if !cfg!(target_os = "windows") {
+        return None;
+    }
+    // Whatever the environment names, it means it.
+    if wgpu::Backends::from_env().is_some() {
+        return None;
+    }
+    without_vulkan(configured)
+}
+
+/// [`windows_backends`] without the platform and environment tests, so the rule
+/// itself can be checked on the machine this is built on.
+#[cfg(not(target_arch = "wasm32"))]
+fn without_vulkan(configured: egui_wgpu::wgpu::Backends) -> Option<egui_wgpu::wgpu::Backends> {
+    use egui_wgpu::wgpu;
+    // Nothing to drop, or nothing left to run on if it were dropped.
+    if !configured.contains(wgpu::Backends::VULKAN) || !configured.contains(wgpu::Backends::DX12) {
+        return None;
+    }
+    Some(configured - wgpu::Backends::VULKAN)
+}
+
 /// Whether the Raspberry Pi's GPU is here behind Mesa's Vulkan driver.
 ///
 /// V3D is the 3D block in the Broadcom SoCs on the Pi 4 and Pi 5 (and so the
@@ -393,6 +444,33 @@ mod renderer_fallback_tests {
             "crates/sdroxide-ui/src/app/mod.rs:9:9",
             "called `Option::unwrap()` on a `None` value"
         ));
+    }
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod windows_backend_tests {
+    use super::without_vulkan;
+    use crate::egui_wgpu::wgpu::Backends;
+
+    /// A Windows machine opens on D3D12 with OpenGL behind it, and never loads
+    /// the Vulkan ICD that crashed issue #242 — an adapter that is enumerated
+    /// and then not chosen has already been in the process.
+    #[test]
+    fn windows_leaves_vulkan_out_of_the_instance() {
+        let picked = without_vulkan(Backends::PRIMARY | Backends::GL).expect("a swap");
+        assert!(!picked.contains(Backends::VULKAN));
+        assert!(picked.contains(Backends::DX12), "D3D12 is what is left to render through");
+        assert!(picked.contains(Backends::GL), "and OpenGL behind it for anything without D3D12");
+    }
+
+    /// Nothing to do where Vulkan is not on the table, and nothing to be done
+    /// where it is the only thing on it: dropping it there would leave a window
+    /// with no renderer at all, which is worse than a driver that might crash.
+    #[test]
+    fn a_configuration_with_nowhere_else_to_go_is_left_alone() {
+        assert_eq!(without_vulkan(Backends::GL), None);
+        assert_eq!(without_vulkan(Backends::VULKAN), None);
+        assert_eq!(without_vulkan(Backends::VULKAN | Backends::GL), None);
     }
 }
 

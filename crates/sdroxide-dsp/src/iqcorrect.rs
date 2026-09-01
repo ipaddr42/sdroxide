@@ -181,15 +181,31 @@ impl IqCorrect {
         if !self.balance {
             return;
         }
-        for s in buf {
+        // Cut at the estimator's own block boundary and run the samples
+        // between two of them straight through. The coefficients only ever
+        // change at such a boundary, so this corrects exactly what the
+        // sample-at-a-time loop corrected — but the loop below has no branch
+        // and no shared accumulator in it, which is the difference between a
+        // vector of samples per iteration and one. At 2.4 Msps this pass was
+        // measured at a seventh of the whole receive thread.
+        let mut at = 0;
+        while at < buf.len() {
+            let take = (BLOCK - self.n).min(buf.len() - at);
             let (alpha, gain) = (self.alpha as f32, self.gain as f32);
-            let i = s.re;
-            let q = gain * (s.im - alpha * i);
-            s.im = q;
-            self.sum_ii += (i as f64) * (i as f64);
-            self.sum_qq += (q as f64) * (q as f64);
-            self.sum_iq += (i as f64) * (q as f64);
-            self.n += 1;
+            let (mut ii, mut qq, mut iq) = (0.0f64, 0.0f64, 0.0f64);
+            for s in &mut buf[at..at + take] {
+                let i = s.re;
+                let q = gain * (s.im - alpha * i);
+                s.im = q;
+                ii += (i as f64) * (i as f64);
+                qq += (q as f64) * (q as f64);
+                iq += (i as f64) * (q as f64);
+            }
+            self.sum_ii += ii;
+            self.sum_qq += qq;
+            self.sum_iq += iq;
+            self.n += take;
+            at += take;
             if self.n >= BLOCK {
                 self.update();
             }

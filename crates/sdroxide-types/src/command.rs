@@ -643,6 +643,17 @@ pub enum Command {
         /// which is what a memory written before the field existed already
         /// means: recall onto whatever the repeater controls are set to.
         repeater: Option<crate::RepeaterState>,
+        /// The antenna socket to store with the channel, by the name the front
+        /// end gives the port. `None` clears it, which means "recall this
+        /// channel without moving the antenna" — see
+        /// [`crate::MemoryChannel::antenna`], which reads an absent field the
+        /// same way.
+        ///
+        /// A name the front end does not have is dropped rather than stored: a
+        /// channel may perfectly well have been captured on another radio's
+        /// socket, and remembering a port this receiver has never had would
+        /// leave a memory that can only ever be recalled onto nothing.
+        antenna: Option<String>,
     },
 
     /// Working a repeater: the transmit shift, the sub-audible tone under the
@@ -831,4 +842,83 @@ pub enum Command {
     ///
     /// Appended for the usual reason — postcard numbers variants by position.
     SetContestSerial(u32),
+
+    /// Switch the *radio* off (`false`), or back on again (`true`) — its own
+    /// power switch, over the control link (issue #239).
+    ///
+    /// Not sdroxide's power switch: the tab strip's one closes the interface
+    /// and leaves the radio running, and this one leaves the interface open and
+    /// switches the radio off — which is exactly what an operator away from the
+    /// shack wants, because the link has to survive for the switch back on to
+    /// reach anything.
+    ///
+    /// Ignored on a front end with no such command
+    /// ([`crate::DeviceCaps::commands_rig_power`]), which is every SDR: their
+    /// only power switch is the USB cable.
+    ///
+    /// Appended for the usual reason — postcard numbers variants by position.
+    SetRigPower(bool),
+
+    /// Add channels to the memory list — a repeater directory or a channel
+    /// table read from a file (issue #234).
+    ///
+    /// The ids the caller sends are ignored: the engine owns the numbering,
+    /// because only it knows what is already stored. Channels whose frequency
+    /// and mode a memory already carries are skipped rather than duplicated, so
+    /// re-importing an updated directory adds what is new instead of doubling
+    /// what is not.
+    ///
+    /// Appended for the usual reason — postcard numbers variants by position.
+    ImportMemories(Vec<crate::MemoryChannel>),
+
+    /// Set how the VDL Mode 2 decoder behaves: which of the seven channels to
+    /// listen on, how hard a burst has to be, and how much log to keep.
+    ///
+    /// The engine persists it to `vdl2.json` and echoes it back in
+    /// [`crate::RadioState::vdl2`], so there is no apply step and no way for
+    /// the panel's copy and the engine's to drift apart — the same bargain
+    /// [`Command::SetAdsbConfig`] strikes.
+    ///
+    /// Appended for the usual reason — postcard numbers variants by position.
+    SetVdl2Config(crate::Vdl2Settings),
+
+    /// Binaural (pseudo-stereo) audio on a receiver: spread the passband across
+    /// the stereo image so that pitch becomes direction, and tuning a signal
+    /// floats it from one ear to the other (issue #263). CW and SSB — see
+    /// [`crate::Mode::binaural_audio`] — and ignored while the sub receiver has
+    /// the right ear. Only the main receiver's audio is ever spread: the sub
+    /// receiver *is* the other ear, so it has nothing to be placed across.
+    ///
+    /// Appended for the usual reason — postcard numbers variants by position.
+    SetBinaural {
+        rx: RxId,
+        on: bool,
+    },
+
+    /// Set up the station's external transmit/receive switch: the relay board
+    /// or contact closure that grounds the SDR's antenna while the station
+    /// transmits, and sequences whatever else has to move with the over.
+    ///
+    /// Saved to `relay.json` and echoed back in
+    /// [`crate::RadioEvent::StationConfig`], because the operator setting it up
+    /// may be on another machine entirely and the hardware is on this one.
+    ///
+    /// Boxed: the configuration carries a channel table and four strings, and
+    /// an enum is as big as its largest variant everywhere it is held.
+    ///
+    /// Appended for the usual reason — postcard numbers variants by position.
+    SetRelayConfig(Box<crate::RelayConfig>),
+
+    /// Close one of the T/R switch's contacts briefly, so the operator can hear
+    /// the relay and check their wiring with the transmitter cold.
+    ///
+    /// Refused by the driver while anything is on the air: throwing a relay
+    /// under live RF is the accident the whole subsystem exists to prevent, and
+    /// a test button is exactly the thing somebody presses while wondering why
+    /// their transmission sounds odd.
+    ///
+    /// Appended for the usual reason — postcard numbers variants by position.
+    TestRelay {
+        channel: u8,
+    },
 }

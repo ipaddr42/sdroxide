@@ -222,6 +222,37 @@ pub struct DeviceCaps {
     /// answer. Appended last, for the same reason as `shared_lo_rx`.
     #[serde(default)]
     pub commands_squelch: bool,
+    /// How wide the front end's full-band lane is, in Hz, or `0.0` where it has
+    /// none — see `IqSource::wide_spectrum_db`.
+    ///
+    /// The client needs this *before* the first full-band frame arrives, which
+    /// is why it rides the capabilities and not the frame. It is what bounds
+    /// the panadapter's zoom-out on a receiver whose I/Q is a narrow window
+    /// onto a wide band, and a client that had to wait for a picture to learn
+    /// it would spend the first frames of every session believing the passband
+    /// was the limit — and would shrink a restored window to it before the lane
+    /// had said otherwise.
+    ///
+    /// A span only: *where* it sits moves with the receiver and is carried on
+    /// each frame, where it belongs. Appended last, so every field already on
+    /// the wire keeps its number.
+    #[serde(default)]
+    pub wide_span_hz: f64,
+    /// The radio can be switched off — and back on — from here.
+    ///
+    /// A transceiver with a remote-control port, not an SDR: an Icom answers
+    /// `18 00` / `18 01` on CI-V whether that link is a serial cable or the
+    /// radio's own network socket, and keeps the control end of it alive while
+    /// the set is off so that the second of those can reach it (issue #239).
+    /// False everywhere else, including on every I/Q front end, where the only
+    /// power switch is the USB cable.
+    ///
+    /// Reported by the source (`IqSource::commands_rig_power`), for the reason
+    /// [`Self::commands_squelch`] is: a backend that is not a CAT rig has no
+    /// such field and still has an answer. Appended last, so every field
+    /// already on the wire keeps its number.
+    #[serde(default)]
+    pub commands_rig_power: bool,
 }
 
 impl DeviceCaps {

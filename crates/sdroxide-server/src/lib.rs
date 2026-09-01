@@ -223,6 +223,12 @@ pub(crate) struct Latest {
     /// file here, so a client elsewhere has no copy, and the settings panel it
     /// feeds would otherwise open on defaults and write them back.
     pub radio: Option<Box<sdroxide_types::RadioConfig>>,
+    /// The external T/R switch's health. Replayed on connect for `sat_track`'s
+    /// reason and one more: it is the only thing that tells a remote operator
+    /// whether the relay standing between a kilowatt and their receiver is
+    /// answering, and "nothing has changed since you attached" must not read as
+    /// "nothing is wrong".
+    pub relay: Option<Box<sdroxide_types::RelayStatus>>,
     /// What the RDS decoder has made of the station currently tuned. Replayed on
     /// connect for the same reason as `digi` and `voice`: which station is being
     /// listened to is a standing condition, and a client that attaches after the
@@ -243,6 +249,11 @@ pub(crate) struct Latest {
     /// minutes is a standing condition, and a client that attaches without it
     /// would show an empty radar in front of a working decoder.
     pub adsb_status: Option<Box<sdroxide_types::AdsbStatus>>,
+    /// What the VDL2 decoder has heard. Replayed on connect for the same reason
+    /// the aircraft table is: an hour of messages and a list of who is out there
+    /// are standing conditions, and a client that attaches without them would
+    /// show an empty panel in front of a working decoder.
+    pub vdl2_status: Option<Box<sdroxide_types::Vdl2Status>>,
     /// What the DRM decoder has made of the broadcast currently tuned. Replayed
     /// on connect for the same reason as `rds`: a station's label and the
     /// transmission's parameters are standing conditions, and a client that
@@ -656,14 +667,111 @@ pub async fn serve(params: ServerParams) -> Result<(), ServerError> {
         .route("/solar-ws", get(solar::ws_route))
         .with_state(station);
     app = add_static_routes(app, params.web_root);
+    // Outside the router rather than inside it: this one has to run *before*
+    // the path is matched against a route, and `Router::layer` runs after. See
+    // `strip_proxy_prefix`.
+    let app = tower::Layer::layer(&axum::middleware::from_fn(strip_prefix_layer), app);
 
     let addr: SocketAddr = format!("{}:{}", params.bind, params.port)
         .parse()
         .unwrap_or_else(|_| SocketAddr::from(([0, 0, 0, 0], params.port)));
     let listener = tokio::net::TcpListener::bind(addr).await?;
     info!("server listening on http://{addr}/");
-    axum::serve(listener, app).await?;
+    axum::serve(listener, axum::ServiceExt::<axum::extract::Request>::into_make_service(app))
+        .await?;
     Ok(())
+}
+
+/// The endpoints this server answers at the top of its host.
+///
+/// Named in one place because [`strip_proxy_prefix`] has to recognise one at
+/// the end of a longer path, and a list that drifted from the router would
+/// leave a reverse-proxied station with an endpoint that works from the root
+/// and nowhere else.
+fn is_root_route(path: &str) -> bool {
+    match path {
+        "/ws" | "/solar-ws" | "/radios" => true,
+        _ => path
+            .strip_prefix("/ws/")
+            .is_some_and(|id| !id.is_empty() && id.bytes().all(|b| b.is_ascii_digit())),
+    }
+}
+
+/// The path a request really names, once whatever a reverse proxy left in
+/// front of it has been taken off — or `None` where there is nothing to take
+/// off, which is every request to a station reached directly.
+///
+/// sdroxide behind a proxy on a *subpath* is an ordinary arrangement and not
+/// an exotic one: a Tailscale certificate covers a host and offers no
+/// subdomains, so the only place to put a second service on it is
+/// `https://host/sdroxide/` (issue #241). Some proxies strip the prefix before
+/// forwarding (Caddy's `handle_path`) and some do not (`reverse_proxy` on its
+/// own); with an unstripped prefix every request arrives naming something this
+/// server has never heard of, and the answer was a flat "not found" for the
+/// page and everything under it.
+///
+/// The two shapes are answered separately because they are different questions:
+///
+/// * An **endpoint** is recognised by name. Anything ending in one of
+///   [`is_root_route`]'s paths is that endpoint reached through a prefix, so
+///   the prefix is dropped: `/sdroxide/ws/1` is `/ws/1`.
+/// * Everything else is a **file**, and the client's `dist` is flat — no
+///   subdirectories at all — so a path with a directory in it can only be a
+///   prefix, and the last segment is the file: `/sdroxide/app.wasm` is
+///   `/app.wasm`. A path that ends in `/` names a directory, which is the
+///   client's own page, so it becomes `/`.
+///
+/// Neither can collide with a real request, because there is nothing real
+/// underneath: a station serves four endpoints and one flat directory.
+fn strip_proxy_prefix(path: &str) -> Option<String> {
+    if is_root_route(path) {
+        return None;
+    }
+    // An endpoint under a prefix: the longest suffix that names one wins, so a
+    // station proxied under `/ws/` (which nobody should do, but which costs
+    // nothing to get right) still resolves to its own `/ws`.
+    for (i, _) in path.match_indices('/').skip(1) {
+        if is_root_route(&path[i..]) {
+            return Some(path[i..].to_string());
+        }
+    }
+    // A file under a prefix — or a directory, which is the page itself.
+    let rest = path.trim_start_matches('/');
+    if rest.is_empty() || !rest.contains('/') {
+        // Already at the top: `/`, or a single name the static handler
+        // resolves for itself.
+        return None;
+    }
+    match rest.rsplit('/').next().filter(|f| !f.is_empty()) {
+        Some(file) => Some(format!("/{file}")),
+        None => Some("/".to_string()),
+    }
+}
+
+/// Rewrite the request's path through [`strip_proxy_prefix`] before it is
+/// matched against a route. The query string is carried across untouched — it
+/// is what `?view=solar` and `?radio=N` ride in.
+async fn strip_prefix_layer(
+    mut req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    if let Some(path) = strip_proxy_prefix(req.uri().path()) {
+        let with_query = match req.uri().query() {
+            Some(q) => format!("{path}?{q}"),
+            None => path,
+        };
+        let mut parts = req.uri().clone().into_parts();
+        // A path built out of one this request already carried, so it parses;
+        // a failure here leaves the request exactly as it arrived, which is
+        // the behaviour of every station that is not behind a proxy anyway.
+        if let Ok(pq) = with_query.parse() {
+            parts.path_and_query = Some(pq);
+            if let Ok(uri) = axum::http::Uri::from_parts(parts) {
+                *req.uri_mut() = uri;
+            }
+        }
+    }
+    next.run(req).await
 }
 
 /// The station's radios and where to reach each one, as JSON:
@@ -974,6 +1082,10 @@ fn handle_event(shared: &Shared, ev: RadioEvent) {
                 latest.adsb_status = Some(st.clone());
                 Some(ServerMsg::AdsbStatus(st))
             }
+            RadioEvent::Vdl2Status(st) => {
+                latest.vdl2_status = Some(st.clone());
+                Some(ServerMsg::Vdl2Status(st))
+            }
             // Native-only for now: every station this shipped for runs its
             // own hardware locally, so there is no `ServerMsg` variant for
             // this yet — see `RadioEvent::Qo100Status`'s own doc.
@@ -1076,6 +1188,10 @@ fn handle_event(shared: &Shared, ev: RadioEvent) {
             RadioEvent::RotatorStatus { connected, az_deg, el_deg, error } => {
                 Some(ServerMsg::RotatorStatus { connected, az_deg, el_deg, error })
             }
+            RadioEvent::RelayStatus(st) => {
+                latest.relay = Some(st.clone());
+                Some(ServerMsg::RelayStatus(st))
+            }
             // Handled above, and deliberately not forwarded: the skimmer
             // firehose is a hundred times the spot list's traffic, and the
             // solar relay already carries what it adds up to. See
@@ -1166,8 +1282,7 @@ fn add_embedded_or_placeholder(app: Router) -> Router {
     async fn serve_embedded(headers: axum::http::HeaderMap, uri: Uri) -> axum::response::Response {
         use std::fmt::Write as _;
 
-        let path = uri.path().trim_start_matches('/');
-        let path = if path.is_empty() { "index.html" } else { path };
+        let path = asset_name(uri.path());
         match WebAssets::get(path) {
             Some(f) => {
                 // The content hash rust-embed already computed at build time,
@@ -1198,6 +1313,28 @@ fn add_embedded_or_placeholder(app: Router) -> Router {
     app.fallback(serve_embedded)
 }
 
+/// Which file in the client's `dist` a request path asks for.
+///
+/// A directory — the root, or anything ending in `/` — is the client's own
+/// page. So is a name with no extension: that is a reverse-proxy prefix
+/// arriving without its trailing slash (`https://host/sdroxide`), where the
+/// browser has not yet been given a page to resolve `./bundle.js` against.
+/// Serving it the page is what makes the address work with or without the
+/// slash, and the page's own links are relative, so the assets follow.
+///
+/// Anything with an extension is asked for by name and answered by name, so a
+/// bundle that really is missing still says so instead of returning HTML that
+/// the browser would try to run as JavaScript.
+///
+/// Paths arrive here already stripped of any prefix — see
+/// [`strip_proxy_prefix`] — so there is nothing left to trim but the leading
+/// slash.
+#[cfg(feature = "embed-web")]
+fn asset_name(path: &str) -> &str {
+    let name = path.trim_start_matches('/');
+    if name.is_empty() || name.ends_with('/') || !name.contains('.') { "index.html" } else { name }
+}
+
 #[cfg(not(feature = "embed-web"))]
 fn add_embedded_or_placeholder(app: Router) -> Router {
     app.fallback(|| async {
@@ -1205,4 +1342,73 @@ fn add_embedded_or_placeholder(app: Router) -> Router {
          in crates/sdroxide-web and pass --web-root, or rebuild the server \
          with the embed-web feature."
     })
+}
+
+#[cfg(test)]
+mod proxy_prefix_tests {
+    use super::strip_proxy_prefix;
+
+    /// A station reached directly is left entirely alone: every path it can be
+    /// asked for already means what it says.
+    #[test]
+    fn nothing_in_front_means_nothing_to_strip() {
+        for path in ["/", "/ws", "/ws/0", "/ws/12", "/radios", "/solar-ws", "/index.html"] {
+            assert_eq!(strip_proxy_prefix(path), None, "{path}");
+        }
+    }
+
+    /// Behind a proxy that forwards its prefix — Caddy's plain `reverse_proxy`
+    /// — every one of those arrives with the prefix still on it, and every one
+    /// used to be answered with "not found" (issue #241).
+    #[test]
+    fn a_prefix_comes_off_the_endpoints_and_the_files() {
+        let strip = |p: &str| strip_proxy_prefix(p).unwrap_or_else(|| panic!("{p} was left alone"));
+        assert_eq!(strip("/sdroxide/"), "/");
+        assert_eq!(strip("/sdroxide/index.html"), "/index.html");
+        assert_eq!(strip("/sdroxide/sdroxide-web-abc123_bg.wasm"), "/sdroxide-web-abc123_bg.wasm");
+        assert_eq!(strip("/sdroxide/ws"), "/ws");
+        assert_eq!(strip("/sdroxide/ws/2"), "/ws/2");
+        assert_eq!(strip("/sdroxide/solar-ws"), "/solar-ws");
+        assert_eq!(strip("/sdroxide/radios"), "/radios");
+        // More than one level deep is the same answer: the client's dist is
+        // flat, so anything above the file is somebody's routing.
+        assert_eq!(strip("/shack/sdr/ws/1"), "/ws/1");
+        assert_eq!(strip("/shack/sdr/audio_bridge.js"), "/audio_bridge.js");
+    }
+
+    /// `/ws/<id>` is a number, and only a number: `/ws/latest` is a file called
+    /// `latest` somewhere, not radio number nothing.
+    #[test]
+    fn only_a_number_names_a_radio() {
+        assert_eq!(strip_proxy_prefix("/ws/latest"), Some("/latest".to_string()));
+        assert_eq!(strip_proxy_prefix("/sdroxide/ws/latest"), Some("/latest".to_string()));
+        // …and the real one still resolves through a prefix that is itself /ws.
+        assert_eq!(strip_proxy_prefix("/ws/ws/3"), Some("/ws/3".to_string()));
+    }
+}
+
+#[cfg(all(test, feature = "embed-web"))]
+mod asset_name_tests {
+    use super::asset_name;
+
+    /// A directory is the client's page, and so is a bare prefix with no
+    /// trailing slash — which is what a browser asks for when somebody types
+    /// `https://host/sdroxide` without one.
+    #[test]
+    fn a_directory_is_the_page() {
+        assert_eq!(asset_name("/"), "index.html");
+        assert_eq!(asset_name(""), "index.html");
+        assert_eq!(asset_name("/sdroxide/"), "index.html");
+        assert_eq!(asset_name("/sdroxide"), "index.html");
+    }
+
+    /// A file asked for by name is answered by name, so a bundle that really
+    /// is missing says so rather than handing the browser HTML to run as
+    /// JavaScript.
+    #[test]
+    fn a_file_is_a_file() {
+        assert_eq!(asset_name("/index.html"), "index.html");
+        assert_eq!(asset_name("/audio_bridge.js"), "audio_bridge.js");
+        assert_eq!(asset_name("/sdroxide-web-abc_bg.wasm"), "sdroxide-web-abc_bg.wasm");
+    }
 }

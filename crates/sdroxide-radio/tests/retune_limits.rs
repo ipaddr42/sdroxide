@@ -178,6 +178,66 @@ fn a_driver_that_refuses_a_tune_puts_the_dial_back() {
     }
 }
 
+/// A dial inside the current span, but below the *centre's own* reachable
+/// floor, needs no retune at all — a WOLA downconverter's own output (see
+/// `sdroxide_dsp::WbDdc`'s module doc) genuinely carries the whole span
+/// around wherever its centre is pinned, so a click there is a plain VFO
+/// move within spectrum already arriving. A front end's own published range
+/// narrower than that (the centre-only range half its output rate away from
+/// DC — real, but not the range to publish for this purpose; see
+/// `sdroxide_dsp::reachable_range_hz`'s own doc comment) refused this dial
+/// outright even though nothing needed to move: dialling to 820 kHz with the
+/// centre already at 1.25 MHz, at 2.5 Msps, was refused instead of just
+/// working, because 820 kHz is not itself a centre the front end can park
+/// on — even though it plainly still falls inside the 0-2.5 MHz the current
+/// centre already covers.
+#[test]
+fn a_vfo_below_the_centres_own_floor_but_inside_the_current_span_needs_no_retune() {
+    const FLOOR_CENTER: f64 = 1_250_000.0;
+    const SPAN: f64 = 2_500_000.0;
+    // Inside [0, SPAN] around FLOOR_CENTER, so genuinely already arriving —
+    // and inside the 45% "usable" window too, so `keep_vfo_in_span` should
+    // see no reason to touch the hardware centre at all.
+    const DIAL: f64 = 820_000.0;
+
+    let asked = Arc::new(AtomicBool::new(false));
+    let source = Tunable {
+        center_hz: FLOOR_CENTER,
+        rate_hz: SPAN,
+        lo_offset_hz: 0.0,
+        // `Tunable::new` seeds this from the module's own `CENTER` const,
+        // which this test does not use — it has to start where the source
+        // itself starts, or "the centre never moved" is checked against the
+        // wrong starting point.
+        landed: Arc::new(Mutex::new(FLOOR_CENTER)),
+        ..Tunable::new(&asked)
+    };
+    let landed = Arc::clone(&source.landed);
+    // The wide, Nyquist-style range a WbDdc-backed front end actually
+    // publishes (sdroxide-rx888::band::freq_ranges's own choice for the
+    // identical clamp) — not the narrower centre-only range.
+    let mut h =
+        start_engine(Box::new(source), caps(vec![(0.0, 40_000_000.0)]), EngineConfig::default());
+    let thread = h.thread.take();
+
+    h.cmd_tx.send(Command::SetVfo { vfo: Vfo::A, hz: DIAL }).unwrap();
+    let (notices, lost, dial) = drain(&h.event_rx, 1.0);
+
+    assert_eq!(lost, None);
+    assert!(notices.is_empty(), "820 kHz is already inside the current span, got {notices:?}");
+    assert!((dial - DIAL).abs() < 1.0, "the dial should have landed on {DIAL}, not {dial}");
+    let lo = *landed.lock().unwrap();
+    assert!(
+        (lo - FLOOR_CENTER).abs() < 1.0,
+        "the hardware centre should never have moved from {FLOOR_CENTER}, landed on {lo}"
+    );
+
+    drop(h.cmd_tx);
+    if let Some(t) = thread {
+        let _ = t.join();
+    }
+}
+
 /// A front end that parks its LO clear of the VFO can still work the top of its
 /// range: the LO goes to the mirror position rather than off the end, and the
 /// operator keeps the frequency they asked for.

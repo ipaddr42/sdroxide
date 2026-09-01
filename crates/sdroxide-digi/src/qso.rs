@@ -1060,6 +1060,19 @@ impl QsoMachine {
     /// The setup panel says so where the activity is chosen; here the ordinary
     /// exchange simply goes out, which is the one behaviour that is never
     /// wrong on the air.
+    /// Whether the operator has *chosen* the EU VHF contest, whatever the
+    /// station is equipped to send.
+    ///
+    /// [`Self::contest`] answers the narrower question — whether this station
+    /// can honestly transmit the exchange, which needs a six-character locator
+    /// — and that is the right test for the transmitter. It is the wrong one
+    /// for the receiver: a station with only a four-character grid is still
+    /// sitting in the middle of a contest and still wants to read what is going
+    /// on around it.
+    pub(crate) fn contest_selected(&self) -> bool {
+        self.cfg.contest == ContestMode::EuVhf
+    }
+
     pub(crate) fn contest(&self) -> ContestMode {
         match self.cfg.contest {
             ContestMode::EuVhf

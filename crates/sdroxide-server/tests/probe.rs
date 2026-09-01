@@ -20,7 +20,10 @@ use tokio_tungstenite::tungstenite::Message;
 use sdroxide_proto::{AudioCaps, ClientMsg, PROTO_VERSION, ServerMsg, decode, encode};
 use sdroxide_radio::{EngineConfig, SigGenSource, start_engine};
 use sdroxide_server::{ProbeFn, RadioParams, ServerParams, serve};
-use sdroxide_types::{DeviceCaps, DeviceProbe, ProbeAnswer, ProbeTest, RtlSdrDevice, TestKind};
+use sdroxide_types::{
+    DeviceCaps, DeviceProbe, ProbeAnswer, ProbeTest, PublicSdrDirectory, PublicSdrEntry,
+    PublicSdrNetwork, RtlSdrDevice, TestKind,
+};
 
 const PORT: u16 = 39474;
 const UNSUPPORTED_PORT: u16 = 39475;
@@ -61,6 +64,38 @@ fn far_end_dongle() -> RtlSdrDevice {
         name: "Generic RTL2832U OEM".into(),
         vid: 0x0bda,
         pid: 0x2838,
+    }
+}
+
+/// The receiver list this station is pretending to have fetched.
+fn far_end_directory(refresh: bool) -> PublicSdrDirectory {
+    PublicSdrDirectory {
+        entries: vec![PublicSdrEntry {
+            network: PublicSdrNetwork::KiwiSdr,
+            name: "Wessex KiWi".into(),
+            location: "South West England, UK".into(),
+            antenna: "Switched".into(),
+            device: "KiwiSDR 1 v1.902".into(),
+            address: "wessex.example.org:8073".into(),
+            lat: Some(50.74),
+            lon: Some(-2.63),
+            grid: "IO80qr".into(),
+            min_hz: 50_000.0,
+            max_hz: 30_000_000.0,
+            users: 3,
+            max_users: 8,
+            api_channels: Some(1),
+            max_iq_rate: 12_000.0,
+            full_control: true,
+            session_limit_min: 0,
+            snr_db: Some(20),
+        }],
+        fetched_unix: 1_788_000_000,
+        // Which way round this came is part of the answer: a list served from
+        // disk is what makes the window open instantly, and the operator is
+        // told how old it is.
+        stale: !refresh,
+        notes: Vec::new(),
     }
 }
 
@@ -113,6 +148,13 @@ async fn the_far_ends_devices_reach_a_remote_client() {
         match req {
             DeviceProbe::RtlSdr => ProbeAnswer::RtlSdr(vec![far_end_dongle()]),
             DeviceProbe::SerialPorts => ProbeAnswer::SerialPorts(vec!["/dev/ttyACM1".into()]),
+            // The one probe that is not about this machine's own hardware. It
+            // still has to come from here: a browser client has no HTTP client
+            // and could not read either directory across origins if it had, so
+            // asking the station is the only route the web UI has to it.
+            DeviceProbe::PublicSdrs { refresh } => {
+                ProbeAnswer::PublicSdrs(Box::new(far_end_directory(refresh)))
+            }
             // The slow one: a connection test takes seconds, and this is where
             // a server that ran probes on the socket task would show it.
             DeviceProbe::Test(ProbeTest::Tci(addr)) => {
@@ -167,6 +209,26 @@ async fn the_far_ends_devices_reach_a_remote_client() {
     match next_answer(&mut ws).await {
         ProbeAnswer::Test(TestKind::Tci, Ok(s)) => assert!(s.contains("shack:40001")),
         other => panic!("expected the connection test's answer, got {other:?}"),
+    }
+
+    // The public-SDR directory, which is how a browser client browses at all.
+    // Both forms, because they are different requests: the cached one is what
+    // opening the window asks for, and the refresh is the ⟳ chip.
+    send(&mut ws, &ClientMsg::Probe(DeviceProbe::PublicSdrs { refresh: false })).await;
+    match next_answer(&mut ws).await {
+        ProbeAnswer::PublicSdrs(d) => {
+            assert!(d.stale, "a cached answer must say so, or its age is invisible");
+            assert_eq!(d.entries.len(), 1);
+            assert_eq!(d.entries[0].address, "wessex.example.org:8073");
+            assert_eq!(d.count(PublicSdrNetwork::KiwiSdr), 1);
+            assert_eq!(d.count(PublicSdrNetwork::SpyServer), 0);
+        }
+        other => panic!("expected the receiver list, got {other:?}"),
+    }
+    send(&mut ws, &ClientMsg::Probe(DeviceProbe::PublicSdrs { refresh: true })).await;
+    match next_answer(&mut ws).await {
+        ProbeAnswer::PublicSdrs(d) => assert!(!d.stale, "a refresh went to the network"),
+        other => panic!("expected the receiver list, got {other:?}"),
     }
 }
 

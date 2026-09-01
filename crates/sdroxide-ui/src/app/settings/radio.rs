@@ -36,12 +36,95 @@ fn probe_only<R>(ui: &mut egui::Ui, can_probe: bool, add: impl FnOnce(&mut egui:
 
 /// CAT / Audio interface: serial + PTT parameters (the interface itself is
 /// chosen by the selector in `settings_body`).
+/// The antenna-socket row for a radio whose port list is the radio's own —
+/// every Icom with a selector, reached over CAT or over the network.
+///
+/// Drawn from the *capabilities* rather than from the configuration, because
+/// there is nothing here to configure: whether the radio has a selector is only
+/// known once it has answered the read its control link sends when the session
+/// opens, and a radio with one connector NAKs that and gets no row at all
+/// (issues #235, #238). Applies immediately, like every other antenna control.
+fn radio_antenna_row(
+    ui: &mut egui::Ui,
+    caps: Option<&sdroxide_types::DeviceCaps>,
+    antenna_rx: &str,
+    id: &str,
+    cmds: &mut Vec<Command>,
+) {
+    let ports: Vec<String> = caps.map(|c| c.antennas_rx.clone()).unwrap_or_default();
+    if ports.len() < 2 {
+        return;
+    }
+    ui.label("Antenna").on_hover_text(
+        "Which socket on the back the radio is using — its own ANT command, the \
+         same setting as the ANT button on the front panel.\n\n\
+         Applies immediately, and it is the radio's setting rather than a copy \
+         kept here: the socket the radio is on is read back when the session \
+         opens.\n\n\
+         The choice is remembered per band. Switch to the beam on 2 m and the \
+         wire on 40, and each comes back the next time the dial crosses into \
+         that band — and the next time sdroxide starts. A memory channel \
+         stored here carries its socket too.",
+    );
+    let shown = if antenna_rx.is_empty() { "—" } else { antenna_rx };
+    ComboBox::from_id_salt(id).selected_text(shown).show_styled(ui, |ui| {
+        for a in &ports {
+            if ui.selectable_label(antenna_rx == a, a).clicked() {
+                cmds.push(Command::SetAntenna { dir: Direction::Rx, name: a.clone() });
+            }
+        }
+    });
+    ui.end_row();
+}
+
+/// The radio's own power switch, for a control link that carries one.
+///
+/// Two buttons rather than a toggle, because there is nothing here that *reads*
+/// the switch: a radio that is off answers nothing, so the only honest thing a
+/// toggle could show is the last thing it was told, and an operator away from
+/// the shack would be reading their own last click back. Two buttons say what
+/// they do and claim nothing about what the radio is currently doing.
+fn radio_power_row(
+    ui: &mut egui::Ui,
+    caps: Option<&sdroxide_types::DeviceCaps>,
+    cmds: &mut Vec<Command>,
+) {
+    if !caps.is_some_and(|c| c.commands_rig_power) {
+        return;
+    }
+    ui.label("Radio power").on_hover_text(
+        "Switch the radio itself off, and back on again, over the control \
+         link — not sdroxide's own on/off, which closes the interface and \
+         leaves the radio running.\n\n\
+         For the switch back on to reach anything, the radio's control end has \
+         to stay awake while it is off. Over the network that is what \
+         Network Control does. Over a serial cable it is the radio's CI-V \
+         port, which stays powered from the mains supply on a set that is \
+         switched off at the front rather than unplugged; sdroxide sends the \
+         wake-up run Icom's own documentation asks for in front of the \
+         power-on.\n\n\
+         Switching off ends the audio and the meters — there is no radio \
+         behind them — and sdroxide keeps the control link open so the \
+         switch back on has somewhere to go.",
+    );
+    ui.horizontal(|ui| {
+        if ui.button("On").clicked() {
+            cmds.push(Command::SetRigPower(true));
+        }
+        if ui.button("Off").clicked() {
+            cmds.push(Command::SetRigPower(false));
+        }
+    });
+    ui.end_row();
+}
+
 pub(in crate::app) fn settings_cat_tab(
     ui: &mut egui::Ui,
     serial_ports: &[String],
     radio_edit: &mut Option<sdroxide_types::RadioConfig>,
-    // Which antenna socket the radio says it is receiving on — for the one
-    // family here whose rig has two.
+    caps: Option<&sdroxide_types::DeviceCaps>,
+    // Which antenna socket the radio says it is receiving on — for the
+    // families here whose rigs have two.
     antenna_rx: &str,
     can_probe: bool,
     cmds: &mut Vec<Command>,
@@ -626,6 +709,11 @@ pub(in crate::app) fn settings_cat_tab(
             ui.end_row();
         }
 
+        if cfg.cat.family == CatFamily::Icom {
+            radio_antenna_row(ui, caps, antenna_rx, "cat_icom_antenna", cmds);
+            radio_power_row(ui, caps, cmds);
+        }
+
         if matches!(cfg.cat.family, CatFamily::Icom | CatFamily::Xiegu) {
             ui.label("Radio ID (hex)");
             let mut hex = format!("{:02X}", cfg.cat.icom_radio_id);
@@ -816,11 +904,15 @@ pub(in crate::app) fn settings_hpsdr_tab(
         ui.end_row();
 
         ui.label("Filter board").on_hover_text(
-            "Accessory board on the Hermes-Lite 2's J16 header. Leave this at \"None\" \
-             unless a filter board is actually fitted: those seven pins are \
+            "Accessory board on the Hermes-Lite 2's J16 header (or the open-collector \
+             outputs of any other openHPSDR board). \"N2ADR\" picks one relay per band; \
+             \"Alex / Hermes band code\" puts the band number on outputs 1-4, which is what \
+             an ANAN's Alex board, a Zeus SDR, a HiQSDR and Quisk expect. Leave this at \
+             \"None\" unless a filter board is actually fitted: those seven pins are \
              general-purpose open-collector outputs, and operators also wire them to \
              amplifier PTT, antenna relays and transverter switching. Driving them from \
-             band data would start operating whatever is connected.",
+             band data would start operating whatever is connected. Applies on \
+             Apply / reconnect.",
         );
         ComboBox::from_id_salt("hpsdr_filter")
             .width(220.0)
@@ -1820,6 +1912,180 @@ pub(in crate::app) fn settings_spyserver_tab(
     );
 }
 
+/// The KiwiSDR / Web-888 interface.
+///
+/// Short, because there is very little to decide: the receiver owns the front
+/// end and the rate, and what is left is where it is, who to say we are, and
+/// how much of the link to spend on the band view.
+pub(in crate::app) fn settings_kiwisdr_tab(
+    ui: &mut egui::Ui,
+    radio_edit: &mut Option<sdroxide_types::RadioConfig>,
+    test: &mut bool,
+    test_result: &Option<crate::app::settings::TestOutcome>,
+    can_probe: bool,
+    cmds: &mut Vec<Command>,
+) {
+    use sdroxide_types::KiwiConfig;
+    let Some(radio) = radio_edit.as_mut() else {
+        ui.label("Waiting for the configuration of the machine the radio is attached to.");
+        return;
+    };
+    let cfg = &mut radio.kiwi;
+
+    egui::Grid::new("kiwi-grid").num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
+        ui.label("Receiver address").on_hover_text(
+            "Where the receiver serves its web page: an address, or an address \
+             and port. The port defaults to 8073, which is a KiwiSDR's own.\n\n\
+             Note that a receiver reached through the project's proxy \
+             (something.proxy.kiwisdr.com — nearly half the public ones) answers \
+             on port 80 instead, so give it explicitly. Picking a receiver from \
+             \"Public SDRs\" fills this in correctly.\n\nTakes effect on Apply.",
+        );
+        crate::chrome::field(
+            ui,
+            egui::TextEdit::singleline(&mut cfg.address)
+                .desired_width(240.0)
+                .hint_text("host or host:port, e.g. kiwi.example.org:8073"),
+        );
+        ui.end_row();
+
+        ui.label("Password").on_hover_text(
+            "The receiver's *user* password, where its operator has set one. \
+             Blank on almost every public receiver. Not the admin password.\n\n\
+             Takes effect on Apply.",
+        );
+        crate::chrome::field(
+            ui,
+            egui::TextEdit::singleline(&mut cfg.password).password(true).desired_width(160.0),
+        );
+        ui.end_row();
+
+        ui.label("Announce as").on_hover_text(
+            "The name this connection shows up under, which the receiver's \
+             owner and everybody else listening to it can see.\n\n\
+             Left blank it is your station callsign, which is the network's own \
+             convention — some operators do block clients that will not \
+             identify. Takes effect on Apply.",
+        );
+        crate::chrome::field(
+            ui,
+            egui::TextEdit::singleline(&mut cfg.ident)
+                .desired_width(160.0)
+                .hint_text("blank = station callsign"),
+        );
+        ui.end_row();
+
+        ui.label("Band view").on_hover_text(
+            "Ask the receiver for its own waterfall as well as its I/Q, and \
+             draw it in the strip above the panadapter.\n\n\
+             Worth having: the I/Q is only about 12 kHz wide, so without this \
+             there is nothing to tune *by*. It is a second connection carrying \
+             roughly 20 kB/s at full speed, against the I/Q's 44 kB/s.\n\n\
+             Takes effect on Apply.",
+        );
+        let mut wide = cfg.wide_lane;
+        crate::chrome::checkbox(ui, &mut wide, "show the receiver's 0-30 MHz waterfall");
+        cfg.wide_lane = wide;
+        ui.end_row();
+
+        ui.label("Band view speed").on_hover_text(
+            "How often the receiver sends a waterfall row, 1 (slowest) to 4. \
+             The only setting here that changes what the link costs while \
+             running, so turn it down on a metered connection.\n\n\
+             Applies immediately.",
+        );
+        let mut speed = cfg.wf_speed.clamp(KiwiConfig::WF_SPEED_MIN, KiwiConfig::WF_SPEED_MAX);
+        if ui
+            .add_enabled(
+                cfg.wide_lane,
+                egui::Slider::new(&mut speed, KiwiConfig::WF_SPEED_MIN..=KiwiConfig::WF_SPEED_MAX),
+            )
+            .changed()
+        {
+            cfg.wf_speed = speed;
+            cmds.push(Command::SetGain {
+                dir: Direction::Rx,
+                element: KiwiConfig::WF_SPEED_ELEMENT.to_string(),
+                db: f64::from(speed),
+            });
+        }
+        ui.end_row();
+
+        ui.label("Receiver AGC").on_hover_text(
+            "The *receiver's* AGC, which is on the far side of the link and \
+             ahead of the I/Q — so it acts before anything sdroxide does.\n\n\
+             On by default, unlike every local SDR here, because the measured \
+             alternative was worse: on a live receiver the manual gain was not \
+             monotonic across its range and its top end clipped the I/Q at full \
+             scale, while the AGC held about -24 dBFS with 7 dB of headroom.\n\n\
+             It does mean the sample amplitude is not a signal level, which is \
+             why the S-meter is read from the receiver's own figure instead. \
+             Applies immediately.",
+        );
+        let mut agc = cfg.agc;
+        if crate::chrome::checkbox(ui, &mut agc, "let the receiver ride its own gain").changed() {
+            cfg.agc = agc;
+            cmds.push(Command::SetGain {
+                dir: Direction::Rx,
+                element: KiwiConfig::AGC_ELEMENT.to_string(),
+                db: f64::from(u8::from(agc)),
+            });
+        }
+        ui.end_row();
+
+        ui.label("Manual gain").on_hover_text(
+            "Fixed gain when the receiver's AGC is off, on its own 0-90 scale. \
+             Not decibels of anything stated — the protocol calls it manGain \
+             and says no more, and it was measured not to be monotonic, so \
+             treat it as a dial to find a good spot on rather than a \
+             calibration. Applies immediately.",
+        );
+        let mut gain = cfg.man_gain;
+        if ui.add_enabled(!cfg.agc, egui::Slider::new(&mut gain, 0..=90)).changed() {
+            cfg.man_gain = gain;
+            cmds.push(Command::SetGain {
+                dir: Direction::Rx,
+                element: KiwiConfig::MAN_GAIN_ELEMENT.to_string(),
+                db: f64::from(gain),
+            });
+        }
+        ui.end_row();
+
+        ui.label("");
+        // The test reads the receiver's `/status` page from wherever the radio
+        // is, and deliberately does not open a session: a receiver has only
+        // four or eight channels and taking one to ask a question would, on a
+        // busy receiver, be the reason it was full.
+        probe_only(ui, can_probe, |ui| {
+            if ui
+                .button("Test connection")
+                .on_hover_text(
+                    "Read the receiver's status page: what it is, what it \
+                     covers, how many channels are free, and whether its \
+                     operator allows connections from apps other than a \
+                     browser. Takes none of its channels.",
+                )
+                .clicked()
+            {
+                *test = true;
+            }
+        });
+        ui.end_row();
+    });
+    test_result_line(ui, test_result);
+    ui.add_space(6.0);
+    ui.label(
+        RichText::new(format!(
+            "Receive only — this is somebody else's antenna. The panadapter is the ~12 kHz \
+             the receiver sends as I/Q, which follows the dial; the band view above it is its \
+             own waterfall, and tuning across it retunes the receiver. About {:.0} kB/s while \
+             connected. Press \"Apply / reconnect\" to switch without a restart.",
+            cfg.link_kbytes_s(),
+        ))
+        .weak(),
+    );
+}
+
 pub(in crate::app) fn settings_tci_tab(
     ui: &mut egui::Ui,
     radio_edit: &mut Option<sdroxide_types::RadioConfig>,
@@ -1877,6 +2143,27 @@ pub(in crate::app) fn settings_tci_tab(
             );
         ui.end_row();
 
+        // How far the rig's IQ runs behind the `dds:` that moved it. The
+        // panadapter labels each frame with the centre its *samples* were taken
+        // at, and this is the only number that says which centre that was — so
+        // it belongs to the rig, not to sdroxide, and the default is a
+        // measurement of one particular rig rather than a constant.
+        ui.label("Stream delay");
+        crate::chrome::slider(
+            ui,
+            egui::Slider::new(&mut cfg.tci.stream_delay_ms, 0.0..=400.0).suffix(" ms").step_by(1.0),
+        )
+        .on_hover_text(
+            "How long the rig's IQ takes to arrive on a new centre after sdroxide moves it. \
+             It is the rig's own DSP pipeline, not the network — a server on this machine \
+             has one too — and while the panadapter is dragged fully zoomed out, being wrong \
+             by this much moves the newest waterfall rows sideways of the history by the \
+             error times the speed of the drag. Too high displaces them exactly as far as \
+             too low, the other way. Measure it with `cargo run --release -p sdroxide-tci \
+             --example retune_latency`; the default is a SunSDR2DX on ExpertSDR3 at 192 kHz.",
+        );
+        ui.end_row();
+
         ui.label("");
         // The test opens its own socket from wherever it is pressed, so a
         // green answer here would only say this screen can reach the rig — a
@@ -1905,10 +2192,13 @@ pub(in crate::app) fn settings_tci_tab(
 pub(in crate::app) fn settings_icomnet_tab(
     ui: &mut egui::Ui,
     radio_edit: &mut Option<sdroxide_types::RadioConfig>,
+    caps: Option<&sdroxide_types::DeviceCaps>,
+    antenna_rx: &str,
     test: &mut bool,
     copy_report: &mut bool,
     test_result: &Option<crate::app::settings::TestOutcome>,
     can_probe: bool,
+    cmds: &mut Vec<Command>,
 ) {
     use sdroxide_types::{CwKeying, IcomNetConfig, IcomRxSource, IcomScopeSpan};
     let Some(cfg) = radio_edit.as_mut() else {
@@ -1969,6 +2259,9 @@ pub(in crate::app) fn settings_icomnet_tab(
                 }
             });
         ui.end_row();
+
+        radio_antenna_row(ui, caps, antenna_rx, "icomnet_antenna", cmds);
+        radio_power_row(ui, caps, cmds);
 
         ui.label("Audio sample rate");
         ComboBox::from_id_salt("icomnet_rate")
@@ -2104,7 +2397,9 @@ pub(in crate::app) fn settings_icomnet_tab(
         .on_hover_text(
             "Transmit audio is only heard when the radio's MOD input is set to LAN. \
                  sdroxide can write that on a model whose menu numbering it knows; on any \
-                 other it says so and leaves the menu alone.",
+                 other it says so and leaves the menu alone. It is a loan: whatever the \
+                 radio held there is read first and put back when the session ends, so a \
+                 rig used on its own afterwards still hears its own microphone.",
         );
         ui.end_row();
 
@@ -2683,6 +2978,21 @@ pub(in crate::app) fn settings_smartsdr_tab(
         });
         ui.end_row();
 
+        // Said out loud rather than left in the tooltip above: "why is the band
+        // only 192 kHz wide?" is the question this interface gets asked (issue
+        // #184), and an operator wondering that is looking at this row, not
+        // hovering it.
+        ui.label("");
+        ui.label(
+            RichText::new(
+                "192 kHz is the widest DAX IQ stream a FLEX will send, and the radio ties \
+                 the panadapter's span to it — so that is the whole span, and no setting \
+                 here widens it.",
+            )
+            .weak(),
+        );
+        ui.end_row();
+
         ui.label("DAX IQ channel").on_hover_text(
             "The radio has four. Change this only if something else on the network \
              is already using channel 1 — the radio refuses a channel twice over.",
@@ -3238,6 +3548,9 @@ pub(in crate::app) fn settings_rx888_tab(
     rescan: &mut bool,
     apply: &mut bool,
     can_probe: bool,
+    // Where the dial is, so a width the tuner's IF cannot fill can say so while
+    // the receiver is actually up there rather than only in the abstract.
+    dial_hz: f64,
     cmds: &mut Vec<Command>,
 ) {
     use sdroxide_types::Rx888Config;
@@ -3374,20 +3687,32 @@ pub(in crate::app) fn settings_rx888_tab(
         ui.label("Panadapter width");
         ui.horizontal(|ui| {
             let rate = cfg.rx888.adc_rate_hz;
+            // A width the tuner's IF cannot fill is marked rather than hidden:
+            // it is a perfectly good HF setting, and on a receiver that spends
+            // its life below 65 MHz there is nothing wrong with it at all.
             let width_label = |bins: u32| {
                 format!(
-                    "{} — 1/{}",
+                    "{} — 1/{}{}",
                     bw_label(Rx888Config::ddc_out_rate_hz(rate, bins)),
                     Rx888Config::DDC_BLOCK / bins.max(1),
+                    if Rx888Config::width_works_on_vhf(rate, bins) { "" } else { "  · HF only" },
                 )
             };
             let bins = cfg.rx888.ddc_bins;
             ComboBox::from_id_salt("rx888_width")
-                .width(180.0)
+                .width(210.0)
                 .selected_text(width_label(if bins == 0 { 256 } else { bins }))
                 .show_styled(ui, |ui| {
                     for b in Rx888Config::DDC_BIN_CHOICES {
-                        ui.selectable_value(&mut cfg.rx888.ddc_bins, b, width_label(b));
+                        ui.selectable_value(&mut cfg.rx888.ddc_bins, b, width_label(b))
+                            .on_hover_text(if Rx888Config::width_works_on_vhf(rate, b) {
+                                "Usable on both front ends."
+                            } else {
+                                "Below the VHF crossover this is an ordinary width. Above it \
+                                 the tuner's 8 MHz IF cannot be centred in a window this \
+                                 wide, so the live spectrum sits off to one side of the \
+                                 panadapter with nothing beside it."
+                            });
                     }
                 });
             ui.add(
@@ -3399,22 +3724,47 @@ pub(in crate::app) fn settings_rx888_tab(
         });
         ui.end_row();
         ui.label("");
-        ui.add(
-            egui::Label::new(
-                egui::RichText::new(
-                    "How much of the digitised spectrum the panadapter shows at once. \
-                     The whole DSP chain runs at this width, so wider costs \
-                     proportionally more CPU — 1/2 is the entire band in the \
-                     waterfall, and a serious amount of arithmetic. Above the \
-                     VHF crossover the tuner's IF filter is 8 MHz wide: wider \
-                     settings show its skirts, and on ones too wide to centre \
-                     on the IF the tuned signal simply rides off-centre in \
-                     the panadapter.",
+        let rate = cfg.rx888.adc_rate_hz;
+        ui.vertical(|ui| {
+            ui.add(
+                egui::Label::new(
+                    egui::RichText::new(format!(
+                        "How much of the digitised spectrum the panadapter shows at once. \
+                         The whole DSP chain runs at this width, so wider costs \
+                         proportionally more CPU — 1/2 is the entire band in the \
+                         waterfall, and a serious amount of arithmetic. Above the VHF \
+                         crossover ({:.1} MHz) the panadapter is not looking at the \
+                         antenna but at the tuner's IF, which is 8 MHz wide and parked \
+                         at {:.2} MHz — so anything wider than {} cannot be centred on \
+                         it, and the extra width is dead spectrum beside the signal \
+                         rather than more of it.",
+                        Rx888Config::vhf_crossover_hz(rate) / 1e6,
+                        Rx888Config::VHF_IF_CENTER_HZ / 1e6,
+                        bw_label(2.0 * Rx888Config::VHF_IF_CENTER_HZ),
+                    ))
+                    .weak(),
                 )
-                .weak(),
-            )
-            .wrap(),
-        );
+                .wrap(),
+            );
+            // Said out loud while it is actually happening: the symptom — every
+            // signal crowded onto the right-hand half — looks like a broken
+            // receiver rather than a setting.
+            if dial_hz >= Rx888Config::vhf_crossover_hz(rate)
+                && !Rx888Config::width_works_on_vhf(rate, cfg.rx888.ddc_bins)
+            {
+                ui.add(
+                    egui::Label::new(
+                        egui::RichText::new(
+                            "The dial is above the crossover now, so this width is showing \
+                             the tuner's 8 MHz off-centre with dead spectrum beside it. \
+                             Narrow the width to fill the panadapter.",
+                        )
+                        .color(crate::theme::YELLOW()),
+                    )
+                    .wrap(),
+                );
+            }
+        });
         ui.end_row();
 
         ui.label("VGA gain");
@@ -4927,6 +5277,244 @@ pub(in crate::app) fn settings_hydrasdr_tab(
     );
 }
 
+/// Fobos SDR interface: receiver, input, sample rate, gain, clock source.
+///
+/// The receiver, input and sample rate all reopen the device rather than
+/// applying live: the input because `Rf` and the HF ports are different
+/// hardware paths (`fobos_rx_set_direct_sampling`) and the HF ports build a
+/// software downconverter at open time, the rate because `IqSource` has no
+/// live rate setter to carry one — the driver crate has the stop/reconfigure/
+/// restart machinery (`sdroxide_fobos::handle::Ctrl::Rate`), but nothing
+/// short of a reopen reaches it, so this is a reopen like the other two and
+/// not a live control that happens to be slow. LNA/VGA gain and the clock
+/// source do apply immediately — the gain sliders only doing anything on
+/// `Rf`, see [`sdroxide_types::FobosPort`]'s own doc comment for why.
+#[allow(clippy::too_many_arguments)]
+pub(in crate::app) fn settings_fobos_tab(
+    ui: &mut egui::Ui,
+    devices: &[sdroxide_types::FobosDevice],
+    caps: Option<&sdroxide_types::DeviceCaps>,
+    radio_edit: &mut Option<sdroxide_types::RadioConfig>,
+    rescan: &mut bool,
+    apply: &mut bool,
+    can_probe: bool,
+    cmds: &mut Vec<Command>,
+) {
+    use sdroxide_types::{FobosConfig, FobosPort, diversity_cost_note};
+    let Some(cfg) = radio_edit.as_mut() else {
+        ui.label("Waiting for the configuration of the machine the radio is attached to.");
+        return;
+    };
+
+    let before = (cfg.fobos.serial.clone(), cfg.fobos.port, cfg.fobos.sample_rate_hz);
+
+    // The rates this particular unit turned out to have once one is
+    // connected, else a list measured on the one real unit this backend was
+    // verified against — see `FobosConfig::SAMPLE_RATES`'s own doc comment.
+    let rates: Vec<f64> = match caps {
+        Some(c) if c.driver == "fobos" && !c.sample_rates.is_empty() => c.sample_rates.clone(),
+        _ => FobosConfig::SAMPLE_RATES.to_vec(),
+    };
+    let from_device = caps.is_some_and(|c| c.driver == "fobos" && !c.sample_rates.is_empty());
+
+    egui::Grid::new("fobos-grid").num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
+        ui.label("Receiver");
+        probe_only(ui, can_probe, |ui| {
+            ui.horizontal(|ui| {
+                if ui
+                    .button("Rescan")
+                    .on_hover_text(
+                        "Re-list Fobos SDRs. No device is opened, so this is safe to \
+                         press while receiving.",
+                    )
+                    .clicked()
+                {
+                    *rescan = true;
+                }
+                let shown = if cfg.fobos.serial.is_empty() {
+                    "— first one found —".to_string()
+                } else {
+                    cfg.fobos.serial.clone()
+                };
+                ComboBox::from_id_salt("fobos_dev").width(300.0).selected_text(shown).show_styled(
+                    ui,
+                    |ui| {
+                        if devices.is_empty() {
+                            ui.label("No Fobos SDR found — press Rescan");
+                        }
+                        ui.selectable_value(
+                            &mut cfg.fobos.serial,
+                            String::new(),
+                            "— first one found —",
+                        );
+                        for d in devices {
+                            ui.selectable_value(&mut cfg.fobos.serial, d.serial.clone(), d.label());
+                        }
+                    },
+                );
+            });
+        });
+        ui.end_row();
+
+        ui.label("Input");
+        ui.horizontal(|ui| {
+            for p in FobosPort::ALL {
+                let hover = match p {
+                    FobosPort::Rf => {
+                        "Through the tuner: LNA, VGA, and the mixer's own frequency range."
+                    }
+                    FobosPort::Hf1 => {
+                        "Direct sampling on the HF1 antenna input — no tuner, no LNA/VGA \
+                         gain, tuned entirely in software."
+                    }
+                    FobosPort::Hf2 => "Direct sampling on the HF2 antenna input, same as HF1.",
+                    FobosPort::HfDual => {
+                        "Both real ADC channels at once, combined by the diversity filter \
+                         below — a noise source nulled, or two fading paths combined."
+                    }
+                };
+                ui.selectable_value(&mut cfg.fobos.port, p, p.name()).on_hover_text(hover);
+            }
+        });
+        ui.end_row();
+        if cfg.fobos.port != FobosPort::Rf {
+            ui.label("");
+            ui.add(
+                egui::Label::new(
+                    RichText::new(
+                        "Direct sampling — the tuner (and so LNA/VGA gain) is not in the \
+                         path. The rate below is a target for the software downconverter, \
+                         not a hardware setting, so the achieved rate can differ from it.",
+                    )
+                    .weak(),
+                )
+                .wrap(),
+            );
+            ui.end_row();
+        }
+
+        ui.label("Sample rate");
+        ui.horizontal(|ui| {
+            ComboBox::from_id_salt("fobos_rate")
+                .width(150.0)
+                .selected_text(format!("{:.3} Msps", cfg.fobos.sample_rate_hz / 1e6))
+                .show_styled(ui, |ui| {
+                    for r in &rates {
+                        ui.selectable_value(
+                            &mut cfg.fobos.sample_rate_hz,
+                            *r,
+                            format!("{:.3} Msps", r / 1e6),
+                        );
+                    }
+                });
+            ui.add(
+                egui::Label::new(
+                    RichText::new(if from_device {
+                        "this receiver's own reported rates".to_string()
+                    } else {
+                        "measured on one real unit — connect this receiver and Rescan to \
+                         see its own list"
+                            .to_string()
+                    })
+                    .weak(),
+                )
+                .wrap(),
+            );
+        });
+        ui.end_row();
+
+        ui.label("LNA gain");
+        ui.add_enabled_ui(cfg.fobos.port == FobosPort::Rf, |ui| {
+            if crate::chrome::slider(
+                ui,
+                egui::Slider::new(&mut cfg.fobos.lna_gain, 0..=FobosConfig::LNA_GAIN_MAX),
+            )
+            .changed()
+            {
+                push_gain(cmds, FobosConfig::LNA_GAIN_ELEMENT, cfg.fobos.lna_gain as f64);
+            }
+        });
+        ui.end_row();
+
+        ui.label("VGA gain");
+        ui.add_enabled_ui(cfg.fobos.port == FobosPort::Rf, |ui| {
+            if crate::chrome::slider(
+                ui,
+                egui::Slider::new(&mut cfg.fobos.vga_gain, 0..=FobosConfig::VGA_GAIN_MAX),
+            )
+            .changed()
+            {
+                push_gain(cmds, FobosConfig::VGA_GAIN_ELEMENT, cfg.fobos.vga_gain as f64);
+            }
+        });
+        ui.end_row();
+
+        ui.label("Clock source");
+        if ui.checkbox(&mut cfg.fobos.clk_external, "External reference").changed() {
+            push_gain(cmds, FobosConfig::CLK_EXTERNAL_ELEMENT, cfg.fobos.clk_external as u8 as f64);
+        }
+        ui.end_row();
+
+        // Which way it combines, how fast it chases, and holding it are on
+        // the main window's own DIV strip once this radio is selected (see
+        // `sdroxide_types::DIV_MODE_ELEMENT`'s own doc comment) — filter
+        // length is the one control that stays here, the same split every
+        // other diversity-capable backend's settings tab uses.
+        if cfg.fobos.port == FobosPort::HfDual {
+            ui.label("Diversity taps");
+            ui.horizontal(|ui| {
+                if ui
+                    .add(
+                        DragValue::new(&mut cfg.fobos.div_taps)
+                            .speed(1.0)
+                            .range(1..=FobosConfig::DIV_TAPS_MAX)
+                            .suffix(" taps"),
+                    )
+                    .on_hover_text(
+                        "One tap is a gain and a phase — a null at one frequency that \
+                         gets worse either side of it, which is all an analogue phaser \
+                         can do. Each further tap buys one sample period of the path \
+                         difference between HF1 and HF2 that the filter can equalise, \
+                         which is what turns that notch into a band quiet all the way \
+                         across.",
+                    )
+                    .changed()
+                {
+                    push_gain(
+                        cmds,
+                        sdroxide_types::DIV_TAPS_ELEMENT,
+                        f64::from(cfg.fobos.div_taps),
+                    );
+                }
+                ui.label(
+                    RichText::new(diversity_cost_note(
+                        cfg.fobos.div_taps,
+                        cfg.fobos.sample_rate_hz,
+                    ))
+                    .weak(),
+                );
+            });
+            ui.end_row();
+        }
+    });
+
+    if (cfg.fobos.serial.clone(), cfg.fobos.port, cfg.fobos.sample_rate_hz) != before {
+        *apply = true;
+    }
+
+    ui.add_space(6.0);
+    ui.label(
+        RichText::new(
+            "Receive only. RF port (tuner), HF1/HF2 (direct sampling, decoded in software) \
+             and HF1+HF2 (both at once, combined by the diversity filter) all work. The \
+             receiver, input and sample rate take effect on Apply; gain, clock source and \
+             taps apply as you change them — the diversity filter's mode, adapt rate and \
+             hold are on the main window's own DIV box once this radio is selected.",
+        )
+        .weak(),
+    );
+}
+
 /// HackRF interface: radio, rate, the front end, and — behind its own switch —
 /// the transmitter.
 ///
@@ -5355,7 +5943,17 @@ pub(in crate::app) fn settings_sdrplay_tab(
     // set: the driver ignores a switch the real hardware lacks, whereas a
     // hidden switch cannot be un-hidden by an operator whose service just
     // isn't running yet.
-    let listed = devices.iter().find(|d| d.serial == cfg.sdrplay.serial).or(devices.first());
+    //
+    // A named serial that the list does not carry is *not* licence to describe
+    // some other receiver: on a station with two RSPs that put the RSPdx's
+    // serial in the picker and the RSPduo's antenna ports, tuner rows and LNA
+    // ladder underneath it (issue #259). Only "— first one found —" falls back
+    // to whatever is first.
+    let listed = if cfg.sdrplay.serial.trim().is_empty() {
+        devices.first()
+    } else {
+        devices.iter().find(|d| d.serial == cfg.sdrplay.serial)
+    };
     let model = listed.map(|d| d.model()).unwrap_or(SdrPlayModel::Rsp1b);
     // ...and the same rule, kept rather than dropped, is what decides the
     // RSPduo's own rows. An empty device list is *not* evidence that this is
@@ -5381,6 +5979,23 @@ pub(in crate::app) fn settings_sdrplay_tab(
     // empty serial, indistinguishable from "first one found".
     if let Some(w) = devices.iter().find_map(|d| d.identity_warning()) {
         ui.label(RichText::new(w).color(Color32::from_rgb(220, 170, 70)));
+        ui.add_space(6.0);
+    }
+
+    // A serial pinned to a receiver that is not there any more — unplugged,
+    // switched off in Device Manager, or held by another application. Said
+    // here rather than left for Apply to fail on, because the rows below now
+    // describe nothing in particular and the picker looks, misleadingly, as
+    // though a receiver were selected.
+    if listed.is_none() && !cfg.sdrplay.serial.trim().is_empty() && !devices.is_empty() {
+        ui.label(
+            RichText::new(format!(
+                "Serial {} is not among the receivers the SDRplay service reports. Pick one \
+                 of the listed receivers, or replug this one and press Rescan.",
+                cfg.sdrplay.serial.trim()
+            ))
+            .color(Color32::from_rgb(220, 170, 70)),
+        );
         ui.add_space(6.0);
     }
 
@@ -6637,11 +7252,18 @@ pub(in crate::app) fn settings_lime_tab(
             }
             ui.end_row();
 
-            ui.label("Transmit port");
+            ui.label("Transmit port").on_hover_text(
+                "The board's two transmit sockets are two different matching networks, not \
+                 two jacks onto the same one: BAND1 (TX_1) carries 30 MHz to 1.9 GHz and \
+                 BAND2 (TX_2) is the 13 cm port. Keying an amateur band below 23 cm out of \
+                 BAND2 puts the over into a matching network that passes almost none of it — \
+                 every setting reads correct, the drive is whatever you set, and the power \
+                 meter stays at zero. Leave this on Automatic and it follows the dial.",
+            );
             let text = if cfg.lime.antenna_tx.is_empty() {
                 "Automatic".to_string()
             } else {
-                LimeConfig::port_label(cfg.lime.channel, &cfg.lime.antenna_tx, true)
+                LimeConfig::tx_port_label(cfg.lime.channel, &cfg.lime.antenna_tx)
             };
             let before_tx = cfg.lime.antenna_tx.clone();
             let chan = cfg.lime.channel;
@@ -6651,7 +7273,7 @@ pub(in crate::app) fn settings_lime_tab(
                     ui.selectable_value(
                         &mut cfg.lime.antenna_tx,
                         a.to_string(),
-                        LimeConfig::port_label(chan, a, true),
+                        LimeConfig::tx_port_label(chan, a),
                     );
                 }
             });

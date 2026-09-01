@@ -141,10 +141,33 @@ pub enum Backend {
     /// shares the Airspy's USB id. Appended last, for the same reason as
     /// `SmartSdr` above.
     HydraSdr,
+    /// A KiwiSDR or Web-888 (the board its listing calls "KiwiSDR 2") reached
+    /// over the network — the ~900 receivers published on `rx.kiwisdr.com`, and
+    /// any private one on the same firmware.
+    ///
+    /// The shape is [`Backend::SpyServerVfo`]'s: a *narrow* I/Q window that
+    /// follows the dial — the receiver's own audio channel, taken as I/Q at
+    /// about 12 kHz — plus the receiver's full 0-30 MHz waterfall as the band
+    /// view. Two WebSocket streams from one session, and the only two the
+    /// protocol offers; there is no wideband I/Q to ask for.
+    ///
+    /// Receive only, and not because of a missing feature: these are other
+    /// people's antennas. Appended after `HydraSdr` above, for the same
+    /// reason as `SmartSdr` there.
+    KiwiSdr,
+    /// RigExpert Fobos SDR, driven through the vendor's `libfobos` — the one
+    /// interface this radio speaks; no separately documented raw USB
+    /// protocol exists to reimplement instead. `libfobos` is LGPL-2.1 and
+    /// open source, but found with dlopen at *runtime* all the same, for the
+    /// same build-portability reason the SDRplay and LimeSDR backends do:
+    /// nothing is linked at build time, so this ships in every build variant
+    /// and a machine without it enumerates nothing and opening explains what
+    /// to install. Appended last, for the same reason as `SmartSdr` above.
+    Fobos,
 }
 
 impl Backend {
-    pub const ALL: [Backend; 20] = [
+    pub const ALL: [Backend; 22] = [
         Backend::Auto,
         Backend::Soapy,
         Backend::Cat,
@@ -157,6 +180,7 @@ impl Backend {
         Backend::RtlTcp,
         Backend::SpyServer,
         Backend::SpyServerVfo,
+        Backend::KiwiSdr,
         Backend::Rx888,
         Backend::AirspyHf,
         Backend::Airspy,
@@ -165,6 +189,7 @@ impl Backend {
         Backend::Elad,
         Backend::Lime,
         Backend::HydraSdr,
+        Backend::Fobos,
     ];
     pub fn label(self) -> &'static str {
         match self {
@@ -180,6 +205,7 @@ impl Backend {
             Backend::RtlTcp => "RTL-SDR over rtl_tcp (network)",
             Backend::SpyServer => "SpyServer (network)",
             Backend::SpyServerVfo => "SpyServer VFO+FFT, low bandwidth (network)",
+            Backend::KiwiSdr => "KiwiSDR / Web-888 (network)",
             Backend::Rx888 => "RX-888 (USB)",
             Backend::AirspyHf => "Airspy HF+ (USB)",
             Backend::Airspy => "Airspy R2 / Mini (USB)",
@@ -188,6 +214,7 @@ impl Backend {
             Backend::Elad => "ELAD FDM-DUO / FDM-S (USB)",
             Backend::Lime => "LimeSDR + LimeRFE (LimeSuite)",
             Backend::HydraSdr => "HydraSDR RFOne (USB)",
+            Backend::Fobos => "RigExpert Fobos SDR (USB)",
             Backend::None => "Not configured",
         }
     }
@@ -1183,15 +1210,26 @@ pub enum HpsdrFilterBoard {
     /// N2ADR filter board: one-hot relay select, forwarded by the gateware over
     /// I2C to the board's MCP23008.
     N2adr,
+    /// Alex-style band code: the band as a four-bit number on outputs 1–4,
+    /// which is what a Hermes/ANAN, a Zeus SDR, a HiQSDR and Quisk's own
+    /// filter switching all expect (issue #196).
+    ///
+    /// Outputs 5–7 stay off. They are not part of the band code — on the
+    /// boards that use this mapping they are spare pins operators wire to a
+    /// preamplifier, an attenuator or a transverter, and this backend has no
+    /// way to know which.
+    Alex,
 }
 
 impl HpsdrFilterBoard {
-    pub const ALL: [HpsdrFilterBoard; 2] = [HpsdrFilterBoard::None, HpsdrFilterBoard::N2adr];
+    pub const ALL: [HpsdrFilterBoard; 3] =
+        [HpsdrFilterBoard::None, HpsdrFilterBoard::N2adr, HpsdrFilterBoard::Alex];
 
     pub fn label(self) -> &'static str {
         match self {
             HpsdrFilterBoard::None => "None — outputs stay off",
             HpsdrFilterBoard::N2adr => "N2ADR filter board",
+            HpsdrFilterBoard::Alex => "Alex / Hermes band code (Zeus, HiQSDR, Quisk)",
         }
     }
 }
@@ -1419,17 +1457,55 @@ pub struct TciConfig {
     /// belongs to receiver 0's radio. `#[serde(default)]` on the struct keeps
     /// every existing `radio.json` on receiver 0, exactly as before.
     pub rx: u32,
+    /// How long after a `dds:` command the IQ actually arrives on the new
+    /// centre, in milliseconds — what the panadapter's axis has to be held back
+    /// by so a pan draws the band where it really is. See
+    /// `IqSource::stream_delay_s` for what goes wrong without it.
+    ///
+    /// Configurable because it belongs to the rig and the link rather than to
+    /// this protocol: nothing in TCI reports it (the `dds:` echo is a command
+    /// acknowledgement, returning in 0.4 ms), so it can only be declared. The
+    /// default is [`TciConfig::DEFAULT_STREAM_DELAY_MS`]; set it to 0 to switch
+    /// the compensation off entirely.
+    pub stream_delay_ms: f64,
 }
 
 impl Default for TciConfig {
     fn default() -> Self {
-        TciConfig { address: "127.0.0.1:50001".into(), iq_sample_rate_hz: 192_000.0, rx: 0 }
+        TciConfig {
+            address: "127.0.0.1:50001".into(),
+            iq_sample_rate_hz: 192_000.0,
+            rx: 0,
+            stream_delay_ms: TciConfig::DEFAULT_STREAM_DELAY_MS,
+        }
     }
 }
 
 impl TciConfig {
     /// IQ sample rates offered in the UI.
     pub const IQ_RATES: [f64; 3] = [48_000.0, 96_000.0, 192_000.0];
+
+    /// Measured on a SunSDR2DX through ExpertSDR3 over the loopback interface:
+    /// a `dds:` step took 109–131 ms to reach the samples at 192 kHz, 129 ms at
+    /// 96 kHz and 169 ms at 48 kHz — near enough one number rather than a fixed
+    /// count of samples, which is what a rig-side pipeline measured in
+    /// milliseconds looks like. Only 21 ms of it was sdroxide's own ring.
+    ///
+    /// One rig on one host, so it is a starting point and not a constant of
+    /// nature; a TCI server across a network will be slower. The cost of having
+    /// it wrong is bounded either way — the axis is off by the drag rate times
+    /// the *error*, where before it was off by the drag rate times the whole
+    /// delay.
+    ///
+    /// A second ExpertSDR3 setup on another SunSDR2DX, also on loopback,
+    /// measured **159 ms** at 192 kHz (2026-08-31) — 47 ms to first movement
+    /// and 159 ms to settle, so the retune is a ramp rather than a step and no
+    /// single delay is exact across it. That is a 50 ms spread on the same rig
+    /// *model*, which is why this is a slider on the settings tab and not a
+    /// constant: it has to be calibrated per setup with
+    /// `cargo run --release -p sdroxide-tci --example retune_latency`, and
+    /// confirmed by eye on a drag.
+    pub const DEFAULT_STREAM_DELAY_MS: f64 = 130.0;
 }
 
 /// What the Icom's LAN audio stream is carrying.
@@ -2327,6 +2403,126 @@ impl SpyServerConfig {
     }
 }
 
+/// A KiwiSDR or Web-888, reached over its web port. Receive only.
+///
+/// The receiver runs the whole front end: it decides the sample rate, it owns
+/// the AGC, and what arrives is one of its eight (or four) user channels taken
+/// as I/Q rather than as audio. So there is very little to configure here
+/// compared with a radio on a bus — an address, who to say we are, and how much
+/// of the link to spend on the waterfall.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct KiwiConfig {
+    /// `host` or `host:port`. The port may be left off and defaults to 8073,
+    /// which is what a Kiwi listens on out of the box — but note that the
+    /// project's own reverse proxy (`*.proxy.kiwisdr.com`, which is how nearly
+    /// half the public receivers are reached) answers on 80 instead, so an
+    /// address picked from the directory always carries its port explicitly.
+    pub address: String,
+    /// The *user* password, where the operator has set one. Not the admin
+    /// password, and usually empty: most public receivers ask for nothing.
+    pub password: String,
+    /// The name this end announces with `SET ident_user`, which the receiver's
+    /// owner and its other listeners can see.
+    ///
+    /// Empty means "the station callsign, or `sdroxide` when none is set" —
+    /// resolved where the source is opened, because this crate cannot reach the
+    /// configuration. Identifying is the network's convention rather than a
+    /// requirement, and some operators do block clients that will not.
+    pub ident: String,
+    /// Ask for the receiver's waterfall as well as its I/Q, to fill the
+    /// full-band strip.
+    ///
+    /// On by default. It is a second WebSocket carrying about 20 kB/s at the
+    /// default speed, against the I/Q's 44 kB/s — and without it the only band
+    /// view is the ~12 kHz the I/Q covers, which is not enough to tune by.
+    pub wide_lane: bool,
+    /// Waterfall frame rate, 1 (slowest) to 4. The receiver caps this at its
+    /// own `wf_fps_max`, which was 23 fps on the one this was measured against.
+    pub wf_speed: u8,
+    /// The *receiver's* AGC, which sits ahead of the I/Q and so ahead of
+    /// everything this program does.
+    ///
+    /// On by default, which is unlike every bus-attached backend here and is
+    /// deliberate. Measured on a live receiver, the manual gain was not
+    /// monotonic across its range and its top end clipped the I/Q at full
+    /// scale, while the AGC held about -24 dBFS RMS with 7 dB of headroom. An
+    /// AGC on the far side of the link is the lesser evil.
+    ///
+    /// It does mean the I/Q amplitude is not a signal level, which is why the
+    /// S-meter is read from the receiver's own per-frame figure instead.
+    pub agc: bool,
+    /// Fixed gain when [`Self::agc`] is off, on the receiver's own 0-90 scale.
+    /// Not decibels of anything stated: the protocol calls it `manGain` and
+    /// says nothing more.
+    pub man_gain: u8,
+}
+
+impl Default for KiwiConfig {
+    fn default() -> Self {
+        KiwiConfig {
+            address: String::new(),
+            password: String::new(),
+            ident: String::new(),
+            wide_lane: true,
+            wf_speed: 3,
+            agc: true,
+            man_gain: 50,
+        }
+    }
+}
+
+impl KiwiConfig {
+    /// The port a KiwiSDR serves its web UI on unless its operator moved it.
+    pub const DEFAULT_PORT: u16 = 8073;
+
+    /// Pseudo-elements, riding `SetGain` the way the SpyServer's do — see
+    /// [`SpyServerConfig::GAIN_ELEMENT`]. Here rather than in the driver
+    /// because the settings tab builds them and is shared with the wasm client,
+    /// which cannot see `sdroxide-kiwisdr`.
+    pub const AGC_ELEMENT: &'static str = "KIWIAGC";
+    pub const MAN_GAIN_ELEMENT: &'static str = "KIWIGAIN";
+    pub const WIDE_LANE_ELEMENT: &'static str = "KIWIWF";
+    pub const WF_SPEED_ELEMENT: &'static str = "KIWIWFSPD";
+
+    /// Slowest and fastest waterfall speeds the protocol accepts.
+    pub const WF_SPEED_MIN: u8 = 1;
+    pub const WF_SPEED_MAX: u8 = 4;
+
+    /// The configured address as `host:port`, supplying the default port when
+    /// the operator typed only a host. Same rule as [`RtlTcpConfig::endpoint`],
+    /// including the bracketed-IPv6 case.
+    pub fn endpoint(&self) -> String {
+        let a = self.address.trim();
+        let has_port = match a.rfind(']') {
+            Some(close) => a[close + 1..].starts_with(':'),
+            None => a.contains(':'),
+        };
+        if has_port { a.to_string() } else { format!("{a}:{}", Self::DEFAULT_PORT) }
+    }
+
+    /// What to announce as, given the station callsign. Empty callsign and
+    /// empty override both fall back to the program name, because announcing
+    /// nothing at all is what some operators block.
+    pub fn ident_or(&self, callsign: &str) -> String {
+        let explicit = self.ident.trim();
+        if !explicit.is_empty() {
+            return explicit.to_string();
+        }
+        let call = callsign.trim();
+        if call.is_empty() { "sdroxide".to_string() } else { format!("{call} (sdroxide)") }
+    }
+
+    /// Roughly what one connected receiver costs, in kilobytes a second, so the
+    /// settings tab can say it before the operator finds out.
+    ///
+    /// Measured, not derived: 44.3 kB/s of I/Q and 20.4 kB/s of waterfall at
+    /// `wf_speed` 4 against a KiwiSDR 1 running v1.902.
+    pub fn link_kbytes_s(&self) -> f64 {
+        44.3 + if self.wide_lane { 20.4 * f64::from(self.wf_speed.clamp(1, 4)) / 4.0 } else { 0.0 }
+    }
+}
+
 /// One RTL-SDR dongle found on the USB bus. Wasm-safe so it can cross the
 /// `RadioController` trait to the settings UI.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -2512,6 +2708,38 @@ impl Rx888Config {
     pub fn ddc_out_rate_hz(adc_rate_hz: f64, ddc_bins: u32) -> f64 {
         let bins = if ddc_bins == 0 { 256 } else { ddc_bins };
         adc_rate_hz * f64::from(bins) / f64::from(Self::DDC_BLOCK)
+    }
+
+    /// The R828D's IF carrier with its 8 MHz filter selected
+    /// (`sdroxide_rx888::band::IF_CENTER_HZ`), repeated here for the reason
+    /// [`Self::DDC_BLOCK`] is: the settings UI has to be able to label a width
+    /// without linking the driver.
+    pub const VHF_IF_CENTER_HZ: f64 = 4_570_000.0;
+
+    /// Where the receiver hands over to its tuner
+    /// (`sdroxide_rx888::band::crossover_hz`): the ADC's own Nyquist limit,
+    /// unless that lands below the tuner's floor.
+    pub fn vhf_crossover_hz(adc_rate_hz: f64) -> f64 {
+        (adc_rate_hz / 2.0).max(24_000_000.0)
+    }
+
+    /// Whether a panadapter width is usable *above* that crossover.
+    ///
+    /// The downconverter reads a **real** spectrum, so its window must lie
+    /// inside DC..Nyquist and its centre clamps up to `out/2` at the bottom.
+    /// Above the crossover the wanted signal is no longer the antenna — it is
+    /// the tuner's IF, parked at [`Self::VHF_IF_CENTER_HZ`] — so a window wider
+    /// than twice that cannot be centred on the IF at all. It pins at `out/2`,
+    /// the tuner's 8 MHz of IF fills only the low part of it, and the VHF
+    /// path's spectrum inversion then puts that on the *right* of the
+    /// panadapter with dead spectrum to its left.
+    ///
+    /// Nothing is broken when this is false — every width is delivered, and the
+    /// tuned signal is received and reported off-centre. There is simply no
+    /// more signal to show: the tuner has 8 MHz and no more, however wide the
+    /// window asking for it.
+    pub fn width_works_on_vhf(adc_rate_hz: f64, ddc_bins: u32) -> bool {
+        Self::ddc_out_rate_hz(adc_rate_hz, ddc_bins) <= 2.0 * Self::VHF_IF_CENTER_HZ
     }
 }
 
@@ -3365,6 +3593,62 @@ impl LimeConfig {
             _ => return None,
         };
         Some(format!("RX{}_{suffix}", channel + 1))
+    }
+
+    /// The band each transmit port is matched for, straight out of LimeSuite's
+    /// own `LMS7_Device::GetTxPathBand` (23.11):
+    ///
+    /// ```text
+    /// case LMS_PATH_TX1: return Range(30e6, 1.9e9);
+    /// case LMS_PATH_TX2: return Range(2e9, 2.6e9);
+    /// ```
+    ///
+    /// These are not alternatives. They are two different matching networks on
+    /// the board, and BAND2 — the microwave one — passes essentially nothing on
+    /// any band this program is normally used for. A LimeSDR keyed on 145 MHz
+    /// out of BAND2 answers every command with `ok`, reports full drive,
+    /// streams its samples, and puts nothing on a power meter (issue #94).
+    ///
+    /// `None` for a name this table does not describe, so a board reporting
+    /// something unexpected is never second-guessed on figures that do not
+    /// describe it. Deliberately not mirrored for receive either: LimeSuite's
+    /// receive table stops LNAW at 700 MHz and LNAL at 900, and the boards
+    /// plainly do better than that — 2 m and even 20 m are received on `RX1_W`
+    /// — so vetting a receive port against it would refuse the cabling that
+    /// works.
+    pub fn tx_port_band(port: &str) -> Option<(f64, f64)> {
+        match port.trim().to_ascii_uppercase().as_str() {
+            "BAND1" => Some((30.0e6, 1.9e9)),
+            "BAND2" => Some((2.0e9, 2.6e9)),
+            _ => None,
+        }
+    }
+
+    /// Whether `port` is matched for `hz`. A port [`Self::tx_port_band`] does
+    /// not know gets the benefit of the doubt.
+    pub fn tx_port_covers(port: &str, hz: f64) -> bool {
+        Self::tx_port_band(port).is_none_or(|(lo, hi)| hz >= lo && hz <= hi)
+    }
+
+    /// A transmit port with its socket *and* the band it is matched for:
+    /// `BAND1 — TX1_1, 30 MHz–1.9 GHz`. The band is the part that matters —
+    /// see [`Self::tx_port_band`] — and leaving it off a picker is how an
+    /// operator ends up transmitting 2 m into a 13 cm matching network.
+    pub fn tx_port_label(channel: u8, port: &str) -> String {
+        let label = Self::port_label(channel, port, true);
+        match Self::tx_port_band(port) {
+            Some((lo, hi)) => format!("{label}, {} – {}", Self::mhz(lo), Self::mhz(hi)),
+            None => label,
+        }
+    }
+
+    /// A frequency in whichever of MHz or GHz reads better.
+    fn mhz(hz: f64) -> String {
+        if hz >= 1.0e9 {
+            format!("{:.1} GHz", hz / 1.0e9)
+        } else {
+            format!("{:.0} MHz", hz / 1.0e6)
+        }
     }
 
     /// The same for a transmit port: `BAND1` on chain 0 is `TX1_1`.
@@ -5522,6 +5806,208 @@ impl SoapyConfig {
     }
 }
 
+/// One Fobos SDR from `fobos_rx_list_devices` — free to ask for (no device is
+/// opened), unlike most of the vendor-library-backed enumerations here.
+/// Always has a serial: `libfobos`'s own enumeration is serial-based, unlike
+/// a bare USB descriptor that may have none.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FobosDevice {
+    pub serial: String,
+}
+
+impl FobosDevice {
+    pub fn label(&self) -> String {
+        format!("Fobos SDR  (serial {})", self.serial)
+    }
+}
+
+/// Which of the Fobos SDR's inputs to stream. `Rf` goes through the tuner
+/// (mixer, LNA, VGA); `Hf1`/`Hf2` bypass it for direct sampling of one real
+/// ADC channel apiece, turned into complex baseband entirely in software
+/// (`sdroxide_fobos::stream`'s own `WbDdc` path) — the front end LNA/VGA gain
+/// switches is powered down while either runs, so those two controls have no
+/// effect here. `HfDual` runs both real channels at once, through their own
+/// `WbDdc`s, combined by [`FobosConfig`]'s own diversity filter — the two
+/// channels come from one ADC and one clock, so unlike an RSPduo's two
+/// independent tuners the relative phase between them is reproducible across
+/// a restart (measured directly on the radio, not assumed: under a degree
+/// of inter-channel phase drift across repeated stop/start cycles).
+/// Changing the port reopens the device: `Rf` and the HF ports use
+/// different hardware paths
+/// (`fobos_rx_set_direct_sampling`) and the HF ports build their
+/// downconverter(s) at open time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum FobosPort {
+    #[default]
+    Rf,
+    Hf1,
+    Hf2,
+    HfDual,
+}
+
+impl FobosPort {
+    pub fn name(self) -> &'static str {
+        match self {
+            FobosPort::Rf => "RF",
+            FobosPort::Hf1 => "HF1",
+            FobosPort::Hf2 => "HF2",
+            FobosPort::HfDual => "HF1 + HF2 (diversity)",
+        }
+    }
+
+    pub const ALL: [FobosPort; 4] =
+        [FobosPort::Rf, FobosPort::Hf1, FobosPort::Hf2, FobosPort::HfDual];
+}
+
+/// RigExpert Fobos SDR (USB) backend configuration. Receive only, through
+/// `libfobos` — LGPL-2.1 and open source (github.com/rigexpert/libfobos),
+/// found with dlopen at runtime the way the SDRplay and LimeSDR backends find
+/// their own vendor libraries, for the same build-portability reason: this
+/// crate ships in every build variant without every contributor needing
+/// `libfobos` installed to compile sdroxide.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct FobosConfig {
+    /// Pin a receiver by its serial; empty means "the first one found".
+    pub serial: String,
+    pub port: FobosPort,
+    /// The ADC's own I/Q rate on [`FobosPort::Rf`]; the *target* complex
+    /// output rate of the software downconverter on the HF ports — the
+    /// achieved rate can differ from either (both a real hardware quirk
+    /// below ~8 Msps on `Rf`, and the HF path's own power-of-two bin
+    /// quantization), reported back rather than assumed.
+    ///
+    /// On the HF ports this also sets a floor on which centre frequencies
+    /// are reachable at all: the downconverter selects a band directly out
+    /// of a real FFT's non-negative bins, so the band can never straddle DC,
+    /// and the lowest centre it can select is half this rate. A wider
+    /// output rate here means a wider panadapter view but a higher floor —
+    /// see `FobosConfig::default()`'s own comment for why the default is as
+    /// narrow as it is.
+    pub sample_rate_hz: f64,
+    /// 0..3. [`FobosPort::Rf`] only — see [`FobosPort`]'s own doc comment.
+    pub lna_gain: u8,
+    /// 0..31. Same caveat as `lna_gain`.
+    pub vga_gain: u8,
+    pub clk_external: bool,
+
+    /// Diversity filter settings — meaningful only on [`FobosPort::HfDual`],
+    /// which is what actually turns the filter on. Unlike an RSPduo or a
+    /// LimeSDR's second chain there is no separate `enabled`/`role` field
+    /// here: running both real channels *is* asking for diversity, so the
+    /// port selection already says so.
+    ///
+    /// The same adaptive [`sdroxide_dsp::Diversity`] filter the RSPduo and
+    /// the LimeSDR's second chain already use: Cancel or Combine mode,
+    /// configurable taps and adaptation rate, with a freeze/hold control.
+    pub div_mode: DiversityMode,
+    /// How many taps the adaptive filter has, 1 to [`DIVERSITY_MAX_TAPS`].
+    pub div_taps: u8,
+    /// How fast the filter adapts, 0 to 1.
+    pub div_rate: f32,
+    /// Hold the filter where it is.
+    pub div_frozen: bool,
+}
+
+impl Default for FobosConfig {
+    fn default() -> Self {
+        FobosConfig {
+            serial: String::new(),
+            port: FobosPort::default(),
+            // Narrow enough that the HF ports' near-DC floor (half this
+            // rate — see `sample_rate_hz`'s own doc comment) sits at
+            // 312.5 kHz, under every AM/mediumwave broadcast frequency, not
+            // above most of them: a wider figure such as 2 Msps (this
+            // backend's first default) puts the floor at 1.25 MHz, which
+            // silently makes the entire AM broadcast band untunable on
+            // Hf1/Hf2/HfDual — the dial accepts a lower frequency, the
+            // downconverter clamps it back up to the floor without saying
+            // so, and whatever is actually at the floor gets decoded and
+            // labelled with the frequency the operator asked for instead.
+            // 625 kHz is also this crate's own achievable minimum: the
+            // downconverter's smallest bin count already lands here, so
+            // nothing narrower is being left on the table by picking this
+            // as the default. On `Rf` this may snap to a different rate —
+            // see `sample_rate_hz`'s own doc comment — which is reported
+            // back rather than hidden.
+            sample_rate_hz: 625_000.0,
+            // The values this backend was verified against real hardware
+            // with, not a documented "recommended" figure — a reasonable,
+            // moderate starting point either way.
+            lna_gain: 2,
+            vga_gain: 10,
+            clk_external: false,
+            div_mode: DiversityMode::default(),
+            div_taps: 8,
+            div_rate: 0.7,
+            div_frozen: false,
+        }
+    }
+}
+
+impl FobosConfig {
+    /// A real hardware gain stage, 0..3 — see [`FobosPort`]'s own doc
+    /// comment for why it only does anything on [`FobosPort::Rf`].
+    pub const LNA_GAIN_ELEMENT: &'static str = "LNA";
+    pub const LNA_GAIN_MAX: u8 = 3;
+    /// A real hardware gain stage, 0..31, same [`FobosPort::Rf`]-only
+    /// caveat as `LNA_GAIN_ELEMENT`.
+    pub const VGA_GAIN_ELEMENT: &'static str = "VGA";
+    pub const VGA_GAIN_MAX: u8 = 31;
+    /// Pseudo-element carrying the clock-source switch: internal (default)
+    /// or external reference. Rides the existing `SetGain` command so this
+    /// backend needs no new `Command` variant, and is deliberately absent
+    /// from `DeviceCaps::gains` so nothing renders it as a slider.
+    pub const CLK_EXTERNAL_ELEMENT: &'static str = "CLKEXT";
+    /// See [`DIVERSITY_MAX_TAPS`] — the settings panel's own bound on
+    /// `div_taps`, same constant every other diversity-capable backend here
+    /// uses.
+    pub const DIV_TAPS_MAX: u8 = DIVERSITY_MAX_TAPS;
+
+    /// Sample rates to offer before a receiver has answered — the settings
+    /// tab shows the device's own reported list once `DeviceCaps` has one,
+    /// same as [`HydraSdrConfig::SAMPLE_RATES`]. These are not from a
+    /// datasheet: they are the 13-entry list `fobos_rx_get_samplerates`
+    /// reported on the real unit this backend was verified against (which
+    /// may not be every Fobos's own list), plus the 625 kHz entry
+    /// `sdroxide-fobos::device::samplerates` adds to that reported list for
+    /// the HF ports — see its own doc comment.
+    ///
+    /// [`FobosConfig::default`]'s `sample_rate_hz` must always appear here
+    /// and in that list both, or the settings dropdown renders it as
+    /// selected text with no entry behind it and the first touch of that
+    /// control loses it for good — which is exactly what happened to 625 kHz,
+    /// the rate the default was chosen as in the first place.
+    pub const SAMPLE_RATES: [f64; 14] = [
+        0.625e6, 1.25e6, 2.5e6, 5.0e6, 8.0e6, 10.0e6, 12.5e6, 16.0e6, 20.0e6, 25.0e6, 32.0e6,
+        40.0e6, 50.0e6, 80.0e6,
+    ];
+}
+
+/// Tuning ranges an operator stated for an interface this radio is not on at
+/// the moment.
+///
+/// [`RadioConfig::freq_ranges_rx`] and its transmit twin describe *a device*,
+/// and a tab can be moved from one device to another — by the interface picker
+/// in Settings, or wholesale by "Public SDRs". Leaving the numbers where they
+/// were makes them a statement about hardware that is no longer there: issue
+/// #254, where taking a public SpyServer in the tab an IC-9700 was in left the
+/// receiver's published 200-350 MHz clamped over the Icom when the operator
+/// switched back, with no way to see where it had come from.
+///
+/// So the ranges travel with the interface they were stated for.
+/// [`RadioConfig::set_backend`] parks the pair being left here and takes back
+/// whatever this radio last stated for the one being taken up. One entry per
+/// interface at most, which bounds the list at the number of variants
+/// [`Backend`] has.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ParkedRanges {
+    pub backend: Backend,
+    pub rx: Vec<(f64, f64)>,
+    pub tx: Vec<(f64, f64)>,
+}
+
 /// Persisted backend configuration (`radio.json`).
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 #[serde(default)]
@@ -5610,6 +6096,64 @@ pub struct RadioConfig {
     /// HydraSDR RFOne. Appended after `soapy`, for the same reason as every
     /// field above it.
     pub hydrasdr: HydraSdrConfig,
+    /// KiwiSDR / Web-888. Appended after `hydrasdr`, for the same reason as
+    /// every field above it: the layout is positional.
+    pub kiwi: KiwiConfig,
+    /// Stated tuning ranges belonging to interfaces this radio is not on —
+    /// see [`ParkedRanges`]. Appended after `kiwi`, for the same reason as
+    /// every field above it: the layout is positional.
+    ///
+    /// Empty in a configuration written before this existed, which is exactly
+    /// right: such a radio has only ever stated ranges for the interface it is
+    /// on, and those are still in the two fields above.
+    pub freq_ranges_parked: Vec<ParkedRanges>,
+    /// RigExpert Fobos SDR. Appended after `freq_ranges_parked`, for the same
+    /// reason as every field above it: the layout is positional, so a new
+    /// block goes on the end and nowhere else — and, appended or not, it is
+    /// what made `PROTO_VERSION` 118 (see that constant's own history entry:
+    /// this struct rides `ServerMsg::RadioConfig` and
+    /// `Command::SetRadioConfig` whole, so a peer one field short reads the
+    /// tail of every one of them out of step).
+    pub fobos: FobosConfig,
+}
+
+impl RadioConfig {
+    /// Point this radio at another interface, carrying the stated tuning
+    /// ranges with the interface they were stated for.
+    ///
+    /// Every path that changes [`Self::backend`] on a configured radio goes
+    /// through here rather than assigning the field: the ranges are the
+    /// operator's word about a *device*, and a tab that has been moved to a
+    /// different one must not go on enforcing the last one's limits. See
+    /// [`ParkedRanges`] for what that cost in issue #254.
+    ///
+    /// Nothing else in the configuration moves. Every interface already has a
+    /// block of its own, so the address, the sound cards and the converter in
+    /// front of them are all still there when a radio comes back to where it
+    /// was.
+    pub fn set_backend(&mut self, backend: Backend) {
+        if backend == self.backend {
+            return;
+        }
+        // Park what the interface being left had stated, under its own name,
+        // so that coming back to it is not a retype. Nothing is parked for an
+        // interface that stated nothing — an empty pair means "take the
+        // device's own answer", which is also what a missing entry means.
+        let (rx, tx) =
+            (std::mem::take(&mut self.freq_ranges_rx), std::mem::take(&mut self.freq_ranges_tx));
+        let left = self.backend;
+        self.freq_ranges_parked.retain(|p| p.backend != left);
+        if !rx.is_empty() || !tx.is_empty() {
+            self.freq_ranges_parked.push(ParkedRanges { backend: left, rx, tx });
+        }
+        // ...and take back whatever was stated for the one being taken up.
+        if let Some(i) = self.freq_ranges_parked.iter().position(|p| p.backend == backend) {
+            let p = self.freq_ranges_parked.remove(i);
+            self.freq_ranges_rx = p.rx;
+            self.freq_ranges_tx = p.tx;
+        }
+        self.backend = backend;
+    }
 }
 
 #[cfg(test)]
@@ -6231,6 +6775,29 @@ mod tests {
         assert!(HydraSdrConfig::SAMPLE_RATES.windows(2).all(|w| w[0] > w[1]));
     }
 
+    /// A default the operator can never get back to is worse than no default:
+    /// the settings dropdown builds its entries from this list and renders
+    /// `sample_rate_hz` as the *selected text* whether or not an entry
+    /// matches, so a default missing from the list looks selected right up
+    /// until the first click and then cannot be chosen again. 625 kHz was
+    /// exactly that — and it is not an arbitrary rate to lose: it is the one
+    /// the default was chosen as, because half of it is the HF ports'
+    /// reachable floor and anything wider puts that floor above the bottom of
+    /// the AM broadcast band (see `FobosConfig::default`'s own comment, and
+    /// `sdroxide-fobos::stream`'s
+    /// `the_default_hf_rate_keeps_the_whole_am_broadcast_band_reachable`).
+    #[test]
+    fn the_default_fobos_rate_is_one_the_settings_menu_actually_offers() {
+        let default = FobosConfig::default().sample_rate_hz;
+        assert!(
+            FobosConfig::SAMPLE_RATES.iter().any(|r| (r - default).abs() < 1.0),
+            "the default {default} Hz is not in SAMPLE_RATES {:?}",
+            FobosConfig::SAMPLE_RATES,
+        );
+        // Narrowest first, the way the menu reads.
+        assert!(FobosConfig::SAMPLE_RATES.windows(2).all(|w| w[0] < w[1]));
+    }
+
     /// The `part_id` word is the only thing that says which HF+ is on the other
     /// end — every model enumerates as the same `03eb:800c`.
     #[test]
@@ -6509,6 +7076,66 @@ mod tests {
         assert_eq!(cfg.freq_ranges_tx, vec![(430_000_000.0, 440_000_000.0)]);
     }
 
+    /// Issue #254. The stated ranges describe a device, so moving a tab to
+    /// another interface has to leave them behind with the one they were
+    /// stated for — and hand them back when the operator comes home.
+    #[test]
+    fn stated_ranges_travel_with_the_interface_they_were_stated_for() {
+        let mut cfg = RadioConfig { backend: Backend::IcomNet, ..RadioConfig::default() };
+        cfg.freq_ranges_rx = vec![(144e6, 148e6)];
+        cfg.freq_ranges_tx = vec![(144e6, 146e6)];
+
+        cfg.set_backend(Backend::SpyServer);
+        assert_eq!(cfg.backend, Backend::SpyServer);
+        assert!(cfg.freq_ranges_rx.is_empty(), "the Icom's receive range came along");
+        assert!(cfg.freq_ranges_tx.is_empty(), "the Icom's transmit range came along");
+
+        // The receiver states its own, the way "Public SDRs" does.
+        cfg.freq_ranges_rx = vec![(200e6, 350e6)];
+
+        cfg.set_backend(Backend::IcomNet);
+        assert_eq!(cfg.freq_ranges_rx, vec![(144e6, 148e6)], "the Icom's own, back again");
+        assert_eq!(cfg.freq_ranges_tx, vec![(144e6, 146e6)]);
+
+        cfg.set_backend(Backend::SpyServer);
+        assert_eq!(cfg.freq_ranges_rx, vec![(200e6, 350e6)], "and the SpyServer's, back again");
+        assert!(cfg.freq_ranges_tx.is_empty());
+    }
+
+    /// The parked list is keyed by interface, so a tab shuffled around the
+    /// picker cannot grow one without bound — and an interface that stated
+    /// nothing parks nothing, because an empty pair and a missing entry both
+    /// mean "take the device's own answer".
+    #[test]
+    fn parking_ranges_keeps_one_entry_per_interface_and_none_for_an_empty_one() {
+        let mut cfg = RadioConfig { backend: Backend::IcomNet, ..RadioConfig::default() };
+        cfg.freq_ranges_rx = vec![(144e6, 148e6)];
+        for _ in 0..4 {
+            cfg.set_backend(Backend::SpyServer);
+            cfg.set_backend(Backend::IcomNet);
+        }
+        assert_eq!(cfg.freq_ranges_rx, vec![(144e6, 148e6)]);
+        assert!(cfg.freq_ranges_parked.is_empty(), "{:?}", cfg.freq_ranges_parked);
+
+        // Setting the interface it is already on is not a move.
+        cfg.set_backend(Backend::IcomNet);
+        assert_eq!(cfg.freq_ranges_rx, vec![(144e6, 148e6)]);
+        assert!(cfg.freq_ranges_parked.is_empty());
+    }
+
+    /// A `radio.json` from before the parked list existed loads with an empty
+    /// one, which is the truth about it: such a radio has only ever stated
+    /// ranges for the interface it is on, and those are still where they were.
+    #[test]
+    fn a_config_from_before_ranges_were_parked_still_loads() {
+        let cfg: RadioConfig = serde_json::from_str(
+            r#"{"backend": "IcomNet", "freq_ranges_rx": [[144000000.0, 148000000.0]]}"#,
+        )
+        .expect("parses");
+        assert_eq!(cfg.freq_ranges_rx, vec![(144_000_000.0, 148_000_000.0)]);
+        assert!(cfg.freq_ranges_parked.is_empty());
+    }
+
     #[test]
     fn hpsdr_defaults_round_trip() {
         let cfg = HpsdrConfig::default();
@@ -6549,5 +7176,33 @@ mod tests {
         assert_eq!(chains("LimeSDR-PCIe, media=PCIe"), 2);
         assert_eq!(chains("LimeSDR-Mini_v2, media=USB 3.0"), 1);
         assert_eq!(chains("LimeNET-Micro, media=USB 2.0"), 1);
+    }
+
+    /// Which RX-888 panadapter widths the tuner's IF can actually fill.
+    ///
+    /// The reported case, at the 129.6 MHz clock: 1/32 and 1/16 look right and
+    /// everything above them puts the whole of the live spectrum on the right
+    /// of the waterfall. That is not a width the receiver failed to deliver —
+    /// it is the R828D's 8 MHz IF, parked at 4.57 MHz, in a window too wide to
+    /// centre on it, mirrored by the VHF path's high-side injection.
+    #[test]
+    fn a_vhf_width_has_to_fit_around_the_tuners_if() {
+        const CLOCK: f64 = 129_600_000.0;
+        let ok = |bins| Rx888Config::width_works_on_vhf(CLOCK, bins);
+        assert!(ok(256), "1/32 — 4.05 MHz, centred on the IF with room to spare");
+        assert!(ok(512), "1/16 — 8.1 MHz, the widest that still centres");
+        assert!(!ok(1024), "1/8 — 16.2 MHz, the width in the report");
+        assert!(!ok(2048));
+        assert!(!ok(4096));
+
+        // The boundary is twice the IF carrier, whatever the clock: at half
+        // this one the same 8.1 MHz is 1/8 rather than 1/16, and still fits.
+        assert!(Rx888Config::width_works_on_vhf(64_800_000.0, 1024));
+        assert!(!Rx888Config::width_works_on_vhf(64_800_000.0, 2048));
+
+        // And the crossover the warning is keyed on: Nyquist, until that falls
+        // below the tuner's own floor.
+        assert_eq!(Rx888Config::vhf_crossover_hz(CLOCK), 64_800_000.0);
+        assert_eq!(Rx888Config::vhf_crossover_hz(32_400_000.0), 24_000_000.0);
     }
 }

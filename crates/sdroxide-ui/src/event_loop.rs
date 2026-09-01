@@ -89,6 +89,15 @@ pub fn run(
         }
     });
 
+    // `centered` is a first-start convenience, and eframe applies it *after*
+    // it has restored the geometry the last session saved — so leaving it set
+    // walks a remembered window back to the middle of the screen on every
+    // start (issue #256; the centring itself is issue #234). It is asked for
+    // only where there is genuinely nothing remembered.
+    if options.centered && remembers_geometry(app_name) {
+        options.centered = false;
+    }
+
     let mut builder = EventLoop::<UserEvent>::with_user_event();
     // The hook is part of `NativeOptions`, and building the loop here is what
     // takes it out of eframe's hands — so it has to be applied here too.
@@ -104,6 +113,20 @@ pub fn run(
         return Err(eframe::Error::AppCreation(e.into()));
     }
     result.map_err(eframe::Error::WinitEventLoop)
+}
+
+/// Whether a previous session left window geometry behind for eframe to
+/// restore.
+///
+/// Read the way eframe reads it — its own storage directory, its own `app.ron`,
+/// its own `"window"` key — but only for the key's presence, so nothing here
+/// has to agree with `WindowSettings`' layout. Absent, unreadable or
+/// unrecognisable all mean "nothing remembered", which is the answer that
+/// leaves the window centred; the worst a wrong guess can do is centre a
+/// window that had a position, exactly as before this existed.
+fn remembers_geometry(app_name: &str) -> bool {
+    let Some(dir) = eframe::storage_dir(app_name) else { return false };
+    std::fs::read_to_string(dir.join("app.ron")).is_ok_and(|s| s.contains("\"window\""))
 }
 
 /// eframe's own handler, with the one thing it does not do: put the loop back

@@ -96,7 +96,6 @@ fn achieved_center_hz(
 pub struct Rx888Source {
     handle: Rx888Handle,
     center: f64,
-    rx_scratch: Vec<f32>,
     label: String,
     vga_db: f64,
     att_db: f64,
@@ -140,7 +139,6 @@ impl Rx888Source {
             // dial must survive that. The correction below moves only the
             // centre, through the adoption path that leaves the VFOs alone.
             center: center_hz,
-            rx_scratch: Vec::new(),
             label,
             vga_db: cfg.vga_db,
             att_db: cfg.attenuator_db,
@@ -219,19 +217,15 @@ impl IqSource for Rx888Source {
     }
 
     fn read(&mut self, buf: &mut [Complex32]) -> Result<usize> {
-        let need = buf.len() * 2;
-        if self.rx_scratch.len() < need {
-            self.rx_scratch.resize(need, 0.0);
-        }
-        let n = self.handle.read(&mut self.rx_scratch[..need]);
+        // Straight into the caller's block: the ring's interleaved floats and a
+        // complex buffer are the same bytes, so there is nothing to unpack —
+        // see `sdroxide_dsp::as_interleaved_mut`.
+        let n = self.handle.read(sdroxide_dsp::as_interleaved_mut(buf));
         let pairs = n / 2;
         if pairs == 0 {
             // Nothing yet — brief nap so the DSP loop doesn't spin hot.
             std::thread::sleep(Duration::from_millis(2));
             return Ok(0);
-        }
-        for p in 0..pairs {
-            buf[p] = Complex32::new(self.rx_scratch[2 * p], self.rx_scratch[2 * p + 1]);
         }
         Ok(pairs)
     }

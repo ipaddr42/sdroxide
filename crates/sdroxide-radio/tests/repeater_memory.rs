@@ -168,6 +168,7 @@ fn a_memory_carries_its_repeater_setup_both_ways() {
         freq_hz: SIMPLEX_HZ,
         mode: Mode::Nfm,
         repeater: None,
+        antenna: None,
     });
     memories(&h.event_rx, |m| m[1].repeater.is_none());
     send(Command::RecallMemory(simplex_id));
@@ -185,6 +186,7 @@ fn a_memory_carries_its_repeater_setup_both_ways() {
         freq_hz: RPT_HZ,
         mode: Mode::Nfm,
         repeater: Some(edited),
+        antenna: None,
     });
     let after = memories(&h.event_rx, |m| m[0].repeater == Some(edited));
     assert_eq!(after[0].id, rpt_id, "an edit is the same channel, not a new one");

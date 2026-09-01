@@ -259,6 +259,8 @@ pub struct AudioOutput {
     stream: cpal::Stream,
     /// The rate the stream actually runs at — resample to this.
     pub sample_rate: f64,
+    /// Channels the *card* opened with. Not the shape of what to write: the
+    /// ring is interleaved stereo either way — see [`start_output`].
     pub channels: u16,
     underruns: Arc<AtomicU64>,
 }
@@ -839,6 +841,15 @@ pub fn start_input_stereo(
 /// the producer to feed with **interleaved stereo** (L, R) frames. Ring
 /// capacity is one second. Accepts any native sample format, converting from
 /// f32.
+///
+/// The stereo pair is the ring's format and not the device's:
+/// [`AudioOutput::channels`] says what the card opened with, and the callback
+/// takes an (L, R) out of the ring for every frame it fills whatever that is,
+/// mixing the two down itself on a mono card. A caller that writes one sample
+/// per frame to a mono device therefore does not get a quieter stream, it gets
+/// one played at double speed with each pair averaged together — see
+/// `AudioCatSource::tx_write_audio` for the over that went out that way
+/// (issue #247).
 pub fn start_output(
     device_name: Option<&str>,
     preferred_rate: u32,

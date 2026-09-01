@@ -424,6 +424,20 @@ impl Phy {
         conn.write_attr(&self.phy_id, Some(TX_LO), "frequency", &format!("{}", hz.round() as i64))
     }
 
+    /// Where the transmit synthesiser actually is.
+    ///
+    /// A read, not a guess, and it costs one round trip: `key_up` uses it to
+    /// decide whether this over needs the synthesiser moved at all, and moving
+    /// it is the expensive half of keying an AD9361 (see that function). What
+    /// the part reports is the frequency it *achieved*, which is quantised to
+    /// the RF PLL's own step and so is not always the number that was written.
+    pub fn tx_lo(&self, conn: &mut Connection) -> Result<f64> {
+        let text = conn.read_attr(&self.phy_id, Some(TX_LO), "frequency")?;
+        text.trim()
+            .parse::<f64>()
+            .map_err(|_| Error::Msg(format!("the transmit oscillator answered {text:?}")))
+    }
+
     /// The one gain-control mode in which the operator, rather than the
     /// AD9361, owns the receive gain register.
     pub const MANUAL_AGC: &'static str = "manual";

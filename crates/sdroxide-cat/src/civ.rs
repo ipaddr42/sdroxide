@@ -82,7 +82,8 @@ pub fn mode_to_civ(m: Mode) -> u8 {
         | Mode::Aprs
         | Mode::SstvFm
         | Mode::RttyFm
-        | Mode::Adsb => 0x05,
+        | Mode::Adsb
+        | Mode::Vdl2 => 0x05,
         Mode::Spec => 0x01,
     }
 }
@@ -348,6 +349,106 @@ pub fn parse_squelch_reply(data: &[u8]) -> Option<f32> {
         return None;
     }
     Some(decode_meter(&data[1..])?.min(255) as f32 / 255.0)
+}
+
+/// Switch the radio off (`18 00`) or on (`18 01`).
+///
+/// Powering **on** is the awkward direction. A sleeping Icom's CI-V receiver is
+/// clocked down, and the first bytes of a frame arriving at it are lost — so
+/// Icom's own instruction is to send a run of `0xFE` wake-up bytes in front of
+/// the frame, long enough to cover the time the receiver takes to come up. How
+/// many depends on how fast they go out, which is why `wake` is a count rather
+/// than a constant: [`WAKE_BYTES_FOR`] works it out from the port's baud rate,
+/// and a link with no baud rate to speak of — the radio's own network socket —
+/// passes the figure Icom's remote-control software uses there.
+///
+/// Switching **off** needs none of that: the radio is awake and listening.
+///
+/// Transcribed from the CI-V reference guides (the command is `0x18` on every
+/// model that has it) and from wfview, which drives the same two frames over
+/// both link types. Not exercised against a radio here (issue #239).
+pub fn power_frames(radio: u8, on: bool, wake: usize) -> Vec<Vec<u8>> {
+    let f = frame(radio, 0x18, &[u8::from(on)]);
+    if !on || wake == 0 {
+        return vec![f];
+    }
+    vec![vec![0xFE; wake], f]
+}
+
+/// How many `0xFE` wake-up bytes go in front of a power-on frame at `baud`.
+///
+/// Icom's figure is a *duration* — the radio's CI-V receiver needs roughly
+/// 14 ms of line activity to come up — so the count scales with the rate. The
+/// standard rates are the table Icom's own guides print and Hamlib sends; any
+/// other rate falls back to the same 14 ms worked out from the line speed, with
+/// a floor under it so a very slow port still sends a recognisable run.
+pub fn wake_bytes_for(baud: u32) -> usize {
+    match baud {
+        4800 => 7,
+        9600 => 13,
+        19200 => 27,
+        38400 => 53,
+        57600 => 79,
+        115200 => 159,
+        // Ten bit-times to the byte on an 8N1 line, 14 ms of them.
+        b => ((b as f64 * 0.014) / 10.0).round().max(7.0) as usize,
+    }
+}
+
+/// The wake-up run to send over a link with no baud rate — the radio's own
+/// network socket, where the frame goes out in one packet. Icom's remote
+/// software sends 150 there and so does wfview.
+pub const WAKE_BYTES_LAN: usize = 150;
+
+/// The antenna sockets an Icom's antenna selector switches between, in the
+/// order the command numbers them: `ANT1` is `0x00`.
+///
+/// Two, not four. The command carries a socket *number* and there is nothing in
+/// CI-V that says how many a given model has: an IC-7610 and an IC-7700 have
+/// two, the IC-785x line has four, and most of the range — an IC-7300, an
+/// IC-705, an IC-9700, whose three sockets are one per band and not selectable
+/// — has one and answers [`read_antenna_frame`] with a NAK. Two is what every
+/// model with a *selector* has at least, and offering a fourth socket to a
+/// radio with two would move a relay to a connector that is not there. See
+/// `Protocol::antennas` for how the list is only published once the rig has
+/// answered that read at all.
+pub const ANTENNAS: [&str; 2] = ["ANT1", "ANT2"];
+
+/// Put the receiver — and the transmitter with it; Icom's selector is one
+/// relay — on `name`, one of [`ANTENNAS`]. `None` for a name from another
+/// radio's list, which must never be allowed to pick a socket number by
+/// accident.
+///
+/// Three bytes rather than two: `12 <socket> <rx-antenna>`, the form wfview
+/// sends and the one the models with a separate receive-antenna connector
+/// (IC-7610, IC-7851) expect. The trailing byte is that connector's own
+/// setting and is left at `0` — sdroxide does not offer it, and writing
+/// anything else here would switch a receive-only input the operator never
+/// asked about.
+pub fn set_antenna_frame(radio: u8, name: &str) -> Option<Vec<u8>> {
+    let n = ANTENNAS.iter().position(|a| a.eq_ignore_ascii_case(name))? as u8;
+    Some(frame(radio, 0x12, &[n, 0x00]))
+}
+
+/// Ask which socket the rig is on (cmd `0x12`, no payload).
+///
+/// Sent once when the link opens, and it asks two questions at once: which
+/// socket, and — because a radio with one antenna NAKs it — whether there is a
+/// selector here at all.
+pub fn read_antenna_frame(radio: u8) -> Vec<u8> {
+    frame(radio, 0x12, &[])
+}
+
+/// Read an antenna reply (cmd `0x12`) back to one of [`ANTENNAS`].
+///
+/// The payload is the socket number, optionally followed by the receive-antenna
+/// connector's setting, which is ignored here. A socket past the two this end
+/// offers — a four-socket IC-785x left on ANT3 — answers `None` rather than
+/// being rounded onto one of them: it is a real port sdroxide cannot name, and
+/// claiming the radio is on ANT1 would be a lie the operator could act on.
+pub fn parse_antenna_reply(data: &[u8]) -> Option<&'static str> {
+    let n = *data.first()? as usize;
+    ANTENNAS.get(n).copied()
 }
 
 /// Hand the rig's *own* RIT, ΔTX (XIT) and split back to neutral.
@@ -621,6 +722,21 @@ pub fn set_menu_frame(radio: u8, item: u16, value: &[u8]) -> Vec<u8> {
 /// Read a Set-mode menu item back.
 pub fn read_menu_frame(radio: u8, item: u16) -> Vec<u8> {
     frame(radio, 0x1A, &[0x05, (item >> 8) as u8, item as u8])
+}
+
+/// The item number and value in a `1A` reply — what the radio answers a
+/// [`read_menu_frame`] with.
+///
+/// The length is what tells an answer from a question: a read carries
+/// `05 <hi> <lo>` and nothing more, which is exactly what our own frame looks
+/// like on its way out, and an answer appends the value to it. `None` for the
+/// other `1A` sub-commands (`00`-`04` are the memory-keyer and band-edge
+/// blocks) and for a reply too short to hold a value.
+pub fn parse_menu_reply(data: &[u8]) -> Option<(u16, &[u8])> {
+    if data.first() != Some(&0x05) || data.len() < 4 {
+        return None;
+    }
+    Some(((u16::from(data[1]) << 8) | u16::from(data[2]), &data[3..]))
 }
 
 // ---------------------------------------------------------------------------
@@ -1155,6 +1271,69 @@ mod tests {
         assert!(!clear_offsets_frames(0x94).contains(&simplex_frame(0x94)));
     }
 
+    /// The radio's own power switch is command `0x18`, and a power-*on* has to
+    /// wake the radio's control receiver first (issue #239).
+    #[test]
+    fn a_power_on_is_preceded_by_a_wake_up_run() {
+        // Off: one frame, nothing in front of it. The radio is awake.
+        assert_eq!(
+            power_frames(0x94, false, 27),
+            vec![vec![0xFE, 0xFE, 0x94, 0xE0, 0x18, 0x00, 0xFD]]
+        );
+        // On: the wake-up run, then the frame.
+        let on = power_frames(0x94, true, 27);
+        assert_eq!(on.len(), 2);
+        assert_eq!(on[0], vec![0xFE; 27]);
+        assert_eq!(on[1], vec![0xFE, 0xFE, 0x94, 0xE0, 0x18, 0x01, 0xFD]);
+        // A link that needs no wake sends the frame alone.
+        assert_eq!(
+            power_frames(0x94, true, 0),
+            vec![vec![0xFE, 0xFE, 0x94, 0xE0, 0x18, 0x01, 0xFD]]
+        );
+        // The run is a duration, so it scales with the line rate — Icom's own
+        // table, which is Hamlib's too.
+        assert_eq!(wake_bytes_for(4800), 7);
+        assert_eq!(wake_bytes_for(9600), 13);
+        assert_eq!(wake_bytes_for(19200), 27);
+        assert_eq!(wake_bytes_for(38400), 53);
+        assert_eq!(wake_bytes_for(57600), 79);
+        assert_eq!(wake_bytes_for(115200), 159);
+        // An off-table rate is worked out rather than refused, and never so
+        // short that it could not wake anything.
+        assert_eq!(wake_bytes_for(230400), 323);
+        assert_eq!(wake_bytes_for(300), 7);
+    }
+
+    /// The antenna selector is command `0x12`: a socket number, and the
+    /// receive-antenna byte behind it that sdroxide always leaves at zero
+    /// (issue #238).
+    #[test]
+    fn the_antenna_selector_carries_a_socket_number() {
+        assert_eq!(
+            set_antenna_frame(0x94, "ANT1"),
+            Some(vec![0xFE, 0xFE, 0x94, 0xE0, 0x12, 0x00, 0x00, 0xFD])
+        );
+        assert_eq!(
+            set_antenna_frame(0x94, "ANT2"),
+            Some(vec![0xFE, 0xFE, 0x94, 0xE0, 0x12, 0x01, 0x00, 0xFD])
+        );
+        // A name off another radio's list must never pick a socket by accident.
+        assert_eq!(set_antenna_frame(0x94, "LNAW"), None);
+        assert_eq!(set_antenna_frame(0x94, ""), None);
+        // The read asks for the socket and, by being answered at all, for
+        // whether there is a selector here.
+        assert_eq!(read_antenna_frame(0x94), vec![0xFE, 0xFE, 0x94, 0xE0, 0x12, 0xFD]);
+        // The reply is the socket, optionally with the receive-antenna
+        // connector's own setting behind it, which is not ours to read.
+        assert_eq!(parse_antenna_reply(&[0x00]), Some("ANT1"));
+        assert_eq!(parse_antenna_reply(&[0x01, 0x00]), Some("ANT2"));
+        assert_eq!(parse_antenna_reply(&[0x01, 0x01]), Some("ANT2"));
+        // A four-socket rig left on ANT3 is a real port this end cannot name,
+        // and calling it ANT1 would be a lie the operator could act on.
+        assert_eq!(parse_antenna_reply(&[0x02]), None);
+        assert_eq!(parse_antenna_reply(&[]), None);
+    }
+
     /// Squelch is a level on command `0x14`, sub-command `0x03`, on the same
     /// 0–255 scale as the power beside it.
     #[test]
@@ -1451,5 +1630,16 @@ mod tests {
             read_menu_frame(0xB6, 0x0079),
             vec![0xFE, 0xFE, 0xB6, 0xE0, 0x1A, 0x05, 0x00, 0x79, 0xFD]
         );
+    }
+
+    #[test]
+    fn a_menu_answer_is_told_from_the_question_by_its_length() {
+        // The answer to "what is in 0084?" — MIC, on an IC-7300MK2.
+        assert_eq!(parse_menu_reply(&[0x05, 0x00, 0x84, 0x00]), Some((0x0084, &[0x00][..])));
+        // The question itself, which is what our own frame looks like coming
+        // back off the bus: no value, so nothing to record.
+        assert_eq!(parse_menu_reply(&[0x05, 0x00, 0x84]), None);
+        // And another `1A` sub-command is not a menu item at all.
+        assert_eq!(parse_menu_reply(&[0x06, 0x01, 0x01, 0x00]), None);
     }
 }

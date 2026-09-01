@@ -941,6 +941,8 @@ fn probe_caps(dev: &soapysdr::Device) -> Result<DeviceCaps> {
         center_is_dial: false,
         cw_audio_keyed: false,
         commands_squelch: false,
+        commands_rig_power: false,
+        wide_span_hz: 0.0,
         // A SoapySDR device may well have two coherent receivers; nothing in
         // the API says so, and nothing here combines them.
         diversity: false,

@@ -225,6 +225,13 @@ impl PanadapterSource {
             // picture is combining two aerials, this radio is listening to
             // what came out of that.
             diversity: rx.diversity,
+            // The receiver's too — it is the one drawing the band — and the
+            // engine overwrites it from `Self::wide_span_hz` in any case.
+            wide_span_hz: rx.wide_span_hz,
+            // The transceiver's: the power switch on offer here is the switch
+            // on the radio being *listened to*, and switching the receiver
+            // painting the picture off would leave nothing to draw with.
+            commands_rig_power: ctrl.commands_rig_power,
         }
     }
 
@@ -353,6 +360,11 @@ impl IqSource for PanadapterSource {
         Some((center - self.off, span))
     }
 
+    /// The lent receiver's lane, whose width the I.F. offset does not change.
+    fn wide_span_hz(&self) -> f64 {
+        self.rx.wide_span_hz()
+    }
+
     fn set_gain_element(&mut self, name: &str, db: f64) -> Result<()> {
         self.rx.set_gain_element(name, db)
     }
@@ -426,6 +438,15 @@ impl IqSource for PanadapterSource {
     /// is being received.
     fn mutes_rx_audio_on_tx(&self) -> bool {
         self.cfg.mute_on_tx && !self.cfg.blank_on_tx
+    }
+
+    /// The operator's own setting, with no `blank_on_tx` in it: the blanking is
+    /// the engine declining to read through an over *it* keyed, and it has
+    /// nothing to say about one the transceiver keyed itself — that one is
+    /// received right through, so the mute is the only thing that can silence
+    /// it (issue #244).
+    fn mutes_rx_audio_on_rig_tx(&self) -> bool {
+        self.cfg.mute_on_tx
     }
 
     // ── Control: the transceiver ────────────────────────────────────────────
@@ -583,6 +604,19 @@ impl IqSource for PanadapterSource {
     /// being listened to — see `merge_caps`.
     fn commands_squelch(&self) -> bool {
         self.ctrl.commands_squelch() && self.cfg.audio == PanadapterAudio::Transceiver
+    }
+
+    /// The transceiver's power switch, not the receiver's: it is the radio
+    /// being listened to, and the one an operator away from the shack means
+    /// when they say "switch the radio off" (issue #239). Switching off the
+    /// receiver painting the picture would leave the pairing with no picture
+    /// and no way back.
+    fn set_rig_power(&mut self, on: bool) -> Result<()> {
+        self.ctrl.set_rig_power(on)
+    }
+
+    fn commands_rig_power(&self) -> bool {
+        self.ctrl.commands_rig_power()
     }
 
     /// Gated on the same test, so the two answers cannot disagree: a level that
@@ -898,6 +932,22 @@ mod tests {
         assert!(src.mutes_rx_audio_on_tx());
         let (src, _, _) = pair(cfg());
         assert!(!src.mutes_rx_audio_on_tx(), "a blanked receiver has nothing to mute");
+    }
+
+    /// An over the operator keys at the radio is received right through —
+    /// nothing here drives it, so the engine never stops reading for it — and
+    /// the mute is then the only thing that can silence a receiver listening to
+    /// its own station's transmitter. So it follows the operator's own MUTE ON
+    /// TRANSMIT and nothing else: the blanking above says what happens to an
+    /// over *sdroxide* keys and has no bearing on this one (issue #244).
+    #[test]
+    fn a_rig_driven_over_is_muted_by_the_mute_alone() {
+        for blank in [true, false] {
+            let on = PanadapterConfig { mute_on_tx: true, blank_on_tx: blank, ..cfg() };
+            assert!(pair(on).0.mutes_rx_audio_on_rig_tx(), "blank_on_tx {blank}");
+            let off = PanadapterConfig { mute_on_tx: false, blank_on_tx: blank, ..cfg() };
+            assert!(!pair(off).0.mutes_rx_audio_on_rig_tx(), "blank_on_tx {blank}");
+        }
     }
 
     /// An I.F. tap's receiver is tuned `offset_hz` away from the dial, so the

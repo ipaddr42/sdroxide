@@ -66,6 +66,10 @@ const PUSHED_POLL_PERIOD: Duration = Duration::from_secs(3);
 /// Mirrors the LAN backend's watchdog, which exists for the same reasons: the
 /// enables are fire-and-forget, and several ordinary things stop the sweeps.
 const SCOPE_STALL: Duration = Duration::from_secs(3);
+/// How long to wait before asking a rig again which antenna socket it is on,
+/// and how many times. See where `antenna_probes_left` is seeded.
+const ANTENNA_PROBE_RETRY: Duration = Duration::from_secs(2);
+const ANTENNA_PROBE_RETRIES: u8 = 3;
 
 /// How soon after a stall to ask the radio again, and the ceiling the interval
 /// backs off to while it stays quiet. The enables are idempotent, but a rig
@@ -420,6 +424,37 @@ trait Protocol: Send {
     fn read_antenna(&self) -> Vec<Vec<u8>> {
         Vec::new()
     }
+    /// Frames that switch the *radio* off, or back on again — its own power
+    /// switch, over the control link (issue #239). `baud` is the port's line
+    /// rate, which a power-*on* needs: a sleeping radio's control receiver has
+    /// to be woken with a run of bytes long enough to cover the time it takes
+    /// to come up, and how many bytes that is depends on how fast they go out.
+    ///
+    /// Empty — the default — for a family with no such command, and the caller
+    /// publishes no power switch for it (see
+    /// [`sdroxide_types::DeviceCaps::commands_rig_power`]).
+    fn set_rig_power(&mut self, _on: bool, _baud: u32) -> Vec<Vec<u8>> {
+        Vec::new()
+    }
+    /// Whether [`Protocol::set_rig_power`] reaches this family at all. Asked
+    /// before a frame has gone out, so it cannot be inferred from the above.
+    fn commands_rig_power(&self) -> bool {
+        false
+    }
+
+    /// Whether [`Protocol::antennas`] is a *claim about the family* or a
+    /// *question for the radio*.
+    ///
+    /// An ELAD FDM-DUO has two sockets and says so from the model name alone.
+    /// A CI-V rig does not: the same dialect covers an IC-7610 with a selector
+    /// and an IC-705 with one connector, and the only thing that tells them
+    /// apart is whether the rig answers the antenna read at all. A family that
+    /// answers true here publishes no sockets until it has (see
+    /// [`CatHandle::antennas`]), so a radio with one antenna shows no antenna
+    /// control rather than a switch that does nothing.
+    fn antennas_probed(&self) -> bool {
+        false
+    }
 
     /// Whether a mode change can move this rig's *dial*.
     ///
@@ -678,6 +713,28 @@ impl Protocol for Civ {
     fn commands_squelch(&self) -> bool {
         true
     }
+    /// ANT1/ANT2, and only once the radio has answered the read below — see
+    /// [`Protocol::antennas_probed`] and [`civ::ANTENNAS`].
+    fn antennas(&self) -> &'static [&'static str] {
+        &civ::ANTENNAS
+    }
+    fn antennas_probed(&self) -> bool {
+        true
+    }
+    /// `18 00` / `18 01`, with the wake-up run in front of a power-on — see
+    /// [`civ::power_frames`].
+    fn set_rig_power(&mut self, on: bool, baud: u32) -> Vec<Vec<u8>> {
+        civ::power_frames(self.radio, on, civ::wake_bytes_for(baud))
+    }
+    fn commands_rig_power(&self) -> bool {
+        true
+    }
+    fn set_antenna(&mut self, name: &str) -> Vec<Vec<u8>> {
+        civ::set_antenna_frame(self.radio, name).into_iter().collect()
+    }
+    fn read_antenna(&self) -> Vec<Vec<u8>> {
+        vec![civ::read_antenna_frame(self.radio)]
+    }
     /// The same enable sequence the LAN backend sends, because it is the same
     /// scope: run it, stream it here, and — when a span is chosen — put it in
     /// centre mode so it follows the dial, since a scope left in a fixed mode
@@ -751,6 +808,15 @@ impl Protocol for Civ {
                         if let Some(m) = civ::civ_to_mode(b) {
                             out.push(CatUpdate::Mode(m));
                         }
+                    }
+                }
+                // Which antenna socket the rig is on (0x12), asked for once
+                // when the port opens. A radio with a single connector NAKs
+                // the read instead, which is what keeps the antenna control
+                // off the screen for it — see `Protocol::antennas_probed`.
+                0x12 => {
+                    if let Some(name) = civ::parse_antenna_reply(&reply.data) {
+                        out.push(CatUpdate::Antenna(name));
                     }
                 }
                 // Level read (0x14): the transmit power (0x0A) and the
@@ -937,6 +1003,8 @@ enum CatCmd {
     Filter(Mode, f32, f32),
     /// Which antenna socket to receive on, by name.
     Antenna(String),
+    /// Switch the radio itself off, or back on again.
+    RigPower(bool),
     Stop,
 }
 
@@ -956,6 +1024,12 @@ pub struct CatHandle {
     commands_filter: bool,
     commands_squelch: bool,
     antennas: &'static [&'static str],
+    commands_rig_power: bool,
+    /// Whether the sockets in `antennas` may be offered yet — see
+    /// [`Protocol::antennas_probed`]. `false` from the start on a family whose
+    /// list is a question for the radio, and set by the serial thread the
+    /// moment the rig answers the antenna read.
+    antennas_known: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl CatHandle {
@@ -1027,15 +1101,33 @@ impl CatHandle {
         let _ = self.cmd_tx.send(CatCmd::Filter(mode, lo_hz, hi_hz));
     }
     /// The antenna sockets this rig can put its receiver on, or empty where the
-    /// family has no such command. What the caller publishes as
-    /// `DeviceCaps::antennas_rx`.
+    /// family has no such command — and, on a family whose list has to be
+    /// asked for ([`Protocol::antennas_probed`]), empty until the radio has
+    /// answered. What the caller publishes as `DeviceCaps::antennas_rx`, and
+    /// what `IqSource::learned_antennas` re-publishes when the answer lands.
     pub fn antennas(&self) -> &'static [&'static str] {
-        self.antennas
+        if self.antennas_known.load(std::sync::atomic::Ordering::Relaxed) {
+            self.antennas
+        } else {
+            &[]
+        }
+    }
+    /// Switch the radio off, or back on again. Silently ignored on a family
+    /// with no such command — see [`Self::commands_rig_power`].
+    pub fn set_rig_power(&self, on: bool) {
+        if !self.commands_rig_power {
+            return;
+        }
+        let _ = self.cmd_tx.send(CatCmd::RigPower(on));
+    }
+    /// Whether [`Self::set_rig_power`] reaches this rig.
+    pub fn commands_rig_power(&self) -> bool {
+        self.commands_rig_power
     }
     /// Put the receiver on `name`, one of [`Self::antennas`]. Silently ignored
     /// on a rig with one socket, and on a name that rig has never heard of.
     pub fn set_antenna(&self, name: &str) {
-        if !self.antennas.contains(&name) {
+        if !self.antennas().contains(&name) {
             return;
         }
         let _ = self.cmd_tx.send(CatCmd::Antenna(name.to_string()));
@@ -1200,13 +1292,23 @@ pub fn spawn(cfg: CatConfig) -> CatHandle {
     let commands_squelch = make_protocol(&cfg).commands_squelch();
     // And the same again for the antenna sockets: the caps this device
     // publishes are built before a single frame has gone out, so the list has
-    // to come from the framing rather than from the rig.
+    // to come from the framing rather than from the rig. Where the framing
+    // cannot answer for the model — every CI-V rig shares one dialect and only
+    // some have a selector — the list is held back until the radio has replied
+    // to the opening read.
     let antennas = make_protocol(&cfg).antennas();
+    let commands_rig_power = make_protocol(&cfg).commands_rig_power();
+    let antennas_known = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(
+        !make_protocol(&cfg).antennas_probed(),
+    ));
+    let antennas_known_in = antennas_known.clone();
     let scope = std::sync::Arc::new(std::sync::Mutex::new(None));
     let scope_in = scope.clone();
     std::thread::Builder::new()
         .name("sdroxide-cat".into())
-        .spawn(move || serial_thread(cfg, cmd_rx, event_tx, telem_tx, signal_tx, scope_in))
+        .spawn(move || {
+            serial_thread(cfg, cmd_rx, event_tx, telem_tx, signal_tx, scope_in, antennas_known_in)
+        })
         .expect("spawn cat thread");
     CatHandle {
         cmd_tx,
@@ -1219,6 +1321,8 @@ pub fn spawn(cfg: CatConfig) -> CatHandle {
         commands_filter,
         commands_squelch,
         antennas,
+        commands_rig_power,
+        antennas_known,
     }
 }
 
@@ -1441,24 +1545,54 @@ fn write_frame_within(
     failed
 }
 
-/// Whether the rig's own repeater shift needs putting back to simplex, given
-/// the dial this end believes it is on and the band that was last asserted for.
+/// The lowest frequency a transceiver has a repeater shift on. Below it the
+/// only thing that can put a duplex setting back is a band stacking register,
+/// which is a band crossing; above it there are auto-repeater functions that
+/// arm on the *frequency*, so the assertion has to follow every move.
 ///
-/// True once per band: the first dial a fresh connection learns, and every
-/// crossing after that. `asserted` is updated in place, so a caller that acts
-/// on the answer will not be told again until the dial moves somewhere else.
+/// 28 MHz rather than 30: 10 m FM repeaters live at 29.6, and they are the
+/// lowest ones anybody works.
+pub const DUPLEX_FLOOR_HZ: f64 = 28_000_000.0;
+
+/// Whether the rig's own repeater shift needs putting back to simplex, given
+/// the dial this end believes it is on and the dial that was last asserted for.
+///
+/// On HF this is true once per band: the first dial a fresh connection learns,
+/// and every crossing after that, because a band stacking register is the only
+/// thing down there that can restore a duplex setting and it does so when the
+/// dial crosses into the band.
+///
+/// From [`DUPLEX_FLOOR_HZ`] up it is true on **every** move of the dial. Icom's
+/// auto-repeater function (and its equivalents) arms on the frequency, not on
+/// the band: tuning from one 2 m channel to another inside the same band puts
+/// DUP back without ever crossing a band edge, and the over then goes out a
+/// shift away from where the operator asked for it (issue #233). A frame per
+/// settled dial position is what that costs; the rig NAKs it if it has no such
+/// command, and the poll already carries more traffic than this does.
+///
+/// `asserted` is updated in place, so a caller that acts on the answer will not
+/// be told again until the dial moves somewhere else.
 ///
 /// A dial outside every amateur band is [`sdroxide_types::Band::Gen`], and two
-/// such frequencies are the same "band" here — a radio whose duplex is
+/// such HF frequencies are the same "band" here — a radio whose duplex is
 /// re-stacked between two out-of-band frequencies is not one this can see, and
 /// there is nothing to transmit there anyway.
-fn needs_simplex(dial_hz: Option<f64>, asserted: &mut Option<sdroxide_types::Band>) -> bool {
+fn needs_simplex(dial_hz: Option<f64>, asserted: &mut Option<f64>) -> bool {
     let Some(hz) = dial_hz else { return false };
-    let band = sdroxide_types::Band::containing(hz);
-    if *asserted == Some(band) {
+    let same = match *asserted {
+        None => false,
+        Some(prev) => {
+            prev == hz
+                || (prev < DUPLEX_FLOOR_HZ
+                    && hz < DUPLEX_FLOOR_HZ
+                    && sdroxide_types::Band::containing(prev)
+                        == sdroxide_types::Band::containing(hz))
+        }
+    };
+    if same {
         return false;
     }
-    *asserted = Some(band);
+    *asserted = Some(hz);
     true
 }
 
@@ -1733,6 +1867,7 @@ fn serial_thread(
     telem_tx: Sender<TxTelemetry>,
     signal_tx: Sender<f32>,
     scope_out: std::sync::Arc<std::sync::Mutex<Option<ScopeFrame>>>,
+    antennas_known: std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) {
     let mut protocol = make_protocol(&cfg);
     let poll_period = poll_period(&cfg);
@@ -1902,6 +2037,17 @@ fn serial_thread(
         let mut last_sweep = Instant::now();
         let mut next_scope_nudge = Instant::now() + SCOPE_STALL;
         let mut scope_retry = SCOPE_RETRY;
+        // The antenna read is the one opening question whose *absence of an
+        // answer* is itself meaningful — it is how a rig with one socket says
+        // so — which makes a lost reply indistinguishable from a rig without a
+        // selector, and leaves the panel with no antenna control until the next
+        // reconnect (issue #258). So it is asked again, a few times, and then
+        // let go: three more chances at a reply cost four frames on a radio
+        // that has no selector, and rescue the far commoner case of an answer
+        // that collided with the opening burst.
+        let mut antenna_probes_left =
+            if protocol.antennas_probed() { ANTENNA_PROBE_RETRIES } else { 0 };
+        let mut next_antenna_probe = Instant::now() + ANTENNA_PROBE_RETRY;
 
         let mut next_poll = Instant::now();
         // Backdated so the first poll of a connection carries the mode: the app
@@ -1963,12 +2109,12 @@ fn serial_thread(
         // Only forward genuine changes so the engine isn't re-notified every poll.
         let mut emit_freq: Option<f64> = None;
         let mut emit_mode: Option<Mode> = None;
-        // The band this end has already put the rig's own repeater shift back
-        // to simplex for (see [`Protocol::clear_duplex`]). `None` on a fresh
-        // connection, so the first dial the rig reports — the opening poll's
-        // answer, a round trip after the port opens — asserts it once, and
-        // every band change after that re-asserts it.
-        let mut simplex_band: Option<sdroxide_types::Band> = None;
+        // The dial this end has already put the rig's own repeater shift back
+        // to simplex for (see [`Protocol::clear_duplex`] and [`needs_simplex`]).
+        // `None` on a fresh connection, so the first dial the rig reports — the
+        // opening poll's answer, a round trip after the port opens — asserts it
+        // once, and a move after that re-asserts it.
+        let mut simplex_dial: Option<f64> = None;
         // The rig's own transmit state as last reported upwards, and when its
         // last answer arrived. `None` = never answered, which is where a family
         // with no such read stays for good.
@@ -2061,6 +2207,29 @@ fn serial_thread(
                             last_sent_freq = Some(hz);
                             emit_freq = Some(hz); // suppress the poll echo
                             freq_deadline = Instant::now() + Duration::from_millis(50);
+                        }
+                        // …and on a shift the rig may have re-armed on that
+                        // frequency by itself (issue #233). Only when the dial
+                        // actually moved for this over — `needs_simplex` says
+                        // no for the ordinary case where transmit lands where
+                        // we listen, so a digital burst still keys with nothing
+                        // queued in front of it.
+                        if on {
+                            let mut failed = false;
+                            if needs_simplex(emit_freq, &mut simplex_dial) {
+                                for f in protocol.clear_duplex() {
+                                    failed |= write_frame(
+                                        &mut *port,
+                                        &mut *protocol,
+                                        &f,
+                                        &mut last_write,
+                                        &mut io,
+                                    );
+                                }
+                            }
+                            if failed {
+                                break 'io true;
+                            }
                         }
                         let failed = match cfg.ptt {
                             PttMethod::Vox => false,
@@ -2187,6 +2356,39 @@ fn serial_thread(
                             break 'io true;
                         }
                     }
+                    // The radio's own power switch. Written straight out
+                    // rather than debounced: it is a button an operator
+                    // presses, and the wake-up run in front of a power-on is
+                    // the one frame here that is *meant* to be long.
+                    Ok(CatCmd::RigPower(on)) => {
+                        let mut failed = false;
+                        for f in protocol.set_rig_power(on, cfg.serial.baud) {
+                            failed |= write_frame(
+                                &mut *port,
+                                &mut *protocol,
+                                &f,
+                                &mut last_write,
+                                &mut io,
+                            );
+                        }
+                        if failed {
+                            break 'io true;
+                        }
+                        // Switching the radio off takes the link with it: the
+                        // reads that follow go unanswered, and everything this
+                        // end believes about the rig is about to be about a
+                        // radio that is not there. Forget it, so a radio
+                        // switched back on is re-asserted from scratch rather
+                        // than from a cache of how it used to be.
+                        if !on {
+                            last_sent_freq = None;
+                            last_sent_power.forget();
+                            last_sent_squelch = None;
+                            last_sent_antenna = None;
+                            simplex_dial = None;
+                            mode_memory = ModeMemory::default();
+                        }
+                    }
                     Ok(CatCmd::Stop) => return,
                     Err(TryRecvError::Empty) => break,
                     Err(TryRecvError::Disconnected) => return,
@@ -2297,7 +2499,7 @@ fn serial_thread(
             // transmit frequency went out with the key-down — and the one
             // moment the bus must not carry a receive setting is the one the
             // meters are being read in.
-            if !ptt && needs_simplex(emit_freq, &mut simplex_band) {
+            if !ptt && needs_simplex(emit_freq, &mut simplex_dial) {
                 let mut failed = false;
                 for f in protocol.clear_duplex() {
                     failed |= write_frame(&mut *port, &mut *protocol, &f, &mut last_write, &mut io);
@@ -2407,6 +2609,22 @@ fn serial_thread(
                     next_scope_nudge = now + scope_retry;
                     scope_retry = (scope_retry * 2).min(SCOPE_RETRY_MAX);
                     for f in protocol.scope_requests() {
+                        if write_frame(&mut *port, &mut *protocol, &f, &mut last_write, &mut io) {
+                            break 'io true;
+                        }
+                    }
+                }
+            }
+
+            // Ask again for the socket while the rig has not answered at all.
+            // See where `antenna_probes_left` is seeded.
+            if antenna_probes_left > 0 && Instant::now() >= next_antenna_probe {
+                if antennas_known.load(std::sync::atomic::Ordering::Relaxed) {
+                    antenna_probes_left = 0;
+                } else {
+                    antenna_probes_left -= 1;
+                    next_antenna_probe = Instant::now() + ANTENNA_PROBE_RETRY;
+                    for f in protocol.read_antenna() {
                         if write_frame(&mut *port, &mut *protocol, &f, &mut last_write, &mut io) {
                             break 'io true;
                         }
@@ -2555,6 +2773,12 @@ fn serial_thread(
                 // put the panel back on the port the operator just left, and leave it disagreeing
                 // with the radio.
                 if let CatUpdate::Antenna(a) = u {
+                    // The radio answered at all, so it has a selector: the
+                    // sockets can be offered now (see
+                    // [`Protocol::antennas_probed`]). Marked whether or not the
+                    // report itself is forwarded — a rig that has one is a rig
+                    // that has one, however the answer crossed our command.
+                    antennas_known.store(true, std::sync::atomic::Ordering::Relaxed);
                     if last_sent_antenna.is_none_or(|w| w == a) {
                         let _ = event_tx.send(u);
                     }
@@ -2622,31 +2846,46 @@ mod tests {
     use super::*;
     use sdroxide_types::CatFamily;
 
-    /// The rig's own repeater shift is put back to simplex once per band, not
-    /// once per connection: an IC-9700 keeps a band stacking register per band
-    /// and restores that band's duplex the moment the dial crosses into it,
-    /// which is what left 70 cm and 23 cm stuck on DUP− (issue #192).
+    /// The rig's own repeater shift is put back to simplex once per band on HF,
+    /// not once per connection: an IC-9700 keeps a band stacking register per
+    /// band and restores that band's duplex the moment the dial crosses into
+    /// it, which is what left 70 cm and 23 cm stuck on DUP− (issue #192).
     #[test]
     fn the_duplex_is_re_asserted_on_every_band_change() {
-        use sdroxide_types::Band;
-        let mut asserted: Option<Band> = None;
+        let mut asserted: Option<f64> = None;
         // Nothing is claimed about a rig that has not said where it is.
         assert!(!needs_simplex(None, &mut asserted));
         assert_eq!(asserted, None);
         // The first dial a fresh connection learns arms it once…
-        assert!(needs_simplex(Some(145_500_000.0), &mut asserted));
-        assert_eq!(asserted, Some(Band::M2));
-        // …and only once: a dial that moves inside the band changes nothing,
-        // and neither does the same frequency arriving on every poll.
-        assert!(!needs_simplex(Some(145_500_000.0), &mut asserted));
-        assert!(!needs_simplex(Some(144_500_000.0), &mut asserted));
+        assert!(needs_simplex(Some(14_074_000.0), &mut asserted));
+        // …and on HF only once: a dial that moves inside the band changes
+        // nothing, and neither does the same frequency arriving on every poll.
+        assert!(!needs_simplex(Some(14_074_000.0), &mut asserted));
+        assert!(!needs_simplex(Some(14_200_000.0), &mut asserted));
+        // A band crossing re-asserts it.
+        assert!(needs_simplex(Some(7_074_000.0), &mut asserted));
+        // And back again — a band already visited is still a band change.
+        assert!(needs_simplex(Some(14_074_000.0), &mut asserted));
+    }
+
+    /// Above the VHF floor it is every *move*, not every band: Icom's
+    /// auto-repeater arms on the frequency, so tuning between two 2 m channels
+    /// puts DUP back without ever crossing a band edge (issue #233).
+    #[test]
+    fn a_vhf_dial_re_asserts_the_duplex_wherever_it_moves() {
+        let mut asserted: Option<f64> = None;
+        assert!(needs_simplex(Some(147_000_000.0), &mut asserted));
+        // The same frequency arriving on every poll is not a move.
+        assert!(!needs_simplex(Some(147_000_000.0), &mut asserted));
+        // Another channel in the same band is.
+        assert!(needs_simplex(Some(146_875_000.0), &mut asserted));
+        assert!(needs_simplex(Some(147_000_000.0), &mut asserted));
         // 70 cm and 23 cm are where the IC-9700 puts DUP− back.
         assert!(needs_simplex(Some(432_500_000.0), &mut asserted));
-        assert_eq!(asserted, Some(Band::M70));
         assert!(needs_simplex(Some(1_297_000_000.0), &mut asserted));
-        assert_eq!(asserted, Some(Band::Cm23));
-        // And back again — a band already visited is still a band change.
-        assert!(needs_simplex(Some(145_500_000.0), &mut asserted));
+        // 10 m FM repeaters are above the floor too.
+        assert!(needs_simplex(Some(29_680_000.0), &mut asserted));
+        assert!(needs_simplex(Some(29_620_000.0), &mut asserted));
     }
 
     /// `FE FE 00 94 00 …` — the rig telling the bus its dial has moved.

@@ -77,7 +77,7 @@ pub fn make_modulator(mode: Mode, rate: f64, passband: (f32, f32)) -> Option<Box
         // DRM joins them for a plainer reason than CW's: it is a broadcast
         // system. There is no amateur DRM transmission to make, and a
         // receiver that could key one has no business doing so.
-        Mode::Cw | Mode::Wfm | Mode::Spec | Mode::Drm | Mode::Adsb => None,
+        Mode::Cw | Mode::Wfm | Mode::Spec | Mode::Drm | Mode::Adsb | Mode::Vdl2 => None,
     }
 }
 

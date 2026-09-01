@@ -42,31 +42,18 @@ pub(in crate::app) enum AdsbSort {
     Signal,
 }
 
-impl AdsbSort {
-    const ALL: [AdsbSort; 6] = [
-        AdsbSort::Heard,
-        AdsbSort::Callsign,
-        AdsbSort::Altitude,
-        AdsbSort::Speed,
-        AdsbSort::Range,
-        AdsbSort::Signal,
-    ];
-    fn label(self) -> &'static str {
-        match self {
-            AdsbSort::Heard => "HEARD",
-            AdsbSort::Callsign => "CALL",
-            AdsbSort::Altitude => "ALT",
-            AdsbSort::Speed => "SPD",
-            AdsbSort::Range => "RANGE",
-            AdsbSort::Signal => "SIG",
-        }
-    }
-}
-
 /// Below this the two signal columns come off the table. A row that has run out
 /// of room prints its columns on top of each other, which is worse than not
 /// printing them.
 const NARROW_W: f32 = 330.0;
+
+/// Above this there is room for the signal column too.
+///
+/// It is the sort key with no other home — every other one names a column the
+/// table already had — so it is drawn wherever it fits rather than left
+/// unreachable, and the divider beside the list is draggable for the widths
+/// where it does not.
+const WIDE_W: f32 = 430.0;
 
 impl SdroxideApp {
     pub(in crate::app) fn adsb_panel(
@@ -92,19 +79,27 @@ impl SdroxideApp {
         let pane = self.phone_pane(ui, self.state.rx[0].mode);
         let full_w = ui.available_width();
 
+        // The list keeps a draggable share of the width. The floor is the
+        // narrow table (callsign, altitude and age); the ceiling leaves the map
+        // enough to still be a radar picture rather than a strip.
+        const HANDLE_W: f32 = 7.0;
+        let list_w = (full_w * self.view.adsb_split_fraction)
+            .clamp(240.0, (full_w - HANDLE_W - 200.0).max(240.0));
+
         ui.horizontal_top(|ui| {
             if pane.is_none_or(|p| p == 0) {
                 ui.allocate_ui_with_layout(
-                    egui::vec2(
-                        if pane.is_some() { full_w } else { (full_w * 0.42).clamp(240.0, 460.0) },
-                        avail_h,
-                    ),
+                    egui::vec2(if pane.is_some() { full_w } else { list_w }, avail_h),
                     egui::Layout::top_down(egui::Align::Min),
                     |ui| self.adsb_list(ui, &st, now, avail_h),
                 );
             }
             if pane.is_none() {
-                ui.separator();
+                let h = crate::chrome::split_handle(ui, egui::vec2(HANDLE_W, avail_h), None);
+                if h.dragged() {
+                    self.view.adsb_split_fraction =
+                        ((list_w + h.drag_delta().x) / full_w.max(1.0)).clamp(0.15, 0.85);
+                }
             }
             if pane.is_none_or(|p| p == 1) {
                 ui.vertical(|ui| self.adsb_map_pane(ui, &st, now, avail_h));
@@ -205,20 +200,7 @@ impl SdroxideApp {
         let home = self.adsb_home();
         ui.horizontal_wrapped(|ui| {
             ui.set_min_height(20.0);
-            for s in AdsbSort::ALL {
-                if s == AdsbSort::Range && home.is_none() {
-                    continue; // nothing to measure from
-                }
-                let on = self.adsb_sort == s;
-                if crate::chrome::chip(ui, on, RichText::new(s.label()).size(10.0)).clicked() {
-                    if on {
-                        self.adsb_sort_desc = !self.adsb_sort_desc;
-                    } else {
-                        self.adsb_sort = s;
-                        self.adsb_sort_desc = true;
-                    }
-                }
-            }
+            ui.label(RichText::new("AIRCRAFT").strong().size(10.5).color(theme::CYAN()));
             ui.add(
                 egui::TextEdit::singleline(&mut self.adsb_filter)
                     .hint_text("filter")
@@ -240,13 +222,23 @@ impl SdroxideApp {
 
         let selected = self.adsb_map.selected;
         let card = selected.and_then(|i| st.aircraft.iter().find(|a| a.icao == i));
-        let card_h = if card.is_some() { (avail_h * 0.40).clamp(120.0, 250.0) } else { 0.0 };
-        let list_h = (avail_h - card_h - 46.0).max(48.0);
+        // The card takes a draggable share of the column, but only while there
+        // is one: with nothing selected the list has the lot and there is no
+        // divider to grab.
+        const HANDLE_H: f32 = 7.0;
+        let card_h = if card.is_some() {
+            (avail_h * self.view.adsb_card_fraction).clamp(90.0, (avail_h - 120.0).max(90.0))
+        } else {
+            0.0
+        };
+        let list_h =
+            (avail_h - card_h - 46.0 - if card.is_some() { HANDLE_H } else { 0.0 }).max(48.0);
 
         let drop_map_s = self.state.adsb.drop_map_s;
         // Outside the scroll area, so a busy sector does not scroll the column
-        // headings off the top of the table it is describing.
-        adsb_head_row(ui, home.is_some());
+        // headings off the top of the table it is describing — and so they stay
+        // where they can be clicked to re-order it.
+        adsb_head_row(ui, home.is_some(), &mut self.adsb_sort, &mut self.adsb_sort_desc);
         let mut pick = None;
         egui::ScrollArea::vertical()
             .id_salt("adsb-aircraft")
@@ -268,7 +260,14 @@ impl SdroxideApp {
         }
 
         if let Some(a) = card {
-            ui.separator();
+            let w = ui.available_width();
+            let h = crate::chrome::split_handle(ui, egui::vec2(w, HANDLE_H), None);
+            if h.dragged() {
+                // Drag up grows the card, which is the half the pointer is
+                // heading for.
+                self.view.adsb_card_fraction =
+                    ((card_h - h.drag_delta().y) / avail_h.max(1.0)).clamp(0.12, 0.8);
+            }
             self.adsb_card(ui, a, now, card_h, home);
         }
     }
@@ -527,32 +526,29 @@ impl SdroxideApp {
 }
 
 /// The column headings, drawn with the same offsets the rows use.
-fn adsb_head_row(ui: &mut egui::Ui, have_home: bool) {
-    let w = ui.available_width();
-    let (rect, _) = ui.allocate_exact_size(egui::vec2(w, 14.0), egui::Sense::hover());
-    if !ui.is_rect_visible(rect) {
-        return;
-    }
-    let p = ui.painter_at(rect);
-    let font = egui::FontId::monospace(8.5);
-    let ink = theme::gray(110);
-    let cols = columns(w, have_home);
-    for (x, align, text) in [
-        (cols.call, egui::Align2::LEFT_CENTER, "CALL"),
-        (cols.icao, egui::Align2::LEFT_CENTER, "ICAO"),
-        (cols.alt, egui::Align2::RIGHT_CENTER, "ALT"),
-        (cols.spd, egui::Align2::RIGHT_CENTER, "GS"),
-        (cols.trk, egui::Align2::RIGHT_CENTER, "TRK"),
-        (cols.vs, egui::Align2::RIGHT_CENTER, "V/S"),
-        (cols.sqk, egui::Align2::RIGHT_CENTER, "SQK"),
-        (cols.range, egui::Align2::RIGHT_CENTER, "KM"),
-        (cols.age, egui::Align2::RIGHT_CENTER, "AGE"),
-    ] {
-        if x.is_nan() {
-            continue;
-        }
-        p.text(egui::pos2(rect.left() + x, rect.center().y), align, text, font.clone(), ink);
-    }
+fn adsb_head_row(ui: &mut egui::Ui, have_home: bool, sort: &mut AdsbSort, desc: &mut bool) {
+    const L: egui::Align2 = egui::Align2::LEFT_CENTER;
+    const R: egui::Align2 = egui::Align2::RIGHT_CENTER;
+    let cols = columns(ui.available_width(), have_home);
+    crate::app::panels::widgets::sort_head_row(
+        ui,
+        &[
+            (cols.call, L, "CALL", Some(AdsbSort::Callsign)),
+            // The address is the callsign column's fallback, not an order
+            // anybody wants a sky in.
+            (cols.icao, L, "ICAO", None),
+            (cols.alt, R, "ALT", Some(AdsbSort::Altitude)),
+            (cols.spd, R, "GS", Some(AdsbSort::Speed)),
+            (cols.sig, R, "SIG", Some(AdsbSort::Signal)),
+            (cols.trk, R, "TRK", None),
+            (cols.vs, R, "V/S", None),
+            (cols.sqk, R, "SQK", None),
+            (cols.range, R, "KM", Some(AdsbSort::Range)),
+            (cols.age, R, "AGE", Some(AdsbSort::Heard)),
+        ],
+        sort,
+        desc,
+    );
 }
 
 /// Column x offsets, in points from the left of a row.
@@ -561,6 +557,7 @@ struct Cols {
     icao: f32,
     alt: f32,
     spd: f32,
+    sig: f32,
     trk: f32,
     vs: f32,
     sqk: f32,
@@ -581,7 +578,11 @@ fn columns(w: f32, have_home: bool) -> Cols {
     let sqk = if narrow { f32::NAN } else { after_range };
     let vs = if narrow { f32::NAN } else { sqk - 40.0 };
     let trk = if vs.is_nan() { after_range } else { vs - 44.0 };
-    Cols { call: 5.0, icao: 62.0, alt: 158.0, spd: 196.0, trk, vs, sqk, range, age }
+    // The last column to appear and the first to go: it is the only one whose
+    // heading has to clear the fixed left-hand group, and at [`WIDE_W`] it
+    // just does — with or without a range column between it and the edge.
+    let sig = if w < WIDE_W { f32::NAN } else { trk - 34.0 };
+    Cols { call: 5.0, icao: 62.0, alt: 158.0, spd: 196.0, sig, trk, vs, sqk, range, age }
 }
 
 /// One row of the aircraft table. Returns true if it was clicked.
@@ -652,6 +653,7 @@ fn adsb_row(
     }
     put(cols.alt, egui::Align2::RIGHT_CENTER, a.fmt_altitude(), mono.clone(), ink);
     put(cols.spd, egui::Align2::RIGHT_CENTER, a.fmt_speed(), mono.clone(), ink);
+    put(cols.sig, egui::Align2::RIGHT_CENTER, format!("{:.0}", a.rssi_dbfs), small.clone(), dim);
     put(
         cols.trk,
         egui::Align2::RIGHT_CENTER,
