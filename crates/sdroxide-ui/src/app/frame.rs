@@ -173,6 +173,9 @@ impl eframe::App for SdroxideApp {
         // to take on the frame it is chosen in or the picker feels dead.
         crate::theme::set_spot_colors(&self.ui_settings.spot_colors);
         crate::theme::set_bandplan_colors(&self.ui_settings.bandplan_colors);
+        // …and whether the maps carry cities, which the four of them read
+        // through one shared painter.
+        crate::theme::set_map_cities(self.ui_settings.map_cities);
         // The interface scale is egui's zoom factor, which egui also lets the
         // operator drive with ctrl+plus / ctrl+minus, so it is written only
         // when the setting itself moves — see `theme::apply_zoom`. It reads
@@ -184,6 +187,7 @@ impl eframe::App for SdroxideApp {
         }
         self.drain_events(&ctx, now);
         self.poll_adif_import();
+        self.poll_settings_import();
         self.refresh_band_conditions(now);
 
         // A server that asks for a password gets the whole window until it has
@@ -402,7 +406,12 @@ impl eframe::App for SdroxideApp {
             // are large enough to read on the waterfall. RIFP straddles the
             // dial rather than sitting above it, so its window is symmetric
             // and as wide as the profile's channel.
-            let (sub_lo, sub_hi) = if mode.is_vdl2() {
+            let (sub_lo, sub_hi) = if mode.is_ais() {
+                // Both AIS channels and a little either side, not a sub-band:
+                // the two are 50 kHz apart and both are being read at once, so
+                // framing one of them would be a view of half the traffic.
+                (dial - 60_000.0, dial + 60_000.0)
+            } else if mode.is_vdl2() {
                 // The whole datalink group, not a sub-band: seven channels
                 // spread over 325 kHz are all being read at once, and framing
                 // one of them would be a view of a sixth of what is happening.
@@ -441,6 +450,12 @@ impl eframe::App for SdroxideApp {
                 (dial - half, dial + half)
             } else if mode.is_rf_paint() {
                 (dial + 150.0, dial + 3450.0)
+            } else if mode.is_lower_sideband_at(dial) {
+                // Mirrored, because the mode is: SSTV and RADE keep phone
+                // practice and ride the lower sideband on 160/80/40 m, so their
+                // sub-band is *below* the dial there. Framed above it, the
+                // opening view of the mode is the empty side of the signal.
+                (dial - 3500.0, dial + 200.0)
             } else {
                 (dial - 200.0, dial + 3500.0)
             };
@@ -467,7 +482,14 @@ impl eframe::App for SdroxideApp {
                 self.view.view_hi_hz = sub_hi;
             }
             self.digi_view_fit = Some((mode, dial, center));
-            let audio_hz = self.digi_status.as_ref().map(|s| s.audio_hz).unwrap_or(1500.0);
+            // Which side of the dial the mode's audio band is on. Every tone
+            // offset below is a distance from the dial and every marker is drawn
+            // at dial + offset, so on the bands where the mode rides the lower
+            // sideband (SSTV and RADE on 160/80/40 m) they all belong below it.
+            // Display only: the controllers go on reporting an offset as a
+            // width from the dial, whichever side they are being worked on.
+            let side = if mode.is_lower_sideband_at(dial) { -1.0 } else { 1.0 };
+            let audio_hz = side * self.digi_status.as_ref().map(|s| s.audio_hz).unwrap_or(1500.0);
             let is_text = mode.is_text_modem();
             // RTTY shows mark/space tuning lines; Olivia the tone-bank edges;
             // PSK just the centre marker.
@@ -506,7 +528,7 @@ impl eframe::App for SdroxideApp {
             } else if mode == Mode::Rade {
                 // The RADE V1 OFDM carriers, so the operator can see whether the
                 // signal is sitting inside the modem's window.
-                vec![1062.0, 1876.0]
+                vec![side * 1062.0, side * 1876.0]
             } else {
                 Vec::new()
             };
@@ -592,6 +614,18 @@ impl eframe::App for SdroxideApp {
                         Some(spectrum_view::AudioCursor {
                             hz: audio_hz,
                             click_sets_offset: !mode.holds_standard_tones(),
+                            // CW only for now: RTTY and WEFAX sit off their
+                            // dials too and could follow, but each wants
+                            // checking against real signals first.
+                            line_on_cursor: false,
+                            // Where the window is centred is a separate
+                            // question from where the tuning line is drawn,
+                            // and RTTY has already been checked on the air for
+                            // this one: its tone pair is 2210 Hz off the dial,
+                            // so a click-tune zoomed in tighter than that left
+                            // the dial off the picture and the re-centring
+                            // carried the signal away with it.
+                            center_on_cursor: mode.holds_standard_tones(),
                         }),
                         if matches!(mode, Mode::Ft8 | Mode::Ft2) {
                             self.digi_status
@@ -670,6 +704,8 @@ impl eframe::App for SdroxideApp {
                                     self.adsb_panel(ui, &mut cmds, panel_h);
                                 } else if mode.is_vdl2() {
                                     self.vdl2_panel(ui, &mut cmds, panel_h);
+                                } else if mode.is_ais() {
+                                    self.ais_panel(ui, &mut cmds, panel_h);
                                 } else if mode.is_aprs() {
                                     self.aprs_panel(ui, &mut cmds, panel_h);
                                 } else if mode.is_packet() {
@@ -762,9 +798,17 @@ impl eframe::App for SdroxideApp {
             };
             let width = ui.available_width();
             let cw_pitch = cw_mode.then(|| spectrum_view::AudioCursor {
-                hz: self.digi_status.as_ref().map_or(700.0, |s| s.audio_hz),
+                hz: self.cw_pitch_hz(),
                 // A click tunes the dial so the signal lands on the cursor.
                 click_sets_offset: false,
+                // With the readout reading the signal, the tuning line follows
+                // it there — see `UiSettings::cw_qrg`.
+                line_on_cursor: self.ui_settings.cw_qrg,
+                // And so does the middle of the window: with the readout and
+                // the line both on the cursor, a window still centred on the
+                // dial would be the one thing left disagreeing. Off by
+                // default, with the setting.
+                center_on_cursor: self.ui_settings.cw_qrg,
             });
             if show_wf {
                 ui.allocate_ui(egui::vec2(width, wf_h), |ui| {
@@ -843,13 +887,15 @@ impl eframe::App for SdroxideApp {
         self.scanner_window(&ctx, &mut cmds);
         self.ism_window(&ctx, &mut cmds);
         self.adsb_setup_window(&ctx, &mut cmds);
+        self.cw_macro_window(&ctx, &mut cmds);
+        self.ais_setup_window(&ctx, &mut cmds);
         self.vdl2_setup_window(&ctx, &mut cmds);
         self.rds_window(&ctx);
         self.drm_window(&ctx, &mut cmds);
         self.voice_window(&ctx, &mut cmds);
         self.settings_window(&ctx, &mut cmds);
         self.digi_settings_window(&ctx, &mut cmds);
-        self.logbook_window(&ctx);
+        self.logbook_window(&ctx, &mut cmds);
         self.mail_window(&ctx, &mut cmds);
         self.mail_log_window(&ctx);
         self.spots_window(&ctx, &mut cmds);
@@ -1094,6 +1140,14 @@ impl SdroxideApp {
                     self.speech.announcer.reseed();
                     self.speech.announcer.reset_decodes();
                 }
+                // The *same* front end, revising what it said about itself: an
+                // antenna list learned from a rig that has only now answered,
+                // a gain ladder as long as the band the dial has just crossed
+                // into. Only the capabilities move — everything the arm above
+                // throws away belongs to this radio and is still current, and
+                // throwing it away on a QSY would blank the wideband strip and
+                // re-read every image store for nothing.
+                RadioEvent::CapabilitiesUpdated(c) => self.caps = Some(c),
                 RadioEvent::State(s) => {
                     let prev_vfo = self.state.active_freq_hz();
                     let prev_rate = self.state.sample_rate;
@@ -1201,9 +1255,16 @@ impl SdroxideApp {
                     // held: the same reception arrives twice whenever a slot we
                     // decoded ourselves also comes back from WSPRnet, and two
                     // rows for one beacon reads as the mode double-counting.
+                    //
+                    // Through a set rather than a scan per arrival: the list
+                    // holds a night of receptions now, and a linear search
+                    // through it for every spot in a WSPRnet download is the
+                    // one shape of this that grows with the square of a busy
+                    // band (issue #316).
+                    let mut held: std::collections::HashSet<_> =
+                        self.wspr_spots.iter().map(|e| e.dedup_key()).collect();
                     for spot in s.into_iter().rev() {
-                        let key = spot.dedup_key();
-                        if self.wspr_spots.iter().any(|e| e.dedup_key() == key) {
+                        if !held.insert(spot.dedup_key()) {
                             continue;
                         }
                         self.wspr_spots.insert(0, spot);
@@ -1278,6 +1339,7 @@ impl SdroxideApp {
                 RadioEvent::IsmStatus(st) => self.ism_status = Some(st),
                 RadioEvent::AdsbStatus(st) => self.adsb_status = Some(st),
                 RadioEvent::Vdl2Status(st) => self.vdl2_status = Some(st),
+                RadioEvent::AisStatus(st) => self.ais_status = Some(st),
                 RadioEvent::Qo100Status(st) => self.qo100_status = Some(st),
                 RadioEvent::SstvStatus(s) => {
                     // Adopt a *newly* detected RX mode for the next transmit, but
@@ -1389,6 +1451,13 @@ impl SdroxideApp {
                     // allocation that is never freed.
                     if sdroxide_types::band_plan() != &c.band_plan {
                         sdroxide_types::set_band_plan(c.band_plan.clone());
+                    }
+                    // The operator's own additions to the modes' frequency
+                    // tables, on the same terms and for the same reason: the
+                    // station owns the list, and this client draws the picker
+                    // from it. Guarded against the same leak.
+                    if sdroxide_types::digi_presets() != c.digi_presets.as_slice() {
+                        sdroxide_types::set_digi_presets(c.digi_presets.clone());
                     }
                 }
                 RadioEvent::TleSubStatus(s) => self.on_tle_sub_status(s),

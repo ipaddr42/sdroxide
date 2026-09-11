@@ -421,6 +421,18 @@ impl IqSource for HackRfSource {
         if let Some(w) = &self.handle.link_warning {
             parts.push(w.clone());
         }
+        // The dial and the radio have parted company: the engine was told this
+        // tune succeeded when it was posted to the stream thread, and the radio
+        // has been refusing it ever since. Without this the panadapter goes on
+        // labelling a frequency the radio is not on, and nothing anywhere says
+        // why (issue #352).
+        if self.handle.ctrl_stuck() {
+            parts.push(
+                "this radio is refusing settings changes — the frequency and gains on \
+                 screen are not what it is running. Unplug it and plug it back in"
+                    .to_string(),
+            );
+        }
         (!parts.is_empty()).then(|| parts.join(" — "))
     }
 }

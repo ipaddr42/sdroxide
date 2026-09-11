@@ -5,9 +5,29 @@
 # needs write access to the usbfs node, both to open the device and to detach
 # the dvb_usb_rtl28xxu DVB driver from it.
 #
-# TAG+="uaccess" hands an ACL to whoever is logged in at the active seat. That
-# is better than the older GROUP="plugdev" recipe, which needs a group to exist,
-# the user to be added to it, and a full re-login before it takes effect.
+# TAG+="uaccess" hands an ACL to whoever is logged in at the active seat, which
+# needs no group to exist and no re-login. It is the better half of this rule
+# and it is not the whole of it: uaccess grants nothing where there is no seat
+# to be logged in at — WSL2, a headless box reached over ssh, a container, or
+# sdroxide running as a systemd service — and the device stays root-owned and
+# unreachable for reasons nothing on screen explains (issue #350).
+#
+# So GROUP="plugdev" comes along as a fallback, taking effect for anyone in
+# that group when the ACL does not. To use it:
+#
+#   sudo groupadd -f plugdev && sudo usermod -aG plugdev $USER
+#
+# then log out and back in (`newgrp plugdev` for the current shell).
+#
+# That fallback is why the permissions below are applied on their own lines at
+# the end rather than appended to each id. udev resolves GROUP at parse time,
+# and a group that does not exist on this machine — plugdev ships on Debian and
+# Ubuntu, but not on Arch or Fedora — discards THE WHOLE RULE LINE, not just the
+# GROUP token. Written the obvious way, as one line per id carrying MODE, GROUP
+# and TAG together, a missing plugdev takes uaccess down with it and the device
+# stays root-owned on exactly the distros that never had the group (issue #350
+# again, from the other side). Keeping GROUP alone on its own line means only
+# that line is dropped and the ACL still lands.
 #
 # Install:
 #   sudo cp 60-sdroxide-rtlsdr.rules /usr/lib/udev/rules.d/
@@ -19,47 +39,52 @@
 
 # The two generic Realtek ids, which cover the overwhelming majority of dongles
 # including every RTL-SDR Blog V3 and V4.
-SUBSYSTEM=="usb", ATTRS{idVendor}=="0bda", ATTRS{idProduct}=="2832", MODE="0660", TAG+="uaccess"
-SUBSYSTEM=="usb", ATTRS{idVendor}=="0bda", ATTRS{idProduct}=="2838", MODE="0660", TAG+="uaccess"
+SUBSYSTEM=="usb", ATTRS{idVendor}=="0bda", ATTRS{idProduct}=="2832", ENV{SDROXIDE_RTLSDR}="1"
+SUBSYSTEM=="usb", ATTRS{idVendor}=="0bda", ATTRS{idProduct}=="2838", ENV{SDROXIDE_RTLSDR}="1"
 
 # OEM-branded DVB-T sticks built on the same silicon.
-SUBSYSTEM=="usb", ATTRS{idVendor}=="0413", ATTRS{idProduct}=="6680", MODE="0660", TAG+="uaccess"
-SUBSYSTEM=="usb", ATTRS{idVendor}=="0413", ATTRS{idProduct}=="6f0f", MODE="0660", TAG+="uaccess"
-SUBSYSTEM=="usb", ATTRS{idVendor}=="0458", ATTRS{idProduct}=="707f", MODE="0660", TAG+="uaccess"
-SUBSYSTEM=="usb", ATTRS{idVendor}=="0ccd", ATTRS{idProduct}=="00a9", MODE="0660", TAG+="uaccess"
-SUBSYSTEM=="usb", ATTRS{idVendor}=="0ccd", ATTRS{idProduct}=="00b3", MODE="0660", TAG+="uaccess"
-SUBSYSTEM=="usb", ATTRS{idVendor}=="0ccd", ATTRS{idProduct}=="00b4", MODE="0660", TAG+="uaccess"
-SUBSYSTEM=="usb", ATTRS{idVendor}=="0ccd", ATTRS{idProduct}=="00b5", MODE="0660", TAG+="uaccess"
-SUBSYSTEM=="usb", ATTRS{idVendor}=="0ccd", ATTRS{idProduct}=="00b7", MODE="0660", TAG+="uaccess"
-SUBSYSTEM=="usb", ATTRS{idVendor}=="0ccd", ATTRS{idProduct}=="00b8", MODE="0660", TAG+="uaccess"
-SUBSYSTEM=="usb", ATTRS{idVendor}=="0ccd", ATTRS{idProduct}=="00b9", MODE="0660", TAG+="uaccess"
-SUBSYSTEM=="usb", ATTRS{idVendor}=="0ccd", ATTRS{idProduct}=="00c0", MODE="0660", TAG+="uaccess"
-SUBSYSTEM=="usb", ATTRS{idVendor}=="0ccd", ATTRS{idProduct}=="00c6", MODE="0660", TAG+="uaccess"
-SUBSYSTEM=="usb", ATTRS{idVendor}=="0ccd", ATTRS{idProduct}=="00d3", MODE="0660", TAG+="uaccess"
-SUBSYSTEM=="usb", ATTRS{idVendor}=="0ccd", ATTRS{idProduct}=="00d7", MODE="0660", TAG+="uaccess"
-SUBSYSTEM=="usb", ATTRS{idVendor}=="0ccd", ATTRS{idProduct}=="00e0", MODE="0660", TAG+="uaccess"
-SUBSYSTEM=="usb", ATTRS{idVendor}=="1554", ATTRS{idProduct}=="5020", MODE="0660", TAG+="uaccess"
-SUBSYSTEM=="usb", ATTRS{idVendor}=="15f4", ATTRS{idProduct}=="0131", MODE="0660", TAG+="uaccess"
-SUBSYSTEM=="usb", ATTRS{idVendor}=="15f4", ATTRS{idProduct}=="0133", MODE="0660", TAG+="uaccess"
-SUBSYSTEM=="usb", ATTRS{idVendor}=="185b", ATTRS{idProduct}=="0620", MODE="0660", TAG+="uaccess"
-SUBSYSTEM=="usb", ATTRS{idVendor}=="185b", ATTRS{idProduct}=="0650", MODE="0660", TAG+="uaccess"
-SUBSYSTEM=="usb", ATTRS{idVendor}=="185b", ATTRS{idProduct}=="0680", MODE="0660", TAG+="uaccess"
-SUBSYSTEM=="usb", ATTRS{idVendor}=="1b80", ATTRS{idProduct}=="d393", MODE="0660", TAG+="uaccess"
-SUBSYSTEM=="usb", ATTRS{idVendor}=="1b80", ATTRS{idProduct}=="d394", MODE="0660", TAG+="uaccess"
-SUBSYSTEM=="usb", ATTRS{idVendor}=="1b80", ATTRS{idProduct}=="d395", MODE="0660", TAG+="uaccess"
-SUBSYSTEM=="usb", ATTRS{idVendor}=="1b80", ATTRS{idProduct}=="d397", MODE="0660", TAG+="uaccess"
-SUBSYSTEM=="usb", ATTRS{idVendor}=="1b80", ATTRS{idProduct}=="d398", MODE="0660", TAG+="uaccess"
-SUBSYSTEM=="usb", ATTRS{idVendor}=="1b80", ATTRS{idProduct}=="d39d", MODE="0660", TAG+="uaccess"
-SUBSYSTEM=="usb", ATTRS{idVendor}=="1b80", ATTRS{idProduct}=="d3a4", MODE="0660", TAG+="uaccess"
-SUBSYSTEM=="usb", ATTRS{idVendor}=="1b80", ATTRS{idProduct}=="d3a8", MODE="0660", TAG+="uaccess"
-SUBSYSTEM=="usb", ATTRS{idVendor}=="1b80", ATTRS{idProduct}=="d3af", MODE="0660", TAG+="uaccess"
-SUBSYSTEM=="usb", ATTRS{idVendor}=="1b80", ATTRS{idProduct}=="d3b0", MODE="0660", TAG+="uaccess"
-SUBSYSTEM=="usb", ATTRS{idVendor}=="1d19", ATTRS{idProduct}=="1101", MODE="0660", TAG+="uaccess"
-SUBSYSTEM=="usb", ATTRS{idVendor}=="1d19", ATTRS{idProduct}=="1102", MODE="0660", TAG+="uaccess"
-SUBSYSTEM=="usb", ATTRS{idVendor}=="1d19", ATTRS{idProduct}=="1103", MODE="0660", TAG+="uaccess"
-SUBSYSTEM=="usb", ATTRS{idVendor}=="1d19", ATTRS{idProduct}=="1104", MODE="0660", TAG+="uaccess"
-SUBSYSTEM=="usb", ATTRS{idVendor}=="1f4d", ATTRS{idProduct}=="a803", MODE="0660", TAG+="uaccess"
-SUBSYSTEM=="usb", ATTRS{idVendor}=="1f4d", ATTRS{idProduct}=="b803", MODE="0660", TAG+="uaccess"
-SUBSYSTEM=="usb", ATTRS{idVendor}=="1f4d", ATTRS{idProduct}=="c803", MODE="0660", TAG+="uaccess"
-SUBSYSTEM=="usb", ATTRS{idVendor}=="1f4d", ATTRS{idProduct}=="d286", MODE="0660", TAG+="uaccess"
-SUBSYSTEM=="usb", ATTRS{idVendor}=="1f4d", ATTRS{idProduct}=="d803", MODE="0660", TAG+="uaccess"
+SUBSYSTEM=="usb", ATTRS{idVendor}=="0413", ATTRS{idProduct}=="6680", ENV{SDROXIDE_RTLSDR}="1"
+SUBSYSTEM=="usb", ATTRS{idVendor}=="0413", ATTRS{idProduct}=="6f0f", ENV{SDROXIDE_RTLSDR}="1"
+SUBSYSTEM=="usb", ATTRS{idVendor}=="0458", ATTRS{idProduct}=="707f", ENV{SDROXIDE_RTLSDR}="1"
+SUBSYSTEM=="usb", ATTRS{idVendor}=="0ccd", ATTRS{idProduct}=="00a9", ENV{SDROXIDE_RTLSDR}="1"
+SUBSYSTEM=="usb", ATTRS{idVendor}=="0ccd", ATTRS{idProduct}=="00b3", ENV{SDROXIDE_RTLSDR}="1"
+SUBSYSTEM=="usb", ATTRS{idVendor}=="0ccd", ATTRS{idProduct}=="00b4", ENV{SDROXIDE_RTLSDR}="1"
+SUBSYSTEM=="usb", ATTRS{idVendor}=="0ccd", ATTRS{idProduct}=="00b5", ENV{SDROXIDE_RTLSDR}="1"
+SUBSYSTEM=="usb", ATTRS{idVendor}=="0ccd", ATTRS{idProduct}=="00b7", ENV{SDROXIDE_RTLSDR}="1"
+SUBSYSTEM=="usb", ATTRS{idVendor}=="0ccd", ATTRS{idProduct}=="00b8", ENV{SDROXIDE_RTLSDR}="1"
+SUBSYSTEM=="usb", ATTRS{idVendor}=="0ccd", ATTRS{idProduct}=="00b9", ENV{SDROXIDE_RTLSDR}="1"
+SUBSYSTEM=="usb", ATTRS{idVendor}=="0ccd", ATTRS{idProduct}=="00c0", ENV{SDROXIDE_RTLSDR}="1"
+SUBSYSTEM=="usb", ATTRS{idVendor}=="0ccd", ATTRS{idProduct}=="00c6", ENV{SDROXIDE_RTLSDR}="1"
+SUBSYSTEM=="usb", ATTRS{idVendor}=="0ccd", ATTRS{idProduct}=="00d3", ENV{SDROXIDE_RTLSDR}="1"
+SUBSYSTEM=="usb", ATTRS{idVendor}=="0ccd", ATTRS{idProduct}=="00d7", ENV{SDROXIDE_RTLSDR}="1"
+SUBSYSTEM=="usb", ATTRS{idVendor}=="0ccd", ATTRS{idProduct}=="00e0", ENV{SDROXIDE_RTLSDR}="1"
+SUBSYSTEM=="usb", ATTRS{idVendor}=="1554", ATTRS{idProduct}=="5020", ENV{SDROXIDE_RTLSDR}="1"
+SUBSYSTEM=="usb", ATTRS{idVendor}=="15f4", ATTRS{idProduct}=="0131", ENV{SDROXIDE_RTLSDR}="1"
+SUBSYSTEM=="usb", ATTRS{idVendor}=="15f4", ATTRS{idProduct}=="0133", ENV{SDROXIDE_RTLSDR}="1"
+SUBSYSTEM=="usb", ATTRS{idVendor}=="185b", ATTRS{idProduct}=="0620", ENV{SDROXIDE_RTLSDR}="1"
+SUBSYSTEM=="usb", ATTRS{idVendor}=="185b", ATTRS{idProduct}=="0650", ENV{SDROXIDE_RTLSDR}="1"
+SUBSYSTEM=="usb", ATTRS{idVendor}=="185b", ATTRS{idProduct}=="0680", ENV{SDROXIDE_RTLSDR}="1"
+SUBSYSTEM=="usb", ATTRS{idVendor}=="1b80", ATTRS{idProduct}=="d393", ENV{SDROXIDE_RTLSDR}="1"
+SUBSYSTEM=="usb", ATTRS{idVendor}=="1b80", ATTRS{idProduct}=="d394", ENV{SDROXIDE_RTLSDR}="1"
+SUBSYSTEM=="usb", ATTRS{idVendor}=="1b80", ATTRS{idProduct}=="d395", ENV{SDROXIDE_RTLSDR}="1"
+SUBSYSTEM=="usb", ATTRS{idVendor}=="1b80", ATTRS{idProduct}=="d397", ENV{SDROXIDE_RTLSDR}="1"
+SUBSYSTEM=="usb", ATTRS{idVendor}=="1b80", ATTRS{idProduct}=="d398", ENV{SDROXIDE_RTLSDR}="1"
+SUBSYSTEM=="usb", ATTRS{idVendor}=="1b80", ATTRS{idProduct}=="d39d", ENV{SDROXIDE_RTLSDR}="1"
+SUBSYSTEM=="usb", ATTRS{idVendor}=="1b80", ATTRS{idProduct}=="d3a4", ENV{SDROXIDE_RTLSDR}="1"
+SUBSYSTEM=="usb", ATTRS{idVendor}=="1b80", ATTRS{idProduct}=="d3a8", ENV{SDROXIDE_RTLSDR}="1"
+SUBSYSTEM=="usb", ATTRS{idVendor}=="1b80", ATTRS{idProduct}=="d3af", ENV{SDROXIDE_RTLSDR}="1"
+SUBSYSTEM=="usb", ATTRS{idVendor}=="1b80", ATTRS{idProduct}=="d3b0", ENV{SDROXIDE_RTLSDR}="1"
+SUBSYSTEM=="usb", ATTRS{idVendor}=="1d19", ATTRS{idProduct}=="1101", ENV{SDROXIDE_RTLSDR}="1"
+SUBSYSTEM=="usb", ATTRS{idVendor}=="1d19", ATTRS{idProduct}=="1102", ENV{SDROXIDE_RTLSDR}="1"
+SUBSYSTEM=="usb", ATTRS{idVendor}=="1d19", ATTRS{idProduct}=="1103", ENV{SDROXIDE_RTLSDR}="1"
+SUBSYSTEM=="usb", ATTRS{idVendor}=="1d19", ATTRS{idProduct}=="1104", ENV{SDROXIDE_RTLSDR}="1"
+SUBSYSTEM=="usb", ATTRS{idVendor}=="1f4d", ATTRS{idProduct}=="a803", ENV{SDROXIDE_RTLSDR}="1"
+SUBSYSTEM=="usb", ATTRS{idVendor}=="1f4d", ATTRS{idProduct}=="b803", ENV{SDROXIDE_RTLSDR}="1"
+SUBSYSTEM=="usb", ATTRS{idVendor}=="1f4d", ATTRS{idProduct}=="c803", ENV{SDROXIDE_RTLSDR}="1"
+SUBSYSTEM=="usb", ATTRS{idVendor}=="1f4d", ATTRS{idProduct}=="d286", ENV{SDROXIDE_RTLSDR}="1"
+SUBSYSTEM=="usb", ATTRS{idVendor}=="1f4d", ATTRS{idProduct}=="d803", ENV{SDROXIDE_RTLSDR}="1"
+
+# Permissions, applied on their own lines — see the note at the top of this
+# file for why GROUP must not share a line with TAG+="uaccess".
+ENV{SDROXIDE_RTLSDR}=="1", MODE="0660", TAG+="uaccess"
+ENV{SDROXIDE_RTLSDR}=="1", GROUP="plugdev"

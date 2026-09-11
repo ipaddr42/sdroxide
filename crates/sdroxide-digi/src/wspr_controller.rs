@@ -244,12 +244,10 @@ impl WsprController {
         let dials: Vec<f64> = WSPR_DIALS
             .iter()
             .copied()
-            .filter(|&hz| {
-                Band::ALL
-                    .iter()
-                    .position(|b| *b == Band::containing(hz))
-                    .is_some_and(|i| self.cfg.wspr_hop_bands & (1 << i) != 0)
-            })
+            // `wire_index`, not the band bar's order: the mask is saved, and
+            // the bar's order moves when a band is added to the middle of it
+            // (issue #396).
+            .filter(|&hz| self.cfg.wspr_hop_bands & (1 << Band::containing(hz).wire_index()) != 0)
             .collect();
         if dials.is_empty() {
             return None;

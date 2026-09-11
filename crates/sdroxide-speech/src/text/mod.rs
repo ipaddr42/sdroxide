@@ -123,6 +123,7 @@ impl<'a> Speaker<'a> {
             Mode::Digu => "digital upper",
             Mode::Digl => "digital lower",
             Mode::Dsb => "D S B",
+            Mode::Isb => "I S B",
             Mode::Spec => "spectrum",
             Mode::Ft8 => "F T eight",
             Mode::Ft4 => "F T four",
@@ -154,7 +155,12 @@ impl<'a> Speaker<'a> {
             Mode::Wspr => "whisper",
             Mode::Drm => "D R M",
             Mode::Adsb => "A D S B",
-            Mode::Vdl2 => "V D L 2",
+            // Spelt out like every other number in this table — "F T eight",
+            // "J S eight". A bare digit is not something the phonemizer can
+            // say: it reaches the voice as a character with no pronunciation
+            // and is dropped, leaving "V D L".
+            Mode::Vdl2 => "V D L two",
+            Mode::Ais => "A I S",
         }
     }
 
@@ -170,6 +176,7 @@ impl<'a> Speaker<'a> {
             Band::M17 => "seventeen meters",
             Band::M15 => "fifteen meters",
             Band::M12 => "twelve meters",
+            Band::M11 => "eleven meters",
             Band::M10 => "ten meters",
             Band::M6 => "six meters",
             Band::M4 => "four meters",
@@ -189,6 +196,7 @@ impl<'a> Speaker<'a> {
                 sdroxide_types::Region::R1 => "six centimeters",
                 sdroxide_types::Region::R2 | sdroxide_types::Region::R3 => "five centimeters",
             },
+            Band::Cm3 => "three centimeters",
             Band::Gen => "general coverage",
         }
     }

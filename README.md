@@ -57,7 +57,8 @@ One binary, three ways to run it:
   switched.
 - **Modes** — SSB (USB/LSB), CW, AM, SAM, NFM (with **CTCSS/DCS** decoding and
   tone squelch), WFM (with broadcast
-  pilot-tone **stereo** and **RDS/RBDS**), DSB, DIGU/DIGL, a
+  pilot-tone **stereo** and **RDS/RBDS**), DSB, **ISB** (independent sideband —
+  the two sidebands are two different transmissions, one to each ear), DIGU/DIGL, a
   spectrum-only mode, **FT8/FT4/FT2**, **JS8** (all four speeds, with directed
   messaging, heartbeats and multi-frame free text), the keyboard modes
   **PSK31**, **RTTY**,
@@ -858,6 +859,17 @@ transverter, or an offset of its own — including none at all, which is the
 QO-100 station that hears 10 GHz through an LNB and puts 2.4 GHz straight out of
 the radio. Not yet verified against physical hardware.
 
+A station with more than one box has a **transverter table** below that: up to
+ten rows, each with the band it works (on the dial, in MHz), its own offset, its
+own transmit rule, and a **max drive** the operator's Drive setting is held
+under — a transverter's I.F. input takes milliwatts, and the drive that is right
+for the radio's own bands will destroy it. The dial picks the row; a frequency
+no row covers falls through to the single offset above and then to the bare
+radio, so HF still works on a station whose only converter is a 2 m transverter.
+On an HPSDR board with a filter board on J16 the open-collector band code
+follows the dial too, so an accessory board switches its filters, relays and
+transverters for the band on the air rather than for the intermediate frequency.
+
 Beside it, **RX range** and **TX range** state which frequencies the radio
 covers, in MHz (`144-146, 430-440`). Leave them empty and sdroxide uses what the
 device says about itself. Fill them in when the device says nothing — publishing
@@ -1159,6 +1171,32 @@ already installed, its rules cover the same ids and you need not do anything.
 The `dvb_usb_rtl28xxu` DVB driver does **not** need blacklisting — sdroxide
 detaches it automatically and the kernel rebinds it when the dongle is
 unplugged.
+
+**No desktop session?** Every packaged rule grants access two ways: an ACL for
+whoever is logged in at the seat (`TAG+="uaccess"`), and `GROUP="plugdev"` for
+everyone else. The first grants nothing where there is no seat — **WSL2**, a
+headless machine over ssh, a container, or sdroxide running as a systemd
+service — and there the second is what makes the device reachable:
+
+```sh
+sudo groupadd -f plugdev
+sudo usermod -aG plugdev $USER
+sudo udevadm control --reload
+```
+
+then log out and back in. This applies to every radio below, not just the
+RTL-SDR.
+
+The `udevadm control --reload` is not redundant even if you already ran it when
+installing the rules: udev resolves `GROUP=` when it *parses* a rule, not when
+a device appears, so a `plugdev` created afterwards is invisible to rules
+already loaded. Creating the group first and reloading second works too — the
+order that does not work is creating it and never reloading.
+
+If the group does not exist you lose nothing but that fallback; the `uaccess`
+ACL is on a separate line in every packaged rule precisely so that an unknown
+group cannot take it down with it. `plugdev` ships on Debian and Ubuntu but not
+on Arch or Fedora, where the ACL alone is normally all you need.
 
 **Windows.** The dongle must be bound to **WinUSB**, which you do once with
 [Zadig](https://zadig.akeo.ie/). This is the same step SDR#, gqrx and every
@@ -1470,7 +1508,7 @@ way.
 | `--freq <HZ>` | Center frequency in Hz (default: where the last session was left; `14200000` on a first run). |
 | `--rate <HZ>` | Sample rate in Hz (default: from config). |
 | `--gain <DB>` | Overall RX gain in dB (default: hardware AGC / moderate). |
-| `--mode <MODE>` | Initial mode: `USB LSB CW AM SAM NFM WFM DIGU DIGL DSB SPEC FT8 FT4 FT2 PSK RTTY OLIVIA THOR FSQ HELL SSTV RIFP WEFAX RFPAINT RADE ADS-B VDL2`. Default: the mode the last session was left in. |
+| `--mode <MODE>` | Initial mode: `USB LSB CW AM SAM NFM WFM DIGU DIGL DSB ISB SPEC FT8 FT4 FT2 PSK RTTY OLIVIA THOR FSQ HELL SSTV RIFP WEFAX RFPAINT RADE ADS-B VDL2`. Default: the mode the last session was left in. |
 | `--antenna <NAME>` | RX antenna port, as the device names it (`LNAH`, `TX/RX`; see `--probe`). Default: the port the last session was left on. |
 | `--tx-antenna <NAME>` | TX antenna port, likewise (`BAND1`, `BAND2`). |
 | `--server` | Run as a server: HTTP web client + WebSocket streaming backend. |

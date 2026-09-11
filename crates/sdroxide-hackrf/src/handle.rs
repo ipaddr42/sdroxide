@@ -368,6 +368,16 @@ pub(crate) struct Shared {
     /// every block so a ring that fills during an over is accounted for as the
     /// cost of transmitting rather than as an overrun.
     pub rx_paused: AtomicBool,
+    /// Set while a control change the radio would not take is still owed.
+    ///
+    /// The one fault on this backend that is otherwise completely silent: the
+    /// dial, the panadapter labels and every attached screen come from the
+    /// engine, which was told the tune succeeded the moment it was posted to
+    /// this thread. If the radio then refuses it, the picture goes on saying
+    /// one thing and the radio goes on doing another with nothing anywhere to
+    /// say so (issue #352). Surfaced through `IqSource::open_status`, where the
+    /// operator will see it beside the rest of this radio's standing notices.
+    pub ctrl_stuck: AtomicBool,
 }
 
 impl Shared {
@@ -381,6 +391,7 @@ impl Shared {
             vga_mdb: AtomicI64::new(0),
             txvga_mdb: AtomicI64::new(0),
             rx_paused: AtomicBool::new(false),
+            ctrl_stuck: AtomicBool::new(false),
         }
     }
 
@@ -415,8 +426,8 @@ pub(crate) struct DeviceInfo {
     /// Surfaced through `IqSource::open_status` rather than logged and
     /// forgotten.
     pub snapped_from: Option<f64>,
-    /// Set when the link cannot carry the chosen rate — 20 Msps is 40 MB/s,
-    /// which a high-speed port will not sustain.
+    /// Set when the board has enumerated below the high-speed link every
+    /// HackRF is built for, which no rate it offers will survive.
     pub link_warning: Option<String>,
 }
 
@@ -473,6 +484,12 @@ impl HackRfHandle {
     /// Whether the transmitter is keyed.
     pub fn is_transmitting(&self) -> bool {
         self.shared.tx_active.load(Ordering::Relaxed)
+    }
+
+    /// Whether a settings change the radio would not take is still outstanding
+    /// — see [`Shared::ctrl_stuck`]. Cleared as soon as one lands.
+    pub fn ctrl_stuck(&self) -> bool {
+        self.shared.ctrl_stuck.load(Ordering::Relaxed)
     }
 
     /// How long the radio has gone without delivering samples, measured from

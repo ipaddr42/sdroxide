@@ -29,23 +29,30 @@ fn p1_request() -> [u8; 63] {
 }
 
 /// Map a board-type id to a human name for the given protocol.
+///
+/// The commercial name is carried alongside the board's own, because the board
+/// is what the gateware reports and the radio is what the operator bought: an
+/// Apache ANAN-100D says "Angelia" and nothing on screen said the two were the
+/// same radio, which is a poor start to working out why one will not stream
+/// (issue #365). `board_is_hermes_lite` matches on the prefix, so only the
+/// tail of these ever changes.
 fn board_name(protocol: u8, id: u8) -> String {
     let name = match (protocol, id) {
         (1, 0) => "Metis",
-        (1, 1) => "Hermes",
-        (1, 2) => "Hermes2",
-        (1, 4) => "Angelia",
-        (1, 5) => "Orion",
+        (1, 1) => "Hermes (ANAN-10/10E/100/100B)",
+        (1, 2) => "Griffin",
+        (1, 4) => "Angelia (ANAN-100D)",
+        (1, 5) => "Orion (ANAN-200D)",
         (1, 6) => "Hermes-Lite 2",
-        (1, 10) => "Orion2",
+        (1, 10) => "Orion 2 (ANAN-7000/8000)",
         (2, 0) => "Atlas/Metis",
-        (2, 1) => "Hermes",
+        (2, 1) => "Hermes (ANAN-10/10E/100/100B)",
         (2, 2) => "Hermes2",
-        (2, 3) => "Angelia",
-        (2, 4) => "Orion",
-        (2, 5) => "Orion2",
+        (2, 3) => "Angelia (ANAN-100D)",
+        (2, 4) => "Orion (ANAN-200D)",
+        (2, 5) => "Orion 2 (ANAN-7000/8000)",
         (2, 6) => "Hermes-Lite 2",
-        (2, 10) => "Saturn",
+        (2, 10) => "Saturn (ANAN-G2)",
         _ => return format!("HPSDR board {id}"),
     };
     name.to_string()
@@ -223,7 +230,7 @@ mod tests {
         pkt[11] = 10; // Saturn
         let d = parse_response(&pkt).expect("parsed");
         assert_eq!(d.protocol, 2);
-        assert_eq!(d.board, "Saturn");
+        assert_eq!(d.board, "Saturn (ANAN-G2)");
         assert!(!d.in_use);
         assert_eq!(d.mac, "00:1C:C0:A2:33:44");
     }
@@ -241,6 +248,22 @@ mod tests {
         assert_eq!(d.board, "Hermes-Lite 2");
         assert!(d.in_use);
         assert!(d.supported()); // Protocol 1 is now driven
+    }
+
+    /// The Hermes-Lite's name is matched on by prefix, and the commercial
+    /// names hung on the others must not reach into it.
+    #[test]
+    fn only_the_hermes_lite_answers_to_the_hermes_lite_prefix() {
+        for proto in [1u8, 2] {
+            for id in 0..=10u8 {
+                let name = board_name(proto, id);
+                assert_eq!(
+                    crate::net::board_is_hermes_lite(&name),
+                    id == 6,
+                    "P{proto} board {id} reads {name:?}"
+                );
+            }
+        }
     }
 
     #[test]

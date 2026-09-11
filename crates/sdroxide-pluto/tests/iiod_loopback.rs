@@ -102,6 +102,27 @@ const CONTEXT_XML: &str = r#"<?xml version="1.0" encoding="utf-8"?>
 /// HamGeek Pluto+ field report showed, and it used to be refused outright.
 fn pluto_plus_xml() -> String {
     let xml = CONTEXT_XML
+        // A 2R2T firmware exposes the second chain's *controls* as well as its
+        // samples: its own gain register, gain-control mode and port select,
+        // hanging off the phy's `voltage1` input channel. Without them there is
+        // nothing to reproduce issue #311 against — the client holds every
+        // write for want of a channel to send it to.
+        .replace(
+            r#"    <channel id="voltage0" type="output">
+      <attribute name="rf_port_select" filename="out_voltage0_rf_port_select" />"#,
+            r#"    <channel id="voltage1" type="input">
+      <attribute name="rf_port_select" filename="in_voltage1_rf_port_select" />
+      <attribute name="rf_port_select_available" filename="in_voltage1_rf_port_select_available" />
+      <attribute name="hardwaregain" filename="in_voltage1_hardwaregain" />
+      <attribute name="hardwaregain_available" filename="in_voltage1_hardwaregain_available" />
+      <attribute name="gain_control_mode" filename="in_voltage1_gain_control_mode" />
+      <attribute name="gain_control_mode_available" filename="in_voltage1_gain_control_mode_available" />
+      <attribute name="rf_bandwidth" filename="in_voltage1_rf_bandwidth" />
+      <attribute name="sampling_frequency" filename="in_voltage1_sampling_frequency" />
+    </channel>
+    <channel id="voltage0" type="output">
+      <attribute name="rf_port_select" filename="out_voltage0_rf_port_select" />"#,
+        )
         .replace(
             r#"<scan-element index="1" format="le:s12/16&gt;&gt;0" />
     </channel>"#,
@@ -127,6 +148,7 @@ fn pluto_plus_xml() -> String {
     </channel>"#,
         );
     assert_eq!(xml.matches("voltage3").count(), 2, "the 2R2T surgery must have taken");
+    assert!(xml.contains("in_voltage1_hardwaregain"), "the second chain's controls must be there");
     xml
 }
 
@@ -154,6 +176,15 @@ struct DeviceState {
     /// Models a wedged DMA: the connection is fine, the server is answering,
     /// and no amount of further reading will ever produce a sample.
     wedged_until_reopen: bool,
+    /// The carrier range the synthesiser will actually accept, in Hz.
+    ///
+    /// A real AD9361 driver answers `-EINVAL` to a `frequency` outside the
+    /// range of the part it bound as, which is the only thing that tells a
+    /// board carrying the frequency-expansion modification apart from a stock
+    /// one — the EEPROM model string and `frequency_available` are both the
+    /// unmodified answer on plenty of firmwares (issue #340). `None` accepts
+    /// anything, which is what the rest of these tests want.
+    lo_limit_hz: Option<(f64, f64)>,
 }
 
 /// The sample-rate floor a stock Pluto publishes — and refuses.
@@ -206,6 +237,15 @@ impl Fake {
     fn start_that_hiccups_mid_buffer() -> Fake {
         Fake::start_with(
             DeviceState { stall_next_readbuf: Some(HICCUP), ..DeviceState::default() },
+            CONTEXT_XML.to_string(),
+        )
+    }
+
+    /// A board that pauses under its own load: longer than one payload
+    /// deadline, and with the transfer still on its way — see [`PAUSE`].
+    fn start_that_pauses_mid_buffer() -> Fake {
+        Fake::start_with(
+            DeviceState { stall_next_readbuf: Some(PAUSE), ..DeviceState::default() },
             CONTEXT_XML.to_string(),
         )
     }
@@ -270,11 +310,26 @@ fn default_attr(key: &str) -> &'static str {
     match key {
         "ad9361-phy/OUTPUT/altvoltage0/frequency_available" => "[70000000 1 6000000000]",
         "ad9361-phy/OUTPUT/altvoltage1/frequency_available" => "[70000000 1 6000000000]",
+        // Where a Pluto's synthesisers sit before anyone has tuned it: inside
+        // the part's range, as they have to be, and not the `0` the catch-all
+        // below would hand back.
+        "ad9361-phy/OUTPUT/altvoltage0/frequency" => "2400000000",
+        "ad9361-phy/OUTPUT/altvoltage1/frequency" => "2400000000",
         "ad9361-phy/INPUT/voltage0/hardwaregain_available" => "[0 1 71]",
         "ad9361-phy/OUTPUT/voltage0/hardwaregain_available" => "[-89.750000 0.250000 0.000000]",
         "ad9361-phy/INPUT/voltage0/gain_control_mode_available" => {
             "manual fast_attack slow_attack hybrid"
         }
+        // The second chain, on a 2R2T firmware. Its gain-control mode boots
+        // where the driver's device tree left it and *not* where chain 0's was
+        // just put — which is the whole of issue #311.
+        "ad9361-phy/INPUT/voltage1/hardwaregain_available" => "[0 1 71]",
+        "ad9361-phy/INPUT/voltage1/gain_control_mode_available" => {
+            "manual fast_attack slow_attack hybrid"
+        }
+        "ad9361-phy/INPUT/voltage1/gain_control_mode" => "slow_attack",
+        "ad9361-phy/INPUT/voltage1/rf_port_select_available" => "A_BALANCED B_BALANCED",
+        "ad9361-phy/INPUT/voltage1/rf_port_select" => "A_BALANCED",
         "ad9361-phy/INPUT/voltage0/rf_port_select_available" => "A_BALANCED B_BALANCED",
         "ad9361-phy/OUTPUT/voltage0/rf_port_select_available" => "A B",
         "ad9361-phy/INPUT/voltage0/rf_port_select" => "A_BALANCED",
@@ -365,10 +420,22 @@ fn serve(sock: TcpStream, state: Arc<Mutex<DeviceState>>, stop: Arc<AtomicBool>,
                 }
                 let value =
                     String::from_utf8_lossy(&payload).trim_end_matches('\0').trim().to_string();
+                if refuses_carrier(&state, &key, &value) {
+                    let _ = writer.write_all(b"-22\n");
+                    if writer.flush().is_err() {
+                        break;
+                    }
+                    continue;
+                }
                 // The receive gain register belongs to the AD9361 unless the
                 // gain-control mode is manual; writing it in an attack mode is
                 // `-EOPNOTSUPP`, not a silently ignored write.
-                if key == "ad9361-phy/INPUT/voltage0/hardwaregain"
+                //
+                // Per *chain*, as the part is: a 2R2T board has a register set
+                // and a gain-control mode for each, and putting the first one
+                // in manual says nothing about the second (issue #311).
+                if key.starts_with("ad9361-phy/INPUT/voltage")
+                    && key.ends_with("/hardwaregain")
                     && state
                         .lock()
                         .expect("lock")
@@ -376,6 +443,18 @@ fn serve(sock: TcpStream, state: Arc<Mutex<DeviceState>>, stop: Arc<AtomicBool>,
                         != Some("manual")
                 {
                     let _ = writer.write_all(b"-95\n");
+                    if writer.flush().is_err() {
+                        break;
+                    }
+                    continue;
+                }
+                // `rf_port_select` is the AD9361's one front-end write that
+                // cannot be taken while a buffer is running on the part: the
+                // driver answers `-EINVAL` and the mux stays where it was.
+                // Modelled because a fake that took it would bless a client
+                // whose ANT button does nothing on real hardware (issue #314).
+                if key.ends_with("/rf_port_select") && state.lock().expect("lock").rx_buffer_open {
+                    let _ = writer.write_all(b"-22\n");
                     if writer.flush().is_err() {
                         break;
                     }
@@ -555,6 +634,20 @@ fn stalled_chunk(writer: &mut TcpStream, data: &[u8], mask: &str, how_long: Dura
 /// `["iio:device0", "INPUT", "voltage0", "hardwaregain"]` →
 /// `"ad9361-phy/INPUT/voltage0/hardwaregain"`, so the fake keys on names a
 /// reader recognises rather than on `iio:deviceN`.
+/// Whether the synthesiser would refuse this write, the way a real AD9361
+/// driver refuses a carrier outside the range of the part it bound as.
+///
+/// Shared by both fake servers below so the two cannot drift: it is the only
+/// signal that tells a board carrying the frequency-expansion modification
+/// apart from a stock one — see `DeviceState::lo_limit_hz` and issue #340.
+fn refuses_carrier(state: &Mutex<DeviceState>, key: &str, value: &str) -> bool {
+    if !(key.ends_with("/frequency") && key.contains("/altvoltage")) {
+        return false;
+    }
+    let Some((lo, hi)) = state.lock().expect("lock").lo_limit_hz else { return false };
+    value.parse::<f64>().is_ok_and(|hz| hz < lo || hz > hi)
+}
+
 fn attr_key(words: &[&str]) -> String {
     let mut parts: Vec<String> = words.iter().map(|s| s.to_string()).collect();
     if let Some(first) = parts.first_mut() {
@@ -575,6 +668,13 @@ fn attr_key(words: &[&str]) -> String {
 /// the retry loop is what carries it; under the payload deadline, so the answer
 /// under test is patience rather than the reconnect below.
 const HICCUP: Duration = Duration::from_millis(1_200);
+
+/// A mid-buffer gap longer than one payload deadline, on a transfer that then
+/// finishes: the shape of issue #288, where a PlutoSDR whose own processor is
+/// busy goes quiet for a second or two on a link with no errors and nothing
+/// dropped. Long enough that the old client gave up and redialled; short enough
+/// that the bytes were always going to arrive.
+const PAUSE: Duration = Duration::from_millis(3_000);
 
 /// A mid-buffer gap long enough that the client should stop waiting and replace
 /// the receive socket.
@@ -800,6 +900,43 @@ fn a_gap_in_the_middle_of_a_buffer_does_not_end_the_stream() {
     handle.release();
 }
 
+/// Issue #288: a pause longer than one payload deadline, on a transfer that is
+/// still arriving, costs neither the socket nor the buffer.
+///
+/// Both reports were of a Pluto whose own processor was busy enough to stop
+/// feeding the socket for a second or two — no errors on the link, nothing
+/// dropped, and the samples still on their way. Every one of those used to end
+/// the connection, because the read that hit the gap could not say how far into
+/// the payload it had got and the only safe answer was to redial and reopen the
+/// buffer. Counting the bytes is what makes the gap survivable, and the halves
+/// either side of it still have to splice back into the samples the device
+/// sent.
+#[test]
+fn a_pause_the_transfer_recovers_from_costs_no_socket() {
+    let fake = Fake::start_that_pauses_mid_buffer();
+    let mut handle =
+        PlutoHandle::open(&fake.address(), &config(), 435_000_000.0).expect("open the fake Pluto");
+
+    let mut buf = vec![0f32; 4096];
+    let mut got = 0;
+    wait_up_to(PAUSE + Duration::from_secs(5), "samples across the pause", || {
+        got = handle.rx_read(&mut buf);
+        got > 0
+    });
+    assert!(handle.is_alive(), "a pause must not take the connection down");
+    assert_eq!(
+        fake.connections.load(Ordering::Relaxed),
+        3,
+        "a pause the transfer recovered from must not have cost a socket"
+    );
+    assert_eq!(fake.state.lock().expect("lock").rx_buffer_opens, 1, "...nor a buffer reopen");
+    // And the two halves are still the samples the device sent, in order — a
+    // resumed read that lost its place would interleave I and Q.
+    assert!((buf[0] - (SAMPLE_I as f32 / 2048.0)).abs() < 1e-6, "I was {}", buf[0]);
+    assert!((buf[1] - (SAMPLE_Q as f32 / 2048.0)).abs() < 1e-6, "Q was {}", buf[1]);
+    handle.release();
+}
+
 /// A gap too long to wait out costs one socket, not the whole radio.
 ///
 /// The fault this is drawn from wedged a single TCP connection mid-payload for
@@ -928,6 +1065,38 @@ fn selecting_the_port_already_selected_writes_nothing() {
     wait_for("the port change", || {
         !fake.state.lock().unwrap().writes_of("ad9361-phy/INPUT/voltage0/rf_port_select").is_empty()
     });
+}
+
+/// The AD9361 refuses `rf_port_select` while a buffer is running on it, so the
+/// switch has to stand receive down for the length of the write. Without that
+/// the operator's ANT click was a rejected write and a socket that never moved
+/// (issue #314).
+#[test]
+fn switching_the_antenna_stands_receive_down_for_the_write() {
+    let fake = Fake::start();
+    let mut handle =
+        PlutoHandle::open(&fake.address(), &config(), 435_000_000.0).expect("open the fake Pluto");
+    wait_for("the receive buffer", || fake.state.lock().unwrap().rx_buffer_open);
+    let opens_before = fake.state.lock().expect("lock").rx_buffer_opens;
+
+    handle.set_rx_port("B_BALANCED");
+    wait_for("the port change", || {
+        fake.state.lock().unwrap().get("ad9361-phy/INPUT/voltage0/rf_port_select")
+            == Some("B_BALANCED")
+    });
+    // And receive comes back on its own: a switch that left the buffer closed
+    // would be a radio that went deaf when its antenna was chosen.
+    wait_for("receive to resume", || fake.state.lock().unwrap().rx_buffer_open);
+    let g = fake.state.lock().expect("lock");
+    assert!(g.rx_buffer_opens > opens_before, "the buffer was never closed for the write");
+    drop(g);
+
+    // The transmit port is the same register set and the same rule.
+    handle.set_tx_port("B");
+    wait_for("the transmit port change", || {
+        fake.state.lock().unwrap().get("ad9361-phy/OUTPUT/voltage0/rf_port_select") == Some("B")
+    });
+    wait_for("receive to resume", || fake.state.lock().unwrap().rx_buffer_open);
 }
 
 #[test]
@@ -1328,21 +1497,25 @@ fn a_non_pluto_iio_device_is_refused_by_name() {
     assert!(text.contains("adc081c"), "{text}");
 }
 
-/// A firmware that publishes no `_available` attributes still has to work — and
-/// has to say which figures are guesses rather than quoting them as fact.
-#[test]
-fn a_silent_firmware_falls_back_and_says_so() {
+/// A board whose firmware says nothing useful about its tuning range, with a
+/// synthesiser that accepts `lo_limit_hz` and refuses everything else.
+///
+/// The model string is the AD9363 one and every `_available` attribute is
+/// stripped, so nothing the client can *read* distinguishes a stock board from
+/// a modified one — only what the synthesiser does.
+fn silent_firmware(lo_limit_hz: (f64, f64)) -> (PlutoHandle, Arc<AtomicBool>) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
     let addr = listener.local_addr().expect("addr");
-    // The same context with every `_available` attribute removed, and an
-    // AD9363 model string.
     let xml = CONTEXT_XML
         .replace("(Z7010-AD9364)", "(Z7010-AD9363)")
         .lines()
         .filter(|l| !l.contains("_available"))
         .collect::<Vec<_>>()
         .join("\n");
-    let state = Arc::new(Mutex::new(DeviceState::default()));
+    let state = Arc::new(Mutex::new(DeviceState {
+        lo_limit_hz: Some(lo_limit_hz),
+        ..DeviceState::default()
+    }));
     let stop = Arc::new(AtomicBool::new(false));
     {
         let state = Arc::clone(&state);
@@ -1357,17 +1530,56 @@ fn a_silent_firmware_falls_back_and_says_so() {
             }
         });
     }
-
     let handle = PlutoHandle::open(&addr.to_string(), &config(), 435_000_000.0)
         .expect("a silent firmware still opens");
-    // The AD9363 range, because that is what the model string names.
-    assert_eq!(handle.limits.rx_lo_hz, (325_000_000.0, 3_800_000_000.0));
+    (handle, stop)
+}
+
+/// A firmware that publishes no `_available` attributes still has to work — and
+/// has to say which figures are guesses rather than quoting them as fact.
+#[test]
+fn a_silent_firmware_falls_back_and_says_so() {
+    let (handle, stop) = silent_firmware(AD9363_LO_HZ);
+    // The AD9363 range, because that is what the synthesiser turned out to do.
+    assert_eq!(handle.limits.rx_lo_hz, AD9363_LO_HZ);
     let status = handle.open_status().expect("a guessed limit has to announce itself");
     assert!(status.contains("assuming"), "{status}");
-    assert!(status.contains("tuning range"), "{status}");
+    // …but not about the tuning range, which was measured rather than guessed.
+    assert!(!status.contains("tuning range"), "{status}");
     drop(handle);
     stop.store(true, Ordering::Relaxed);
 }
+
+/// Issue #340: the frequency-expansion modification leaves every *claim* a
+/// Pluto makes about itself untouched — the EEPROM still says AD9363 and the
+/// firmware still publishes the stock range, if it publishes one at all. Only
+/// the synthesiser knows, so the synthesiser is what gets asked.
+#[test]
+fn a_board_modified_to_reach_70_mhz_is_allowed_to() {
+    let (handle, stop) = silent_firmware(AD9364_LO_HZ);
+    assert_eq!(handle.limits.rx_lo_hz, AD9364_LO_HZ);
+    // Both halves of the part move together, so the transmit range follows.
+    assert_eq!(handle.limits.tx_lo_hz, AD9364_LO_HZ);
+    drop(handle);
+    stop.store(true, Ordering::Relaxed);
+}
+
+/// …and the same measurement in the other direction: a firmware that
+/// advertises the wide range on a part that will not deliver it must not leave
+/// the operator tuning to frequencies the radio never reaches.
+#[test]
+fn a_stock_board_advertising_the_wide_range_is_held_to_what_it_can_do() {
+    let fake = Fake::start();
+    fake.state.lock().expect("lock").lo_limit_hz = Some(AD9363_LO_HZ);
+    // `CONTEXT_XML` publishes `[70000000 1 6000000000]` for both synthesisers.
+    let handle = PlutoHandle::open(&fake.address(), &config(), 435_000_000.0).expect("open");
+    assert_eq!(handle.limits.rx_lo_hz, AD9363_LO_HZ);
+    assert_eq!(handle.limits.tx_lo_hz, AD9363_LO_HZ);
+}
+
+/// The stock AD9363 tuning range, and the AD9364 one a modified board reaches.
+const AD9363_LO_HZ: (f64, f64) = (325_000_000.0, 3_800_000_000.0);
+const AD9364_LO_HZ: (f64, f64) = (70_000_000.0, 6_000_000_000.0);
 
 /// The same server as [`serve`], with the context document substituted.
 fn serve_with_xml(
@@ -1428,8 +1640,12 @@ fn serve_with_xml(
                 }
                 let value =
                     String::from_utf8_lossy(&payload).trim_end_matches('\0').trim().to_string();
-                state.lock().expect("lock").attrs.push((key, value));
-                writer.write_all(format!("{len}\n").as_bytes()).is_ok()
+                if refuses_carrier(&state, &key, &value) {
+                    writer.write_all(b"-22\n").is_ok()
+                } else {
+                    state.lock().expect("lock").attrs.push((key, value));
+                    writer.write_all(format!("{len}\n").as_bytes()).is_ok()
+                }
             }
             Some("OPEN") | Some("CLOSE") => writer.write_all(b"0\n").is_ok(),
             Some("READBUF") | Some("WRITEBUF") => writer.write_all(b"-11\n").is_ok(),
@@ -1536,4 +1752,79 @@ fn a_stock_pluto_refuses_a_second_chain() {
     assert!(err.contains("1 chain"), "{err}");
     assert!(err.contains("2R2T"), "the refusal should say what would provide one: {err}");
     rig.release();
+}
+
+/// Issue #311: the gain on a 2R2T board's *second* receiver was refused.
+///
+/// The control thread tracks a gain-control mode per chain and seeds both from
+/// the radio's configuration, but only chain 0 was ever put there — so on a
+/// board whose firmware boots chain 1 in an attack mode, sdroxide believed it
+/// was in manual, sent the gain, and the driver answered `-EOPNOTSUPP` (-95).
+/// The slider moved and nothing happened.
+///
+/// The `voltage1` control channel this needs is what a real 2R2T firmware
+/// exposes and what the fixture now carries; a stock Pluto has none, and there
+/// the write is held rather than sent.
+#[test]
+fn the_second_receivers_gain_reaches_the_second_receiver() {
+    use sdroxide_pluto::PlutoRig;
+
+    let fake = Fake::start_pluto_plus();
+    let cfg = PlutoConfig { agc: PlutoAgc::Manual, rx_gain_db: 40.0, ..config() };
+    let rig = PlutoRig::open(&fake.address(), &cfg, 435_000_000.0).expect("open");
+
+    // Both chains are put where the configuration says before either is used:
+    // the second one's registers boot wherever the driver left them, which is
+    // not where chain 0's config just went.
+    wait_for("chain 1's gain-control mode", || {
+        fake.state.lock().expect("lock").get("ad9361-phy/INPUT/voltage1/gain_control_mode")
+            == Some("manual")
+    });
+
+    let mut r1 = rig.rx(1).expect("attach chain 1");
+    r1.set_rx_gain_db(9.0);
+    wait_for("chain 1's gain", || {
+        fake.state
+            .lock()
+            .expect("lock")
+            .get("ad9361-phy/INPUT/voltage1/hardwaregain")
+            .is_some_and(|v| v.starts_with('9'))
+    });
+
+    // And chain 0 is untouched by it: two receivers, two gain registers.
+    let g = fake.state.lock().expect("lock");
+    assert!(
+        g.get("ad9361-phy/INPUT/voltage0/hardwaregain").unwrap().starts_with("40"),
+        "chain 0's gain moved with chain 1's: {:?}",
+        g.get("ad9361-phy/INPUT/voltage0/hardwaregain")
+    );
+}
+
+/// And if the two ever disagree anyway — another program moved the mode, or a
+/// firmware boots a chain somewhere sdroxide did not put it — a refused gain
+/// write is recovered from rather than merely logged.
+#[test]
+fn a_chain_found_in_the_wrong_mode_is_put_right_and_the_gain_retried() {
+    use sdroxide_pluto::PlutoRig;
+
+    let fake = Fake::start_pluto_plus();
+    let cfg = PlutoConfig { agc: PlutoAgc::Manual, rx_gain_db: 40.0, ..config() };
+    let rig = PlutoRig::open(&fake.address(), &cfg, 435_000_000.0).expect("open");
+    let mut r1 = rig.rx(1).expect("attach chain 1");
+    wait_for("chain 1's opening gain", || {
+        fake.state.lock().expect("lock").get("ad9361-phy/INPUT/voltage1/hardwaregain").is_some()
+    });
+
+    // Somebody else puts the chain into an attack mode behind sdroxide's back.
+    fake.state.lock().expect("lock").attrs.push((
+        "ad9361-phy/INPUT/voltage1/gain_control_mode".to_string(),
+        "slow_attack".to_string(),
+    ));
+
+    r1.set_rx_gain_db(11.0);
+    wait_for("the gain to land after the mode was put back", || {
+        let g = fake.state.lock().expect("lock");
+        g.get("ad9361-phy/INPUT/voltage1/gain_control_mode") == Some("manual")
+            && g.get("ad9361-phy/INPUT/voltage1/hardwaregain").is_some_and(|v| v.starts_with("11"))
+    });
 }

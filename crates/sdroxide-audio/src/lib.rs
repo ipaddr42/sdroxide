@@ -2,8 +2,8 @@
 //! lock-free ring buffer. The DSP engine owns the producer side.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
@@ -138,8 +138,102 @@ fn choose_config(
     best.map(|(_, c, f)| (c, f))
 }
 
+/// How often a stream that keeps reporting glitches may say so.
+///
+/// The first one is logged as it happens, because the first one is news. After
+/// that they are counted and summarised: a virtual audio cable can raise one
+/// every few seconds for as long as it is running, and a line per glitch turns
+/// the diagnostics window into a wall of identical warnings with the rest of
+/// the session's log scrolled off the top of it (issues #338, #343).
+const GLITCH_REPORT_EVERY: Duration = Duration::from_secs(60);
+
+/// The running count of capture glitches on one stream, and when it last said
+/// anything about them.
+///
+/// A glitch here is the host telling us the captured audio is not continuous —
+/// on WASAPI, the data-discontinuity flag; on ALSA, an overrun. Samples between
+/// two callbacks were lost and nothing downstream can tell, because what
+/// arrives is spliced end to end: the panadapter looks perfectly healthy and
+/// the audio has a hole in it. That matters most to the modes that align audio
+/// to a clock — an FT8 cycle with a gap in the middle of it decodes nothing —
+/// which is why it is counted rather than merely survived.
+struct Glitches {
+    n: Arc<AtomicU64>,
+    said: Mutex<(u64, Instant)>,
+    /// Whether a lost sample on this stream costs anything downstream.
+    ///
+    /// True for a receive stream — a hole in a receiver's audio or I/Q is a
+    /// decode that does not happen, and that is what the warning is for. False
+    /// for the microphone, whose samples reach nothing at all except a
+    /// transmitter that is not keyed: while receiving, the ring is drained and
+    /// discarded on every tick, so a microphone that loses a millisecond has
+    /// lost a millisecond of nothing.
+    ///
+    /// The distinction exists because the warning without it is actively
+    /// misleading. Both streams glitch together on a machine that is briefly
+    /// busy, and the operator in issue #367 quite reasonably read two identical
+    /// warnings as two identical faults and went looking for what a USB
+    /// microphone had to do with FT8 not decoding. It had nothing to do with
+    /// it.
+    costs_a_decode: bool,
+}
+
+impl Glitches {
+    fn new(n: Arc<AtomicU64>, costs_a_decode: bool) -> Glitches {
+        Glitches { n, said: Mutex::new((0, Instant::now())), costs_a_decode }
+    }
+
+    /// Record one and log it, at most once per [`GLITCH_REPORT_EVERY`] after
+    /// the first.
+    fn on_glitch(&self, what: &str, device: &str) {
+        let total = self.n.fetch_add(1, Ordering::Relaxed) + 1;
+        let Ok(mut said) = self.said.lock() else { return };
+        let (last_total, at) = *said;
+        if total > 1 && at.elapsed() < GLITCH_REPORT_EVERY {
+            return;
+        }
+        *said = (total, Instant::now());
+        if !self.costs_a_decode {
+            // Recorded and reported, but not as a fault: nothing is listening
+            // to this stream unless the transmitter is keyed by voice, and then
+            // the hole is a millisecond of speech rather than a lost period.
+            info!(
+                "{what}: the audio stream from \"{device}\" glitched ({total} so far) — the \
+                 host lost samples between two callbacks. On the microphone this only matters \
+                 during a voice over, where it is a millisecond of speech; while receiving, \
+                 nothing reads this stream at all and it costs nothing. It is not why a \
+                 digital mode is failing to decode — look at the receiver's own audio stream \
+                 for that."
+            );
+            return;
+        }
+        if total == 1 {
+            warn!(
+                "{what}: the audio stream from \"{device}\" glitched — the host says samples \
+                 were lost between two callbacks, so what reaches the decoders has a hole in \
+                 it spliced out of it. A virtual audio cable (VB-Audio, VAC, Flex DAX) does \
+                 this routinely when the program feeding it is not keeping exact pace; a real \
+                 sound card doing it means this machine is not keeping up. Further glitches on \
+                 this stream are counted and summarised rather than logged one by one."
+            );
+        } else {
+            let since = total - last_total;
+            warn!(
+                "{what}: {since} more audio glitch(es) from \"{device}\" in the last {:.0} s \
+                 ({total} since the stream opened)",
+                at.elapsed().as_secs_f64()
+            );
+        }
+    }
+}
+
 /// Build a running input stream that converts any supported sample format to
 /// f32 and pushes to `producer` (mono channel 0, or interleaved L/R if `stereo`).
+///
+/// `what` and `device` name the stream in anything it has to report, because
+/// a station runs several at once — a microphone, a receiver's audio, a
+/// panadapter's — and "input stream error" said nothing about which.
+#[allow(clippy::too_many_arguments)]
 fn spawn_input(
     device: &cpal::Device,
     config: &cpal::StreamConfig,
@@ -147,8 +241,15 @@ fn spawn_input(
     stereo: bool,
     mut producer: rtrb::Producer<f32>,
     dropped: Arc<AtomicU64>,
+    glitches: Arc<AtomicU64>,
+    what: &'static str,
+    label: String,
+    // Whether a hole in this stream costs a decode — see
+    // `Glitches::costs_a_decode`.
+    costs_a_decode: bool,
 ) -> Result<cpal::Stream, AudioError> {
     let channels = config.channels as usize;
+    let log = Glitches::new(glitches, costs_a_decode);
     macro_rules! build {
         ($t:ty) => {
             device.build_input_stream(
@@ -179,7 +280,16 @@ fn spawn_input(
                         dropped.fetch_add(lost, Ordering::Relaxed);
                     }
                 },
-                |e| warn!("input stream error: {e}"),
+                move |e| {
+                    // A glitch is not a broken stream: the host is telling us
+                    // it lost samples and carried on, and so do we. Everything
+                    // else is a fault worth one line each.
+                    if e.kind() == cpal::ErrorKind::Xrun {
+                        log.on_glitch(what, &label);
+                    } else {
+                        warn!("{what}: audio input from \"{label}\" failed: {e}");
+                    }
+                },
                 None,
             )
         };
@@ -206,8 +316,15 @@ fn spawn_output(
     fmt: SampleFormat,
     mut consumer: rtrb::Consumer<f32>,
     underruns: Arc<AtomicU64>,
+    what: &'static str,
+    label: String,
 ) -> Result<cpal::Stream, AudioError> {
     let channels = config.channels as usize;
+    // The same rate limit the capture side runs on, and for the same reason: a
+    // virtual cable on the playback end glitches just as freely as one on the
+    // capture end. Its count is not published — `underruns` above is the
+    // figure that matters for playback, and it is ours rather than the host's.
+    let log = Glitches::new(Arc::new(AtomicU64::new(0)), true);
     macro_rules! build {
         ($t:ty) => {
             device.build_output_stream(
@@ -237,7 +354,13 @@ fn spawn_output(
                         underruns.fetch_add(1, Ordering::Relaxed);
                     }
                 },
-                |e| warn!("output stream error: {e}"),
+                move |e| {
+                    if e.kind() == cpal::ErrorKind::Xrun {
+                        log.on_glitch(what, &label);
+                    } else {
+                        warn!("{what}: audio output to \"{label}\" failed: {e}");
+                    }
+                },
                 None,
             )
         };
@@ -296,6 +419,7 @@ pub struct AudioInput {
     /// Channels the capture stream actually runs with (1 = mono; IQ needs ≥2).
     pub channels: u16,
     dropped: Arc<AtomicU64>,
+    glitches: Arc<AtomicU64>,
 }
 
 impl AudioInput {
@@ -310,6 +434,19 @@ impl AudioInput {
     /// machine cannot keep up with the rate it was asked for".
     pub fn dropped_frames(&self) -> u64 {
         self.dropped.load(Ordering::Relaxed)
+    }
+
+    /// Times the *host* said the captured audio was not continuous — see
+    /// [`Glitches`].
+    ///
+    /// The other half of [`Self::dropped_frames`], and a different fault
+    /// wearing the same face. Frames dropped here mean this program could not
+    /// keep up; glitches mean the audio never arrived, and no amount of
+    /// headroom on this side would have caught them. An operator whose FT8 will
+    /// not decode needs to know which of the two they have, because the answers
+    /// are "close something" and "fix the audio device".
+    pub fn glitches(&self) -> u64 {
+        self.glitches.load(Ordering::Relaxed)
     }
 }
 
@@ -660,9 +797,50 @@ fn pick_device(
 /// Open an input device (microphone) by name (`None` = system default) and
 /// stream mono f32 samples into the returned consumer's ring (channel 0).
 /// Accepts any native sample format (i16/i32/u16/u8/f32), converting to f32.
+///
+/// The driver's own period is left alone, because a microphone is
+/// latency-critical: what it hears is monitored, keyed and put on the air while
+/// the operator is still speaking. A capture nobody is waiting on in real time
+/// wants [`start_input_buffered`] instead.
 pub fn start_input(
     device_name: Option<&str>,
     preferred_rate: u32,
+) -> Result<(AudioInput, rtrb::Consumer<f32>), AudioError> {
+    // A hole in the microphone is only heard during a voice over, and never
+    // costs a decode: see [`Glitches::costs_a_decode`] and issue #367.
+    start_input_mono(device_name, preferred_rate, false, "mic input", false)
+}
+
+/// [`start_input`] with the same generous, rate-independent capture period as
+/// [`start_input_stereo`] (see [`CAPTURE_BUFFER_MS`]) rather than the driver's
+/// own default.
+///
+/// For a transceiver's demodulated audio, not a microphone. That stream is read
+/// on somebody else's clock — once per block the *attached receiver* hands back,
+/// where a rig's audio arrives beside an SDR's I/Q (`PanadapterAudio::Transceiver`)
+/// — and nothing downstream is waiting on it in real time the way a monitored
+/// microphone is. Left at the driver's default, a short negotiated period
+/// (PipeWire's desktop-interactive quantum can be a few milliseconds) leaves no
+/// margin for scheduling jitter, and a capture callback that misses its own
+/// deadline is a stream-level underrun rather than merely the software ring
+/// this feeds falling behind (issue #354).
+pub fn start_input_buffered(
+    device_name: Option<&str>,
+    preferred_rate: u32,
+) -> Result<(AudioInput, rtrb::Consumer<f32>), AudioError> {
+    start_input_mono(device_name, preferred_rate, true, "radio audio input", true)
+}
+
+/// The body both mono capture openers share. `buffered` asks for the
+/// [`CAPTURE_BUFFER_MS`] period; `what` names the stream in the log, because
+/// "mic input refused" against a rig's sound card would send the reader looking
+/// at the wrong cable.
+fn start_input_mono(
+    device_name: Option<&str>,
+    preferred_rate: u32,
+    buffered: bool,
+    what: &'static str,
+    costs_a_decode: bool,
 ) -> Result<(AudioInput, rtrb::Consumer<f32>), AudioError> {
     let host = cpal::default_host();
     let (device, label) = pick_device(&host, device_name, false)?;
@@ -670,24 +848,51 @@ pub fn start_input(
     let picked = device
         .supported_input_configs()
         .ok()
-        .and_then(|configs| choose_config(configs, preferred_rate, 1));
+        .and_then(|configs| choose_config(configs, preferred_rate, 1))
+        .map(|(cfg, fmt)| {
+            if !buffered {
+                return (cfg, fmt);
+            }
+            // `config_candidates` retries without the period for a device that
+            // will not take the one asked for.
+            let period = capture_period_frames(cfg.sample_rate);
+            (cpal::StreamConfig { buffer_size: cpal::BufferSize::Fixed(period), ..cfg }, fmt)
+        });
     let mut last = AudioError::NoConfig;
     for (config, fmt) in config_candidates(picked, device.default_input_config()) {
         let rate = config.sample_rate;
         let channels = config.channels;
         let (producer, consumer) = rtrb::RingBuffer::<f32>::new(rate as usize);
         let dropped = Arc::new(AtomicU64::new(0));
+        let glitches = Arc::new(AtomicU64::new(0));
         let started = Instant::now();
-        match spawn_input(&device, &config, fmt, false, producer, dropped.clone()) {
+        match spawn_input(
+            &device,
+            &config,
+            fmt,
+            false,
+            producer,
+            dropped.clone(),
+            glitches.clone(),
+            what,
+            label.clone(),
+            costs_a_decode,
+        ) {
             Ok(stream) => {
-                info!(rate, format = ?fmt, device = %label, "mic input running");
+                info!(rate, buffer = ?config.buffer_size, format = ?fmt, device = %label, "{what} running");
                 return Ok((
-                    AudioInput { _stream: stream, sample_rate: rate as f64, channels, dropped },
+                    AudioInput {
+                        _stream: stream,
+                        sample_rate: rate as f64,
+                        channels,
+                        dropped,
+                        glitches,
+                    },
                     consumer,
                 ));
             }
             Err(e) => {
-                warn!("mic input {channels}ch {rate} Hz {fmt:?} refused: {e}");
+                warn!("{what} {channels}ch {rate} Hz {fmt:?} refused: {e}");
                 last = e;
                 if slow_refusal(&label, started.elapsed()) {
                     break;
@@ -803,8 +1008,20 @@ pub fn start_input_stereo(
         let channels = hw_channels.unwrap_or(config.channels);
         let (producer, consumer) = rtrb::RingBuffer::<f32>::new(rate as usize * 2);
         let dropped = Arc::new(AtomicU64::new(0));
+        let glitches = Arc::new(AtomicU64::new(0));
         let started = Instant::now();
-        match spawn_input(&device, &config, fmt, true, producer, dropped.clone()) {
+        match spawn_input(
+            &device,
+            &config,
+            fmt,
+            true,
+            producer,
+            dropped.clone(),
+            glitches.clone(),
+            "radio IQ input",
+            label.clone(),
+            true,
+        ) {
             Ok(stream) => {
                 info!(rate, buffer = ?config.buffer_size, stream_channels = config.channels, hw_channels = channels, format = ?fmt, device = %label, "radio IQ input running");
                 // The card is the one that decides. A panadapter half the width
@@ -820,7 +1037,13 @@ pub fn start_input_stereo(
                     );
                 }
                 return Ok((
-                    AudioInput { _stream: stream, sample_rate: rate as f64, channels, dropped },
+                    AudioInput {
+                        _stream: stream,
+                        sample_rate: rate as f64,
+                        channels,
+                        dropped,
+                        glitches,
+                    },
                     consumer,
                 ));
             }
@@ -868,7 +1091,15 @@ pub fn start_output(
         let (producer, consumer) = rtrb::RingBuffer::<f32>::new(rate as usize * 2);
         let underruns = Arc::new(AtomicU64::new(0));
         let started = Instant::now();
-        match spawn_output(&device, &config, fmt, consumer, underruns.clone()) {
+        match spawn_output(
+            &device,
+            &config,
+            fmt,
+            consumer,
+            underruns.clone(),
+            "audio output",
+            label.clone(),
+        ) {
             Ok(stream) => {
                 info!(rate, channels, format = ?fmt, device = %label, "audio output running");
                 return Ok((

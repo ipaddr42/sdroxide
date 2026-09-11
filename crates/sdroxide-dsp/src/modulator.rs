@@ -21,20 +21,22 @@ pub trait Modulator: Send {
 /// keyed.
 ///
 /// `passband` is the SSB filter's band-pass edges for plain voice (USB/LSB),
-/// so transmit bandwidth follows the operator's receive filter. SSTV takes it
-/// too — not for the width, which is fixed, but for the sign: its sideband
-/// depends on the band (LSB on 160/80/40 m) and so cannot be answered from the
-/// mode alone. Other modes ignore it and use their own fixed passband.
+/// so transmit bandwidth follows the operator's receive filter. SSTV and RADE
+/// take it too — not for the width, which is fixed in both, but for the sign:
+/// their sideband depends on the band (LSB on 160/80/40 m) and so cannot be
+/// answered from the mode alone. Other modes ignore it and use their own fixed
+/// passband.
 pub fn make_modulator(mode: Mode, rate: f64, passband: (f32, f32)) -> Option<Box<dyn Modulator>> {
     let (lo, hi) = match mode {
-        Mode::Lsb | Mode::Usb | Mode::Sstv => passband,
+        Mode::Lsb | Mode::Usb => passband,
+        m if m.sideband_follows_band() => passband,
         _ => mode.default_filter(),
     };
     match mode {
         // FT8/FT4 modulate as USB: the synthesized 12 kHz audio (resampled to
         // 48 k, injected as "mic") is USB-modulated exactly like a real radio.
-        // PSK/RTTY and Olivia/Thor/FSQ ride the same USB path; SSTV rides the
-        // same path on whichever sideband its passband names.
+        // PSK/RTTY and Olivia/Thor/FSQ ride the same USB path; SSTV and RADE
+        // ride the same path on whichever sideband their passband names.
         Mode::Lsb
         | Mode::Usb
         | Mode::Digu
@@ -58,6 +60,11 @@ pub fn make_modulator(mode: Mode, rate: f64, passband: (f32, f32)) -> Option<Box
         | Mode::PacketHf
         | Mode::Rade => Some(Box::new(SsbMod::new(rate, lo, hi))),
         Mode::Am | Mode::Sam | Mode::Dsb => Some(Box::new(AmMod::new(rate))),
+        // ISB is receive only: transmitting it wants two modulators feeding
+        // one linear amplifier, which is a station, not a setting. No
+        // modulator means the transmit gate refuses the over rather than
+        // putting something else on the air under an ISB label.
+        Mode::Isb => None,
         // VHF SSTV modulates the carrier through the voice FM path — see the
         // demodulator, which is its other half: the picture goes into an FM
         // transmitter exactly as speech would.
@@ -77,7 +84,9 @@ pub fn make_modulator(mode: Mode, rate: f64, passband: (f32, f32)) -> Option<Box
         // DRM joins them for a plainer reason than CW's: it is a broadcast
         // system. There is no amateur DRM transmission to make, and a
         // receiver that could key one has no business doing so.
-        Mode::Cw | Mode::Wfm | Mode::Spec | Mode::Drm | Mode::Adsb | Mode::Vdl2 => None,
+        Mode::Cw | Mode::Wfm | Mode::Spec | Mode::Drm | Mode::Adsb | Mode::Vdl2 | Mode::Ais => {
+            None
+        }
     }
 }
 

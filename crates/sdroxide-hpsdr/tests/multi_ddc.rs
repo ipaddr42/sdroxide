@@ -219,14 +219,17 @@ fn two_ddcs_share_one_connection_and_detach_independently() {
         "127.0.0.1".parse().unwrap(),
         384_000.0,
         0.0,
-        sdroxide_types::HpsdrFilterBoard::None,
+        sdroxide_types::HpsdrOcPlan::none(),
         false,
         true,
         sdroxide_types::HpsdrIoRxInput::Radio,
+        // Automatic overload protection off: these tests drive the wire, not
+        // the loop that rides on it.
+        sdroxide_hpsdr::AutoGain::new(false, 1.0, 100, 10_000, -12.0, 48.0),
     )
     .expect("open");
     assert_eq!(board.protocol(), 2);
-    assert_eq!(board.board(), "Saturn");
+    assert_eq!(board.board(), "Saturn (ANAN-G2)");
     assert_eq!(board.ddc_count(), 8);
 
     // A DDC beyond the framing is refused with the count.

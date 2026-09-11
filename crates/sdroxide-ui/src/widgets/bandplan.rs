@@ -57,6 +57,11 @@ fn ham_label(band: Band, region: Region) -> &'static str {
         Band::M17 => "17m HAM",
         Band::M15 => "15m HAM",
         Band::M12 => "12m HAM",
+        // Never actually drawn: `coarse` and `fine` skip the bands that are
+        // not amateur allocations, because `non_ham` already carries this one
+        // as CB and drawing it twice — once in the ham colour — would claim it
+        // was ours (issue #396). Named honestly all the same.
+        Band::M11 => "11m CB",
         Band::M10 => "10m HAM",
         Band::M6 => "6m HAM",
         Band::M4 => "4m HAM",
@@ -71,6 +76,7 @@ fn ham_label(band: Band, region: Region) -> &'static str {
             Region::R1 => "6cm HAM",
             Region::R2 | Region::R3 => "5cm HAM",
         },
+        Band::Cm3 => "3cm HAM",
         Band::Gen => "GEN",
     }
 }
@@ -133,6 +139,11 @@ fn non_ham(region: Region) -> Vec<Seg> {
 fn coarse(region: Region) -> Vec<Seg> {
     let mut v = non_ham(region);
     for band in Band::ALL {
+        // `non_ham` above already carries every allocation that is not ours —
+        // CB included — with its own colour and label.
+        if !band.is_amateur() {
+            continue;
+        }
         let Some((lo, hi)) = band.edges_in(region) else { continue };
         v.push(s(lo, hi, ham_label(band, region), Kind::Ham));
     }
@@ -156,8 +167,12 @@ fn fine(region: Region) -> Vec<Seg> {
         v.push(s(seg.lo, seg.hi, label, kind));
     }
     // The bands with no sub-segment table keep their whole-band block, so
-    // zooming into 2 m or 70 cm does not empty the strip.
+    // zooming into 2 m or 70 cm does not empty the strip. Non-amateur
+    // allocations are `non_ham`'s, as in `coarse`.
     for band in Band::ALL {
+        if !band.is_amateur() {
+            continue;
+        }
         let Some((lo, hi)) = band.edges_in(region) else { continue };
         if !segs.iter().any(|s| s.lo < hi && s.hi > lo) {
             v.push(s(lo, hi, ham_label(band, region), Kind::Ham));
@@ -334,21 +349,33 @@ fn draw_seg(
 /// say about.
 const PANEL_MAX_FRAC: f32 = 0.10;
 
-/// Draw the bandplan strip along the oldest edge of the waterfall rect — its
-/// bottom normally, its top when the waterfall is flipped — so the strip never
-/// covers the newest rows.
+/// How deep the strip will be, worked out without drawing it. Zero where it
+/// would stand aside.
 ///
-/// `panel_below` — a mode panel (FT8's decodes, JS8's chat, CW's keyboard …) is
-/// taking part of the height, so the strip has to fit in [`PANEL_MAX_FRAC`] of
-/// what is left or step aside.
-///
-/// Returns how deep the strip ended up, so that whatever else annotates the
-/// same edge — the memory marks — can stack inwards from it instead of over
-/// it. Zero when it stood aside.
-pub fn overlay(p: &Painter, view: &ViewState, wf: &Rect, panel_below: bool) -> f32 {
+/// Wanted on its own because the memory marks stack inwards from the strip's
+/// inner edge and are laid out before the pointer is dealt with — hundreds of
+/// lines before anything on the waterfall is painted. See
+/// [`super::memories::layout`].
+pub fn height(view: &ViewState, wf: &Rect, panel_below: bool) -> f32 {
+    plan(view, wf, panel_below).map_or(0.0, |p| p.total_h)
+}
+
+/// What the strip works out before it draws anything.
+struct Plan {
+    fs: f32,
+    base_h: f32,
+    digi_h: f32,
+    region: sdroxide_types::Region,
+    digi_rows: Vec<Vec<DigiSeg>>,
+    n_digi: usize,
+    total_h: f32,
+}
+
+/// Decide the strip's rows and depth, or `None` where it stands aside.
+fn plan(view: &ViewState, wf: &Rect, panel_below: bool) -> Option<Plan> {
     let span = view.span();
     if span <= 0.0 || wf.height() < 24.0 {
-        return 0.0;
+        return None;
     }
     let (lo, hi) = (view.view_lo_hz, view.view_hi_hz);
 
@@ -371,8 +398,26 @@ pub fn overlay(p: &Painter, view: &ViewState, wf: &Rect, panel_below: bool) -> f
 
     let total_h = base_h + n_digi as f32 * digi_h;
     if panel_below && total_h > wf.height() * PANEL_MAX_FRAC {
-        return 0.0;
+        return None;
     }
+    Some(Plan { fs, base_h, digi_h, region, digi_rows, n_digi, total_h })
+}
+
+/// Draw the bandplan strip along the oldest edge of the waterfall rect — its
+/// bottom normally, its top when the waterfall is flipped — so the strip never
+/// covers the newest rows.
+///
+/// `panel_below` — a mode panel (FT8's decodes, JS8's chat, CW's keyboard …) is
+/// taking part of the height, so the strip has to fit in [`PANEL_MAX_FRAC`] of
+/// what is left or step aside.
+///
+/// Returns how deep the strip ended up, so that whatever else annotates the
+/// same edge — the memory marks — can stack inwards from it instead of over
+/// it. Zero when it stood aside.
+pub fn overlay(p: &Painter, view: &ViewState, wf: &Rect, panel_below: bool) -> f32 {
+    let span = view.span();
+    let Some(plan) = plan(view, wf, panel_below) else { return 0.0 };
+    let Plan { fs, base_h, digi_h, region, digi_rows, n_digi, total_h } = plan;
     // The allocation row sits outermost, on the waterfall's oldest edge, with
     // the digi rows stacked inwards from it.
     let flip = view.waterfall_flip;

@@ -4,9 +4,31 @@
 # Two kinds of device need permissions here, and neither is granted by default
 # on any distribution.
 #
-# TAG+="uaccess" hands an ACL to whoever is logged in at the active seat. That is
-# better than adding the user to a group, which needs the group to exist, the
-# user to be added to it, and a full re-login before it takes effect.
+# TAG+="uaccess" hands an ACL to whoever is logged in at the active seat, which
+# needs no group to exist and no re-login. It is the better half of this rule
+# and it is not the whole of it: uaccess grants nothing where there is no seat
+# to be logged in at — WSL2, a headless box reached over ssh, a container, or
+# sdroxide running as a systemd service — and the device stays root-owned and
+# unreachable for reasons nothing on screen explains (issue #350).
+#
+# So a GROUP= comes along with it as a fallback, taking effect for anyone in
+# that group when the ACL does not: `plugdev` for the HID boards, `gpio` for the
+# GPIO lines — the group whose own distribution rule this one is agreeing with.
+# To use it:
+#
+#   sudo groupadd -f plugdev && sudo usermod -aG plugdev $USER
+#
+# then log out and back in (`newgrp plugdev` for the current shell).
+#
+# That fallback is why the permissions below are applied on their own lines at
+# the end rather than appended to each id. udev resolves GROUP at parse time,
+# and a group that does not exist on this machine — plugdev ships on Debian and
+# Ubuntu, but not on Arch or Fedora — discards THE WHOLE RULE LINE, not just the
+# GROUP token. Written the obvious way, as one line per id carrying MODE, GROUP
+# and TAG together, a missing plugdev takes uaccess down with it and the device
+# stays root-owned on exactly the distros that never had the group (issue #350
+# again, from the other side). Keeping GROUP alone on its own line means only
+# that line is dropped and the ACL still lands.
 #
 # Install:
 #   sudo cp 60-sdroxide-relay.rules /usr/lib/udev/rules.d/
@@ -30,7 +52,7 @@
 # distribution's own generic FTDI rules already make, and the reason sdroxide's
 # own device list additionally filters on the product string ("USBRelay…")
 # rather than offering everything that answers to these ids.
-SUBSYSTEM=="hidraw", ATTRS{idVendor}=="16c0", ATTRS{idProduct}=="05df", MODE="0660", TAG+="uaccess"
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="16c0", ATTRS{idProduct}=="05df", ENV{SDROXIDE_RELAY_PLUGDEV}="1"
 
 # ── CM108/CM119-family sound-card GPIO ───────────────────────────────────────
 #
@@ -46,19 +68,26 @@ SUBSYSTEM=="hidraw", ATTRS{idVendor}=="16c0", ATTRS{idProduct}=="05df", MODE="06
 # in place, the chip is one of those.
 
 # C-Media's own parts: CM108, CM108B, CM119, CM119A, CM108AH.
-SUBSYSTEM=="hidraw", ATTRS{idVendor}=="0d8c", MODE="0660", TAG+="uaccess"
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="0d8c", ENV{SDROXIDE_RELAY_PLUGDEV}="1"
 
 # SSS1621/SSS1623 and relatives, which clone them.
-SUBSYSTEM=="hidraw", ATTRS{idVendor}=="0c76", ATTRS{idProduct}=="1605", MODE="0660", TAG+="uaccess"
-SUBSYSTEM=="hidraw", ATTRS{idVendor}=="0c76", ATTRS{idProduct}=="1607", MODE="0660", TAG+="uaccess"
-SUBSYSTEM=="hidraw", ATTRS{idVendor}=="0c76", ATTRS{idProduct}=="160b", MODE="0660", TAG+="uaccess"
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="0c76", ATTRS{idProduct}=="1605", ENV{SDROXIDE_RELAY_PLUGDEV}="1"
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="0c76", ATTRS{idProduct}=="1607", ENV{SDROXIDE_RELAY_PLUGDEV}="1"
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="0c76", ATTRS{idProduct}=="160b", ENV{SDROXIDE_RELAY_PLUGDEV}="1"
 
 # The AIOC (All-In-One-Cable), which emulates a CM108 in a microcontroller.
-SUBSYSTEM=="hidraw", ATTRS{idVendor}=="1209", ATTRS{idProduct}=="7388", MODE="0660", TAG+="uaccess"
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="1209", ATTRS{idProduct}=="7388", ENV{SDROXIDE_RELAY_PLUGDEV}="1"
 
 # ── GPIO lines ───────────────────────────────────────────────────────────────
 #
 # For a Raspberry Pi header or any other board with a GPIO character device.
 # Best-effort: many distributions ship their own rule giving these to a `gpio`
 # group, and where they do this one simply agrees with it.
-SUBSYSTEM=="gpio", KERNEL=="gpiochip*", MODE="0660", TAG+="uaccess"
+SUBSYSTEM=="gpio", KERNEL=="gpiochip*", ENV{SDROXIDE_RELAY_GPIO}="1"
+
+# Permissions, applied on their own lines — see the note at the top of this
+# file for why GROUP must not share a line with TAG+="uaccess".
+ENV{SDROXIDE_RELAY_PLUGDEV}=="1", MODE="0660", TAG+="uaccess"
+ENV{SDROXIDE_RELAY_GPIO}=="1", MODE="0660", TAG+="uaccess"
+ENV{SDROXIDE_RELAY_PLUGDEV}=="1", GROUP="plugdev"
+ENV{SDROXIDE_RELAY_GPIO}=="1", GROUP="gpio"

@@ -812,3 +812,179 @@ fn a_swap_to_a_front_end_that_cannot_reach_the_dial_moves_it() {
         let _ = t.join();
     }
 }
+
+/// A Hermes Lite 2 behind a 2 m transverter: the radio covers DC to 38.4 MHz,
+/// the transverter brings 144-148 MHz down to a 28 MHz I.F., and the operator
+/// types the band they tune into the RX range box.
+///
+/// Issue #279: that range used to be read as a *hardware* one and shifted by
+/// the offset along with the device's, so 144-148 with a −116 MHz transverter
+/// came out as 260-264 MHz and the radio refused every frequency in the band it
+/// had just been told about.
+#[test]
+fn a_stated_range_is_on_the_dial_not_the_intermediate_frequency() {
+    /// 28 MHz I.F. for 144 MHz on the air.
+    const XVTR: f64 = -116_000_000.0;
+    let hl2 = DeviceCaps {
+        driver: "test".into(),
+        label: "test".into(),
+        rx_channels: 1,
+        tx_channels: 1,
+        sample_rates: vec![RATE],
+        freq_ranges_rx: vec![(0.0, 38_400_000.0)],
+        freq_ranges_tx: vec![(0.0, 38_400_000.0)],
+        antennas_tx: vec!["TX/RX".into()],
+        ..DeviceCaps::default()
+    };
+    let band = [(144_000_000.0, 148_000_000.0)];
+
+    let caps = sdroxide_radio::converted_caps(hl2.clone(), XVTR, Some(XVTR), &band, &band);
+    assert_eq!(
+        caps.freq_ranges_rx, band,
+        "the band the operator typed is the band they get, offset or no offset"
+    );
+    assert_eq!(caps.freq_ranges_tx, band, "and the same on transmit, through the same transverter");
+
+    // Nothing stated: the device's own answer is the one that moves, because
+    // that one really is in the hardware's domain. 0-38.4 MHz through a
+    // −116 MHz transverter is 116-154.4 MHz on the dial.
+    let device_only = sdroxide_radio::converted_caps(hl2.clone(), XVTR, Some(XVTR), &[], &[]);
+    assert_eq!(device_only.freq_ranges_rx, vec![(116_000_000.0, 154_400_000.0)]);
+
+    // And a stated transmit range cannot hand a transmitter back to an operator
+    // who said there is nothing in the transmit line.
+    let rx_only = sdroxide_radio::converted_caps(hl2, XVTR, None, &band, &band);
+    assert_eq!(rx_only.freq_ranges_rx, band);
+    assert!(rx_only.freq_ranges_tx.is_empty(), "transmit was withdrawn and must stay withdrawn");
+}
+
+/// A station with two transverters on one I.F., which is what issue #278 asked
+/// for: 2 m and 6 m from two boxes into the same 28 MHz receiver, HF straight
+/// in, and each band with its own offset, transmit rule and drive limit.
+#[test]
+fn a_transverter_table_gives_each_band_its_own_offset() {
+    use sdroxide_radio::{ConverterPlan, ConverterStep};
+
+    let plan = ConverterPlan::from_steps([
+        // 6 m into 28 MHz: 28 − 50 = −22.
+        ConverterStep {
+            band: Some((50_000_000.0, 54_000_000.0)),
+            rx_offset_hz: -22_000_000.0,
+            tx_offset_hz: Some(-22_000_000.0),
+            tx_drive: Some(0.05),
+        },
+        // 2 m into the same I.F.: 28 − 144 = −116.
+        ConverterStep {
+            band: Some((144_000_000.0, 148_000_000.0)),
+            rx_offset_hz: -116_000_000.0,
+            tx_offset_hz: Some(-116_000_000.0),
+            tx_drive: Some(0.02),
+        },
+    ]);
+
+    // Each band goes to the same I.F. through a different offset.
+    assert_eq!(plan.offset_for(50_150_000.0), -22_000_000.0);
+    assert_eq!(plan.offset_for(144_300_000.0), -116_000_000.0);
+    // ...and HF is the radio, untouched, which is the whole reason the table
+    // is bands rather than one number.
+    assert_eq!(plan.offset_for(14_200_000.0), 0.0);
+    assert_eq!(plan.step_for(14_200_000.0).tx_offset_hz, Some(0.0), "HF still transmits");
+    assert_eq!(plan.step_for(14_200_000.0).tx_drive, None, "and at whatever drive was set");
+
+    // A drive ceiling belongs to the band, not to the station.
+    assert_eq!(plan.step_for(144_300_000.0).tx_drive, Some(0.02));
+
+    // The published ranges are the union: the radio's own HF, plus each
+    // transverter's band as far as the radio can reach through it.
+    let hl2 = DeviceCaps {
+        driver: "test".into(),
+        label: "test".into(),
+        rx_channels: 1,
+        tx_channels: 1,
+        sample_rates: vec![RATE],
+        freq_ranges_rx: vec![(0.0, 38_400_000.0)],
+        freq_ranges_tx: vec![(0.0, 38_400_000.0)],
+        antennas_tx: vec!["TX/RX".into()],
+        ..DeviceCaps::default()
+    };
+    let caps = sdroxide_radio::plan_caps(hl2, &plan, &[], &[]);
+    for hz in [1_840_000.0, 14_200_000.0, 50_150_000.0, 144_300_000.0] {
+        assert!(caps.may_rx_hz(hz), "{hz} should be reachable");
+        assert!(caps.may_tx_hz(hz), "{hz} should be transmittable");
+    }
+    // 70 cm is reachable through neither: no transverter names it and the
+    // radio stops at 38.4 MHz.
+    assert!(!caps.may_rx_hz(435_000_000.0));
+    // Nor is the *I.F.* still on the dial where a transverter has taken the
+    // band over — 28 MHz is 6 m's I.F., but the radio reaches it directly too,
+    // so it stays; what must not appear is 2 m's band through the 6 m box.
+    assert!(caps.may_rx_hz(28_500_000.0), "the radio's own 10 m is still there");
+}
+
+/// The band-selected offset has to reach the source, not just the plan: a dial
+/// moved from one transverter's band to another retunes the same radio to a
+/// different intermediate frequency.
+#[test]
+fn moving_between_transverters_retunes_the_same_radio() {
+    use sdroxide_radio::{ConverterPlan, ConverterStep};
+
+    let inner = Hardware::new(28_150_000.0);
+    let landed = Arc::clone(&inner.landed);
+    let plan = ConverterPlan::from_steps([
+        ConverterStep {
+            band: Some((50_000_000.0, 54_000_000.0)),
+            rx_offset_hz: -22_000_000.0,
+            tx_offset_hz: Some(-22_000_000.0),
+            tx_drive: Some(0.05),
+        },
+        ConverterStep {
+            band: Some((144_000_000.0, 148_000_000.0)),
+            rx_offset_hz: -116_000_000.0,
+            tx_offset_hz: Some(-116_000_000.0),
+            tx_drive: Some(0.02),
+        },
+    ]);
+    let mut source = ConvertedSource::with_plan(Box::new(inner), plan);
+
+    source.set_center_hz(50_150_000.0).expect("6 m");
+    assert!((*landed.lock().unwrap() - 28_150_000.0).abs() < 1.0);
+    assert!((source.center_hz() - 50_150_000.0).abs() < 1.0, "and reads back as 6 m");
+    assert_eq!(source.tx_drive_ceiling(), Some(0.05));
+
+    source.set_center_hz(144_300_000.0).expect("2 m");
+    assert!((*landed.lock().unwrap() - 28_300_000.0).abs() < 1.0);
+    assert!((source.center_hz() - 144_300_000.0).abs() < 1.0, "and reads back as 2 m");
+    assert_eq!(source.tx_drive_ceiling(), Some(0.02));
+
+    // HF is the radio itself: no offset, no ceiling.
+    source.set_center_hz(14_200_000.0).expect("20 m");
+    assert!((*landed.lock().unwrap() - 14_200_000.0).abs() < 1.0);
+    assert_eq!(source.tx_drive_ceiling(), None);
+}
+
+/// A radio opened on a transverter's I.F. has to come up on the *band*, not on
+/// the I.F.: the engine reads `center_hz()` before it has commanded anything,
+/// and a source that answered 28 MHz would put the dial there.
+#[test]
+fn a_source_opened_on_an_intermediate_frequency_comes_up_on_the_band() {
+    use sdroxide_radio::{ConverterPlan, ConverterStep};
+
+    let plan = ConverterPlan::from_steps([ConverterStep {
+        band: Some((144_000_000.0, 148_000_000.0)),
+        rx_offset_hz: -116_000_000.0,
+        tx_offset_hz: Some(-116_000_000.0),
+        tx_drive: Some(0.02),
+    }]);
+    // Opened where `converter_open_hz` would have put it for a 144.300 dial.
+    let source = ConvertedSource::with_plan(Box::new(Hardware::new(28_300_000.0)), plan.clone());
+    assert!(
+        (source.center_hz() - 144_300_000.0).abs() < 1.0,
+        "came up on {} rather than on 2 m",
+        source.center_hz()
+    );
+
+    // An I.F. no transverter can account for is the radio's own frequency and
+    // is left alone — that is 10 m, not a mis-seeded 2 m.
+    let source = ConvertedSource::with_plan(Box::new(Hardware::new(14_200_000.0)), plan);
+    assert!((source.center_hz() - 14_200_000.0).abs() < 1.0);
+}

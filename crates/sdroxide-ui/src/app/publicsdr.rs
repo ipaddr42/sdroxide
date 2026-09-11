@@ -270,6 +270,39 @@ fn confirm_panel(ui: &mut egui::Ui, blurb: &str) -> Option<Confirm> {
     answer
 }
 
+/// Rank what the chips let through against what is in the search box.
+///
+/// Two tiers, and the second only when the first comes up empty. Every other
+/// directory of KiwiSDRs answers a callsign typed into its filter with the one
+/// receiver named after it, and [`crate::fuzzy`] on its own does not: a
+/// six-character callsign is a scattered subsequence of dozens of the eleven
+/// hundred station names, antennas and place names here by pure accident, so
+/// the row actually wanted arrives buried in them (issue #347). When anything
+/// matches the query literally, then, those are the answer and the accidents
+/// are dropped; the fuzzy matches are what is left when nothing does, which is
+/// where they earn their keep — a half-remembered name or a typo still finds
+/// the receiver.
+fn ranked<'a>(visible: &[&'a PublicSdrEntry], query: &str) -> Vec<(&'a PublicSdrEntry, i32)> {
+    let scored: Vec<(&PublicSdrEntry, i32, bool)> = visible
+        .iter()
+        .filter_map(|e| {
+            let hay = e.haystack();
+            let literal = crate::fuzzy::contains_terms(&hay, query);
+            crate::fuzzy::score_terms(&hay, query).map(|s| (*e, s, literal))
+        })
+        .collect();
+    let any_literal = scored.iter().any(|&(_, _, literal)| literal);
+    let mut rows: Vec<(&PublicSdrEntry, i32)> = scored
+        .into_iter()
+        .filter(|&(_, _, literal)| literal || !any_literal)
+        .map(|(e, score, _)| (e, score))
+        .collect();
+    if !query.is_empty() {
+        rows.sort_by_key(|r| std::cmp::Reverse(r.1));
+    }
+    rows
+}
+
 impl SdroxideApp {
     /// Everything the search and the chips let through, ranked.
     fn public_sdr_rows<'a>(
@@ -290,14 +323,7 @@ impl SdroxideApp {
                     && (!self.public_sdr_in_band || e.covers(dial_hz))
             })
             .collect();
-        let mut rows: Vec<(&PublicSdrEntry, i32)> = visible
-            .iter()
-            .filter_map(|e| crate::fuzzy::score_terms(&e.haystack(), query).map(|s| (*e, s)))
-            .collect();
-        if !query.is_empty() {
-            rows.sort_by_key(|r| std::cmp::Reverse(r.1));
-        }
-        rows
+        ranked(&visible, query)
     }
 
     /// Browse the public-SDR directories and open one as a radio.
@@ -603,6 +629,11 @@ impl SdroxideApp {
                 // reseeded when the interface picker is used.
                 self.radio_cfg = Some(cfg.clone());
                 self.range_edit = None;
+                // ...and the same for where the antenna is, which the entry has
+                // just written: a dialog still showing "at the station" would
+                // put every reception report back in the operator's own square
+                // (issue #284).
+                self.rx_site_edit = None;
                 self.ctrl.set_radio_config(cfg);
                 self.ctrl.reopen_source();
                 // A tab named after the transceiver that used to be in it,
@@ -614,7 +645,15 @@ impl SdroxideApp {
                 // confirmation says the rename is coming.
                 self.radio_tab_requests
                     .push(RadioTabRequest::Rename { id: self.radio_id, name: entry.name.clone() });
-                self.show_notice(format!("Pointing this radio at {}…", entry.name));
+                // Where reports now go out from is worth one clause: it has
+                // changed under the operator, and silently getting it wrong is
+                // what issue #284 was.
+                let site = match entry.locator().as_str() {
+                    "" => " Its position is not published, so nothing it hears will be reported."
+                        .to_string(),
+                    g => format!(" Receptions will be reported from {g}."),
+                };
+                self.show_notice(format!("Pointing this radio at {}…{site}", entry.name));
                 self.show_public_sdrs = false;
             }
             PickAction::NewRadio => {
@@ -700,6 +739,70 @@ mod tests {
         assert_eq!(press("REPLACE"), Some(Confirm::Replace));
         assert_eq!(press("+ TAB INSTEAD"), Some(Confirm::NewTab));
         assert_eq!(press("CANCEL"), Some(Confirm::Cancel));
+    }
+
+    /// A receiver with just enough filled in for the search box to chew on.
+    fn entry(name: &str, location: &str) -> PublicSdrEntry {
+        PublicSdrEntry {
+            network: PublicSdrNetwork::KiwiSdr,
+            name: name.into(),
+            location: location.into(),
+            antenna: String::new(),
+            device: "KiwiSDR".into(),
+            address: "example.com:8073".into(),
+            lat: None,
+            lon: None,
+            grid: String::new(),
+            min_hz: 0.0,
+            max_hz: 30e6,
+            users: 0,
+            max_users: 4,
+            api_channels: Some(2),
+            max_iq_rate: 12_000.0,
+            full_control: true,
+            session_limit_min: 0,
+            snr_db: None,
+        }
+    }
+
+    /// Typing a callsign finds the receiver named after it and nothing else,
+    /// the way every other KiwiSDR directory answers the same query — issue
+    /// #347 is that fuzzy matching alone buried it under a dozen names whose
+    /// letters happened to fall in that order.
+    #[test]
+    fn a_callsign_typed_in_full_finds_only_the_receiver_named_after_it() {
+        let entries = [
+            entry("R7KJG SDR", "Rostov-on-Don"),
+            entry("Rugby 7 Kilo Juliet Golf", "somewhere else entirely"),
+            entry("Radio 7 Kranj Jesenice Gorica", "Slovenia"),
+        ];
+        let visible: Vec<&PublicSdrEntry> = entries.iter().collect();
+        let rows = ranked(&visible, "r7kjg");
+        assert_eq!(rows.len(), 1, "one literal match means one row");
+        assert_eq!(rows[0].0.name, "R7KJG SDR");
+    }
+
+    /// ...but a query nothing carries literally still gets the fuzzy list
+    /// rather than an empty window, so a half-remembered name or a typo is
+    /// still worth typing.
+    #[test]
+    fn a_query_nobody_matches_literally_falls_back_to_the_fuzzy_list() {
+        let entries = [entry("R7KJG SDR", "Rostov-on-Don"), entry("Twente", "Enschede")];
+        let visible: Vec<&PublicSdrEntry> = entries.iter().collect();
+        let rows = ranked(&visible, "rstv");
+        assert!(!rows.is_empty(), "a near miss should still show something");
+        assert_eq!(rows[0].0.name, "R7KJG SDR", "the closest one first");
+    }
+
+    /// An empty box is not a query at all: every row the chips let through
+    /// stays, in the order the directory gave them.
+    #[test]
+    fn an_empty_search_box_keeps_every_row() {
+        let entries = [entry("R7KJG SDR", "Rostov-on-Don"), entry("Twente", "Enschede")];
+        let visible: Vec<&PublicSdrEntry> = entries.iter().collect();
+        let rows = ranked(&visible, "");
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].0.name, "R7KJG SDR");
     }
 
     /// ...and a panel nobody has pressed answers nothing, or the question

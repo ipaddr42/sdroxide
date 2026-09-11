@@ -24,8 +24,8 @@ use std::time::Duration;
 
 pub use discovery::{discover, probe};
 pub use net::{
-    HpsdrBoard, HpsdrError, HpsdrRx, LNA_GAIN_DEFAULT_DB, LNA_GAIN_ELEMENT, LNA_GAIN_MAX_DB,
-    LNA_GAIN_MIN_DB, TX_RATE_HZ, board_has_lna_gain,
+    AutoGain, HpsdrBoard, HpsdrError, HpsdrRx, LNA_GAIN_DEFAULT_DB, LNA_GAIN_ELEMENT,
+    LNA_GAIN_MAX_DB, LNA_GAIN_MIN_DB, TX_RATE_HZ, board_has_lna_gain,
 };
 /// The Protocol 2 NCO math, exported for the wire-level tests and for
 /// diagnosing a board against the spec.

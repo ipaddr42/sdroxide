@@ -92,6 +92,30 @@ pub(in crate::app) fn settings_ui_tab(
             });
         ui.end_row();
 
+        ui.label("Tuning buttons");
+        ui.horizontal(|ui| {
+            crate::chrome::checkbox(ui, &mut cfg.tune_step_buttons, "Show on phone and tablet")
+                .on_hover_text(
+                    "A row of step-down / step / step-up buttons under the control strip on a \
+                     touched screen. There is no wheel to scroll a digit with and no dial, so \
+                     without them the only way to move a known step is to type the whole \
+                     frequency in. Never drawn on a desktop.",
+                );
+            ui.label(RichText::new(format!("Step: {}", cfg.tune_step_label())).weak());
+        });
+        ui.end_row();
+
+        ui.label("Waterfall smoothing");
+        crate::chrome::checkbox(ui, &mut cfg.waterfall_smooth, "Interpolate").on_hover_text(
+            "Blend each screen pixel with the bins and rows around it, so a signal looks \
+                 continuous where the display is wider than the transform. Turn it off for a \
+                 rectangular waterfall — one block per bin, one per row — which is what \
+                 reading a signal's shape off the picture needs: an interpolated signal cannot \
+                 be told apart from a genuinely wider one. A bigger FFT (the FFT chip) is the \
+                 other half of that.",
+        );
+        ui.end_row();
+
         ui.label("Spectrum background");
         ui.horizontal(|ui| {
             crate::chrome::checkbox(ui, &mut cfg.spectrum_gradient, "Gradient");
@@ -183,6 +207,20 @@ pub(in crate::app) fn settings_ui_tab(
              relative to it.",
         );
         enum_combo(ui, "ui-menu-font", &mut cfg.menu_font_size, &FontSize::ALL, FontSize::label);
+        ui.end_row();
+
+        ui.label("Cities on maps").on_hover_text(
+            "Draw the world's cities — a dot per place, with its name beside it \
+             where there is room — on the flat maps: FT8/WSPR, APRS, ADS-B and \
+             AIS.\n\n\
+             They are most of what says *where* a dot is on a map of the whole \
+             world, and they are also the busiest thing on it. Turn them off if \
+             the names are getting in the way of the stations you are reading. \
+             The 3D globe is unaffected — its cities are night-side lights \
+             rather than markers, and nothing there is written across a \
+             contact.",
+        );
+        crate::chrome::checkbox(ui, &mut cfg.map_cities, "show cities and their names");
         ui.end_row();
     });
 

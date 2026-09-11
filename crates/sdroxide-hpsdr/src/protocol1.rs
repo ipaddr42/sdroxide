@@ -34,7 +34,9 @@ use crate::net::{
     lna_gain_code, push_iq,
 };
 use crate::protocol2::be24_to_f32;
-use sdroxide_types::HpsdrFilterBoard;
+use sdroxide_types::HpsdrOcPlan;
+#[cfg(test)]
+use sdroxide_types::{HpsdrFilterBoard, hpsdr_alex_oc as alex_oc, hpsdr_n2adr_oc as n2adr_oc};
 
 const PORT: u16 = 1024;
 /// Samples per 512-byte OZY frame for one receiver (504 data bytes / 8).
@@ -109,74 +111,26 @@ fn config_cc(speed: u8, mox: u8, oc: u8) -> [u8; 5] {
     [CC_CONFIG | mox, speed, (oc & 0x7F) << 1, 0, CONFIG_C4]
 }
 
-/// Open-collector byte for the N2ADR filter board when tuned to `freq_hz`.
-///
-/// The board selects one-hot from its own documentation: bit 0 = 160 m LPF,
-/// 1 = 80 m, 2 = 60/40 m, 3 = 30/20 m, 4 = 17/15 m, 5 = 12/10 m, and bit 6 is a
-/// 3 MHz high-pass used on receive to keep broadcast AM out of the front end.
-/// The board switches that high-pass out itself while transmitting, so it can be
-/// asserted unconditionally above 3 MHz. Frequencies between the ham bands pick
-/// the lowest filter that still passes them, so short-wave listening is not
-/// filtered into silence.
-fn n2adr_oc(freq_hz: f64) -> u8 {
-    let lpf = match freq_hz {
-        f if f <= 2_000_000.0 => 0,
-        f if f <= 4_000_000.0 => 1,
-        f if f <= 7_300_000.0 => 2,
-        f if f <= 14_350_000.0 => 3,
-        f if f <= 21_450_000.0 => 4,
-        _ => 5,
-    };
-    let hpf = if freq_hz >= 3_000_000.0 { 1 << 6 } else { 0 };
-    (1 << lpf) | hpf
-}
-
-/// Open-collector byte for an Alex-style filter board when tuned to `freq_hz`.
-///
-/// Not one-hot like the N2ADR board above: this is the band as a four-bit
-/// number on outputs 1–4, which is the mapping a Hermes/ANAN's Alex board, a
-/// Zeus SDR, a HiQSDR and Quisk's own filter switching all share (issue #196).
-/// 160 m is 1 and the code counts upwards by band — except 60 m, which is 0,
-/// the same byte as "nothing selected", because that is what the boards
-/// expect.
-///
-/// Outputs 5–7 are left off: they carry no part of the band code, and on the
-/// boards that use this mapping they are the spare pins an operator wires to a
-/// preamplifier, an attenuator or a transverter.
-///
-/// Between the bands the boundary sits in the middle of the gap, so a
-/// short-wave listener gets the nearer of the two filters rather than silence,
-/// and everything below 160 m and above 10 m is carried by the band at that
-/// end.
-fn alex_oc(freq_hz: f64) -> u8 {
-    match freq_hz {
-        f if f < 2_750_000.0 => 0x01,  // 160 m
-        f if f < 4_650_000.0 => 0x02,  // 80 m
-        f if f < 6_200_000.0 => 0x00,  // 60 m — no pins, by the board's table
-        f if f < 8_700_000.0 => 0x03,  // 40 m
-        f if f < 12_100_000.0 => 0x04, // 30 m
-        f if f < 16_200_000.0 => 0x05, // 20 m
-        f if f < 19_600_000.0 => 0x06, // 17 m
-        f if f < 23_200_000.0 => 0x07, // 15 m
-        f if f < 26_500_000.0 => 0x08, // 12 m
-        f if f < 39_900_000.0 => 0x09, // 10 m
-        _ => 0x0A,                     // 6 m
-    }
-}
-
 /// Everything the rotating register slots need. `lna_gain` and `pa` are `None`
 /// on boards whose Hermes-Lite-specific register fields we must not touch.
 #[derive(Clone, Copy)]
 struct Regs {
     rx_freq: u32,
     tx_freq: u32,
+    /// Where the operator's dial is, when a transverter has put the radio
+    /// somewhere else — the frequency the accessory board's decoder has to
+    /// switch for. `None` when nothing is in front of the radio, which is when
+    /// the NCO frequency *is* the band.
+    band_dial: Option<f64>,
     lna_gain: Option<f64>,
     /// `Some(true)` to run the Hermes-Lite's onboard PA, `Some(false)` to leave
     /// it off and keep the antenna jack on receive, `None` on a board that is
     /// not a Hermes-Lite (its register 0x09 C2 means Apollo/Alex things and is
     /// left at zero, as before).
     pa: Option<bool>,
-    filter_board: HpsdrFilterBoard,
+    /// The seven open-collector outputs, resolved for this connection — a
+    /// preset's convention or the operator's own per-band table (issue #296).
+    oc: HpsdrOcPlan,
     ptt: bool,
 }
 
@@ -197,12 +151,14 @@ impl Regs {
     /// the low-pass filter has to match what is actually going out — and the
     /// receive frequency otherwise.
     fn oc(&self) -> u8 {
-        let freq = if self.ptt { self.tx_freq } else { self.rx_freq } as f64;
-        match self.filter_board {
-            HpsdrFilterBoard::None => 0,
-            HpsdrFilterBoard::N2adr => n2adr_oc(freq),
-            HpsdrFilterBoard::Alex => alex_oc(freq),
-        }
+        // The dial wins where there is one: with a 2 m transverter in front,
+        // the NCO says 28 MHz and the filters, relays and transverter the
+        // decoder switches all belong to 144 (issue #278).
+        let freq = match self.band_dial {
+            Some(hz) => hz,
+            None => (if self.ptt { self.tx_freq } else { self.rx_freq }) as f64,
+        };
+        self.oc.word(freq, self.ptt)
     }
 
     /// C2 of the drive register (`0x09`). On a Hermes-Lite it carries the PA
@@ -350,6 +306,10 @@ struct Ep6Info {
     /// version bytes. Their exact meaning is board-specific, so they are logged
     /// raw rather than interpreted.
     versions: Option<(u8, u8, u8, u8)>,
+    /// AIN5, the first analogue reading of a status-set-1 frame, as the raw
+    /// 12-bit converter count. On a Hermes-Lite 2 this input carries the
+    /// board's temperature sensor — see [`hl2_temperature_c`].
+    ain5: Option<u16>,
 }
 
 /// Rate limiter for the two Hermes-Lite transmit faults worth shouting about.
@@ -427,10 +387,48 @@ fn decode_ep6_status(cc: &[u8], info: &mut Ep6Info) {
     info.ptt |= cc[0] & 0x01 != 0;
     if cc[0] & 0x80 != 0 {
         info.ack = Some(((cc[0] >> 1) & 0x3F, [cc[1], cc[2], cc[3], cc[4]]));
-    } else if (cc[0] >> 3) & 0x1F == 0 {
-        info.adc_overload |= cc[1] & 0x01 != 0;
-        info.versions = Some((cc[1], cc[2], cc[3], cc[4]));
+        return;
     }
+    match (cc[0] >> 3) & 0x1F {
+        0 => {
+            info.adc_overload |= cc[1] & 0x01 != 0;
+            info.versions = Some((cc[1], cc[2], cc[3], cc[4]));
+        }
+        // Set 1: C1/C2 are AIN5 and C3/C4 AIN1, both big-endian. AIN1 is
+        // forward power on a board that has a coupler wired to it, which the
+        // stock Hermes-Lite 2 has not — AIN5 is the one that means something on
+        // every HL2, and it is the temperature sensor (issue #333).
+        1 => info.ain5 = Some(u16::from_be_bytes([cc[1], cc[2]]) & 0x0FFF),
+        _ => {}
+    }
+}
+
+/// Turn a Hermes-Lite 2's AIN5 reading into degrees Celsius.
+///
+/// The sensor is an MCP9700-class part: 500 mV at 0 °C, 10 mV per degree above
+/// it. The gateware's converter is 12-bit against a 3.26 V reference, which
+/// makes the whole conversion
+///
+/// ```text
+/// °C = (3.26 × count / 4096 − 0.5) / 0.01
+/// ```
+///
+/// the same arithmetic the other HL2 hosts use, so a temperature read here
+/// agrees with one read anywhere else on the same board.
+///
+/// This is the board, not the PA die: the sensor sits on the PCB near the
+/// output stage, so it lags a key-down by a good many seconds and reads well
+/// below the transistors themselves. That is what makes it worth showing — it
+/// is the number that says whether the *board* is running hot over an afternoon
+/// of FT8, which is the failure an HL2 actually has.
+///
+/// `None` for a reading of zero: the converter has not been sampled yet, and
+/// −50 °C is not a temperature this board reports.
+fn hl2_temperature_c(count: u16) -> Option<f32> {
+    if count == 0 {
+        return None;
+    }
+    Some((3.26 * f32::from(count) / 4096.0 - 0.5) / 0.01)
 }
 
 /// Decode an EP6 (radio→host) datagram, appending interleaved I,Q floats.
@@ -445,6 +443,7 @@ fn decode_ep6(d: &[u8], out: &mut Vec<f32>) -> Option<Ep6Info> {
         adc_overload: false,
         ack: None,
         versions: None,
+        ain5: None,
     };
     for f in 0..2 {
         let frame = &d[8 + f * 512..8 + f * 512 + 512];
@@ -501,11 +500,15 @@ pub(crate) fn run(ctx: ThreadCtx) {
         board,
         rate_hz,
         lna_gain_db,
-        filter_board,
+        oc,
         invert_spectrum,
         pa_enable,
         io_rx_input,
+        auto_gain: mut agc,
+        lna_gain_centi_db,
+        adc_overload: overload_line,
         radio_ptt: ptt_line,
+        temp_centi_c,
         mut tx,
         ctrl,
     } = ctx;
@@ -533,9 +536,10 @@ pub(crate) fn run(ctx: ThreadCtx) {
     let mut regs = Regs {
         rx_freq: 7_100_000,
         tx_freq: 7_100_000,
+        band_dial: None,
         lna_gain: has_lna.then_some(lna_gain_db),
         pa: hermes_lite.then_some(pa_enable),
-        filter_board,
+        oc,
         ptt: false,
     };
 
@@ -553,6 +557,36 @@ pub(crate) fn run(ctx: ThreadCtx) {
         }
     );
 
+    let mut buf = [0u8; 2048];
+
+    // Stop before starting. A board left streaming — a session that crashed, a
+    // program killed, a reconnect whose predecessor could not send the stop
+    // because it had been superseded — goes on sending EP6 to that dead
+    // endpoint, and several gateware versions ignore a run command from
+    // anywhere else while they are already running. The radio is then
+    // discovered, accepts everything, and streams to nobody: the endless
+    // "connect, wait for the waterfall, lose it, connect again" of issue #365.
+    // Every reference implementation opens this way (piHPSDR's
+    // `metis_restart`), and on a board that was already idle it costs one
+    // datagram.
+    let _ = socket.send_to(&start_command(false), dest);
+    std::thread::sleep(Duration::from_millis(100));
+    // Whatever was still in flight belongs to the previous session. Dropped
+    // rather than decoded: its sequence numbers are the old stream's, and the
+    // first real datagram would otherwise be counted as a few hundred lost.
+    let mut stale = 0u32;
+    while socket.recv_from(&mut buf).is_ok() {
+        stale += 1;
+        if stale > 1000 {
+            break;
+        }
+    }
+    if stale > 0 {
+        tracing::info!(
+            "HPSDR P1: the radio was already streaming — {stale} datagram(s) from the previous              session dropped before starting"
+        );
+    }
+
     // Prime the registers — two full rotations so every slot lands, including
     // the front-end gain — then start the EP6 I/Q stream. That order is the one
     // rustyHPSDR uses, so the radio begins with its rate, NCO and gain loaded.
@@ -564,7 +598,6 @@ pub(crate) fn run(ctx: ThreadCtx) {
     let _ = socket.send_to(&start_command(true), dest);
     tracing::debug!("HPSDR P1: sent priming EP2 datagrams + run command; awaiting EP6 stream");
 
-    let mut buf = [0u8; 2048];
     let mut rx_scratch: Vec<f32> = Vec::with_capacity(FLOATS_PER_DATAGRAM);
     let mut tx_scratch: Vec<f32> = Vec::with_capacity(FLOATS_PER_DATAGRAM);
     let mut next_ep2 = Instant::now();
@@ -573,6 +606,9 @@ pub(crate) fn run(ctx: ThreadCtx) {
     let mut logged_first_rx = false;
     let mut logged_versions = false;
     let mut warned_no_rx = false;
+    // When the run command was last sent, so it can be repeated while the
+    // board has yet to answer with any I/Q — see the retry below.
+    let mut last_run_cmd = Instant::now();
     let mut radio_ptt = false;
     // See the `push_iq` call: the RX ring is still full for the moment
     // between unkey and the engine draining it.
@@ -611,6 +647,16 @@ pub(crate) fn run(ctx: ThreadCtx) {
                         regs.rx_freq = hz.max(0.0) as u32;
                         rot.urge(Slot::RxFreq);
                         tracing::debug!("HPSDR P1: RX NCO -> {} Hz", regs.rx_freq);
+                    }
+                }
+                Ctrl::BandDial(hz) => {
+                    let hz = hz.filter(|h| h.is_finite() && *h > 0.0);
+                    if regs.band_dial != hz {
+                        regs.band_dial = hz;
+                        tracing::debug!(
+                            "HPSDR P1: accessory-board band follows the dial at {:?} Hz",
+                            hz
+                        );
                     }
                 }
                 Ctrl::RxGain(db) => {
@@ -714,19 +760,42 @@ pub(crate) fn run(ctx: ThreadCtx) {
                             if radio_ptt { "closed" } else { "open" }
                         );
                     }
+                    // The board's own temperature, where the gateware sampled
+                    // it this datagram. Published as a level, like the PTT line
+                    // above, so a caller polling on the meter tick reads
+                    // whatever the last frame said rather than having to catch
+                    // one (issue #333).
+                    if hermes_lite && let Some(c) = info.ain5.and_then(hl2_temperature_c) {
+                        temp_centi_c.store((c * 100.0) as i32, Ordering::Relaxed);
+                    }
                     // An overloaded ADC is the classic "the signal looks weird"
                     // fault: everything intermodulates and the noise floor
                     // jumps. Rate-limit the warning, it can fire every datagram.
-                    if info.adc_overload {
+                    //
+                    // Transmit is excluded from the count as well as from the
+                    // loop: a board's own transmitter leaks into its receiver,
+                    // and the operator has no more use for "your transmitter
+                    // overloaded your receiver" once per over than the loop
+                    // does.
+                    agc.observe(info.adc_overload, regs.ptt, Instant::now());
+                    if info.adc_overload && !regs.ptt {
                         overloads += 1;
                         if last_overload_warn.is_none_or(|t| t.elapsed() >= Duration::from_secs(5))
                         {
                             last_overload_warn = Some(Instant::now());
+                            let advice = if agc.enabled {
+                                "automatic overload protection is on and is winding the gain back"
+                                    .to_string()
+                            } else {
+                                format!(
+                                    "lower the {} gain in Settings → Device, or switch on \
+                                     automatic overload protection on the HPSDR page",
+                                    crate::net::LNA_GAIN_ELEMENT
+                                )
+                            };
                             tracing::warn!(
                                 "HPSDR P1: ADC OVERLOAD reported by the radio ({overloads} so \
-                                 far). The front end is clipping — lower the {} gain in \
-                                 Settings → Device (currently {:+.0} dB).",
-                                crate::net::LNA_GAIN_ELEMENT,
+                                 far). The front end is clipping at {:+.0} dB — {advice}.",
                                 regs.lna_gain.unwrap_or(0.0),
                             );
                         }
@@ -772,14 +841,50 @@ pub(crate) fn run(ctx: ThreadCtx) {
             }
         }
 
+        // The overload light and the loop that acts on it. Outside the receive
+        // arm because both have to keep working through a gap in the stream:
+        // an indicator that stayed lit because no frame arrived to clear it
+        // would be reporting the network rather than the front end.
+        let now = Instant::now();
+        overload_line.store(agc.overloading(now), Ordering::Relaxed);
+        if let Some(g) = regs.lna_gain {
+            if let crate::net::AutoGainStep::Set(want) = agc.step(g, regs.ptt, now) {
+                regs.lna_gain = Some(want);
+                lna_gain_centi_db.store((want * 100.0) as i32, Ordering::Relaxed);
+                // Ahead of the round robin: the point of a hundred-millisecond
+                // attack is that it reaches the board inside a hundred
+                // milliseconds.
+                rot.urge(Slot::LnaGain);
+                tracing::info!(
+                    "HPSDR P1: automatic overload protection moved the {} gain {:+.0} → \
+                     {want:+.0} dB ({} overflow report(s) so far)",
+                    crate::net::LNA_GAIN_ELEMENT,
+                    g,
+                    agc.events,
+                );
+            }
+        }
+
+        // A run command the board never acted on is worth repeating before the
+        // whole connection is torn down and rebuilt around it: the register
+        // priming above is already in the gateware, so a second ask is one
+        // datagram against a five-second reconnect. Some boards drop the first
+        // one when it lands too soon after the priming frames (issue #365).
+        if !logged_first_rx && last_run_cmd.elapsed() >= Duration::from_secs(1) {
+            last_run_cmd = Instant::now();
+            let _ = socket.send_to(&start_command(true), dest);
+            tracing::debug!("HPSDR P1: still no EP6 — run command sent again");
+        }
+
         // Flag a radio that accepted the run command but never streams I/Q — the
         // usual symptom of a wrong sample-rate/endpoint offset or a firewall.
         if !logged_first_rx && !warned_no_rx && started.elapsed() >= Duration::from_secs(3) {
             warned_no_rx = true;
             tracing::warn!(
-                "HPSDR P1: no EP6 I/Q datagrams after 3 s. Check that UDP port {PORT} is not \
-                 blocked, that the radio is idle (not held by another program), and that the \
-                 board actually speaks Protocol 1."
+                "HPSDR P1: no EP6 I/Q datagrams after 3 s, and the run command has been sent \
+                 again since. Check that UDP port {PORT} is not blocked, that the radio is idle \
+                 (not held by another program — it reports that as \"in use\" at discovery), and \
+                 that the board actually speaks Protocol 1."
             );
         }
         stats.tick();
@@ -880,8 +985,14 @@ mod tests {
 
     #[test]
     fn ep6_status_bits() {
-        let mut info =
-            Ep6Info { seq: 0, ptt: false, adc_overload: false, ack: None, versions: None };
+        let mut info = Ep6Info {
+            seq: 0,
+            ptt: false,
+            adc_overload: false,
+            ack: None,
+            versions: None,
+            ain5: None,
+        };
         // Status set 0, PTT closed, ADC overloaded, versions in C2..C4.
         decode_ep6_status(&[0x01, 0x01, 0x11, 0x22, 0x33], &mut info);
         assert!(info.ptt);
@@ -890,11 +1001,93 @@ mod tests {
 
         // A different status set carries power/voltage, not versions: the
         // overload flag and version bytes must not be read out of it.
-        let mut other =
-            Ep6Info { seq: 0, ptt: false, adc_overload: false, ack: None, versions: None };
-        decode_ep6_status(&[0x08, 0xFF, 0xFF, 0xFF, 0xFF], &mut other);
+        let mut other = Ep6Info {
+            seq: 0,
+            ptt: false,
+            adc_overload: false,
+            ack: None,
+            versions: None,
+            ain5: None,
+        };
+        // Set 2 (power/voltage): not versions, and not the temperature either.
+        decode_ep6_status(&[0x10, 0xFF, 0xFF, 0xFF, 0xFF], &mut other);
         assert!(!other.adc_overload);
         assert_eq!(other.versions, None);
+        assert_eq!(other.ain5, None);
+    }
+
+    /// Issue #333: a Hermes-Lite 2 reports its board temperature on AIN5, in
+    /// status set 1 — the frames this decoder used to skip past.
+    #[test]
+    fn a_hermes_lite_reports_its_temperature_on_status_set_one() {
+        // C0: set 1 in bits 7..3, ACK clear, PTT clear.
+        let cc = [1u8 << 3, 0x07, 0x8B, 0x00, 0x00];
+        let mut info = Ep6Info {
+            seq: 0,
+            ptt: false,
+            adc_overload: false,
+            ack: None,
+            versions: None,
+            ain5: None,
+        };
+        decode_ep6_status(&cc, &mut info);
+        assert_eq!(info.ain5, Some(0x078B));
+        // 3.26 × 1931 / 4096 = 1.537 V; less the sensor's 500 mV offset, over
+        // 10 mV per degree, is a shade under 104 °C… which is what this count
+        // means and not a temperature a healthy board reaches. The arithmetic
+        // is what is under test.
+        let c = hl2_temperature_c(0x078B).expect("a reading");
+        assert!((c - 103.7).abs() < 0.5, "{c} °C");
+
+        // A room-temperature board: 25 °C is 750 mV, which is count 942.
+        let c = hl2_temperature_c(942).expect("a reading");
+        assert!((c - 25.0).abs() < 0.5, "{c} °C");
+
+        // Nothing sampled yet is not −50 °C.
+        assert_eq!(hl2_temperature_c(0), None);
+
+        // And set 0 still means what it meant: versions, not a temperature.
+        let mut info = Ep6Info {
+            seq: 0,
+            ptt: false,
+            adc_overload: false,
+            ack: None,
+            versions: None,
+            ain5: None,
+        };
+        decode_ep6_status(&[0x00, 0x01, 0x02, 0x03, 0x04], &mut info);
+        assert!(info.ain5.is_none());
+        assert_eq!(info.versions, Some((0x01, 0x02, 0x03, 0x04)));
+        assert!(info.adc_overload);
+    }
+
+    /// A converter puts the radio on an intermediate frequency, and the
+    /// accessory board's decoder — which is in the antenna line, ahead of the
+    /// converter — has to switch for the band on the *air* rather than for
+    /// that (issue #278).
+    ///
+    /// The example is an upconverter, because that is the one where the two
+    /// answers differ inside these boards' tables: a Ham It Up presents 80 m to
+    /// the receiver at 128.7 MHz, and the filter the antenna needs is 80 m's.
+    #[test]
+    fn the_accessory_board_follows_the_dial_through_a_converter() {
+        let mut regs = Regs {
+            rx_freq: 128_700_000,
+            tx_freq: 128_700_000,
+            band_dial: None,
+            lna_gain: None,
+            pa: None,
+            oc: HpsdrOcPlan::preset(HpsdrFilterBoard::Alex),
+            ptt: false,
+        };
+        // Without a dial, the I.F. is all there is.
+        assert_eq!(regs.oc(), alex_oc(128_700_000.0));
+        regs.band_dial = Some(3_700_000.0);
+        assert_eq!(regs.oc(), alex_oc(3_700_000.0), "the band code has to follow the dial");
+        assert_ne!(regs.oc(), alex_oc(128_700_000.0));
+        // Putting it back is the radio on its own bands again.
+        regs.band_dial = None;
+        assert_eq!(regs.oc(), alex_oc(128_700_000.0));
     }
 
     #[test]
@@ -903,9 +1096,10 @@ mod tests {
         let regs = Regs {
             rx_freq: 7_074_000,
             tx_freq: 7_074_000,
+            band_dial: None,
             lna_gain: None,
             pa: None,
-            filter_board: HpsdrFilterBoard::None,
+            oc: HpsdrOcPlan::none(),
             ptt: false,
         };
         let mut rot = Rotation::new();
@@ -931,9 +1125,10 @@ mod tests {
         let keyed = Regs {
             rx_freq: 7_000_000,
             tx_freq: 7_000_000,
+            band_dial: None,
             lna_gain: None,
             pa: None,
-            filter_board: HpsdrFilterBoard::None,
+            oc: HpsdrOcPlan::none(),
             ptt: true,
         };
         let idle = Regs { ptt: false, ..keyed };
@@ -952,9 +1147,10 @@ mod tests {
         let hl2 = Regs {
             rx_freq: 14_074_000,
             tx_freq: 14_074_000,
+            band_dial: None,
             lna_gain: Some(20.0),
             pa: Some(true),
-            filter_board: HpsdrFilterBoard::None,
+            oc: HpsdrOcPlan::none(),
             ptt: false,
         };
         let cc = hl2.cc(Slot::Drive);
@@ -1022,9 +1218,10 @@ mod tests {
         let regs = Regs {
             rx_freq: 7_000_000,
             tx_freq: 7_000_000,
+            band_dial: None,
             lna_gain: Some(0.0),
             pa: None,
-            filter_board: HpsdrFilterBoard::None,
+            oc: HpsdrOcPlan::none(),
             ptt: false,
         };
         let cc = regs.cc(Slot::LnaGain);
@@ -1126,9 +1323,10 @@ mod tests {
         let regs = Regs {
             rx_freq: 14_074_000,
             tx_freq: 14_074_000,
+            band_dial: None,
             lna_gain: Some(20.0),
             pa: None,
-            filter_board: HpsdrFilterBoard::None,
+            oc: HpsdrOcPlan::none(),
             ptt: false,
         };
         assert_eq!(regs.oc(), 0);
@@ -1138,16 +1336,48 @@ mod tests {
         let split = Regs {
             rx_freq: 14_074_000,
             tx_freq: 7_074_000,
-            filter_board: HpsdrFilterBoard::N2adr,
+            band_dial: None,
+            oc: HpsdrOcPlan::preset(HpsdrFilterBoard::N2adr),
             ..regs
         };
         assert_eq!(split.oc(), n2adr_oc(14_074_000.0), "receiving: follows RX");
         assert_eq!(Regs { ptt: true, ..split }.oc(), n2adr_oc(7_074_000.0), "keyed: follows TX");
         // And the same rule on the band-code preset.
-        let alex = Regs { filter_board: HpsdrFilterBoard::Alex, ..split };
+        let alex = Regs { oc: HpsdrOcPlan::preset(HpsdrFilterBoard::Alex), ..split };
         assert_eq!(alex.oc(), 0x05, "receiving on 20 m");
         assert_eq!(Regs { ptt: true, ..alex }.oc(), 0x03, "keyed on 40 m");
         assert_eq!(config_cc(3, 0, alex.oc())[2], 0x05 << 1);
+    }
+
+    /// The operator's own table, on Protocol 1: their words, on their bands,
+    /// with receive and transmit told apart (issue #296). The register path is
+    /// unchanged — what is new is where the word comes from.
+    #[test]
+    fn a_custom_table_reaches_the_same_register() {
+        let cfg = sdroxide_types::HpsdrConfig {
+            filter_board: HpsdrFilterBoard::Custom,
+            oc_table: vec![sdroxide_types::HpsdrOcRow {
+                band: sdroxide_types::Band::M20,
+                rx: 0x12,
+                tx: 0x52,
+            }],
+            ..sdroxide_types::HpsdrConfig::default()
+        };
+        let regs = Regs {
+            rx_freq: 14_074_000,
+            tx_freq: 14_074_000,
+            band_dial: None,
+            lna_gain: None,
+            pa: None,
+            oc: cfg.oc_plan(),
+            ptt: false,
+        };
+        assert_eq!(regs.oc(), 0x12);
+        assert_eq!(config_cc(3, 0, regs.oc())[2], 0x12 << 1);
+        assert_eq!(Regs { ptt: true, ..regs }.oc(), 0x52, "keyed takes the transmit word");
+        // A band the operator said nothing about asserts nothing, rather than
+        // the nearest band's word.
+        assert_eq!(Regs { rx_freq: 7_074_000, ..regs }.oc(), 0);
     }
 
     #[test]
@@ -1155,9 +1385,10 @@ mod tests {
         let hl2 = Regs {
             rx_freq: 7_000_000,
             tx_freq: 7_000_000,
+            band_dial: None,
             lna_gain: Some(20.0),
             pa: None,
-            filter_board: HpsdrFilterBoard::None,
+            oc: HpsdrOcPlan::none(),
             ptt: false,
         };
         let mut rot = Rotation::new();

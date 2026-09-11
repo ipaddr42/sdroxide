@@ -32,8 +32,23 @@ pub enum Js8Speed {
 }
 
 impl Js8Speed {
+    /// Every speed, in declaration order — which is the *wire* order, since
+    /// postcard numbers variants by it. Iteration order for anything that has
+    /// to touch all four; [`Js8Speed::UI_ORDER`] is what a picker uses.
     pub const ALL: [Js8Speed; 4] =
         [Js8Speed::Normal, Js8Speed::Fast, Js8Speed::Turbo, Js8Speed::Slow];
+
+    /// Every speed as an operator reads them: slowest and most sensitive
+    /// first, fastest and widest last (issue #389).
+    ///
+    /// [`Js8Speed::ALL`] cannot simply be reordered — its order is the wire's
+    /// — and the declaration order is an accident of which submodes JS8Call
+    /// shipped first (A, B, C, then E), which is not a scale of anything. What
+    /// these four *are* is one dial from 30-second slots 25 Hz wide to
+    /// 6-second slots 160 Hz wide, and a row of buttons that jumps about in
+    /// that dial reads as four unrelated choices instead of one.
+    pub const UI_ORDER: [Js8Speed; 4] =
+        [Js8Speed::Slow, Js8Speed::Normal, Js8Speed::Fast, Js8Speed::Turbo];
 
     pub fn label(self) -> &'static str {
         match self {
@@ -41,6 +56,18 @@ impl Js8Speed {
             Js8Speed::Fast => "FAST",
             Js8Speed::Turbo => "TURBO",
             Js8Speed::Slow => "SLOW",
+        }
+    }
+
+    /// One letter for a place too narrow for the name — the tag on a decoded
+    /// message, which has to say which of four waveforms carried it without
+    /// taking a column from the text (issue #389).
+    pub fn tag(self) -> &'static str {
+        match self {
+            Js8Speed::Normal => "N",
+            Js8Speed::Fast => "F",
+            Js8Speed::Turbo => "T",
+            Js8Speed::Slow => "S",
         }
     }
 
@@ -207,6 +234,15 @@ pub struct Js8Msg {
     pub complete: bool,
     /// Addressed to us, to a group we are in, or to @ALLCALL.
     pub to_me: bool,
+    /// The speed this message was decoded at.
+    ///
+    /// Every frame of one message is the same waveform — the assembler will
+    /// not join frames from two speeds — so this is the message's, not the
+    /// first frame's. With multi-speed decoding on, four waveforms share the
+    /// sub-band and the list was the one place that did not say which of them
+    /// a message came in on (issue #389).
+    #[serde(default)]
+    pub speed: Js8Speed,
 }
 
 /// JS8-specific engine status, `None` in every other mode.
@@ -231,6 +267,41 @@ pub struct Js8Status {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Issue #389: the buttons run from the slowest, narrowest waveform to the
+    /// fastest, widest one, and every speed appears exactly once. The wire
+    /// order [`Js8Speed::ALL`] carries is a different question and stays put.
+    #[test]
+    fn the_speed_buttons_run_slowest_to_fastest() {
+        for s in Js8Speed::ALL {
+            assert_eq!(
+                Js8Speed::UI_ORDER.iter().filter(|x| **x == s).count(),
+                1,
+                "{} is not on the row exactly once",
+                s.label()
+            );
+        }
+        for w in Js8Speed::UI_ORDER.windows(2) {
+            assert!(
+                w[0].slot_s() > w[1].slot_s(),
+                "{} does not come before {}",
+                w[0].label(),
+                w[1].label()
+            );
+            assert!(
+                w[0].bandwidth_hz() < w[1].bandwidth_hz(),
+                "{} is not narrower than {}",
+                w[0].label(),
+                w[1].label()
+            );
+        }
+        // One letter each, and four different ones.
+        let tags: Vec<&str> = Js8Speed::ALL.iter().map(|s| s.tag()).collect();
+        for t in &tags {
+            assert_eq!(t.len(), 1, "{t} is not one letter");
+            assert_eq!(tags.iter().filter(|x| *x == t).count(), 1, "{t} is used twice");
+        }
+    }
 
     #[test]
     fn burst_always_fits_inside_its_slot() {

@@ -8,6 +8,60 @@
 //! why this lives on its own, where it can be tested without a serial port or a
 //! socket.
 
+use std::time::{Duration, Instant};
+
+/// How long a frequency this end has just commanded outranks the one the radio
+/// reports.
+///
+/// Every CAT link here is polled, so a read of the dial that went out a moment
+/// before the operator picked a new frequency is answered *after* the write
+/// that moved it — carrying the frequency the radio was on a moment ago. Folded
+/// in, that snaps the dial straight back off the band the operator has just
+/// chosen, and the only way through is to click again and hope the timing falls
+/// differently: the reported symptom of issue #285, where changing band for FT8
+/// took three to five attempts and landed on frequencies nobody asked for
+/// (each failed attempt also writing the wrong entry into the band stack).
+///
+/// Long enough to cover several poll periods on a LAN or WiFi link, and no
+/// longer: a radio that will not go where it was told has to be allowed to win,
+/// or the two stay out of step for the rest of the session. In practice the
+/// radio confirms the new frequency one poll later, and from then on only the
+/// dial it was moved off is held back — the timeout is what covers a radio that
+/// never confirms at all.
+pub(crate) const FREQ_SETTLE: Duration = Duration::from_millis(1000);
+
+/// How long to wait for the radio to agree before asking it again.
+///
+/// A tune is a command with no acknowledgement above it. On a serial port that
+/// hardly matters — the bytes arrive or the cable is out — but a networked Icom
+/// is three UDP conversations, and one datagram lost on the way to the radio is
+/// a band change that simply never happened. Nothing notices: the frequency
+/// read that follows says the radio is where it always was, [`FREQ_SETTLE`]
+/// runs out, and the dial snaps back to it. That is the second half of issue
+/// #297, and the operator's own workaround for it was to click the band again —
+/// three to five times — which is exactly what this does for them.
+///
+/// One poll period plus a round trip, so a radio that is merely being slow is
+/// never asked twice, and at most three resends fit inside [`FREQ_SETTLE`].
+const RETRY_AFTER: Duration = Duration::from_millis(300);
+
+/// A tune this end has asked for, until the radio agrees or [`FREQ_SETTLE`]
+/// runs out. See [`Dial::report`] and [`Dial::retry`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Commanded {
+    /// The dial that was asked for.
+    dial: f64,
+    /// The dial it was asked to leave. Every reply already in flight when the
+    /// tune went out is carrying this one.
+    left: f64,
+    /// When it was first asked for — the clock [`FREQ_SETTLE`] runs on.
+    at: Instant,
+    /// When it last went out, which is what paces [`RETRY_AFTER`].
+    sent: Instant,
+    /// Whether the radio has since reported this dial back.
+    confirmed: bool,
+}
+
 /// Where the rig's dial has to be, and who currently owns it.
 ///
 /// A CAT rig has exactly one frequency control and no DDC behind it, so the VFO,
@@ -28,6 +82,10 @@ pub(crate) struct Dial {
     /// The frequency the last over parked the dial on, until the rig has
     /// reported something else. See [`Self::report`].
     stale_tx: Option<f64>,
+    /// The tune this end last asked for, until the rig has confirmed it and
+    /// stopped repeating the dial it was moved off, or [`FREQ_SETTLE`] has run
+    /// out. See [`Self::report`] and [`Self::retry`].
+    commanded: Option<Commanded>,
 }
 
 impl Dial {
@@ -45,8 +103,9 @@ impl Dial {
     /// retuning then would drag the transmitter off the frequency it was
     /// cleared to use; [`Self::end_tx`] picks the new VFO up on unkey.
     pub(crate) fn set_vfo(&mut self, hz: f64) -> Option<f64> {
+        let leaving = self.rx_hz();
         self.vfo = hz;
-        self.tx.is_none().then(|| self.rx_hz())
+        self.commanding(leaving)
     }
 
     /// Change the RIT offset (0 = RIT off). Same deferral as [`Self::set_vfo`].
@@ -54,8 +113,50 @@ impl Dial {
         if self.rit == hz {
             return None;
         }
+        let leaving = self.rx_hz();
         self.rit = hz;
-        self.tx.is_none().then(|| self.rx_hz())
+        self.commanding(leaving)
+    }
+
+    /// The receive frequency to command now, remembered as ours until the radio
+    /// confirms it — or `None` while an over owns the dial.
+    ///
+    /// The remembering is what [`Self::report`] needs: a write and a read cross
+    /// on every polled link, and without a record of what was just asked for
+    /// there is no way to tell the radio's answer to the old question from its
+    /// answer to the new one.
+    fn commanding(&mut self, leaving: f64) -> Option<f64> {
+        if self.tx.is_some() {
+            return None;
+        }
+        let dial = self.rx_hz();
+        let now = Instant::now();
+        self.commanded =
+            Some(Commanded { dial, left: leaving, at: now, sent: now, confirmed: false });
+        Some(dial)
+    }
+
+    /// The tune to send again, because the radio has not said it took the last
+    /// one. `None` when there is nothing outstanding, when the radio has
+    /// already agreed, or when it is not yet time to ask again.
+    ///
+    /// Driven from the source's own poll rather than from a reply, because the
+    /// case it exists for is the one where no reply is coming: a set-frequency
+    /// frame lost on the way to a networked radio produces no error, no
+    /// refusal and no missing answer — just a radio that is still where it was.
+    /// See [`RETRY_AFTER`].
+    pub(crate) fn retry(&mut self) -> Option<f64> {
+        if self.tx.is_some() {
+            return None;
+        }
+        let c = self.commanded.as_mut()?;
+        // Past the settling time this end has stopped insisting, and
+        // [`Dial::report`] is about to let the radio have the last word.
+        if c.confirmed || c.sent.elapsed() < RETRY_AFTER || c.at.elapsed() >= FREQ_SETTLE {
+            return None;
+        }
+        c.sent = Instant::now();
+        Some(c.dial)
     }
 
     /// Take the dial for an over on `tx_hz`. `None` when transmit already lands
@@ -93,6 +194,33 @@ impl Dial {
     /// (issue #233). So the frequency the over parked on is remembered and
     /// ignored until the rig reports something else, which the restore write
     /// makes it do on the very next poll.
+    ///
+    /// A frequency this end has just *commanded* is guarded the same way and
+    /// for the same reason. The read that answers here may have gone out before
+    /// the write did, in which case it carries where the radio used to be, and
+    /// adopting it undoes the tune the operator just asked for — issue #285,
+    /// where picking an FT8 band took several attempts because most of them
+    /// were being cancelled by the radio's answer to the previous question. So
+    /// a report that disagrees with the outstanding command is dropped until
+    /// the radio confirms the command or [`FREQ_SETTLE`] runs out, whichever
+    /// comes first. The timeout is the important half of that: a radio that
+    /// will not go where it was told — a band it cannot reach, a lock switch —
+    /// gets the last word rather than being argued with forever.
+    ///
+    /// **The radio confirming is not the end of the stale answers.** That was
+    /// issue #297: the same band change, on the same networked Icom, still
+    /// taking three to five clicks with the guard above in place. A LAN Icom's
+    /// CI-V link is a UDP conversation with a sequence number and a resend
+    /// request on top, and a datagram recovered that way is handed up *when it
+    /// arrives* rather than in the order it was sent — as is one the network
+    /// merely delivered late. So the reply that crossed the tune can land a few
+    /// hundred milliseconds behind the reply that confirmed it, by which time
+    /// the guard had lifted and the old frequency was adopted as news. There is
+    /// only one frequency an answer to a question asked before the tune can be
+    /// carrying, and that is the dial the tune moved off, so that one alone
+    /// stays guarded for the rest of the settling time. Anything else the radio
+    /// reports once it has confirmed is the operator's hand on its knob and is
+    /// followed at once.
     pub(crate) fn report(&mut self, dial_hz: f64) -> Option<f64> {
         if self.tx.is_some() {
             return None;
@@ -105,6 +233,25 @@ impl Dial {
             // restore write's own echo, or the operator's hand on the knob.
             self.stale_tx = None;
         }
+        if let Some(mut c) = self.commanded {
+            if (dial_hz - c.dial).abs() < 1.0 {
+                // The radio confirming where it was sent: stop asking again,
+                // but keep holding back the dial it was moved off until the
+                // settling time is up.
+                c.confirmed = true;
+                self.commanded = Some(c);
+            } else if c.at.elapsed() >= FREQ_SETTLE {
+                // Long enough. The radio is somewhere else and means it.
+                self.commanded = None;
+            } else if !c.confirmed || (dial_hz - c.left).abs() < 1.0 {
+                return None;
+            } else {
+                // Confirmed, and now reporting a third frequency: the operator
+                // has their hand on the radio's own knob, and they outrank a
+                // tune that has already been carried out.
+                self.commanded = None;
+            }
+        }
         self.vfo = dial_hz - self.rit;
         Some(self.vfo)
     }
@@ -116,6 +263,12 @@ mod tests {
 
     fn at(vfo: f64) -> Dial {
         Dial { vfo, ..Dial::default() }
+    }
+
+    /// Push the outstanding tune `by` further into the past, so a test can
+    /// reach the settling deadline without sleeping for it.
+    fn age(d: &mut Dial, by: Duration) {
+        d.commanded = d.commanded.map(|c| Commanded { at: c.at - by, sent: c.sent - by, ..c });
     }
 
     #[test]
@@ -181,6 +334,147 @@ mod tests {
         assert_eq!(d.report(147_000_000.0), Some(147_000_000.0));
         // …so the operator really tuning to the input afterwards is adopted.
         assert_eq!(d.report(146_400_000.0), Some(146_400_000.0));
+    }
+
+    /// Issue #285: changing band for FT8 on an Icom over its LAN port landed
+    /// on frequencies nobody had picked, and took three to five attempts to
+    /// stick. Every one of these links is polled, so the read that was already
+    /// in flight when the operator clicked is answered *after* the write — and
+    /// the old frequency, folded in, cancels the new one.
+    #[test]
+    fn the_answer_to_a_read_that_crossed_our_own_tune_does_not_undo_it() {
+        let mut d = at(14_074_000.0);
+        // The operator picks 40 m FT8. That goes to the radio…
+        assert_eq!(d.set_vfo(7_074_000.0), Some(7_074_000.0));
+        // …and the very next thing the radio says is where it was when the read
+        // went out, one poll period ago. It is an answer to the old question.
+        assert_eq!(d.report(14_074_000.0), None);
+        assert_eq!(d.vfo, 7_074_000.0, "the band the operator chose is still the band");
+        // Then the radio catches up and confirms.
+        assert_eq!(d.report(7_074_000.0), Some(7_074_000.0));
+        // With nothing outstanding, the operator's own hand on the knob is
+        // followed again immediately.
+        assert_eq!(d.report(7_075_000.0), Some(7_075_000.0));
+    }
+
+    /// The guard is not a way to overrule the radio. A rig that will not go
+    /// where it was sent — a transmit-only band, a lock switch, a model that
+    /// rounds — has the last word once the settling time is up, because the
+    /// alternative is a readout that disagrees with the radio for the rest of
+    /// the session.
+    #[test]
+    fn a_radio_that_refuses_the_tune_wins_in_the_end() {
+        let mut d = at(14_074_000.0);
+        assert_eq!(d.set_vfo(7_074_000.0), Some(7_074_000.0));
+        assert_eq!(d.report(14_074_000.0), None);
+        // Age the outstanding command past the settling time.
+        age(&mut d, FREQ_SETTLE * 2);
+        assert_eq!(d.report(14_074_000.0), Some(14_074_000.0));
+        assert_eq!(d.vfo, 14_074_000.0);
+    }
+
+    /// Issue #297: the same FT8 band change, on the same networked Icom, still
+    /// took three to five clicks with the [`FREQ_SETTLE`] guard in place.
+    ///
+    /// A LAN Icom's CI-V link is UDP with a sequence number and a resend
+    /// request over it, and a datagram recovered that way arrives *after* the
+    /// ones that overtook it while it was missing. So the answer to the read
+    /// that crossed the tune can land behind the reply that confirmed the tune
+    /// — and by then the guard had lifted and nothing was left to tell that old
+    /// frequency from the operator reaching for the radio's knob.
+    #[test]
+    fn a_stale_answer_that_arrives_after_the_confirmation_is_still_stale() {
+        let mut d = at(14_074_000.0);
+        assert_eq!(d.set_vfo(7_074_000.0), Some(7_074_000.0));
+        // The radio confirms first: this reply left the radio after the tune.
+        assert_eq!(d.report(7_074_000.0), Some(7_074_000.0));
+        // And *now* the one that crossed the tune turns up, recovered by a
+        // resend a few hundred milliseconds late.
+        assert_eq!(d.report(14_074_000.0), None, "the band the operator chose has to stand");
+        assert_eq!(d.vfo, 7_074_000.0);
+        // Which is not a licence to ignore the radio: anything else it says
+        // once it has confirmed is the operator's hand on its own knob.
+        assert_eq!(d.report(7_075_000.0), Some(7_075_000.0));
+        // …and from there the old dial is just a frequency like any other.
+        assert_eq!(d.report(14_074_000.0), Some(14_074_000.0));
+    }
+
+    /// The hold on the frequency that was left is not for ever either — an
+    /// operator who tunes back by hand has to be followed like anybody else.
+    #[test]
+    fn the_dial_that_was_left_is_only_held_back_while_the_tune_settles() {
+        let mut d = at(14_074_000.0);
+        assert_eq!(d.set_vfo(7_074_000.0), Some(7_074_000.0));
+        assert_eq!(d.report(7_074_000.0), Some(7_074_000.0));
+        assert_eq!(d.report(14_074_000.0), None);
+        age(&mut d, FREQ_SETTLE * 2);
+        assert_eq!(d.report(14_074_000.0), Some(14_074_000.0), "the operator went back by hand");
+    }
+
+    /// The other half of issue #297: a set-frequency frame lost on the way to a
+    /// networked radio produces no error and no missing answer, just a radio
+    /// that is still where it was. Asking again is what the operator was doing
+    /// by hand — three to five times.
+    #[test]
+    fn a_tune_the_radio_never_acknowledges_is_sent_again() {
+        let mut d = at(14_074_000.0);
+        assert_eq!(d.set_vfo(7_074_000.0), Some(7_074_000.0));
+        assert_eq!(d.retry(), None, "not before the radio has had time to answer");
+        // The frame was lost: the radio keeps reporting where it always was.
+        assert_eq!(d.report(14_074_000.0), None);
+        d.commanded = d.commanded.map(|c| Commanded { sent: c.sent - RETRY_AFTER, ..c });
+        assert_eq!(d.retry(), Some(7_074_000.0), "ask again rather than give up");
+        assert_eq!(d.retry(), None, "and then wait again before asking a third time");
+        // A resend is not a new tune: it must not push the settling deadline
+        // out, or a radio that never answers would be argued with for ever.
+        age(&mut d, FREQ_SETTLE * 2);
+        assert_eq!(d.retry(), None);
+        assert_eq!(d.report(14_074_000.0), Some(14_074_000.0));
+    }
+
+    /// Nothing is asked twice once the radio has said it went there — the
+    /// common case has to cost exactly one frame.
+    #[test]
+    fn a_tune_the_radio_confirms_is_never_sent_again() {
+        let mut d = at(14_074_000.0);
+        assert_eq!(d.set_vfo(7_074_000.0), Some(7_074_000.0));
+        assert_eq!(d.report(7_074_000.0), Some(7_074_000.0));
+        d.commanded = d.commanded.map(|c| Commanded { sent: c.sent - RETRY_AFTER, ..c });
+        assert_eq!(d.retry(), None);
+    }
+
+    /// And nothing is asked at all while an over owns the dial: the transmit
+    /// frequency went out with the key-down, and a resend of the receive dial
+    /// would drag the transmitter off it mid-transmission.
+    #[test]
+    fn nothing_is_re_asked_while_an_over_owns_the_dial() {
+        let mut d = at(14_074_000.0);
+        assert_eq!(d.set_vfo(7_074_000.0), Some(7_074_000.0));
+        d.begin_tx(7_100_000.0);
+        d.commanded = d.commanded.map(|c| Commanded { sent: c.sent - RETRY_AFTER, ..c });
+        assert_eq!(d.retry(), None);
+    }
+
+    /// RIT rides on the same dial, so a report answering the write *before* the
+    /// offset was applied is the same stale answer and gets the same treatment.
+    #[test]
+    fn the_guard_covers_a_rit_write_too() {
+        let mut d = at(14_074_000.0);
+        assert_eq!(d.set_rit(700.0), Some(14_074_700.0));
+        assert_eq!(d.report(14_074_000.0), None, "the dial before the offset went out");
+        assert_eq!(d.rx_hz(), 14_074_700.0);
+        assert_eq!(d.report(14_074_700.0), Some(14_074_000.0));
+    }
+
+    /// Nothing is commanded during an over, so nothing is guarded either: the
+    /// [`Dial::stale_tx`] rule is what covers that window, and the two must not
+    /// tread on each other.
+    #[test]
+    fn a_retune_deferred_by_an_over_arms_nothing() {
+        let mut d = at(14_074_000.0);
+        d.begin_tx(14_200_000.0);
+        assert_eq!(d.set_vfo(14_080_000.0), None);
+        assert_eq!(d.commanded, None);
     }
 
     /// The guard lasts one over, not for good: a fresh over re-arms it, and

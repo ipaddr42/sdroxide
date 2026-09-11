@@ -30,9 +30,7 @@ mod tci_source;
 use anyhow::{Context, bail};
 use clap::Parser;
 use sdroxide_config::Settings;
-use sdroxide_radio::{
-    ConvertedSource, FileSource, IqSource, SigGenSource, override_caps_ranges, shift_caps,
-};
+use sdroxide_radio::{ConvertedSource, FileSource, IqSource, SigGenSource, override_caps_ranges};
 #[cfg(feature = "soapy")]
 use sdroxide_radio::{DeviceInfo, SoapyDevice, enumerate_devices};
 use sdroxide_types::{Backend, DeviceCaps, FobosPort, IcomNetConfig, RadioConfig};
@@ -81,8 +79,8 @@ struct Cli {
     #[arg(long)]
     gain: Option<f64>,
 
-    /// Initial mode (USB, LSB, CW, AM, SAM, NFM, WFM, DIGU, DIGL, DSB, SPEC, FT8,
-    /// FT4, FT2, PSK, RTTY, PACKET, APRS, ADS-B, VDL2, SSTV, RIFP, OLIVIA, THOR, FSQ)
+    /// Initial mode (USB, LSB, CW, AM, SAM, NFM, WFM, DIGU, DIGL, DSB, ISB, SPEC, FT8,
+    /// FT4, FT2, PSK, RTTY, PACKET, APRS, ADS-B, VDL2, AIS, SSTV, RIFP, OLIVIA, THOR, FSQ)
     ///
     /// Default: the mode the last session was left in.
     #[arg(long)]
@@ -136,6 +134,11 @@ struct Cli {
     /// A bare address reaches the station's first radio. To reach one of its
     /// others, name it: "host:4950/ws/1" — the server lists which id is which
     /// at http://host:4950/radios.
+    ///
+    /// A bare address is dialled as plain "ws://". Where the server sits behind
+    /// something that terminates HTTPS for it — a reverse proxy on 443 — give
+    /// the whole "wss://host/ws" instead; the GUI's Remote tab has a switch for
+    /// the same thing.
     #[arg(long, value_name = "HOST[:PORT]")]
     connect: Option<String>,
 
@@ -1173,9 +1176,11 @@ fn open_source(cli: &Cli, settings: &Settings) -> anyhow::Result<(Box<dyn IqSour
 /// offset goes on here, once, and [`ConvertedSource`] takes it off again for
 /// everything the source reports back.
 ///
-/// Stated ranges go on before the offset, for the same reason: they describe
-/// the hardware, and `shift_caps` moves the hardware's ranges into the
-/// operator's domain whether the hardware or its owner named them.
+/// Stated ranges go on *after* the offset, because they are the one thing here
+/// the operator typed: a transverter owner who writes 144-148 means the band
+/// they tune, not the 28-32 MHz I.F. the radio is really on. Only the device's
+/// own published ranges are in the hardware's domain, and `shift_caps` moves
+/// those into the operator's before the stated ones replace them (issue #279).
 fn open_converted_source(
     radio: &RadioConfig,
     cli: &Cli,
@@ -1184,8 +1189,8 @@ fn open_converted_source(
     if radio.panadapter.is_attached() {
         return open_paired_source(radio, cli, settings);
     }
-    let offset = radio.converter_offset_hz;
-    if offset == 0.0 || !offset.is_finite() {
+    let plan = converter_plan(radio);
+    if plan.is_transparent() {
         let (source, caps) = open_configured_source(radio, cli, settings)?;
         return Ok((source, stated_ranges(caps, radio)));
     }
@@ -1193,6 +1198,7 @@ fn open_converted_source(
     // Not simply `dial + offset`: a dial from before the converter was set up is
     // still in the hardware's own domain, and that sum is below DC — see
     // `converter_open_hz`.
+    let offset = plan.offset_for(cli.center_hz());
     let hw = sdroxide_radio::converter_open_hz(cli.center_hz(), offset);
     if hw != cli.center_hz() + offset {
         tracing::info!(
@@ -1204,23 +1210,74 @@ fn open_converted_source(
     }
     c.freq = Some(hw);
     let (source, caps) = open_configured_source(radio, &c, settings)?;
-    let caps = stated_ranges(caps, radio);
-    // The transmit line is a separate fact about the station, and the operator
-    // states it — see `sdroxide_types::ConverterTx`.
-    let tx_offset = radio.converter_tx.offset_hz(offset);
-    tracing::info!(
-        "frequency converter: hardware tuned {:.6} MHz above the dial; transmit {}",
-        offset / 1e6,
-        match tx_offset {
-            None => "withdrawn".to_string(),
-            Some(t) if t == 0.0 => "not converted (the radio transmits on the dial)".to_string(),
-            Some(t) => format!("tuned {:.6} MHz above the dial", t / 1e6),
+    // Device ranges down into the operator's domain first, then whatever the
+    // operator stated on top of them — that order is what makes a typed range
+    // mean the dial rather than the I.F.
+    let caps = sdroxide_radio::plan_caps(caps, &plan, &radio.freq_ranges_rx, &radio.freq_ranges_tx);
+    log_stated_ranges(radio, &caps);
+    Ok((Box::new(ConvertedSource::with_plan(source, plan)), caps))
+}
+
+/// What is in front of this radio, band by band: the transverter table first,
+/// then the single whole-dial converter offset as the last resort.
+///
+/// Both live in `radio.json` and both mean the same thing — the hardware is
+/// tuned to `dial + offset` — so they are one list here rather than two
+/// mechanisms. A dial that no transverter covers falls through to the single
+/// offset, and to the bare radio when that is zero as well, which is what keeps
+/// HF working on a station whose only converter is a 2 m transverter
+/// (issue #278).
+fn converter_plan(radio: &RadioConfig) -> sdroxide_radio::ConverterPlan {
+    use sdroxide_radio::ConverterStep;
+    let mut steps: Vec<ConverterStep> = Vec::new();
+    for x in radio.transverters.iter().take(sdroxide_types::MAX_TRANSVERTERS) {
+        if !x.enabled || !x.is_band() || !x.offset_hz.is_finite() {
+            continue;
         }
-    );
-    Ok((
-        Box::new(ConvertedSource::new(source, offset, tx_offset)),
-        shift_caps(caps, offset, tx_offset),
-    ))
+        let tx_offset = x.tx.offset_hz(x.offset_hz);
+        steps.push(ConverterStep {
+            band: Some((x.rf_lo_hz, x.rf_hi_hz)),
+            rx_offset_hz: x.offset_hz,
+            tx_offset_hz: tx_offset,
+            // A ceiling of 1.0 is no ceiling; anything less is one.
+            tx_drive: (x.tx_drive < 1.0).then(|| x.tx_drive.clamp(0.0, 1.0)),
+        });
+        tracing::info!(
+            "transverter {}: {:.3}–{:.3} MHz on the dial, hardware {:.6} MHz {}; transmit {}",
+            x.describe(),
+            x.rf_lo_hz / 1e6,
+            x.rf_hi_hz / 1e6,
+            x.offset_hz.abs() / 1e6,
+            if x.offset_hz < 0.0 { "below" } else { "above" },
+            match tx_offset {
+                None => "withdrawn".to_string(),
+                Some(_) => format!("at up to {:.0}% drive", x.tx_drive * 100.0),
+            }
+        );
+    }
+    let offset = radio.converter_offset_hz;
+    if offset != 0.0 && offset.is_finite() {
+        // The transmit line is a separate fact about the station, and the
+        // operator states it — see `sdroxide_types::ConverterTx`.
+        let tx_offset = radio.converter_tx.offset_hz(offset);
+        tracing::info!(
+            "frequency converter: hardware tuned {:.6} MHz above the dial; transmit {}",
+            offset / 1e6,
+            match tx_offset {
+                None => "withdrawn".to_string(),
+                Some(t) if t == 0.0 =>
+                    "not converted (the radio transmits on the dial)".to_string(),
+                Some(t) => format!("tuned {:.6} MHz above the dial", t / 1e6),
+            }
+        );
+        steps.push(ConverterStep {
+            band: None,
+            rx_offset_hz: offset,
+            tx_offset_hz: tx_offset,
+            tx_drive: None,
+        });
+    }
+    sdroxide_radio::ConverterPlan::from_steps(steps)
 }
 
 /// Open a radio that borrows another roster radio's receiver as its panadapter:
@@ -1337,9 +1394,16 @@ fn panadapter_owners() -> std::collections::HashMap<u32, u32> {
 /// refuses to come up.
 fn stated_ranges(caps: DeviceCaps, radio: &RadioConfig) -> DeviceCaps {
     let out = override_caps_ranges(caps, &radio.freq_ranges_rx, &radio.freq_ranges_tx);
+    log_stated_ranges(radio, &out);
+    out
+}
+
+/// Say in the log which of the ranges now in `caps` came from the configuration
+/// rather than from the device.
+fn log_stated_ranges(radio: &RadioConfig, caps: &DeviceCaps) {
     for (dir, stated, applied) in [
-        ("RX", &radio.freq_ranges_rx, &out.freq_ranges_rx),
-        ("TX", &radio.freq_ranges_tx, &out.freq_ranges_tx),
+        ("RX", &radio.freq_ranges_rx, &caps.freq_ranges_rx),
+        ("TX", &radio.freq_ranges_tx, &caps.freq_ranges_tx),
     ] {
         if !stated.is_empty() {
             tracing::info!(
@@ -1348,7 +1412,6 @@ fn stated_ranges(caps: DeviceCaps, radio: &RadioConfig) -> DeviceCaps {
             );
         }
     }
-    out
 }
 
 /// Open the interface selected in `radio.json`. `Auto` prefers a SoapySDR device
@@ -1582,13 +1645,13 @@ fn hpsdr_caps(board: &str, sample_rate: f64, protocol: u8, has_lna: bool, ddc: u
     let hermes_lite = sdroxide_hpsdr::board_has_lna_gain(board);
     let nyquist = if hermes_lite { 38_400_000.0 } else { 61_440_000.0 };
     let gains = if has_lna {
-        vec![sdroxide_types::GainElement {
-            name: sdroxide_hpsdr::LNA_GAIN_ELEMENT.into(),
-            direction: sdroxide_types::Direction::Rx,
-            min_db: sdroxide_hpsdr::LNA_GAIN_MIN_DB,
-            max_db: sdroxide_hpsdr::LNA_GAIN_MAX_DB,
-            step_db: 1.0,
-        }]
+        vec![sdroxide_types::GainElement::db(
+            sdroxide_hpsdr::LNA_GAIN_ELEMENT,
+            sdroxide_types::Direction::Rx,
+            sdroxide_hpsdr::LNA_GAIN_MIN_DB,
+            sdroxide_hpsdr::LNA_GAIN_MAX_DB,
+            1.0,
+        )]
     } else {
         Vec::new()
     };
@@ -1664,35 +1727,25 @@ fn rx888_caps(src: &rx888_source::Rx888Source) -> DeviceCaps {
     use sdroxide_types::{Direction, GainElement, Rx888Config};
     let rate = src.sample_rate_hz();
     let mut gains = vec![
-        GainElement {
-            name: Rx888Config::VGA_ELEMENT.into(),
-            direction: Direction::Rx,
-            min_db: -6.0,
-            max_db: 34.0,
-            // The AD8370's vernier is linear in voltage, so the dB step
-            // varies; a request is snapped to the nearest code and reported
-            // back, which makes a fine slider honest enough.
-            step_db: 0.5,
-        },
-        GainElement {
-            name: Rx888Config::ATT_ELEMENT.into(),
-            direction: Direction::Rx,
-            min_db: -31.5,
-            max_db: 0.0,
-            step_db: 0.5,
-        },
+        // The AD8370's vernier is linear in voltage, so the dB step
+        // varies; a request is snapped to the nearest code and reported
+        // back, which makes a fine slider honest enough.
+        GainElement::db(Rx888Config::VGA_ELEMENT, Direction::Rx, -6.0, 34.0, 0.5),
+        GainElement::db(Rx888Config::ATT_ELEMENT, Direction::Rx, -31.5, 0.0, 0.5),
     ];
     // Only offer the tuner's gain on a receiver that has one, so the control
     // does not appear on a board where it would do nothing.
     if src.vhf_capable() {
-        gains.push(GainElement {
-            name: Rx888Config::TUNER_GAIN_ELEMENT.into(),
-            direction: Direction::Rx,
-            min_db: 0.0,
-            max_db: Rx888Config::TUNER_GAIN_MAX_DB,
+        gains.push(
             // 29 discrete steps, snapped and reported back like the two above.
-            step_db: 0.1,
-        });
+            GainElement::db(
+                Rx888Config::TUNER_GAIN_ELEMENT,
+                Direction::Rx,
+                0.0,
+                Rx888Config::TUNER_GAIN_MAX_DB,
+                0.1,
+            ),
+        );
     }
     DeviceCaps {
         driver: "rx888".into(),
@@ -1745,13 +1798,13 @@ fn airspyhf_caps(src: &airspyhf_source::AirspyHfSource) -> DeviceCaps {
         audio_mode: false,
         freq_ranges_rx: src.model().freq_ranges().to_vec(),
         sample_rates: src.available_rates().to_vec(),
-        gains: vec![GainElement {
-            name: AirspyHfConfig::ATT_ELEMENT.into(),
-            direction: Direction::Rx,
-            min_db: -att_max_db,
-            max_db: 0.0,
-            step_db: att_step_db,
-        }],
+        gains: vec![GainElement::db(
+            AirspyHfConfig::ATT_ELEMENT,
+            Direction::Rx,
+            -att_max_db,
+            0.0,
+            att_step_db,
+        )],
         ..DeviceCaps::default()
     }
 }
@@ -1816,13 +1869,13 @@ fn elad_caps(src: &elad_source::EladSource) -> DeviceCaps {
         // One real gain: the input pad, in or out. The pre-selection filter
         // switch is a pseudo-element and deliberately absent, so only this
         // backend's own settings tab draws it.
-        gains: vec![GainElement {
-            name: EladConfig::ATT_ELEMENT.into(),
-            direction: Direction::Rx,
-            min_db: -sdroxide_types::ELAD_ATTENUATOR_DB,
-            max_db: 0.0,
-            step_db: sdroxide_types::ELAD_ATTENUATOR_DB,
-        }],
+        gains: vec![GainElement::db(
+            EladConfig::ATT_ELEMENT,
+            Direction::Rx,
+            -sdroxide_types::ELAD_ATTENUATOR_DB,
+            0.0,
+            sdroxide_types::ELAD_ATTENUATOR_DB,
+        )],
         // The transceiver's two antenna sockets, on either control path — the
         // rig's `AN` command. Receive only, because that is all `AN` moves: it
         // chooses whether the receiver listens on the shared RTX socket or on
@@ -1876,13 +1929,16 @@ fn airspy_caps(src: &airspy_source::AirspySource) -> DeviceCaps {
         audio_mode: false,
         freq_ranges_rx: vec![AirspyConfig::FREQ_RANGE],
         sample_rates: src.available_rates().to_vec(),
-        gains: vec![GainElement {
-            name: AirspyConfig::GAIN_ELEMENT.into(),
-            direction: Direction::Rx,
-            min_db: 0.0,
-            max_db: (AirspyConfig::GAIN_STEPS - 1) as f64,
-            step_db: 1.0,
-        }],
+        // A place on the gain curve, not a level: 22 steps that set the LNA,
+        // mixer and VGA together by a table in the firmware, and no dB figure
+        // this side could put on one of them.
+        gains: vec![GainElement::steps(
+            AirspyConfig::GAIN_ELEMENT,
+            Direction::Rx,
+            0.0,
+            (AirspyConfig::GAIN_STEPS - 1) as f64,
+            1.0,
+        )],
         ..DeviceCaps::default()
     }
 }
@@ -1926,13 +1982,15 @@ fn hydrasdr_caps(src: &hydrasdr_source::HydraSdrSource) -> DeviceCaps {
         audio_mode: false,
         freq_ranges_rx: vec![HydraSdrConfig::FREQ_RANGE],
         sample_rates: src.available_rates().to_vec(),
-        gains: vec![GainElement {
-            name: HydraSdrConfig::GAIN_ELEMENT.into(),
-            direction: Direction::Rx,
-            min_db: 0.0,
-            max_db: (HydraSdrConfig::GAIN_STEPS - 1) as f64,
-            step_db: 1.0,
-        }],
+        // The Airspy's gain curve, in a fork of it: a step along a table the
+        // firmware owns. See `airspy_caps`.
+        gains: vec![GainElement::steps(
+            HydraSdrConfig::GAIN_ELEMENT,
+            Direction::Rx,
+            0.0,
+            (HydraSdrConfig::GAIN_STEPS - 1) as f64,
+            1.0,
+        )],
         ..DeviceCaps::default()
     }
 }
@@ -2010,21 +2068,25 @@ fn fobos_caps(src: &fobos_source::FobosSource, port: FobosPort) -> DeviceCaps {
         freq_ranges_rx: vec![freq_range],
         sample_rates: rates,
         gains: if port == FobosPort::Rf {
+            // Both are register settings — 0..3 and 0..31 — that the SDK
+            // takes as they stand and puts no decibels on. The backend's own
+            // settings tab has always shown them bare; this is what stops the
+            // main window's Gain slider calling them dB.
             vec![
-                GainElement {
-                    name: FobosConfig::LNA_GAIN_ELEMENT.into(),
-                    direction: Direction::Rx,
-                    min_db: 0.0,
-                    max_db: f64::from(FobosConfig::LNA_GAIN_MAX),
-                    step_db: 1.0,
-                },
-                GainElement {
-                    name: FobosConfig::VGA_GAIN_ELEMENT.into(),
-                    direction: Direction::Rx,
-                    min_db: 0.0,
-                    max_db: f64::from(FobosConfig::VGA_GAIN_MAX),
-                    step_db: 1.0,
-                },
+                GainElement::steps(
+                    FobosConfig::LNA_GAIN_ELEMENT,
+                    Direction::Rx,
+                    0.0,
+                    f64::from(FobosConfig::LNA_GAIN_MAX),
+                    1.0,
+                ),
+                GainElement::steps(
+                    FobosConfig::VGA_GAIN_ELEMENT,
+                    Direction::Rx,
+                    0.0,
+                    f64::from(FobosConfig::VGA_GAIN_MAX),
+                    1.0,
+                ),
             ]
         } else {
             Vec::new()
@@ -2077,29 +2139,11 @@ fn hackrf_caps(src: &hackrf_source::HackRfSource) -> DeviceCaps {
     let range = src.freq_range();
     let tx = src.tx_enabled();
     let mut gains = vec![
-        GainElement {
-            name: HackRfConfig::LNA_ELEMENT.into(),
-            direction: Direction::Rx,
-            min_db: 0.0,
-            max_db: 40.0,
-            step_db: 8.0,
-        },
-        GainElement {
-            name: HackRfConfig::VGA_ELEMENT.into(),
-            direction: Direction::Rx,
-            min_db: 0.0,
-            max_db: 62.0,
-            step_db: 2.0,
-        },
+        GainElement::db(HackRfConfig::LNA_ELEMENT, Direction::Rx, 0.0, 40.0, 8.0),
+        GainElement::db(HackRfConfig::VGA_ELEMENT, Direction::Rx, 0.0, 62.0, 2.0),
     ];
     if tx {
-        gains.push(GainElement {
-            name: HackRfConfig::TXVGA_ELEMENT.into(),
-            direction: Direction::Tx,
-            min_db: 0.0,
-            max_db: 47.0,
-            step_db: 1.0,
-        });
+        gains.push(GainElement::db(HackRfConfig::TXVGA_ELEMENT, Direction::Tx, 0.0, 47.0, 1.0));
     }
     DeviceCaps {
         driver: "hackrf".into(),
@@ -2165,23 +2209,25 @@ fn open_lime_source(
 fn lime_caps(src: &lime_source::LimeSource) -> DeviceCaps {
     use sdroxide_types::{Direction, GainElement, LimeConfig};
     let tx = src.tx_enabled();
-    let mut gains = vec![GainElement {
-        name: LimeConfig::RX_GAIN_ELEMENT.into(),
-        direction: Direction::Rx,
-        min_db: LimeConfig::GAIN_MIN_DB,
-        max_db: LimeConfig::GAIN_MAX_DB,
+    let mut gains = vec![
         // LimeSuite takes an unsigned number of decibels; anything finer is
         // truncated by the library, so offering finer would be a fiction.
-        step_db: 1.0,
-    }];
+        GainElement::db(
+            LimeConfig::RX_GAIN_ELEMENT,
+            Direction::Rx,
+            LimeConfig::GAIN_MIN_DB,
+            LimeConfig::GAIN_MAX_DB,
+            1.0,
+        ),
+    ];
     if tx {
-        gains.push(GainElement {
-            name: LimeConfig::TX_GAIN_ELEMENT.into(),
-            direction: Direction::Tx,
-            min_db: LimeConfig::GAIN_MIN_DB,
-            max_db: LimeConfig::GAIN_MAX_DB,
-            step_db: 1.0,
-        });
+        gains.push(GainElement::db(
+            LimeConfig::TX_GAIN_ELEMENT,
+            Direction::Tx,
+            LimeConfig::GAIN_MIN_DB,
+            LimeConfig::GAIN_MAX_DB,
+            1.0,
+        ));
     }
     DeviceCaps {
         driver: "lime".into(),
@@ -2216,22 +2262,14 @@ fn open_sdrplay_source(
 /// Capabilities for an SDRplay RSP: wideband IQ, receive only, 1 kHz–2 GHz on
 /// every model.
 ///
-/// The two real gain elements are both *negated reductions* — `IF` is −(IF
-/// gain reduction), `LNA` is −(LNA state) — so the sliders read the usual way
-/// round: right is louder. The LNA range is the model's best band; bands with
-/// fewer states get clamped by the driver, which reports the state it kept.
-/// The switches (AGC, notches, bias tee, HDR) ride pseudo-elements that are
-/// deliberately not listed here, so only the SDRplay settings panel renders
-/// them.
-///
-/// The LNA is listed first — the first element is the main window's Gain
-/// slider, and the LNA is the only gain the operator always owns: with the
-/// hardware AGC on (the default) the service holds the IF gain, and a slider
-/// the AGC snaps back is worse than none. It is also the control that
-/// actually clears an overloaded front end, which the IF gain never can.
+/// The two real gain elements come from [`SdrPlaySource::rx_gain_elements`],
+/// which is also what the engine re-asks after a retune — the LNA ladder's
+/// length belongs to the band, so this is a snapshot rather than a fact, and
+/// one place has to own it. The switches (AGC, notches, bias tee, HDR) ride
+/// pseudo-elements that are deliberately not listed here, so only the SDRplay
+/// settings panel renders them.
 fn sdrplay_caps(src: &sdrplay_source::SdrPlaySource) -> DeviceCaps {
-    use sdroxide_types::{Direction, GainElement, SdrPlayConfig};
-    let model = src.model();
+    use sdroxide_types::SdrPlayConfig;
     DeviceCaps {
         driver: "sdrplay".into(),
         label: src.describe(),
@@ -2249,22 +2287,7 @@ fn sdrplay_caps(src: &sdrplay_source::SdrPlaySource) -> DeviceCaps {
         } else {
             SdrPlayConfig::SAMPLE_RATES.to_vec()
         },
-        gains: vec![
-            GainElement {
-                name: SdrPlayConfig::LNA_ELEMENT.into(),
-                direction: Direction::Rx,
-                min_db: -(model.max_lna_state() as f64),
-                max_db: 0.0,
-                step_db: 1.0,
-            },
-            GainElement {
-                name: SdrPlayConfig::IF_GAIN_ELEMENT.into(),
-                direction: Direction::Rx,
-                min_db: -(SdrPlayConfig::IF_GR_MAX as f64),
-                max_db: -(SdrPlayConfig::IF_GR_MIN as f64),
-                step_db: 1.0,
-            },
-        ],
+        gains: src.rx_gain_elements(),
         antennas_rx: src.antennas().to_vec(),
         // Two aerials arriving as one span: what puts the filter's controls on
         // the main strip rather than only in the settings dialog (issue #165).
@@ -2328,23 +2351,23 @@ fn pluto_caps(src: &pluto_source::PlutoSource, rx: u8) -> DeviceCaps {
     // The transmitter belongs to the chain-0 radio — the device has one DUC
     // path wired here.
     let tx_capable = rx == 0;
-    let mut gains = vec![GainElement {
-        name: PlutoConfig::RF_GAIN_ELEMENT.into(),
-        direction: Direction::Rx,
-        min_db: limits.rx_gain_db.0,
-        max_db: limits.rx_gain_db.1,
-        step_db: limits.rx_gain_db.2,
-    }];
+    let mut gains = vec![GainElement::db(
+        PlutoConfig::RF_GAIN_ELEMENT,
+        Direction::Rx,
+        limits.rx_gain_db.0,
+        limits.rx_gain_db.1,
+        limits.rx_gain_db.2,
+    )];
     if tx_capable {
         // Transmit "gain" is the AD9361's attenuator, so this range is
         // negative: 0 dB is full output.
-        gains.push(GainElement {
-            name: PlutoConfig::TX_GAIN_ELEMENT.into(),
-            direction: Direction::Tx,
-            min_db: limits.tx_gain_db.0,
-            max_db: limits.tx_gain_db.1,
-            step_db: limits.tx_gain_db.2,
-        });
+        gains.push(GainElement::db(
+            PlutoConfig::TX_GAIN_ELEMENT,
+            Direction::Tx,
+            limits.tx_gain_db.0,
+            limits.tx_gain_db.1,
+            limits.tx_gain_db.2,
+        ));
     }
     DeviceCaps {
         driver: "pluto".into(),
@@ -2415,15 +2438,17 @@ fn rtlsdr_caps(src: &rtlsdr_source::RtlSdrSource, driver: &str) -> DeviceCaps {
         audio_mode: false,
         freq_ranges_rx,
         sample_rates: sdroxide_types::RtlSdrConfig::SAMPLE_RATES.to_vec(),
-        gains: vec![sdroxide_types::GainElement {
-            name: sdroxide_types::RtlSdrConfig::TUNER_GAIN_ELEMENT.into(),
-            direction: sdroxide_types::Direction::Rx,
-            min_db: 0.0,
-            max_db: sdroxide_types::RtlSdrConfig::GAIN_MAX_DB,
+        gains: vec![
             // The hardware only has 29 discrete steps; a request is snapped to
             // the nearest and reported back, so a fine slider is honest enough.
-            step_db: 0.1,
-        }],
+            sdroxide_types::GainElement::db(
+                sdroxide_types::RtlSdrConfig::TUNER_GAIN_ELEMENT,
+                sdroxide_types::Direction::Rx,
+                0.0,
+                sdroxide_types::RtlSdrConfig::GAIN_MAX_DB,
+                0.1,
+            ),
+        ],
         ..DeviceCaps::default()
     }
 }
@@ -2479,18 +2504,19 @@ fn spyserver_caps(src: &spyserver_source::SpyServerSource, driver: &str) -> Devi
     let gains = if info.maximum_gain_index == 0 || !src.can_control() {
         Vec::new()
     } else {
-        vec![sdroxide_types::GainElement {
-            name: sdroxide_types::SpyServerConfig::GAIN_ELEMENT.into(),
-            direction: sdroxide_types::Direction::Rx,
-            // An index into the far end's gain table, carried in a field named
-            // for decibels because `GainElement` has no other — the same thing
-            // the SDRplay backend's LNA state already does. What an index means
-            // depends on the receiver and on the band, so no dB mapping is
-            // invented; the settings tab says so instead.
-            min_db: 0.0,
-            max_db: f64::from(info.maximum_gain_index),
-            step_db: 1.0,
-        }]
+        vec![
+            // An index into the far end's gain table — the same thing the
+            // SDRplay backend's LNA state is. What an index means depends on
+            // the receiver and on the band, so no dB mapping is invented and
+            // the element says it is counted in steps.
+            sdroxide_types::GainElement::steps(
+                sdroxide_types::SpyServerConfig::GAIN_ELEMENT,
+                sdroxide_types::Direction::Rx,
+                0.0,
+                f64::from(info.maximum_gain_index),
+                1.0,
+            ),
+        ]
     };
     DeviceCaps {
         driver: driver.into(),
@@ -2551,23 +2577,26 @@ fn kiwisdr_caps(src: &kiwisdr_source::KiwiSdrSource) -> DeviceCaps {
         freq_ranges_rx: vec![(lo, hi)],
         sample_rates: vec![src.sample_rate()],
         gains: vec![
-            sdroxide_types::GainElement {
-                name: sdroxide_types::KiwiConfig::AGC_ELEMENT.into(),
-                direction: sdroxide_types::Direction::Rx,
-                min_db: 0.0,
-                max_db: 1.0,
-                step_db: 1.0,
-            },
-            sdroxide_types::GainElement {
-                name: sdroxide_types::KiwiConfig::MAN_GAIN_ELEMENT.into(),
-                direction: sdroxide_types::Direction::Rx,
-                // The receiver's own scale, carried in a field named for
-                // decibels because `GainElement` has no other - the same thing
-                // the SpyServer's gain index and the SDRplay's LNA state do.
-                min_db: 0.0,
-                max_db: 90.0,
-                step_db: 1.0,
-            },
+            // A switch riding a gain element, so its two values are 0 and 1
+            // — which are not decibels either.
+            sdroxide_types::GainElement::steps(
+                sdroxide_types::KiwiConfig::AGC_ELEMENT,
+                sdroxide_types::Direction::Rx,
+                0.0,
+                1.0,
+                1.0,
+            ),
+            // The receiver's own scale, in a field named for decibels because
+            // `GainElement` has no other - the same thing the SpyServer's gain
+            // index and the SDRplay's LNA state are, and counted in steps for
+            // the same reason.
+            sdroxide_types::GainElement::steps(
+                sdroxide_types::KiwiConfig::MAN_GAIN_ELEMENT,
+                sdroxide_types::Direction::Rx,
+                0.0,
+                90.0,
+                1.0,
+            ),
         ],
         ..DeviceCaps::default()
     }
@@ -2748,7 +2777,7 @@ fn smartsdr_caps(model: &str, label: String) -> DeviceCaps {
 /// greyed out the 70 cm button on a rig that has the band, and a 54 MHz
 /// transmit ceiling refused to key a 2 m rig that was hearing the band
 /// perfectly well. What holds a licensed operator in bounds is the
-/// amateur-band gate — region-aware, and 70 cm is the highest band sdroxide's
+/// amateur-band gate — region-aware, and 3 cm is the highest band sdroxide's
 /// table knows — plus the rig's own refusal. An operator who wants a firmer
 /// limit than that can state one in Settings.
 fn cat_caps(radio: &RadioConfig) -> DeviceCaps {

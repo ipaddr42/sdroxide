@@ -89,13 +89,27 @@ pub struct RemoteServer {
     pub host: String,
     /// The port that server listens on — `server_port` in *its* `config.toml`.
     pub port: u16,
+    /// Dial `wss://` rather than `ws://`: the server is behind something that
+    /// terminates TLS for it.
+    ///
+    /// sdroxide's own server speaks plain WebSocket and nothing else, so this
+    /// is never about the server itself — it is about the reverse proxy in
+    /// front of it, which is how a station ends up answering on port 443. A
+    /// browser client never needs the setting because the page it was served
+    /// from already says which scheme to use; the native client has no page to
+    /// follow and would otherwise offer the proxy a `ws://` handshake it can
+    /// only refuse (issue #360).
+    ///
+    /// Off by default, so a `config.toml` written before this reads back as the
+    /// plain link it was.
+    pub tls: bool,
 }
 
 impl Default for RemoteServer {
     fn default() -> Self {
         // The port every sdroxide server binds unless it was told otherwise, so
         // the operator only has to type the half that is actually theirs.
-        RemoteServer { host: String::new(), port: 4950 }
+        RemoteServer { host: String::new(), port: 4950, tls: false }
     }
 }
 
@@ -105,18 +119,25 @@ impl RemoteServer {
     /// A host that already carries a scheme is taken as a complete URL and used
     /// as typed: pasting a `ws://…/ws` (or a `wss://` one from a reverse proxy)
     /// into the address box is a reasonable thing to do, and rebuilding it
-    /// around the port box would only break it. An IPv6 literal is bracketed if
-    /// the operator did not bracket it themselves, because `::1:4950` is not an
-    /// address.
+    /// around the port box would only break it — so [`Self::tls`] does not
+    /// touch it either. An IPv6 literal is bracketed if the operator did not
+    /// bracket it themselves, because `::1:4950` is not an address.
     pub fn url(&self) -> String {
         let host = self.host.trim();
         if host.contains("://") {
             return host.to_string();
         }
+        let scheme = self.scheme();
         if host.contains(':') && !host.starts_with('[') {
-            return format!("ws://[{host}]:{}/ws", self.port);
+            return format!("{scheme}://[{host}]:{}/ws", self.port);
         }
-        format!("ws://{host}:{}/ws", self.port)
+        format!("{scheme}://{host}:{}/ws", self.port)
+    }
+
+    /// Which WebSocket scheme [`Self::url`] will build, for a caller that wants
+    /// to say so rather than dial it.
+    pub fn scheme(&self) -> &'static str {
+        if self.tls { "wss" } else { "ws" }
     }
 
     /// What to call the tab this connection opens: the address as typed, minus
@@ -255,19 +276,36 @@ mod tests {
     /// types: a bare host, a host with the port in it, and a pasted URL.
     #[test]
     fn the_dialled_url_follows_what_was_typed() {
-        let plain = RemoteServer { host: "shack".into(), port: 4950 };
+        let plain = RemoteServer { host: "shack".into(), port: 4950, tls: false };
         assert_eq!(plain.url(), "ws://shack:4950/ws");
         assert_eq!(plain.label(), "shack:4950");
         // A whole URL wins over the port box — including a `wss://` one from a
         // reverse proxy, which this could not have built.
-        let url = RemoteServer { host: "wss://shack.example/ws".into(), port: 4950 };
+        let url = RemoteServer { host: "wss://shack.example/ws".into(), port: 4950, tls: false };
         assert_eq!(url.url(), "wss://shack.example/ws");
         assert_eq!(url.label(), "shack.example");
         // An IPv6 literal needs brackets before a port can be appended to it.
-        let v6 = RemoteServer { host: "fe80::1".into(), port: 4950 };
+        let v6 = RemoteServer { host: "fe80::1".into(), port: 4950, tls: false };
         assert_eq!(v6.url(), "ws://[fe80::1]:4950/ws");
-        let bracketed = RemoteServer { host: "[fe80::1]".into(), port: 4950 };
+        let bracketed = RemoteServer { host: "[fe80::1]".into(), port: 4950, tls: false };
         assert_eq!(bracketed.url(), "ws://[fe80::1]:4950/ws");
+    }
+
+    /// The secure switch, which is the whole of what a station behind a reverse
+    /// proxy needs from this end: the scheme changes and nothing else does, so
+    /// the port the operator typed is still the port dialled (issue #360).
+    #[test]
+    fn the_secure_switch_changes_the_scheme_and_nothing_else() {
+        let tls = RemoteServer { host: "shack.example".into(), port: 443, tls: true };
+        assert_eq!(tls.url(), "wss://shack.example:443/ws");
+        assert_eq!(tls.label(), "shack.example:443");
+        // Brackets are still the IPv6 answer, secure or not.
+        let v6 = RemoteServer { host: "fe80::1".into(), port: 443, tls: true };
+        assert_eq!(v6.url(), "wss://[fe80::1]:443/ws");
+        // A pasted URL is used as typed, so the switch has nothing to say about
+        // it — turning it on must not rewrite somebody's plain-text tunnel.
+        let typed = RemoteServer { host: "ws://shack.example/ws".into(), port: 443, tls: true };
+        assert_eq!(typed.url(), "ws://shack.example/ws");
     }
 
     #[test]

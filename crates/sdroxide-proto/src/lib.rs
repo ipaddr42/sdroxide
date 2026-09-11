@@ -1066,7 +1066,252 @@ use sdroxide_types::{
 /// existed, because JSON is self-describing; postcard is not, so it rescues
 /// nothing on the wire. The handshake's equality test is what stops that
 /// before a frame is exchanged.
-pub const PROTO_VERSION: u16 = 118;
+///
+/// v119: independent sideband — [`sdroxide_types::Mode::Isb`], appended to the
+/// end of `Mode` so no existing discriminant moves. Nothing in the message set
+/// changed shape, and that is exactly why the bump is needed: postcard decodes
+/// a discriminant it has never heard of as an error, so a v118 client handed a
+/// `RadioState` whose mode is 36 fails the whole frame rather than one field.
+/// The handshake refuses the pairing instead (issue #280).
+///
+/// v120: the transverter table — [`sdroxide_types::RadioConfig`] gains
+/// `transverters`, a list with a band and an offset per box. `RadioConfig`
+/// rides `ServerMsg::RadioConfig` and `Command::SetRadioConfig` **whole**, so a
+/// v119 peer handed one with a list on the end reads the tail of every one of
+/// those messages out of step — the same not-survivable addition every config
+/// field before it made (issue #278).
+///
+/// v121: where the antenna is — [`sdroxide_types::RadioConfig`] gains
+/// `rx_site`, which says whether this radio listens on the station's own
+/// antenna or on somebody else's, and where that one is. Reception reports are
+/// posted from it rather than from the operator's locator (issue #284). Same
+/// not-survivable shape change as every config field before it: `RadioConfig`
+/// rides `ServerMsg::RadioConfig` and `Command::SetRadioConfig` whole, so a
+/// v120 peer handed one with an enum on the end reads the tail of every one of
+/// those messages out of step.
+///
+/// v122: the VDL2 decoder's two new counters (issue #265).
+/// [`sdroxide_types::Vdl2Status`] gains `hdlc_bad` and `fec_bypassed`, which
+/// say whether the data field unwrapped and whether the frame came through on
+/// its check sequence alone. The struct rides `ServerMsg::Vdl2Status` whole and
+/// is re-sent a couple of times a second, so a v121 peer would read the tail of
+/// every one of them out of step.
+///
+/// v123: who sent the picture — [`sdroxide_types::SstvStatus`] gains `rx_id`,
+/// the callsign a station sent as an FSK ID after its transmission (issue
+/// #287). The struct rides `ServerMsg::SstvStatus` whole and is re-sent several
+/// times a second while the mode is up, so a v122 peer handed one with an
+/// option on the end reads the tail of every one of them out of step.
+///
+/// v124: the operator's own frequencies —
+/// [`sdroxide_types::StationConfig`] gains `digi_presets`, the list a station
+/// has added to the digital modes' own tables, and
+/// [`sdroxide_types::Command`] gains `SetDigiPresets` to edit it (issue #268).
+/// The config rides `ServerMsg::StationConfig` whole, so a v123 peer handed one
+/// with a list on the end reads the tail of it out of step; the command is
+/// appended last, so no surviving discriminant moved.
+///
+/// v125: controlled-envelope SSB — [`sdroxide_types::TxState`] gains
+/// `cessb_db`, and [`sdroxide_types::Command`] gains `SetCessb` to move it
+/// (issue #283). `TxState` sits in the middle of `RadioState`, which travels
+/// whole on every change, so a v124 peer desynchronises on everything after it;
+/// the command is appended last, so no surviving discriminant moved.
+///
+/// v126: PureSignal on an HPSDR board —
+/// [`sdroxide_types::HpsdrConfig`] gains `puresignal`, `ps_bins`, `ps_rate`
+/// and `ps_frozen` at its tail (issue #283). `HpsdrConfig` is part of
+/// `RadioConfig`, which rides `ServerMsg::RadioConfig` and
+/// `Command::SetRadioConfig` whole, so a v125 peer handed one with four fields
+/// on the end of that block reads the tail of every one of those messages out
+/// of step.
+///
+/// v127: the QO-100 spectral tracker — [`sdroxide_types::Qo100Settings`] gains
+/// `park_lo_hz`, `park_hi_hz`, `decode_telemetry` and `auto_apply`, the
+/// parking window the tracker searches and the two things it may do with what
+/// it finds (issue #291). The struct sits inside `RadioState` with `vdl2`
+/// after it, and `RadioState` rides `ServerMsg::State` whole on every change,
+/// so a v126 peer handed one with four fields in the middle of that block
+/// reads `vdl2` — and the tail of every state update — out of step. It also
+/// rides `Command::SetQo100Config`, which a remote client sends whole when the
+/// operator touches any of the page's chips.
+///
+/// [`sdroxide_types::Qo100Status`] grows in the same commit, but it is not on
+/// the wire yet: `sdroxide_server` maps `RadioEvent::Qo100Status` to `None`
+/// and the QO-100 readout is local to the receiving station.
+/// v128: AIS — the ship-reporting system on the two 162 MHz channels.
+///
+/// `Mode::Ais` is appended to [`sdroxide_types::Mode`], which on its own is
+/// survivable in one direction and not the other: postcard writes an enum's
+/// discriminant positionally, so a v127 peer handed a mode it has no variant
+/// for fails to decode the message carrying it — and `Mode` is inside
+/// `RxState`, inside `RadioState`, which travels whole on every change.
+///
+/// With it: `ServerMsg::AisStatus` carrying the vessel table and what each
+/// channel is doing, `Command::SetAisConfig` to change how the decoder
+/// behaves, and [`sdroxide_types::RadioState::ais`] holding what it was set to
+/// — the settings field appended at the tail of `RadioState`, so a v127 peer
+/// would read the end of every state update out of step. Both the message and
+/// the command are appended last in their enums, so no surviving discriminant
+/// moved.
+///
+/// v129: per-band transmit drive calibration —
+/// [`sdroxide_types::RadioConfig`] gains `tx_drive_trim` at its tail, the
+/// table that makes one Drive setting mean one output power on every band
+/// (issue #295). `RadioConfig` rides `ServerMsg::RadioConfig` and
+/// `Command::SetRadioConfig` whole, so a v128 peer handed one with a field on
+/// the end reads the tail of every one of those messages out of step.
+///
+/// v130: operator-defined open-collector control words —
+/// [`sdroxide_types::HpsdrConfig`] gains `oc_table` at its tail and
+/// [`sdroxide_types::HpsdrFilterBoard`] gains a `Custom` variant (issue #296).
+/// The block sits in the middle of `RadioConfig`, which rides
+/// `ServerMsg::RadioConfig` and `Command::SetRadioConfig` whole, so a v129 peer
+/// reads every field after `hpsdr` out of step; and the enum's new variant is
+/// appended, so no surviving discriminant moved but a v129 peer handed one
+/// fails to decode the message carrying it.
+///
+/// v131: the SDRplay gain controls say what they are and what they may reach.
+/// [`sdroxide_types::GainElement`] gains a `unit`, because decibels are wrong
+/// for one of them: an RSP's RF gain is a step into a band-dependent table and
+/// a control that appended dB to it reported a number three times too small.
+/// The struct rides `DeviceCaps` inside `ServerMsg::Capabilities`, which an RSP
+/// now re-sends on every retune — the ladder's length belongs to the band — so
+/// a v130 peer would read the tail of each one out of step rather than merely
+/// missing a field.
+///
+/// With it, [`sdroxide_types::SdrPlayConfig`] gains `hdr_bw` (which filter the
+/// RSPdx's HDR path runs, previously left at the API's default because nothing
+/// ever wrote it) and `extended_if_gr` (whether the IF gain reduction may go
+/// below the API's 20 dB floor). Both sit at that block's tail, and
+/// `RadioConfig` rides `ServerMsg::RadioConfig` and `Command::SetRadioConfig`
+/// whole, so a v130 peer handed one reads the tail of each of those out of step.
+///
+/// v132: [`ServerMsg::CapabilitiesUpdated`], which says the front end revised
+/// what it said about itself rather than that there is a different one. The
+/// distinction was free while the only thing that moved mid-session was an
+/// antenna list a rig answered for once; the RSP's band-dependent LNA ladder
+/// republishes on every crossing of a band edge, and a client that reads each
+/// of those as a new radio throws away its wideband waterfall mid-QSY. The
+/// variant is appended, so no surviving discriminant moved — but a v131 peer
+/// handed one fails to decode the message carrying it.
+/// v133: [`sdroxide_types::KiwiConfig`] gains `wf_zoom`, how far the
+/// receiver's own waterfall is zoomed into its band (issue #303). `RadioConfig`
+/// rides `ServerMsg::RadioConfig` and `Command::SetRadioConfig` whole and
+/// postcard describes nothing about itself, so a v132 peer handed one reads the
+/// tail of every field after it out of step — the serde default that covers a
+/// stored `radio.json` does nothing on the wire.
+/// v134: `Command::TuneWidebandTo`, which points the front end so a wideband
+/// decoder's *window* lands on a frequency rather than its dial (issue #310).
+/// The ISM band buttons send it instead of `Command::SetVfo`. Appended, so no
+/// surviving discriminant moved — but a v133 peer handed one fails to decode.
+/// v135: the VDL2 channel plan is the whole 25 kHz raster rather than every
+/// other slot of it, so [`sdroxide_types::Vdl2Settings::channels`] is fourteen
+/// bits and not seven (issue #265). A `u8` on the wire where a `u16` is
+/// expected does not simply carry the wrong channels — postcard varints them,
+/// so a v134 peer reads the following fields out of step.
+/// v136: [`sdroxide_types::RadioConfig`] gains `rx_audio_gain_db`, a fixed trim
+/// on the receive audio for a rig whose own codec is quiet — the AF rail's top
+/// is unity and could only turn such a radio down (issue #315). It sits among
+/// that struct's sound-card fields, near its head, and `RadioConfig` rides
+/// `ServerMsg::RadioConfig` and `Command::SetRadioConfig` whole, so a v135 peer
+/// handed one reads almost every field after it out of step.
+/// v137: the receiving antenna. [`sdroxide_types::DeviceCaps`] gains
+/// `has_rx_antenna` and [`sdroxide_types::RadioState`] gains `rx_antenna` — an
+/// Icom's `0x12` reply carries that connector's in/out flag behind the socket,
+/// and sdroxide had been writing the byte as zero on every antenna command,
+/// switching an operator's receive aerial out of circuit on every band change
+/// (issue #229). Both fields sit at their struct's tail, and both structs ride
+/// whole inside `ServerMsg::Capabilities`, `ServerMsg::CapabilitiesUpdated` and
+/// `ServerMsg::State`, so a v136 peer handed one reads the tail of every one of
+/// those out of step rather than merely missing a field. With them,
+/// [`sdroxide_types::Command`] gains `SetRxAntenna`, appended, so no surviving
+/// discriminant moved — but a v136 peer handed one fails to decode the message
+/// carrying it.
+/// v138: a session's worth of new wire, all of it appended and none of it
+/// separable — a v137 peer handed any one of these reads the tail of the
+/// message carrying it out of step.
+///
+/// * [`sdroxide_types::Band`] gains `Cm3`, the 3 cm band an IC-905 reaches
+///   through the 10 GHz unit inside it (issue #326). A band rides inside
+///   `RadioState`, the band stack, every memory and `DigiConfig::tx_audio_hz`,
+///   and a discriminant a v137 peer has no name for stops it decoding any of
+///   them.
+/// * [`sdroxide_types::Meters`] gains `pa_temp_c`, a radio's own temperature
+///   where it measures one — a Hermes-Lite 2 does (issue #333). It sits among
+///   that struct's fields and `Meters` rides `ServerMsg::Meters` whole.
+/// * [`sdroxide_types::QsoRecord`] gains `wrl_sent` and
+///   [`sdroxide_types::NetworkConfig`] gains `wrl_api_key` and
+///   `auto_upload_wrl`; `UploadTarget` and `LoginTarget` each gain `Wrl`, the
+///   World Radio League logbook (issue #337). Both structs ride whole inside
+///   `Command::SetNetworkConfig` and `RadioEvent::Ft8QsoLogged`, and the two
+///   new variants are appended so no surviving discriminant moved — but a v137
+///   client handed one has nowhere to put it.
+/// * [`sdroxide_types::Command`] gains `LogQso`, which carries a hand-entered
+///   contact to the WSJT-X UDP listeners the way the sequencer's own contacts
+///   already went (issue #341). Appended, so no surviving discriminant moved.
+/// v139: [`sdroxide_types::Meters`] gains `adc_overload`, the front end's own
+/// converter-overflow flag where the radio reports one — a Hermes-Lite 2 does,
+/// and on a direct-sampling board it is the only thing that can say the
+/// converter is being driven into its rails by something outside the window
+/// (issue #362). It sits among that struct's fields and `Meters` rides
+/// `ServerMsg::Meters` whole, so a v138 peer handed one reads the tail of it
+/// out of step. [`sdroxide_types::HpsdrConfig`] gains the loop that acts on it
+/// — `auto_gain` and its five settings — appended to a struct that rides inside
+/// `RadioConfig`, with the same consequence.
+///
+/// v140: the operator's own CW message buttons —
+/// [`sdroxide_types::DigiConfig`] gains `cw_macros`, a list of the new
+/// [`sdroxide_types::CwMacro`], each a label and the text that button sends
+/// (issue #374). It sits with the other `cw_*` fields rather than at the tail,
+/// so a v139 peer reads every field after it out of step; `DigiConfig` rides
+/// inside `Command::SetDigiConfig` and `DigiStatus`, both of which cross the
+/// link whole.
+///
+/// v141: the CW panel picks its decoder —
+/// [`sdroxide_types::DigiConfig`] gains `cw_engine`, the existing
+/// [`sdroxide_types::CwEngine`] the skimmer already chose between, because
+/// DeepCW's output layer has no class for an accented letter and only the
+/// timing decoder can copy one (issue #382). It sits with the other `cw_*`
+/// fields rather than at the tail, so a v140 peer reads every field after it
+/// out of step; `DigiConfig` rides inside `Command::SetDigiConfig` and
+/// `DigiStatus`, both of which cross the link whole.
+///
+/// v142: [`sdroxide_types::Js8Msg`] gains `speed`, the submode a decoded
+/// message actually arrived on. With multi-speed decoding on, four waveforms
+/// share the sub-band and the conversation list was the one place that did not
+/// say which of them carried a message (issue #389). It sits at that struct's
+/// tail, and `Js8Msg` rides inside `Js8Status` and so inside `DigiStatus`,
+/// which crosses the link whole — so a v141 peer handed one reads the tail of
+/// every status update out of step rather than merely missing a field.
+///
+/// v143: [`sdroxide_types::Meters`] gains `passband_dbfs`, the level the
+/// software squelch actually compares its threshold against — which is not
+/// `s_dbm` beside it, and on a rig reporting its own meter is not the same
+/// measurement at all, so there was nothing on screen to set the SQL rail
+/// against (issue #394). It sits at that struct's tail and `Meters` rides
+/// `ServerMsg::Meters` whole, so a v142 peer handed one reads the end of it out
+/// of step.
+///
+/// v144: [`sdroxide_types::Band`] gains `M11`, the 11 m citizens' band — on the
+/// bar so it can be tuned and listened to, and flagged as not an amateur
+/// allocation so the transmit lockout still holds there (issue #396). A band
+/// rides inside `RadioState`, the band stack, every memory and
+/// `DigiConfig::tx_audio_hz`, and a discriminant a v143 peer has no name for
+/// stops it decoding any of them.
+///
+/// v145: [`sdroxide_types::CatFamily`] gains `RsHfiq`, the HobbyPCB RS-HFIQ —
+/// an I/Q transceiver whose whole control interface is a frequency command and
+/// a transmit command (issue #383). The variant is appended, so no surviving
+/// discriminant moved, but `CatFamily` rides inside `RadioConfig` and so inside
+/// `ServerMsg::RadioConfig` and `Command::SetRadioConfig`: a v144 peer handed
+/// one fails to decode the message carrying it.
+///
+/// v146: `Command::SstvRestartRx` — abandon the SSTV picture being received and
+/// hunt for the next header, so a VIS misread as a four-minute mode no longer
+/// costs every picture sent while it runs out (issue #397). Appended, so no
+/// surviving discriminant moved, but a v145 station has no name for it and
+/// fails to decode the message carrying it.
+pub const PROTO_VERSION: u16 = 146;
 const VERSION_BYTE: u8 = 0x12;
 
 #[derive(Debug, thiserror::Error)]
@@ -1482,6 +1727,24 @@ pub enum ServerMsg {
     ///
     /// Appended last, for the usual reason.
     RelayStatus(Box<sdroxide_types::RelayStatus>),
+    /// Every vessel the AIS decoder is tracking, plus what both channels are
+    /// doing and why it is not running when it is not. A whole snapshot, twice
+    /// a second — see [`sdroxide_types::AisStatus`].
+    AisStatus(Box<sdroxide_types::AisStatus>),
+    /// The *same* front end, revising what it said about itself — as against
+    /// [`ServerMsg::Capabilities`], which is a different one.
+    ///
+    /// Two things a device says about itself are not constants. A rig on a
+    /// control port cannot say whether it has an antenna selector until the
+    /// link has been round; an RSP's LNA ladder is as long as the *band*
+    /// allows, so its length moves under the dial. Both have to reach the
+    /// client, and neither means the radio changed — read as a new front end,
+    /// a tune across a band edge wipes the client's wideband waterfall, makes
+    /// it re-read every image store and silences its announcer, in the middle
+    /// of a QSY.
+    ///
+    /// Appended last, for the usual reason.
+    CapabilitiesUpdated(DeviceCaps),
 }
 
 /// One radio in a station's roster, as a client sees it.
@@ -1597,6 +1860,9 @@ mod tests {
             ServerMsg::SstvStatus(SstvStatus {
                 tx_mode: SstvMode::Robot36,
                 detected: Some(SstvMode::Scottie2),
+                // The FSK ID a station sent after its picture, which travels
+                // as a whole string rather than a code — it is a callsign.
+                rx_id: Some("OE1XYZ".to_string()),
                 ..SstvStatus::default()
             }),
         ];
@@ -1943,6 +2209,37 @@ mod tests {
 
         let cfg = RadioConfig {
             backend: Backend::RtlSdr,
+            // The other enum with a payload on one variant only, near the end
+            // of the struct — so a slip anywhere above it lands here.
+            rx_site: sdroxide_types::RxSite::Elsewhere("DO30db".into()),
+            // A `Vec` in the middle of the struct, of a struct carrying an enum
+            // — and the enum's own new variant, which is the pair that has to
+            // survive together. Two bands, one asserting different words on
+            // receive and transmit.
+            hpsdr: sdroxide_types::HpsdrConfig {
+                filter_board: sdroxide_types::HpsdrFilterBoard::Custom,
+                oc_table: vec![
+                    sdroxide_types::HpsdrOcRow {
+                        band: sdroxide_types::Band::M40,
+                        rx: 0x01,
+                        tx: 0x41,
+                    },
+                    sdroxide_types::HpsdrOcRow {
+                        band: sdroxide_types::Band::M2,
+                        rx: 0x7F,
+                        tx: 0x00,
+                    },
+                ],
+                ..sdroxide_types::HpsdrConfig::default()
+            },
+            // The last field in the struct, and a `Vec` of a struct carrying an
+            // enum: a length, then variant indices and floats. Two rows, on
+            // bands far apart in `Band`'s declaration order, so a discriminant
+            // read a byte out of step cannot land on the right one by luck.
+            tx_drive_trim: vec![
+                sdroxide_types::BandDriveTrim { band: sdroxide_types::Band::M160, db: -4.5 },
+                sdroxide_types::BandDriveTrim { band: sdroxide_types::Band::M6, db: 2.0 },
+            ],
             converter_offset_hz: 125_000_000.0,
             // The transmit converter is an enum with a payload on one variant
             // only — the shape a self-describing format forgives and postcard

@@ -23,6 +23,100 @@ const VIS_LEADER_HZ: f64 = 1900.0;
 const VIS_BIT1_HZ: f64 = 1100.0;
 const VIS_BIT0_HZ: f64 = 1300.0;
 
+// ── FSK ID: the station's callsign, sent as tones after the picture ──
+//
+// The format is JE3HHT's, as published with MMSSTV and implemented by every
+// SSTV program and unattended repeater that reads one. It is a 45.45 baud FSK
+// stream — 22 ms a bit — of six-bit symbols, most significant bit first,
+// carrying ASCII $20..$5F shifted down to $00..$3F. A whole ID is
+// `$2A C1..CN $01 XSUM`, where the checksum is the XOR of the characters
+// alone. It is preceded by a 300 ms tone and a 100 ms tone that give a receiver
+// something to arm on, and the transition out of the second of those is what
+// times every bit that follows.
+//
+// The point of sending it as tones rather than printing the callsign into the
+// picture is that a machine can read it: an SSTV repeater logs and announces
+// the station that just sent, which a banner across the top of a JPEG can never
+// give it (issue #287).
+
+/// The tone a `1` bit is sent on — and the ID's start bit.
+const FSKID_ONE_HZ: f64 = 1900.0;
+/// The tone a `0` bit is sent on, and the 100 ms block ahead of the start bit.
+const FSKID_ZERO_HZ: f64 = 2100.0;
+/// The 300 ms tone that opens the ID. (MMSSTV sends 1900 Hz here in its narrow
+/// mode; this is the ordinary one.)
+const FSKID_LEADER_HZ: f64 = 1500.0;
+const FSKID_LEADER_S: f64 = 0.300;
+const FSKID_SYNC_S: f64 = 0.100;
+/// 45.45 baud.
+const FSKID_BIT_S: f64 = 0.022;
+/// Header symbol: "an ID starts here".
+const FSKID_HEAD: u8 = 0x2A;
+/// Terminator symbol, ahead of the checksum.
+const FSKID_END: u8 = 0x01;
+/// How many characters of the ID go on the air.
+///
+/// Not in the specification, which gives no limit. A cap belongs here all the
+/// same: every character costs 132 ms of air time after a picture that has
+/// already taken a minute or two, and an ID is a callsign — anything longer is
+/// a mistake in a settings field rather than something to transmit.
+const FSKID_MAX_CHARS: usize = 20;
+
+/// The six-bit symbols of an FSK ID for `text`, ready to be keyed — header,
+/// characters, terminator and checksum. Empty when there is nothing to send.
+///
+/// Characters are folded to upper case (the code space has no lower case) and
+/// anything still outside ASCII `$20..$5F` is dropped rather than mangled: a
+/// callsign with a stray accent sends the rest of itself instead of a symbol
+/// the far end would print as noise.
+#[must_use]
+pub fn fsk_id_symbols(text: &str) -> Vec<u8> {
+    let chars: Vec<u8> = text
+        .trim()
+        .to_ascii_uppercase()
+        .bytes()
+        .filter(|b| (0x20..=0x5F).contains(b))
+        .take(FSKID_MAX_CHARS)
+        .map(|b| b - 0x20)
+        .collect();
+    if chars.is_empty() {
+        return Vec::new();
+    }
+    let xsum = chars.iter().fold(0u8, |a, &c| a ^ c);
+    let mut out = Vec::with_capacity(chars.len() + 3);
+    out.push(FSKID_HEAD);
+    out.extend_from_slice(&chars);
+    out.push(FSKID_END);
+    out.push(xsum);
+    out
+}
+
+/// The text of a complete FSK ID symbol stream, or `None` when it is not one.
+///
+/// The inverse of [`fsk_id_symbols`], and the receiver's whole acceptance test:
+/// the header, the terminator and the checksum all have to agree before a
+/// callsign is believed. That matters more here than it looks — the hunt runs
+/// on whatever is on the frequency, so the framing is the only thing standing
+/// between the operator and a callsign invented out of noise.
+#[must_use]
+pub fn fsk_id_text(symbols: &[u8]) -> Option<String> {
+    let (head, rest) = symbols.split_first()?;
+    if *head != FSKID_HEAD {
+        return None;
+    }
+    let end = rest.iter().position(|&s| s == FSKID_END)?;
+    let (chars, tail) = rest.split_at(end);
+    if chars.is_empty() || chars.len() > FSKID_MAX_CHARS {
+        return None;
+    }
+    // `tail[0]` is the terminator itself; the checksum is the symbol after it.
+    let &xsum = tail.get(1)?;
+    if chars.iter().fold(0u8, |a, &c| a ^ c) != xsum {
+        return None;
+    }
+    Some(chars.iter().map(|&c| (c + 0x20) as char).collect::<String>().trim().to_string())
+}
+
 /// Frequency (Hz) for an 8-bit intensity, black→white.
 fn value_to_hz(v: u8) -> f64 {
     BLACK_HZ + (v as f64 / 255.0) * (WHITE_HZ - BLACK_HZ)
@@ -315,6 +409,59 @@ impl SstvTx {
     pub fn progress(&self) -> f32 {
         if self.total == 0 { 1.0 } else { (self.done as f32 / self.total as f32).clamp(0.0, 1.0) }
     }
+
+    /// Append an FSK identification for `id` to the end of the transmission.
+    ///
+    /// Nothing is added for an empty (or unsendable) `id`, so a station with no
+    /// callsign configured transmits exactly what it did before.
+    ///
+    /// After the picture rather than before it, which is where every program
+    /// that sends one puts it: the receiver has by then finished decoding and
+    /// gone back to hunting, and an unattended repeater has the whole frame in
+    /// hand before it is told whose it was.
+    ///
+    /// The ID is *not* stretched by the transmit clock trim the picture carries.
+    /// That trim exists to null out image slant against a particular receiver's
+    /// sound card, which is a property of the two-dimensional picture; a bit
+    /// stream a hundredth of a percent long decodes the same either way, and
+    /// nothing on the far end is measuring it against the image.
+    #[must_use]
+    pub fn with_fsk_id(mut self, id: &str) -> Self {
+        let symbols = fsk_id_symbols(id);
+        if symbols.is_empty() {
+            return self;
+        }
+        // The same cumulative-exact clock the picture plan uses, restarted for
+        // the ID: each element's sample count comes from the running total, so
+        // rounding 22 ms at 48 kHz (1056 samples exactly) or at 44.1 kHz
+        // (970.2) cannot accumulate into a bit-clock drift the far end has to
+        // chase.
+        let mut emitted: i64 = 0;
+        let mut t_exact: f64 = 0.0;
+        let mut push = |plan: &mut Vec<(f64, u32)>, hz: f64, dur: f64| {
+            t_exact += dur * self.rate;
+            let target = t_exact.round() as i64;
+            let n = (target - emitted).max(0);
+            emitted = target;
+            if n > 0 {
+                plan.push((hz, n as u32));
+            }
+        };
+        push(&mut self.plan, FSKID_LEADER_HZ, FSKID_LEADER_S);
+        push(&mut self.plan, FSKID_ZERO_HZ, FSKID_SYNC_S);
+        // The start bit. It is on the same tone as a `1`, so what marks it is
+        // the transition out of the 100 ms block above — which is exactly what
+        // the receiver times the rest of the stream from.
+        push(&mut self.plan, FSKID_ONE_HZ, FSKID_BIT_S);
+        for sym in symbols {
+            for bit in (0..6).rev() {
+                let one = (sym >> bit) & 1 == 1;
+                push(&mut self.plan, if one { FSKID_ONE_HZ } else { FSKID_ZERO_HZ }, FSKID_BIT_S);
+            }
+        }
+        self.total = self.plan.iter().map(|&(_, n)| n as u64).sum();
+        self
+    }
 }
 
 // ─────────────────────────────── receive ───────────────────────────────
@@ -327,6 +474,9 @@ pub enum SstvEvent {
     Line { y: u16, rgb: Vec<u8> },
     /// The current image reached its last line.
     ImageComplete,
+    /// A station identified itself in tones after its picture — the FSK ID
+    /// every SSTV program and unattended repeater sends and reads.
+    FskId(String),
 }
 
 #[derive(PartialEq)]
@@ -365,6 +515,8 @@ pub struct SstvRx {
 
     // VIS bit accumulation.
     vis_state: VisState,
+    // The FSK ID hunt, which runs whenever no picture is being decoded.
+    fsk_state: FskIdState,
 
     // Image decode bookkeeping.
     line: u16,
@@ -383,6 +535,35 @@ pub struct SstvRx {
     sync_run: u32,
     // Recent sync pulses as (centre sample, pulse length in samples).
     sync_hist: Vec<(u64, u32)>,
+}
+
+/// The hunt for an FSK ID: what has been seen of one so far.
+///
+/// Deliberately a level trigger followed by a fixed clock, not a per-bit
+/// tracking loop. The whole ID is under three seconds and the transmitter's
+/// bit clock is its sound card's, so there is nothing to track — and a receiver
+/// that resynchronised on every edge would be one more thing to go wrong on a
+/// stream that is already protected by a header, a terminator and a checksum.
+struct FskIdState {
+    /// Consecutive samples of the 100 ms block that arms the hunt.
+    arm_run: u32,
+    /// Set once that block has run long enough to be one.
+    armed: bool,
+    /// Sample index of the transition out of it — bit zero's leading edge, and
+    /// the origin every bit below is timed from.
+    start: Option<u64>,
+    /// Data bits taken so far (the start bit is not among them).
+    bits: Vec<bool>,
+    /// How many of them have been sampled, so each is taken exactly once.
+    taken: u32,
+    /// Consecutive samples since arming that were on neither tone.
+    gap: u32,
+}
+
+impl FskIdState {
+    fn reset() -> Self {
+        FskIdState { arm_run: 0, armed: false, start: None, bits: Vec::new(), taken: 0, gap: 0 }
+    }
 }
 
 struct VisState {
@@ -425,6 +606,7 @@ impl SstvRx {
             hist_base: 0,
             sample_idx: 0,
             vis_state: VisState::reset(),
+            fsk_state: FskIdState::reset(),
             line: 0,
             line_start: 0,
             line_samples: 0,
@@ -440,6 +622,37 @@ impl SstvRx {
     /// (detect the mode from the sync cadence).
     pub fn set_expected(&mut self, mode: Option<SstvMode>) {
         self.expected = mode;
+    }
+
+    /// Abandon whatever is being decoded and go back to hunting for a header.
+    ///
+    /// An SSTV receiver that has locked on is committed for the length of the
+    /// mode it locked on to, and the slow modes are long: Scottie DX is four
+    /// and a half minutes, PD290 nearly five. A false VIS — or a real one for a
+    /// mode the transmitting station did not actually send — therefore takes
+    /// the receiver off the air for as long as it takes to run out, and on a
+    /// transponder where pictures follow one another that is several missed.
+    /// This is the way back (issue #397).
+    ///
+    /// The history goes with it, deliberately. It holds the last 1.2 s of the
+    /// picture being abandoned, sync pulses and all, and the free-run hunt
+    /// reads exactly that — left in place it would re-lock on the cadence of
+    /// the transmission the operator has just asked to be rid of. The
+    /// front-end filter, the level meter and the operator's mode selection are
+    /// *not* touched: none of them is about this picture.
+    pub fn restart(&mut self) {
+        self.phase = RxPhase::Hunt;
+        self.vis_state = VisState::reset();
+        self.fsk_state = FskIdState::reset();
+        self.line = 0;
+        self.line_start = 0;
+        self.line_samples = 0;
+        self.last_cr.clear();
+        self.last_cb.clear();
+        self.sync_run = 0;
+        self.sync_hist.clear();
+        self.hist.clear();
+        self.hist_base = self.sample_idx;
     }
 
     /// The mode currently being decoded (or last detected).
@@ -529,8 +742,114 @@ impl SstvRx {
         self.hist.get(i).copied().unwrap_or(1900.0)
     }
 
+    // ── FSK ID detection ──
+    //
+    // Runs alongside the VIS hunt rather than after the picture: the two cannot
+    // be confused (VIS is 1100/1300 Hz around a 1200 Hz sync, the ID is
+    // 1900/2100 with no sync at all), and hunting for it the whole time is what
+    // lets a receiver tuned in late — or one whose picture decode never
+    // started — still learn who is transmitting.
+    fn step_fsk_id(&mut self, out: &mut Vec<SstvEvent>) {
+        let near = |a: f64, b: f64| (a - b).abs() < 80.0;
+        let bit_samples = FSKID_BIT_S * self.rate;
+
+        // Arming: the 100 ms block on the zero tone. Two thirds of it is enough
+        // — the leading edge is where the picture's last pixel ends, and on a
+        // real signal that boundary is not clean.
+        if self.fsk_state.start.is_none() {
+            if near(self.inst_hz, FSKID_ZERO_HZ) {
+                self.fsk_state.arm_run += 1;
+                self.fsk_state.gap = 0;
+                if self.fsk_state.arm_run as f64 > 0.066 * self.rate {
+                    self.fsk_state.armed = true;
+                }
+                return;
+            }
+            if !self.fsk_state.armed {
+                self.fsk_state.arm_run = 0;
+                return;
+            }
+            // Armed and now on the one tone: this is the start bit's leading
+            // edge, and the clock for everything after it.
+            if near(self.inst_hz, FSKID_ONE_HZ) {
+                self.fsk_state.start = Some(self.sample_idx);
+                self.fsk_state.bits.clear();
+                self.fsk_state.taken = 0;
+                return;
+            }
+            // In between the two. A 200 Hz shift does not arrive instantly —
+            // the discriminator and the filter ahead of it take a moment to
+            // follow it — so the samples spanning the edge belong to neither
+            // tone, and treating one of them as "this was not an ID after all"
+            // threw the arming away a few samples before the start bit it was
+            // waiting for. Anything longer than a bit or two is a real signal
+            // that simply was not one.
+            self.fsk_state.gap += 1;
+            if self.fsk_state.gap as f64 > 3.0 * bit_samples {
+                self.fsk_state = FskIdState::reset();
+            }
+            return;
+        }
+
+        let Some(start) = self.fsk_state.start else { return };
+        // Bit 0 is the start bit and carries nothing, so the data begins at 1.
+        let k = self.fsk_state.taken + 1;
+        // Sampled at the middle of the bit, where the transitions either side
+        // are furthest away.
+        let at = start + ((k as f64 + 0.5) * bit_samples) as u64;
+        // Strictly greater: `sample_idx` is one *past* the newest sample in the
+        // history (it is bumped before the step runs), so waiting only for
+        // equality asks `hz_at` for a sample that has not been stored yet — and
+        // its "nothing here" answer is 1900 Hz, which is a perfectly good `1`.
+        // Every bit read as one, and every ID decoded as $3F $3F $3F…
+        if self.sample_idx <= at {
+            return;
+        }
+        self.fsk_state.taken += 1;
+        let hz = self.hz_at(at);
+        if near(hz, FSKID_ONE_HZ) {
+            self.fsk_state.bits.push(true);
+        } else if near(hz, FSKID_ZERO_HZ) {
+            self.fsk_state.bits.push(false);
+        } else {
+            // Neither tone: the stream has ended (or was never one). Give up
+            // and go back to arming rather than keying noise into the symbols.
+            self.fsk_state = FskIdState::reset();
+            return;
+        }
+
+        // A whole symbol has arrived; see whether the stream so far is an ID.
+        if self.fsk_state.bits.len() % 6 != 0 {
+            return;
+        }
+        let symbols: Vec<u8> = self
+            .fsk_state
+            .bits
+            .chunks_exact(6)
+            .map(|c| c.iter().fold(0u8, |a, &b| (a << 1) | u8::from(b)))
+            .collect();
+        // A header that is not the header can never become one, so a stream
+        // that starts wrong is dropped at the first symbol instead of being
+        // carried for the length of a callsign.
+        if symbols[0] != FSKID_HEAD {
+            self.fsk_state = FskIdState::reset();
+            return;
+        }
+        if let Some(text) = fsk_id_text(&symbols) {
+            out.push(SstvEvent::FskId(text));
+            self.fsk_state = FskIdState::reset();
+            return;
+        }
+        // Nothing yet, and nothing that can still become something: the
+        // longest legal ID is the header, the cap, the terminator and the sum.
+        if symbols.len() > FSKID_MAX_CHARS + 3 {
+            self.fsk_state = FskIdState::reset();
+        }
+    }
+
     // ── VIS detection ──
     fn step_hunt(&mut self, out: &mut Vec<SstvEvent>) {
+        self.step_fsk_id(out);
         let near = |a: f64, b: f64| (a - b).abs() < 90.0;
         let is_leader = near(self.inst_hz, VIS_LEADER_HZ);
         let is_sync = near(self.inst_hz, SYNC_HZ);
@@ -827,6 +1146,159 @@ impl SstvRx {
 mod tests {
     use super::*;
 
+    /// The symbol stream against the published format, character by character.
+    ///
+    /// Worth spelling out rather than only round-tripping: a codec tested
+    /// against nothing but its own inverse agrees with itself whatever it does,
+    /// and what has to be true here is that it agrees with MMSSTV. `$2A`, then
+    /// ASCII less `$20`, then `$01`, then the XOR of the characters alone.
+    #[test]
+    fn the_symbols_are_the_published_ones() {
+        assert_eq!(
+            fsk_id_symbols("OE1XYZ"),
+            vec![
+                0x2A, // header
+                0x2F, // O
+                0x25, // E
+                0x11, // 1
+                0x38, // X
+                0x39, // Y
+                0x3A, // Z
+                0x01, // terminator
+                0x2F ^ 0x25 ^ 0x11 ^ 0x38 ^ 0x39 ^ 0x3A,
+            ]
+        );
+        // Lower case has no code of its own and is folded, not dropped...
+        assert_eq!(fsk_id_symbols("oe1xyz"), fsk_id_symbols("OE1XYZ"));
+        // ...and a character with no code at all is left out rather than
+        // mangled into one that would print as noise at the far end.
+        assert_eq!(fsk_id_symbols("OE1XYZ\u{00fc}"), fsk_id_symbols("OE1XYZ"));
+        // Nothing to identify with is nothing to send.
+        assert!(fsk_id_symbols("").is_empty());
+        assert!(fsk_id_symbols("   ").is_empty());
+    }
+
+    #[test]
+    fn a_stream_that_does_not_check_out_is_not_a_callsign() {
+        let good = fsk_id_symbols("OE1XYZ");
+        assert_eq!(fsk_id_text(&good).as_deref(), Some("OE1XYZ"));
+        // One bit of one character wrong: the checksum is the whole point.
+        let mut bad = good.clone();
+        bad[3] ^= 1;
+        assert_eq!(fsk_id_text(&bad), None);
+        // No header, no terminator, nothing after the terminator: each on its
+        // own is enough to refuse.
+        assert_eq!(fsk_id_text(&good[1..]), None);
+        assert_eq!(fsk_id_text(&good[..good.len() - 2]), None);
+        assert_eq!(fsk_id_text(&good[..good.len() - 1]), None);
+    }
+
+    /// The whole of issue #287: a picture, then the callsign in tones, decoded
+    /// off the audio by the receiver rather than by the encoder's own inverse.
+    #[test]
+    fn the_id_comes_back_off_the_air() {
+        let rate = 48_000.0;
+        let mode = SstvMode::Robot36;
+        let (w, h) = mode.dimensions();
+        let rgb = vec![128u8; w as usize * h as usize * 3];
+        let mut tx = SstvTx::new(mode, &rgb, w, h, rate, 0.0).with_fsk_id("OE1XYZ");
+        let mut rx = SstvRx::new(rate);
+        let mut events = Vec::new();
+        let mut block = vec![0.0f32; 4096];
+        let mut heard = None;
+        let mut guard = 0;
+        while !tx.done() && guard < 40_000 {
+            let n = tx.next_block(&mut block);
+            rx.process(&block[..n], &mut events);
+            for e in events.drain(..) {
+                if let SstvEvent::FskId(id) = e {
+                    heard = Some(id);
+                }
+            }
+            guard += 1;
+        }
+        assert_eq!(heard.as_deref(), Some("OE1XYZ"));
+    }
+
+    /// A station with nothing to identify with transmits exactly what it used
+    /// to — no leader, no tail, not one sample.
+    #[test]
+    fn no_callsign_adds_no_air_time() {
+        let rate = 48_000.0;
+        let mode = SstvMode::Robot36;
+        let (w, h) = mode.dimensions();
+        let rgb = vec![64u8; w as usize * h as usize * 3];
+        let plain = SstvTx::new(mode, &rgb, w, h, rate, 0.0).total_samples();
+        assert_eq!(SstvTx::new(mode, &rgb, w, h, rate, 0.0).with_fsk_id("").total_samples(), plain);
+        // And one that has something to send costs the leader plus six bits a
+        // character, which is about two and a half seconds for a callsign.
+        let with = SstvTx::new(mode, &rgb, w, h, rate, 0.0).with_fsk_id("OE1XYZ").total_samples();
+        let added = (with - plain) as f64 / rate;
+        let want = FSKID_LEADER_S + FSKID_SYNC_S + FSKID_BIT_S * (1.0 + 6.0 * 9.0);
+        assert!((added - want).abs() < 0.01, "the ID added {added:.3} s, expected {want:.3} s");
+    }
+
+    /// Issue #397: a receiver committed to a four-minute mode has to be able
+    /// to let go of it.
+    ///
+    /// Locked on to Scottie DX and then restarted, it must be hunting again —
+    /// and it must *stay* hunting on the audio that is still arriving from the
+    /// transmission it abandoned, because the free-run detector reads the
+    /// history buffer and the history buffer was full of that picture's sync
+    /// pulses. Then a new header on the same receiver has to start a picture,
+    /// which is the half that says the restart re-armed rather than merely
+    /// stopped.
+    #[test]
+    fn a_restart_lets_go_of_the_picture_and_hunts_again() {
+        let rate = 48_000.0;
+        let (w, h) = SstvMode::ScottieDx.dimensions();
+        let rgb = vec![96u8; w as usize * h as usize * 3];
+        let mut tx = SstvTx::new(SstvMode::ScottieDx, &rgb, w, h, rate, 0.0);
+        let mut rx = SstvRx::new(rate);
+        let mut events = Vec::new();
+        let mut block = vec![0.0f32; 4096];
+
+        // Far enough in to be decoding lines, not merely to have seen the VIS.
+        while !rx.receiving() || rx.progress() < 0.02 {
+            let n = tx.next_block(&mut block);
+            assert!(n > 0, "the transmission ran out before the picture started");
+            rx.process(&block[..n], &mut events);
+            events.clear();
+        }
+        assert_eq!(rx.mode(), SstvMode::ScottieDx);
+
+        rx.restart();
+        assert!(!rx.receiving(), "the picture was not let go of");
+        assert_eq!(rx.progress(), 0.0);
+
+        // Another second of the abandoned transmission: a receiver that kept
+        // its history would lock straight back on to the cadence it is hearing.
+        for _ in 0..12 {
+            let n = tx.next_block(&mut block);
+            rx.process(&block[..n], &mut events);
+            events.clear();
+        }
+        assert!(!rx.receiving(), "it re-locked on the transmission it was told to abandon");
+
+        // ...and the next station's header still starts a picture.
+        let (w2, h2) = SstvMode::Robot36.dimensions();
+        let rgb2 = vec![32u8; w2 as usize * h2 as usize * 3];
+        let mut next = SstvTx::new(SstvMode::Robot36, &rgb2, w2, h2, rate, 0.0);
+        let mut detected = None;
+        let mut guard = 0;
+        while detected.is_none() && !next.done() && guard < 2_000 {
+            let n = next.next_block(&mut block);
+            rx.process(&block[..n], &mut events);
+            for e in events.drain(..) {
+                if let SstvEvent::ModeDetected(m) = e {
+                    detected = Some(m);
+                }
+            }
+            guard += 1;
+        }
+        assert_eq!(detected, Some(SstvMode::Robot36), "the restarted receiver heard nothing");
+    }
+
     /// End-to-end: encode a small gradient, decode it back, and check the VIS
     /// mode was recovered and the image roughly matches.
     #[test]
@@ -859,7 +1331,7 @@ mod tests {
                 match e {
                     SstvEvent::ModeDetected(m) => detected = Some(m),
                     SstvEvent::Line { .. } => lines += 1,
-                    SstvEvent::ImageComplete => {}
+                    SstvEvent::ImageComplete | SstvEvent::FskId(_) => {}
                 }
             }
             guard += 1;
@@ -935,7 +1407,7 @@ mod tests {
                 match e {
                     SstvEvent::ModeDetected(m) => detected = Some(m),
                     SstvEvent::Line { .. } => lines += 1,
-                    SstvEvent::ImageComplete => {}
+                    SstvEvent::ImageComplete | SstvEvent::FskId(_) => {}
                 }
             }
         }

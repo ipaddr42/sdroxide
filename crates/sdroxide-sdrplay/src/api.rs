@@ -117,7 +117,9 @@ fn devices_locked(api: &ffi::Api) -> Result<Vec<ffi::DeviceT>> {
     let err = unsafe { (api.get_devices)(devs.as_mut_ptr(), &mut n, ffi::MAX_DEVICES as u32) };
     unsafe { (api.unlock_device_api)() };
     if err != ffi::ERR_SUCCESS {
-        return Err(Error::from_status(api, "GetDevices", err));
+        // `sdrplay_api_Fail` is all the library says, and on Linux the usual
+        // reason is one it cannot see: the kernel has the receiver.
+        return Err(Error::from_status(api, "GetDevices", err).with_host_hint());
     }
     Ok(devs[..(n as usize).min(ffi::MAX_DEVICES)]
         .iter()
@@ -154,6 +156,32 @@ pub fn try_list() -> Result<Vec<SdrPlayDevice>> {
         }
     }
     Ok(out)
+}
+
+/// The serial the configured one actually names — the concrete receiver an
+/// empty string ("the first one found") resolves to, and the one an explicit
+/// serial resolves to if it is present at all.
+///
+/// The registry that lets two radios share one board is keyed by this rather
+/// than by what each radio's configuration happens to say, and that is the
+/// whole point (issue #392). An RSPduo running both tuners is *one* API
+/// session, and the second radio must attach to the first one's session rather
+/// than open its own. But one radio may name the board by serial while the
+/// other is still on "the first one found" — the same receiver, two different
+/// strings — and keyed on the strings the second radio tried to open a device
+/// this process already held. The service's table only lists receivers that
+/// are *free*, so the answer it got back was "no SDRplay RSP found", about a
+/// receiver plainly working in the next tab.
+///
+/// `None` when nothing is there to resolve to, which leaves the caller to key
+/// on what it was given and let the open report the real failure.
+pub fn resolve_serial(serial: &str) -> Option<String> {
+    let want = serial.trim();
+    // Held receivers lead the list (see `try_list`), which is what makes an
+    // empty serial resolve to the board already open rather than to some other
+    // one the service still has free.
+    let devs = try_list().ok()?;
+    devs.into_iter().find(|d| want.is_empty() || d.serial == want).map(|d| d.serial)
 }
 
 /// List the RSPs the service reports. Best-effort: no library, no service or
@@ -195,7 +223,7 @@ pub(crate) fn select(
         let mut n: u32 = 0;
         let err = unsafe { (api.get_devices)(devs.as_mut_ptr(), &mut n, ffi::MAX_DEVICES as u32) };
         if err != ffi::ERR_SUCCESS {
-            return Err(Error::from_status(&api, "GetDevices", err));
+            return Err(Error::from_status(&api, "GetDevices", err).with_host_hint());
         }
         let want = serial.trim();
         let mut dev = *devs[..(n as usize).min(ffi::MAX_DEVICES)]
@@ -203,6 +231,18 @@ pub(crate) fn select(
             .filter(|d| d.valid != 0)
             .find(|d| want.is_empty() || d.serial() == want)
             .ok_or_else(|| {
+                // A receiver this process already holds is missing from the
+                // table *because* it is ours, and saying "not found" about it
+                // sends the operator looking for a cable fault (issue #392).
+                if let Some((held, _)) = s.held.iter().find(|(h, _)| want.is_empty() || h == want) {
+                    return Error::InUse(format!(
+                        "the SDRplay RSP (serial {held}) is already open in this program — a \
+                         second radio has to share that session rather than open its own. On \
+                         an RSPduo, set both radios to that serial, turn dual-tuner mode on \
+                         with the second tuner as \"a second radio\", and give each radio a \
+                         different tuner."
+                    ));
+                }
                 Error::NotFound(if want.is_empty() {
                     "no SDRplay RSP found — is one plugged in, and is the SDRplay API service \
                      running?"
@@ -213,6 +253,7 @@ pub(crate) fn select(
                          receiver in Settings → Radio"
                     )
                 })
+                .with_host_hint()
             })?;
 
         let model = SdrPlayModel::from_hw_ver(dev.hw_ver);

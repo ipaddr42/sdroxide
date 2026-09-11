@@ -24,6 +24,11 @@ pub struct AudioCatSource {
     /// spliced I/Q stream still paints a healthy panadapter, and only the audio
     /// — which has to be continuous — gives it away. See [`Self::check_dropped`].
     drops: DropWatch,
+    /// Whether the two capture channels are actually in quadrature. A rig set
+    /// to send demodulated audio down a stereo cable puts the same signal on
+    /// both of them, which is a real signal wearing an I/Q stream's clothes —
+    /// see [`QuadratureWatch`].
+    quad: QuadratureWatch,
     format: SoundFormat,
     /// What the right channel is multiplied by on the way into the complex
     /// stream: `1.0` normally, `-1.0` when the rig's I and Q are the other way
@@ -141,7 +146,7 @@ impl AudioCatSource {
         // more silence either side of it.
         let opened = match cfg.format {
             SoundFormat::Iq => sdroxide_audio::start_input_stereo(audio_in, cfg.iq_rate_hz),
-            SoundFormat::DemodAudio => sdroxide_audio::start_input(audio_in, 48_000),
+            SoundFormat::DemodAudio => sdroxide_audio::start_input_buffered(audio_in, 48_000),
         };
         let dev_label = audio_in.unwrap_or("system default");
         // A dummy, always-empty ring keeps `read` returning silence when RX is
@@ -305,6 +310,7 @@ impl AudioCatSource {
             in_consumer,
             in_rate,
             drops: DropWatch::started(std::time::Instant::now()),
+            quad: QuadratureWatch::default(),
             format,
             q_sign,
             iq_shift,
@@ -439,6 +445,161 @@ impl DropWatch {
 /// than a period: nothing looks at all while the source is not being read.
 const DROP_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// How many pairs a [`QuadratureWatch`] weighs before it says anything. A
+/// quarter of a second at 48 kHz: long enough that a moment of silence between
+/// two overs is not read as a dead channel, short enough that the operator is
+/// told while they are still looking at the picture that puzzled them.
+const QUAD_WINDOW_PAIRS: usize = 12_000;
+
+/// Coherence above which the two channels are carrying the same signal rather
+/// than two quadrature halves of one.
+///
+/// Real I/Q from a rig sits near zero: the two channels are the same signal a
+/// quarter-cycle apart at every frequency, so over a band of them the products
+/// cancel. Even a badly unbalanced front end — the ±3 dB and several degrees
+/// that leave a mirror image 20 dB down — stays well under a tenth. One signal
+/// copied onto both wires reads 1.0 exactly, and this is set to catch that and
+/// nothing else.
+const QUAD_COHERENT: f32 = 0.9;
+
+/// Below this, a channel is carrying nothing: the ratio of the quieter
+/// channel's power to the louder one's. Four orders of magnitude down is
+/// silence next to any signal, and still above the noise a live but unconnected
+/// input picks up.
+const QUAD_DEAD_RATIO: f32 = 1e-4;
+
+/// Watches the two capture channels for the one arrangement that cannot work:
+/// a stream declared as I/Q whose channels are not in quadrature.
+///
+/// The commonest way to get one is to point sdroxide at a radio's *demodulated*
+/// audio and tell it the card carries I/Q. A demodulated channel is one real
+/// signal, and a stereo cable carries it twice — so `I` and `Q` are the same
+/// numbers, the complex stream they build is that real signal at 45°, and its
+/// spectrum is symmetric about the dial. Every signal appears twice, once
+/// either side, and neither *Invert spectrum* nor *I/Q correction* touches it:
+/// there is no sideband to swap and no imbalance to trim, because there was
+/// never a second sideband to begin with (issue #308).
+///
+/// It is worth saying out loud because the picture is *plausible*. The
+/// panadapter is the right width, the noise floor is where it should be, the
+/// signals are real signals — they are simply each drawn twice, and an operator
+/// who has not seen it before reads it as a receiver fault rather than as a
+/// setting.
+///
+/// A free struct with the arithmetic in it, for the reason [`DropWatch`] is
+/// one: the thing it watches lives behind a sound card, and what actually goes
+/// wrong is the sums.
+#[derive(Default)]
+struct QuadratureWatch {
+    i: f64,
+    q: f64,
+    ii: f64,
+    qq: f64,
+    iq: f64,
+    n: usize,
+    /// What the last completed window concluded, so a verdict is announced when
+    /// it changes and not once per window forever.
+    said: Option<QuadVerdict>,
+}
+
+/// What a window of samples says about the two channels.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum QuadVerdict {
+    /// Two channels a quarter-cycle apart: an I/Q stream.
+    Quadrature,
+    /// Both channels carrying one signal — demodulated audio, not I/Q.
+    SameOnBoth,
+    /// One channel silent. Half a cable, or a mono source opened as stereo.
+    OneChannelDead,
+}
+
+impl QuadratureWatch {
+    /// Fold one block in, and return a verdict on the window it completes when
+    /// that verdict is not the one already announced.
+    fn observe(&mut self, iq: &[Complex32]) -> Option<QuadVerdict> {
+        for c in iq {
+            let (i, q) = (f64::from(c.re), f64::from(c.im));
+            self.i += i;
+            self.q += q;
+            self.ii += i * i;
+            self.qq += q * q;
+            self.iq += i * q;
+        }
+        self.n += iq.len();
+        if self.n < QUAD_WINDOW_PAIRS {
+            return None;
+        }
+        let verdict = self.verdict();
+        self.i = 0.0;
+        self.q = 0.0;
+        self.ii = 0.0;
+        self.qq = 0.0;
+        self.iq = 0.0;
+        self.n = 0;
+        // A window with nothing in it at all — the rig is off, or this is the
+        // silence of an over — says nothing about the wiring, so it is neither
+        // reported nor allowed to clear a report already made.
+        let verdict = verdict?;
+        (self.said.replace(verdict) != Some(verdict)).then_some(verdict)
+    }
+
+    /// The completed window's verdict, or `None` when both channels are silent
+    /// and there is nothing to compare.
+    ///
+    /// Measured about each channel's own mean rather than about zero, which is
+    /// not a nicety: a sound card's DC offset is common to both channels, so on
+    /// a quiet band the raw correlation between them is the *offset* correlating
+    /// with itself and reads as a perfect 1.0 — a healthy front end accused of
+    /// carrying one signal twice. The same subtraction stops an offset on one
+    /// channel alone standing in for a signal on it.
+    fn verdict(&self) -> Option<QuadVerdict> {
+        let n = self.n as f64;
+        if n <= 1.0 {
+            return None;
+        }
+        let (mi, mq) = (self.i / n, self.q / n);
+        let ii = (self.ii / n - mi * mi).max(0.0);
+        let qq = (self.qq / n - mq * mq).max(0.0);
+        let iq = self.iq / n - mi * mq;
+        let loud = ii.max(qq);
+        if loud <= 0.0 || !loud.is_finite() {
+            return None;
+        }
+        // Absolute silence on both wires is a radio that is not sending, not a
+        // wiring fault. The threshold is on the *quieter* channel relative to
+        // the louder one, so this only fires when one of them is live.
+        if (ii.min(qq) / loud) < f64::from(QUAD_DEAD_RATIO) {
+            return Some(QuadVerdict::OneChannelDead);
+        }
+        let coherence = (iq.abs() / (ii * qq).sqrt()) as f32;
+        Some(if coherence >= QUAD_COHERENT {
+            QuadVerdict::SameOnBoth
+        } else {
+            QuadVerdict::Quadrature
+        })
+    }
+}
+
+/// What to tell the operator about a verdict, or `None` where there is nothing
+/// wrong to tell them about.
+fn quadrature_complaint(v: QuadVerdict) -> Option<&'static str> {
+    match v {
+        QuadVerdict::Quadrature => None,
+        QuadVerdict::SameOnBoth => Some(
+            "radio I/Q: both capture channels are carrying the same signal, so this is \
+             demodulated audio and not I/Q. The spectrum will be mirrored about the dial \
+             and every signal drawn twice, and neither Invert spectrum nor I/Q correction \
+             can help — there is no second sideband to recover. Either set Sound format to \
+             \"Demod audio\" under Settings \u{2192} Radio, or switch the radio\u{2019}s virtual \
+             cable to its raw I/Q output (in PowerSDR, VAC \u{2192} Direct I/Q).",
+        ),
+        QuadVerdict::OneChannelDead => Some(
+            "radio I/Q: one capture channel is silent. I/Q needs both — check that the \
+             card is a stereo one and that the radio is feeding both channels of it.",
+        ),
+    }
+}
+
 /// The corrector a given configuration asks for, or `None` when it asks for
 /// nothing — see [`sdroxide_types::CatConfig::iq_correction`] and
 /// [`sdroxide_types::CatConfig::iq_dc_block_hz`].
@@ -491,6 +652,7 @@ fn fill_iq(
     src: &mut rtrb::Consumer<f32>,
     buf: &mut [Complex32],
     q_sign: f32,
+    quad: &mut QuadratureWatch,
     correct: Option<&mut IqCorrect>,
     shift: Option<&mut Nco>,
 ) -> usize {
@@ -501,6 +663,16 @@ fn fill_iq(
         let q = src.pop().unwrap_or(0.0);
         buf[n] = Complex32::new(i, q * q_sign);
         n += 1;
+    }
+    // Ahead of everything below, on the samples as the card handed them over.
+    // The corrector adapts to what it is given and the oscillator moves it, and
+    // this asks a question about the wiring rather than about the band: are
+    // these two channels a quarter-cycle apart at all? Conjugating them does
+    // not change the answer, so `q_sign` is allowed to have happened.
+    if let Some(v) = quad.observe(&buf[..n])
+        && let Some(complaint) = quadrature_complaint(v)
+    {
+        tracing::warn!("{complaint}");
     }
     // Ahead of the shift, and after the conjugation — which the estimator does
     // not mind either way, because a conjugated stream has its DC and its
@@ -613,6 +785,7 @@ impl IqSource for AudioCatSource {
                     &mut self.in_consumer,
                     buf,
                     self.q_sign,
+                    &mut self.quad,
                     self.iq_correct.as_mut(),
                     self.iq_shift.as_mut(),
                 );
@@ -653,6 +826,7 @@ impl IqSource for AudioCatSource {
                 &mut self.in_consumer,
                 buf,
                 self.q_sign,
+                &mut self.quad,
                 self.iq_correct.as_mut(),
                 self.iq_shift.as_mut(),
             ),
@@ -691,6 +865,13 @@ impl IqSource for AudioCatSource {
 
     fn poll_control(&mut self) -> Vec<ControlUpdate> {
         let mut out = Vec::new();
+        // A tune the rig has not agreed to yet, asked for again. Cheap
+        // insurance on a serial port, where a command is only lost to a cable
+        // or a rig that was busy; the case it was written for is the networked
+        // Icom sharing this `Dial` — see [`Dial::retry`] and issue #297.
+        if let Some(f) = self.dial.retry() {
+            self.cat.set_freq(f);
+        }
         let updates = self.cat.poll();
         // Anything at all from the rig is also the answer to "is there a radio
         // on the control port": a link that only came up later — the operator
@@ -718,6 +899,12 @@ impl IqSource for AudioCatSource {
                 sdroxide_cat::CatUpdate::Antenna(name) => {
                     self.antenna = name.to_string();
                     out.push(ControlUpdate::Antenna(name));
+                }
+                // The receiving antenna, from the same reply — read when the
+                // port opened and again after every band change, because the
+                // radio recalls it per band and this end never asserts it.
+                sdroxide_cat::CatUpdate::RxAntenna(on) => {
+                    out.push(ControlUpdate::RxAntenna(on));
                 }
                 // The power the rig came up on, read once when the port opened.
                 // The engine adopts it into the Drive slider rather than
@@ -757,6 +944,13 @@ impl IqSource for AudioCatSource {
     fn set_control_mode(&mut self, mode: Mode) -> Result<()> {
         self.cat.set_mode(mode);
         Ok(())
+    }
+
+    /// The CAT link does: the mode goes through `digi_mode` there, on whichever
+    /// sideband the dial says analog SSTV or RADE is riding — see
+    /// `commanded_mode`.
+    fn resolves_band_sideband(&self) -> bool {
+        true
     }
 
     /// Put the receiver on one of the rig's antenna sockets — an ELAD FDM-DUO's
@@ -800,6 +994,22 @@ impl IqSource for AudioCatSource {
 
     fn commands_rig_power(&self) -> bool {
         self.cat.commands_rig_power()
+    }
+
+    /// The rig's separate receiving antenna, learned the same way the socket
+    /// list is: the flag rides behind the socket in the antenna reply, and a
+    /// radio without the connector answers the socket alone.
+    fn rx_antenna(&self) -> Option<bool> {
+        self.cat.rx_antenna()
+    }
+
+    fn set_rx_antenna(&mut self, on: bool) -> Result<()> {
+        self.cat.set_rx_antenna(on);
+        Ok(())
+    }
+
+    fn reread_rx_antenna(&mut self) {
+        self.cat.reread_antenna();
     }
 
     /// The panel's width control, sent to the only filter in the path.
@@ -1126,11 +1336,25 @@ mod tests {
     fn inverting_iq_mirrors_the_signal_about_the_dial() {
         let mut buf = [Complex32::new(0.0, 0.0); 512];
 
-        let n = fill_iq(&mut tone_ring(1000.0, 512), &mut buf, 1.0, None, None);
+        let n = fill_iq(
+            &mut tone_ring(1000.0, 512),
+            &mut buf,
+            1.0,
+            &mut QuadratureWatch::default(),
+            None,
+            None,
+        );
         assert_eq!(n, 512, "every pair consumed");
         assert!((mean_freq_hz(&buf[..n]) - 1000.0).abs() < 1.0, "above the dial, unchanged");
 
-        let n = fill_iq(&mut tone_ring(1000.0, 512), &mut buf, -1.0, None, None);
+        let n = fill_iq(
+            &mut tone_ring(1000.0, 512),
+            &mut buf,
+            -1.0,
+            &mut QuadratureWatch::default(),
+            None,
+            None,
+        );
         assert_eq!(n, 512);
         assert!((mean_freq_hz(&buf[..n]) + 1000.0).abs() < 1.0, "below the dial once inverted");
     }
@@ -1146,14 +1370,28 @@ mod tests {
 
         // The rig's centre is 8 kHz above the dial, so the station on the dial
         // arrives 8 kHz below centre — and has to read as being on it.
-        let n = fill_iq(&mut tone_ring(-8_000.0, 512), &mut buf, 1.0, None, Some(&mut nco));
+        let n = fill_iq(
+            &mut tone_ring(-8_000.0, 512),
+            &mut buf,
+            1.0,
+            &mut QuadratureWatch::default(),
+            None,
+            Some(&mut nco),
+        );
         assert_eq!(n, 512);
         assert!(mean_freq_hz(&buf[..n]).abs() < 1.0, "the dial is the dial again");
 
         // Everything else keeps its distance from it: a station 1 kHz up the
         // band is 1 kHz up the band, not 9.
         let mut nco = Nco::new(8_000.0, RATE as f64);
-        let n = fill_iq(&mut tone_ring(-7_000.0, 512), &mut buf, 1.0, None, Some(&mut nco));
+        let n = fill_iq(
+            &mut tone_ring(-7_000.0, 512),
+            &mut buf,
+            1.0,
+            &mut QuadratureWatch::default(),
+            None,
+            Some(&mut nco),
+        );
         assert!((mean_freq_hz(&buf[..n]) - 1000.0).abs() < 1.0, "1 kHz above the dial");
     }
 
@@ -1168,7 +1406,14 @@ mod tests {
 
         // Miswired, so the card delivers the conjugate: the station that sits
         // 8 kHz below the rig's centre arrives looking like +8 kHz.
-        let n = fill_iq(&mut tone_ring(8_000.0, 512), &mut buf, -1.0, None, Some(&mut nco));
+        let n = fill_iq(
+            &mut tone_ring(8_000.0, 512),
+            &mut buf,
+            -1.0,
+            &mut QuadratureWatch::default(),
+            None,
+            Some(&mut nco),
+        );
         assert!(mean_freq_hz(&buf[..n]).abs() < 1.0, "on the dial, both corrections applied");
     }
 
@@ -1193,7 +1438,14 @@ mod tests {
         let mut buf = vec![Complex32::new(0.0, 0.0); N];
         let mut corr = IqCorrect::new(DC_BLOCK_HZ, RATE as f64);
         let mut nco = Nco::new(8_000.0, RATE as f64);
-        let n = fill_iq(&mut c, &mut buf, 1.0, Some(&mut corr), Some(&mut nco));
+        let n = fill_iq(
+            &mut c,
+            &mut buf,
+            1.0,
+            &mut QuadratureWatch::default(),
+            Some(&mut corr),
+            Some(&mut nco),
+        );
         assert_eq!(n, N);
 
         // Judged on the settled tail: the blocker charges over a few hundred
@@ -1267,12 +1519,33 @@ mod tests {
 
         // Same input, drained in two halves through the same oscillator.
         let mut halves = [Complex32::new(0.0, 0.0); 512];
-        let a = fill_iq(&mut ring, &mut halves[..256], 1.0, None, Some(&mut nco));
-        let b = fill_iq(&mut ring, &mut halves[256..], 1.0, None, Some(&mut nco));
+        let a = fill_iq(
+            &mut ring,
+            &mut halves[..256],
+            1.0,
+            &mut QuadratureWatch::default(),
+            None,
+            Some(&mut nco),
+        );
+        let b = fill_iq(
+            &mut ring,
+            &mut halves[256..],
+            1.0,
+            &mut QuadratureWatch::default(),
+            None,
+            Some(&mut nco),
+        );
         assert_eq!((a, b), (256, 256));
 
         let mut nco = Nco::new(8_000.0, RATE as f64);
-        let n = fill_iq(&mut tone_ring(-8_000.0, 512), &mut whole, 1.0, None, Some(&mut nco));
+        let n = fill_iq(
+            &mut tone_ring(-8_000.0, 512),
+            &mut whole,
+            1.0,
+            &mut QuadratureWatch::default(),
+            None,
+            Some(&mut nco),
+        );
         assert_eq!(n, 512);
         for (k, (x, y)) in whole.iter().zip(halves.iter()).enumerate() {
             assert!((x - y).norm() < 1e-4, "sample {k} differs across the block boundary");
@@ -1289,40 +1562,118 @@ mod tests {
             p.push(v).unwrap();
         }
         let mut buf = [Complex32::new(0.0, 0.0); 4];
-        assert_eq!(fill_iq(&mut c, &mut buf, 1.0, None, None), 1);
+        assert_eq!(fill_iq(&mut c, &mut buf, 1.0, &mut QuadratureWatch::default(), None, None), 1);
         assert_eq!(buf[0], Complex32::new(1.0, 2.0));
         // The odd `3.0` is still waiting, and pairs with what arrives next.
         p.push(4.0).unwrap();
-        assert_eq!(fill_iq(&mut c, &mut buf, -1.0, None, None), 1);
+        assert_eq!(fill_iq(&mut c, &mut buf, -1.0, &mut QuadratureWatch::default(), None, None), 1);
         assert_eq!(buf[0], Complex32::new(3.0, -4.0));
     }
 
-    /// Field report: a Kenwood on its I/Q output followed mode changes made at
-    /// the radio but not ones made in sdroxide. Quadrature is not `audio_mode`,
-    /// so the engine's "command the rig's mode" gate never fired — the same
-    /// hole the Icom LAN backend had, and the same flag closes it.
-    ///
-    /// Both formats, because the answer must not depend on which one the
-    /// operator picked: the radio owns its mode either way.
+    /// A window of the stream a rig actually sends: one complex tone, which is
+    /// a signal on one side of the dial and nothing on the other.
+    fn quad_window(f_hz: f64, rate: f64, n: usize) -> Vec<Complex32> {
+        (0..n)
+            .map(|k| {
+                let t = std::f64::consts::TAU * f_hz * k as f64 / rate;
+                Complex32::new(t.cos() as f32, t.sin() as f32)
+            })
+            .collect()
+    }
+
+    /// The arrangement issue #308 arrived as: a radio sending demodulated audio
+    /// down a stereo cable, so the same real signal is on both wires. It must
+    /// be recognised, and it must be recognised for what it is rather than as a
+    /// front end with a bad image — no amount of I/Q correction can help.
     #[test]
-    fn a_cat_rig_owns_its_mode_in_either_sound_format() {
-        for format in [SoundFormat::Iq, SoundFormat::DemodAudio] {
-            // A port that cannot be opened: `open` is deliberately degradable
-            // (the CAT thread retries in the background and the audio streams
-            // are best-effort), so this needs neither a rig nor a sound card.
-            let cfg = CatConfig {
-                serial: sdroxide_types::SerialConfig {
-                    path: "/nonexistent/sdroxide-test-tty".into(),
-                    ..Default::default()
-                },
-                format,
-                ..Default::default()
-            };
-            let src = AudioCatSource::open(cfg, None, None).expect("open is best-effort");
-            assert!(
-                src.commands_rx_mode(),
-                "{format:?}: the transceiver in front of us owns its mode"
-            );
-        }
+    fn one_signal_on_both_wires_is_not_iq() {
+        let mut w = QuadratureWatch::default();
+        // Three audio tones, as speech or a band of FT8 would be: what matters
+        // is that both channels carry the identical numbers.
+        let mono: Vec<Complex32> = (0..QUAD_WINDOW_PAIRS)
+            .map(|k| {
+                let t = k as f64 / 48_000.0;
+                let a = (std::f64::consts::TAU * 700.0 * t).sin()
+                    + 0.5 * (std::f64::consts::TAU * 1900.0 * t).sin()
+                    + 0.3 * (std::f64::consts::TAU * 2600.0 * t).sin();
+                Complex32::new(a as f32, a as f32)
+            })
+            .collect();
+        assert_eq!(w.observe(&mono), Some(QuadVerdict::SameOnBoth));
+        assert!(quadrature_complaint(QuadVerdict::SameOnBoth).is_some());
+        // Said once, not once per window: the operator gets a sentence, not a
+        // log full of the same sentence.
+        assert_eq!(w.observe(&mono), None);
+    }
+
+    /// And a real I/Q stream must not be accused of it — including one with the
+    /// imbalance a rig's quadrature mixer really has, which leaves a mirror
+    /// image 20 dB down and is exactly what `IqCorrect` is for.
+    #[test]
+    fn a_real_iq_stream_is_left_alone() {
+        let mut w = QuadratureWatch::default();
+        assert_eq!(
+            w.observe(&quad_window(1500.0, 48_000.0, QUAD_WINDOW_PAIRS)),
+            Some(QuadVerdict::Quadrature)
+        );
+
+        // 3 dB of amplitude error and 10 degrees of phase error on Q, which is
+        // a worse front end than any rig ships.
+        let skewed: Vec<Complex32> = (0..QUAD_WINDOW_PAIRS)
+            .map(|k| {
+                let t = std::f64::consts::TAU * 1500.0 * k as f64 / 48_000.0;
+                Complex32::new(t.cos() as f32, (1.41 * (t + 10.0f64.to_radians()).sin()) as f32)
+            })
+            .collect();
+        let mut w = QuadratureWatch::default();
+        assert_eq!(
+            w.observe(&skewed),
+            Some(QuadVerdict::Quadrature),
+            "an unbalanced front end is still I/Q"
+        );
+        // And nothing is said about it: the verdict is the good one.
+        assert!(quadrature_complaint(QuadVerdict::Quadrature).is_none());
+    }
+
+    /// Half a cable. Reported as its own thing: the remedy is not the same one.
+    #[test]
+    fn a_silent_channel_is_reported_as_a_silent_channel() {
+        let mut w = QuadratureWatch::default();
+        let one_sided: Vec<Complex32> = quad_window(1500.0, 48_000.0, QUAD_WINDOW_PAIRS)
+            .into_iter()
+            .map(|c| Complex32::new(c.re, 0.0))
+            .collect();
+        assert_eq!(w.observe(&one_sided), Some(QuadVerdict::OneChannelDead));
+    }
+
+    /// A sound card's DC offset is common to both channels, so before the means
+    /// were taken out it correlated with itself and read as a perfect 1.0 —
+    /// a healthy front end told it was carrying one signal twice, on any band
+    /// quiet enough for the offset to be the largest thing there.
+    #[test]
+    fn a_dc_offset_is_not_a_signal_on_both_wires() {
+        let mut w = QuadratureWatch::default();
+        let offset: Vec<Complex32> = quad_window(1500.0, 48_000.0, QUAD_WINDOW_PAIRS)
+            .into_iter()
+            .map(|c| Complex32::new(0.02 * c.re + 0.5, 0.02 * c.im + 0.5))
+            .collect();
+        assert_eq!(w.observe(&offset), Some(QuadVerdict::Quadrature));
+    }
+
+    /// Silence on both wires is a radio that is not sending. It must neither be
+    /// complained about nor allowed to cancel a complaint already made — the
+    /// pause between two overs would otherwise re-arm the warning every time.
+    #[test]
+    fn silence_says_nothing_either_way() {
+        let mut w = QuadratureWatch::default();
+        let mono: Vec<Complex32> = (0..QUAD_WINDOW_PAIRS)
+            .map(|k| Complex32::new(k as f32 % 3.0, k as f32 % 3.0))
+            .collect();
+        assert_eq!(w.observe(&mono), Some(QuadVerdict::SameOnBoth));
+        let quiet = vec![Complex32::new(0.0, 0.0); QUAD_WINDOW_PAIRS];
+        assert_eq!(w.observe(&quiet), None);
+        // Still the same verdict standing, so the next live window is not a
+        // second warning.
+        assert_eq!(w.observe(&mono), None);
     }
 }

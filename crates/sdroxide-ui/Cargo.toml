@@ -27,6 +27,13 @@ eframe = { version = "0.36.1", default-features = false, features = [
     "x11",
     "persistence",
 ] }
+# The browser build's WebSocket is the one `web-sys` provides, and it follows
+# the page: a client served over https upgrades itself to `wss://`. The native
+# remote client has no page to follow, so it dials what the operator typed —
+# and without ewebsock's `tls` feature tungstenite is compiled with no TLS at
+# all and refuses every `wss://` URL it is given, which is what a station
+# behind a reverse proxy on port 443 is reached by (issue #360). The feature is
+# added in the native block below rather than here so wasm never pulls rustls.
 ewebsock = { version = "0.8.0", optional = true }
 sdroxide-proto = { path = "../sdroxide-proto", optional = true }
 # SSTV: crop/scale + PNG decode/encode of gallery and TX-source images, and
@@ -51,6 +58,11 @@ remote = ["dep:ewebsock", "dep:sdroxide-proto"]
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 rfd = "0.17.2"
+# TLS for the native remote client, unified with the entry above rather than
+# replacing it: a `wss://` server — one behind a reverse proxy terminating
+# HTTPS, which is how a station on port 443 is usually reached — is refused
+# outright by a tungstenite built without it. See the note beside that entry.
+ewebsock = { version = "0.8.0", optional = true, features = ["tls"] }
 # The OS timezone, for the solar view's local-time clock. `clock` is the only
 # feature that matters here; the browser build asks JavaScript for the offset
 # instead, so chrono never reaches the wasm dependency path.

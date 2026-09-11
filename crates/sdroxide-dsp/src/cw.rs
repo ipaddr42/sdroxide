@@ -92,6 +92,30 @@ const TABLE: &[(char, &str)] = &[
     ('"', ".-..-."),
     ('\'', ".----."),
     ('@', ".--.-."),
+    // The accented letters ITU-R M.1677-1 lists beside the plain alphabet.
+    // They are ordinary Morse, not an extension: a Nordic or German operator
+    // sends them without comment, and a receiver that has never been told
+    // about them copies each one as a `?` (issue #382).
+    //
+    // One character per code, because the table has to invert: several of
+    // these are shared between languages — `.-.-` is A-umlaut and also
+    // A-E-ligature, `---.` is O-umlaut and also O-slash — and which of them
+    // was meant is not in the signal. [`fold`] is what lets the *transmit*
+    // side accept the others and send the code they share.
+    //
+    // `----` is deliberately absent. M.1677 lists it as the digraph CH (and
+    // Slovene/Croatian S-caron), and it is not a character this table can
+    // hold — but more to the point, four dahs is exactly what a run of
+    // mis-timed T's looks like, and turning that into a letter would be
+    // turning noise into words.
+    ('Ä', ".-.-"),
+    ('Å', ".--.-"),
+    ('Ç', "-.-.."),
+    ('È', ".-..-"),
+    ('É', "..-.."),
+    ('Ñ', "--.--"),
+    ('Ö', "---."),
+    ('Ü', "..--"),
 ];
 
 /// Decode a `.-` element string to a character, or `None` if it is not Morse.
@@ -102,8 +126,43 @@ pub fn morse_decode(code: &str) -> Option<char> {
 /// Encode a character to its `.-` element string. Case-insensitive; `None` for
 /// anything with no Morse representation.
 pub fn morse_encode(ch: char) -> Option<&'static str> {
-    let up = ch.to_ascii_uppercase();
+    let up = fold(ch);
     TABLE.iter().find(|(c, _)| *c == up).map(|(_, code)| *code)
+}
+
+/// The character [`TABLE`] actually carries for `ch`: upper case, with the
+/// national letters that *share* one Morse code folded onto the one entry that
+/// holds it.
+///
+/// Two things are going on here, and the second is the reason this is not
+/// `to_ascii_uppercase`. The ASCII version leaves every accented letter alone,
+/// so a lower-case `ä` never matched the table at all. And Morse gives one code
+/// to letters several languages spell differently — `.-.-` is Ä to a German and
+/// Æ to a Dane, `---.` is Ö and Ø, `.--.-` is Å and À — so the sender's own
+/// spelling has to reach the one entry the table holds for that code.
+///
+/// A character whose upper case is more than one letter — German ß, which
+/// upper-cases to "SS" — is left alone rather than truncated to its first
+/// letter: sending S for ß would put a *different word* on the air, and no code
+/// at all is the answer the keyer already had for it.
+fn fold(ch: char) -> char {
+    let mut up = ch.to_uppercase();
+    let (Some(c), None) = (up.next(), up.next()) else { return ch };
+    match c {
+        // ITU-R M.1677-1 writes the first three of these as one row each —
+        // "à å", "ä", "é" — and the national alphabets that use the same code
+        // for their own letter follow from that: Danish and Norwegian Æ and Ø,
+        // Polish Ą, Ć, Ł, Ń and Ę, Esperanto Ĉ and Ŭ.
+        'Æ' | 'Ą' => 'Ä',
+        'Ø' => 'Ö',
+        'À' => 'Å',
+        'Ć' | 'Ĉ' => 'Ç',
+        'Ł' => 'È',
+        'Ę' | 'Đ' => 'É',
+        'Ń' => 'Ñ',
+        'Ŭ' => 'Ü',
+        c => c,
+    }
 }
 
 // ─── the envelope-domain timing engine ───────────────────────────────────────
@@ -1567,6 +1626,32 @@ mod tests {
                 assert_ne!(a.1, b.1, "{} and {} share {}", a.0, b.0, a.1);
             }
         }
+    }
+
+    /// Issue #382: `ä`, `ö` and `å` are ordinary Morse — ITU-R M.1677-1 lists
+    /// them — and copying them as `?` is a hole in the table, not a font.
+    #[test]
+    fn the_accented_letters_go_out_and_come_back() {
+        for (ch, code) in
+            [('Ä', ".-.-"), ('Å', ".--.-"), ('Ö', "---."), ('Ü', "..--"), ('É', "..-..")]
+        {
+            assert_eq!(morse_encode(ch), Some(code), "{ch} sent");
+            assert_eq!(morse_decode(code), Some(ch), "{code} copied");
+            // Lower case reaches the same entry, which `to_ascii_uppercase`
+            // never did: it leaves every letter outside ASCII alone.
+            let lower = ch.to_lowercase().next().expect("one lower-case letter");
+            assert_eq!(morse_encode(lower), Some(code), "{lower} sent");
+        }
+        // The letters that share a code with one of those reach it too, so a
+        // Danish operator's Æ and Ø go out as the code they have always had.
+        assert_eq!(morse_encode('ø'), morse_encode('ö'));
+        assert_eq!(morse_encode('æ'), morse_encode('ä'));
+        assert_eq!(morse_encode('à'), morse_encode('å'));
+        // ß upper-cases to two letters, and half of a word is worse than none.
+        assert_eq!(morse_encode('ß'), None);
+        // And a real over in it copies back as itself.
+        let msg = "DE OH2ABC = QTH JYVASKYLA MEN HÄR ÄR DET KALLT = 73";
+        assert_eq!(copy(msg, &Chan::default()).trim(), msg, "clean copy differs");
     }
 
     #[test]

@@ -35,6 +35,22 @@ pub enum Error {
 }
 
 impl Error {
+    /// Add what this machine looks like from outside the vendor's library, when
+    /// there is anything to add — see [`crate::linux::hint`].
+    ///
+    /// Only the two errors that mean "the receiver is not there": a service
+    /// that is not running and a device somebody else already holds are
+    /// already as specific as they can be, and a second explanation on top of
+    /// them would be a guess.
+    pub(crate) fn with_host_hint(self) -> Error {
+        let Some(hint) = crate::linux::hint() else { return self };
+        match self {
+            Error::Api { call, text } => Error::Api { call, text: format!("{text} — {hint}") },
+            Error::NotFound(text) => Error::NotFound(format!("{text} {hint}")),
+            other => other,
+        }
+    }
+
     /// Wrap an API status, routing the codes with a specific fix to the
     /// errors that state it.
     pub(crate) fn from_status(api: &ffi::Api, call: &'static str, err: ffi::ErrT) -> Error {

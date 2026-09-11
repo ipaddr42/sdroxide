@@ -43,14 +43,19 @@ pub fn iq_to_f32(format: SpyServerFormat, body: &[u8], gain: f32, out: &mut Vec<
             }
         }
         SpyServerFormat::Float32 => {
-            // Deliberately a multiply, matching the reference client. Float
-            // samples arrive already normalised and *pre-attenuated* by the
-            // server's digital gain rather than scaled up by it, so undoing it
-            // goes the other way from the integer formats above. Turning this
-            // into a divide "for consistency" is the mistake to avoid: it is
-            // silent, and it lands the level out by twice the gain.
+            // A divide, like the integer formats — and *not* what SDR++ does.
+            // Its client multiplies floats by the header gain on the belief
+            // that the server pre-attenuates them, and this branch used to copy
+            // that. Measured against a real server it is the other way round:
+            // a float stream asked for 20 dB arrives with header flags of 20
+            // and its samples ten times larger — the same raw values as the
+            // int16 stream at 20 dB, noise floor 20 dB up. So the multiply
+            // applied the gain twice. Nobody notices at 0 dB, which is what an
+            // undecimated stream opens at; with the gain set by hand, or by
+            // the client's own loop, it is hard clipping.
+            let scale = 1.0 / gain;
             for w in body[..whole].chunks_exact(4) {
-                out.push(f32::from_le_bytes([w[0], w[1], w[2], w[3]]) * gain);
+                out.push(f32::from_le_bytes([w[0], w[1], w[2], w[3]]) * scale);
             }
         }
     }
@@ -110,9 +115,12 @@ mod tests {
         assert_eq!(out[2], 0.5);
     }
 
-    /// The header's gain is undone, and the float path goes the *other way*
-    /// from the integer ones. Asserted against literals precisely so that a
-    /// divide slipping into the float branch is caught.
+    /// The header's gain is undone the same way in every format. The float
+    /// path used to multiply instead — copied from SDR++, on the belief that
+    /// the server pre-attenuates floats — and a real server amplifies them
+    /// exactly as it does the integers, so that applied the gain twice.
+    /// Asserted against literals precisely so that a multiply slipping back
+    /// into the float branch is caught.
     #[test]
     fn the_digital_gain_in_the_flags_is_undone_per_format() {
         // 20 dB is a linear factor of ten.
@@ -126,9 +134,11 @@ mod tests {
         iq_to_f32(SpyServerFormat::Int16, &body, gain, &mut out);
         assert!((out[0] - 0.05).abs() < 1e-6, "16-bit divides by the gain");
 
-        let body: Vec<u8> = [0.05f32, 0.0].iter().flat_map(|v| v.to_le_bytes()).collect();
+        // The same 0.5 full scale, as the server sends it after 20 dB of gain:
+        // a float of 0.5, which has to come out as the 0.05 the int16 did.
+        let body: Vec<u8> = [0.5f32, 0.0].iter().flat_map(|v| v.to_le_bytes()).collect();
         iq_to_f32(SpyServerFormat::Float32, &body, gain, &mut out);
-        assert!((out[0] - 0.5).abs() < 1e-6, "float MULTIPLIES by the gain");
+        assert!((out[0] - 0.05).abs() < 1e-6, "float divides by the gain too");
 
         // A gain of unity is the identity in every format.
         iq_to_f32(SpyServerFormat::Uint8, &[255, 128], 1.0, &mut out);

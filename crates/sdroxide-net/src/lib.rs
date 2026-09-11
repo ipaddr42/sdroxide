@@ -25,6 +25,7 @@ mod wsprnet;
 
 pub use event::NetEvent;
 pub use manager::SpotManager;
+pub use pskupload::MAX_REPORT_HZ as MAX_PSK_REPORT_HZ;
 pub use pskupload::Report as PskReport;
 pub use wsprnet::{Item as WsprItem, Query as WsprQuery, Reporter as WsprReporter};
 

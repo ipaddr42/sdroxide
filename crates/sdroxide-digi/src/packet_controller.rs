@@ -1251,6 +1251,12 @@ impl DigiEngine for PacketController {
         self.ch.fill_tx_block(out)
     }
 
+    /// The AX.25 modem is built at the tap rate and transmits there, so this
+    /// is one of the two modes whose transmit audio is not 48 kHz.
+    fn tx_rate(&self) -> f64 {
+        self.tap_rate
+    }
+
     fn on_burst_done(&mut self) {
         self.ch.on_burst_done();
         self.status_dirty = true;
@@ -1375,6 +1381,21 @@ mod tests {
         let mut block = [1.0f32; 480];
         assert!(c.fill_tx_block(&mut block), "an over with nothing to send must end");
         assert!(block.iter().all(|s| *s == 0.0), "silence, not stale audio");
+    }
+
+    /// The AX.25 modem is built at the tap rate, so this is one of the two
+    /// controllers whose transmit audio is not 48 kHz — and the engine
+    /// rate-matches from whatever this says. Answering 48 kHz here would send a
+    /// burst at twice its baud rate on a radio that receives at 24 (issue
+    /// #150); the FT8 side of the same seam is issue #359.
+    #[test]
+    fn the_transmit_rate_follows_the_tap() {
+        use crate::DigiEngine;
+
+        for tap in [24_000.0, 48_000.0] {
+            let c = PacketController::new(Mode::Packet, DigiConfig::default(), tap);
+            assert_eq!(DigiEngine::tx_rate(&c), tap);
+        }
     }
 
     #[test]

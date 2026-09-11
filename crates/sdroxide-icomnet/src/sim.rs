@@ -63,6 +63,11 @@ pub struct SimOptions {
     /// looks like from outside: control answers, login succeeds, the data ports
     /// are named — and nothing ever answers on them.
     pub mute_data_ports: bool,
+    /// Ignore this many set-frequency commands before honouring any, as a
+    /// radio whose CI-V datagram was lost on the way looks from the client's
+    /// side: acknowledged by nothing, refused by nothing, and still on the old
+    /// frequency. This is the shape of issue #297.
+    pub ignore_tunes: u32,
     /// What every Set-mode menu item holds before the client writes anything
     /// (`1A 05`). `0x00` is MIC on an IC-7300MK2's modulation inputs, and on no
     /// model is it the value that means LAN — so a test can tell "the client
@@ -86,6 +91,7 @@ impl Default for SimOptions {
             port: 0,
             bind: Ipv4Addr::LOCALHOST,
             mute_data_ports: false,
+            ignore_tunes: 0,
             menu_default: 0x00,
         }
     }
@@ -112,6 +118,9 @@ struct Recorded {
     /// keeps these across a session, which is the whole of issue #252: what is
     /// left here when the client goes is what the operator finds on the rig.
     menu: BTreeMap<u16, u8>,
+    /// Where the client has tuned the radio, or `None` while it is still on
+    /// [`SimOptions::freq_hz`].
+    dial: Option<f64>,
 }
 
 /// A running simulated radio. Dropping it stops the thread.
@@ -121,6 +130,8 @@ pub struct Sim {
     recorded: Arc<Mutex<Recorded>>,
     /// What an item nobody has written holds — see [`SimOptions::menu_default`].
     menu_default: u8,
+    /// The dial the radio started on — see [`Sim::dial`].
+    start_dial: f64,
     /// Whether the scope is streaming — `27 11` sets it, and a test can clear
     /// it. See [`Sim::stall_scope`].
     scope_out: Arc<AtomicBool>,
@@ -144,6 +155,8 @@ impl Sim {
         let scope_out = Arc::new(AtomicBool::new(false));
 
         let menu_default = opts.menu_default;
+        let start_dial = opts.freq_hz;
+        let ignore_tunes = opts.ignore_tunes;
         let mut civ = SimStream::new(civ, "civ");
         let mut audio_stream = SimStream::new(audio, "audio");
         civ.mute = opts.mute_data_ports;
@@ -164,6 +177,8 @@ impl Sim {
             next_scope: Instant::now(),
             phase: 0.0,
             drop_counter: 0,
+            dial: start_dial,
+            ignore_tunes,
         };
         let join =
             std::thread::Builder::new().name("icomnet-sim".into()).spawn(move || radio.run())?;
@@ -172,6 +187,7 @@ impl Sim {
             alive,
             recorded: recorded.clone(),
             menu_default,
+            start_dial,
             scope_out,
             join: Some(join),
         })
@@ -190,6 +206,12 @@ impl Sim {
     /// Every CI-V frame the client has sent.
     pub fn civ_frames(&self) -> Vec<Vec<u8>> {
         self.recorded.lock().unwrap_or_else(|e| e.into_inner()).civ.clone()
+    }
+
+    /// Where the radio's dial is now: what the client last set with `0x05`, or
+    /// the frequency it was started on.
+    pub fn dial(&self) -> f64 {
+        self.recorded.lock().unwrap_or_else(|e| e.into_inner()).dial.unwrap_or(self.start_dial)
     }
 
     /// Whether the client got as far as opening the streams.
@@ -439,6 +461,12 @@ struct SimRadio {
     next_scope: Instant,
     phase: f64,
     drop_counter: u32,
+    /// The dial, which `0x05` moves. A simulator whose frequency is a constant
+    /// cannot show a tune failing to stick, which is the one thing issues #285
+    /// and #297 were about.
+    dial: f64,
+    /// Tunes still to be swallowed — see [`SimOptions::ignore_tunes`].
+    ignore_tunes: u32,
 }
 
 impl SimRadio {
@@ -606,9 +634,21 @@ impl SimRadio {
             // Read frequency.
             0x03 => Some(reply({
                 let mut b = vec![0x03];
-                b.extend_from_slice(&bcd_freq(self.opts.freq_hz));
+                b.extend_from_slice(&bcd_freq(self.dial));
                 b
             })),
+            // Set frequency: the radio goes there and says so from then on.
+            0x05 => {
+                if self.ignore_tunes > 0 {
+                    self.ignore_tunes -= 1;
+                    return;
+                }
+                if let Some(hz) = unbcd_freq(&frame[5..frame.len() - 1]) {
+                    self.dial = hz;
+                    self.recorded.lock().unwrap_or_else(|e| e.into_inner()).dial = Some(hz);
+                }
+                Some(vec![0xfe, 0xfe, 0xe0, addr, 0xfb, 0xfd])
+            }
             // Read mode: USB, wide.
             0x04 => Some(reply(vec![0x04, 0x01, 0x01])),
             0x15 => match frame.get(5) {
@@ -641,7 +681,7 @@ impl SimRadio {
                 }
             }
             // Anything we are told to set is simply acknowledged.
-            0x05 | 0x06 | 0x0f | 0x14 | 0x16 | 0x1a | 0x1c | 0x21 | 0x27 => {
+            0x06 | 0x0f | 0x14 | 0x16 | 0x1a | 0x1c | 0x21 | 0x27 => {
                 Some(vec![0xfe, 0xfe, 0xe0, addr, 0xfb, 0xfd])
             }
             _ => None,
@@ -690,7 +730,7 @@ impl SimRadio {
         f.push(0x01); // division 1
         f.push(0x01); // of 1 — the LAN form
         f.push(0x00); // centre mode
-        f.extend_from_slice(&bcd_freq(self.opts.freq_hz));
+        f.extend_from_slice(&bcd_freq(self.dial));
         f.extend_from_slice(&bcd_freq(50_000.0)); // ±50 kHz span
         f.push(0x00); // in range
         // As many bins, on the scale, this model actually sweeps: an IC-7760
@@ -767,9 +807,32 @@ fn bcd_freq(hz: f64) -> [u8; 5] {
     out
 }
 
+/// The inverse of [`bcd_freq`]: five little-endian BCD bytes back to Hz.
+fn unbcd_freq(bytes: &[u8]) -> Option<f64> {
+    if bytes.len() < 5 {
+        return None;
+    }
+    let mut hz: u64 = 0;
+    for &b in bytes[..5].iter().rev() {
+        let (hi, lo) = ((b >> 4) as u64, (b & 0x0f) as u64);
+        if hi > 9 || lo > 9 {
+            return None;
+        }
+        hz = hz * 100 + hi * 10 + lo;
+    }
+    Some(hz as f64)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_tune_moves_the_simulated_dial_and_comes_back_out_again() {
+        assert_eq!(unbcd_freq(&bcd_freq(7_074_000.0)), Some(7_074_000.0));
+        assert_eq!(unbcd_freq(&[0x00, 0x00]), None, "a truncated frame is not a frequency");
+        assert_eq!(unbcd_freq(&[0xff, 0x00, 0x00, 0x00, 0x00]), None, "nor is a bad nibble");
+    }
 
     #[test]
     fn bcd_matches_icoms_little_endian_nibble_order() {

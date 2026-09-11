@@ -739,6 +739,12 @@ impl DigiEngine for AprsController {
         self.ch.fill_tx_block(out)
     }
 
+    /// As for packet, whose modem this shares: built at the tap rate, so the
+    /// audio comes back at the tap rate.
+    fn tx_rate(&self) -> f64 {
+        self.tap_rate
+    }
+
     fn on_burst_done(&mut self) {
         self.ch.on_burst_done();
         self.status_dirty = true;

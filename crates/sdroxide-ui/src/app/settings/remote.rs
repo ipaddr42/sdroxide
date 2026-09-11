@@ -45,9 +45,9 @@ pub(in crate::app) fn settings_remote_tab(
     );
     ui.add_space(8.0);
 
-    // A pasted URL carries its own port (or its scheme's default), so the box
-    // below has nothing left to say and greys out rather than sitting there
-    // looking as though it still applies.
+    // A pasted URL carries its own scheme and its own port (or that scheme's
+    // default), so the two boxes below have nothing left to say and grey out
+    // rather than sitting there looking as though they still apply.
     let typed_url = cfg.host.contains("://");
     let mut entered = false;
     egui::Grid::new("remote-grid").num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
@@ -61,7 +61,7 @@ pub(in crate::app) fn settings_remote_tab(
         let addr = addr.on_hover_text(
             "The machine running sdroxide --server: a host name, an IPv4 or IPv6 address, or a \
              complete ws:// (or wss://) URL if the server sits behind a reverse proxy — a URL is \
-             used exactly as typed and ignores the port below.",
+             used exactly as typed and ignores the port and the switch below.",
         );
         // Enter in the address box is the same as pressing CONNECT: an address
         // box is a thing one types into and presses return on.
@@ -73,6 +73,23 @@ pub(in crate::app) fn settings_remote_tab(
             ui.add(egui::DragValue::new(&mut cfg.port).range(1..=65535)).on_hover_text(
                 "The port that server listens on — server_port in its config.toml. 4950 unless \
                  it was given --port.",
+            );
+        });
+        ui.end_row();
+
+        // The scheme, as a switch rather than as something to be spelled out in
+        // the address box. A browser client reads it off the page it was served
+        // from; this one has no page, so the operator has to say — and until
+        // they could, a station behind an HTTPS proxy on 443 was reachable only
+        // by typing the whole URL out, which then took the port box with it
+        // (issue #360).
+        ui.label(RichText::new("Secure").strong());
+        ui.add_enabled_ui(!typed_url, |ui| {
+            ui.checkbox(&mut cfg.tls, "wss:// (TLS)").on_hover_text(
+                "Tick this where the server sits behind something that terminates HTTPS for it — \
+                 a reverse proxy on port 443, which is the usual way a station is reached across \
+                 the open internet. sdroxide's own server speaks plain ws:// and does not want \
+                 this.",
             );
         });
         ui.end_row();
@@ -130,8 +147,9 @@ pub(in crate::app) fn settings_remote_tab(
              at the top of the window switches between them (⊞ puts two side by side). Close it \
              from the roster at the top of the Radio tab — that hangs up; nothing on the server \
              is changed.\n\nIf the server asks for a username and password, its sign-in screen \
-             comes up in the new tab. Nothing on this link is encrypted, so across the open \
-             internet put it through a VPN or an SSH tunnel.",
+             comes up in the new tab. A plain ws:// link carries none of this encrypted, so \
+             across the open internet either put it through a VPN or an SSH tunnel, or terminate \
+             HTTPS in front of the server and tick Secure above.",
         )
         .weak(),
     );

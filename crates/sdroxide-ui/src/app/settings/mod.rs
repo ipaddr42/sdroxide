@@ -161,6 +161,9 @@ pub(in crate::app) struct SettingsIo<'a> {
     /// The RX and TX tuning ranges as typed, buffered until Apply — see
     /// `SdroxideApp::range_edit`.
     ranges: &'a mut Option<(String, String)>,
+    /// Where the antenna is, buffered until Apply — see
+    /// `SdroxideApp::rx_site_edit`.
+    rx_site: &'a mut Option<sdroxide_types::RxSite>,
     audio_pick: &'a mut Option<(bool, Option<String>)>,
     hpsdr_discover: &'a mut bool,
     /// Re-enumerate the USB bus for RTL-SDR dongles. Cheap and non-invasive —
@@ -173,6 +176,10 @@ pub(in crate::app) struct SettingsIo<'a> {
     airspyhf_copy_report: &'a mut bool,
     hackrf_rescan: &'a mut bool,
     hackrf_copy_report: &'a mut bool,
+    /// The General tab's settings-file buttons, which touch the disk and so
+    /// have to wait for `&mut self` like everything else here (issue #356).
+    settings_export: &'a mut bool,
+    settings_import: &'a mut bool,
     airspy_rescan: &'a mut bool,
     airspy_copy_report: &'a mut bool,
     /// Re-enumerate the USB bus for HydraSDR RFOne receivers. Opens nothing.
@@ -360,6 +367,245 @@ fn freq_range_edit(ui: &mut egui::Ui, id: &str, text: &mut String, hover: &str) 
         if let Err(e) = sdroxide_types::parse_freq_ranges(text) {
             ui.label(RichText::new(e).color(Color32::from_rgb(230, 90, 80)));
         }
+    });
+}
+
+/// A frequency field shown and typed in megahertz, held in hertz.
+///
+/// The converter Offset above these is in hertz because that is how every
+/// converter's documentation states it. A transverter's *band* is not: nobody
+/// writes 144000000, and the RX/TX range boxes on this same page are already in
+/// megahertz. So this one reads the way a band plan does.
+fn mhz_drag(ui: &mut egui::Ui, hz: &mut f64, hover: &str) -> egui::Response {
+    ui.add(
+        egui::DragValue::new(hz)
+            .speed(1000.0)
+            .range(0.0..=sdroxide_types::FREQ_RANGE_MAX_HZ)
+            .custom_formatter(|n, _| format!("{:.4}", n / 1e6))
+            .custom_parser(|s| s.trim().parse::<f64>().ok().map(|m| m * 1e6))
+            .suffix(" MHz"),
+    )
+    .on_hover_text(hover)
+}
+
+/// The transverter table: one row per box in front of the radio, each with the
+/// band it works and the offset it works it at (issue #278).
+///
+/// Kept apart from the single **Offset** field above rather than replacing it.
+/// The two answer different questions: an upconverter or an LNB is in front of
+/// *everything* and has one offset for the whole dial, while a transverter is
+/// in front of one band and the radio is on its own below. A station can have
+/// both, and a dial no row covers falls through to the offset above it.
+fn transverter_table(ui: &mut egui::Ui, cfg: &mut sdroxide_types::RadioConfig) {
+    use sdroxide_types::{ConverterTx as Tx, MAX_TRANSVERTERS, Transverter};
+
+    ui.add_space(10.0);
+    ui.separator();
+    ui.add_space(4.0);
+    ui.label(RichText::new("Transverters").size(14.0).strong().color(crate::theme::CYAN()));
+    ui.add_space(2.0);
+    ui.label(
+        RichText::new(
+            "One row per box. While the dial is inside a row's band the radio is tuned to \
+             dial + offset and that row's transmit rule and drive limit apply; outside every \
+             row the radio is on its own bands. Rows are tried top to bottom.",
+        )
+        .weak(),
+    );
+    ui.add_space(6.0);
+
+    let mut remove: Option<usize> = None;
+    egui::Grid::new("xvtr-grid").num_columns(8).spacing([10.0, 6.0]).striped(true).show(ui, |ui| {
+        for h in ["", "Name", "Band low", "Band high", "Offset", "Transmit", "Max drive", ""] {
+            ui.label(RichText::new(h).weak().size(10.0));
+        }
+        ui.end_row();
+
+        for (i, x) in cfg.transverters.iter_mut().enumerate() {
+            crate::chrome::checkbox(ui, &mut x.enabled, "").on_hover_text(
+                "Off takes this transverter out of the line without losing the row — the \
+                     band goes back to whatever the radio reaches on its own.",
+            );
+            crate::chrome::field(
+                ui,
+                egui::TextEdit::singleline(&mut x.name)
+                    .id_salt(("xvtr-name", i))
+                    .desired_width(110.0)
+                    .hint_text("2 m"),
+            )
+            .on_hover_text("What you call it. Shown in the log when the dial selects it.");
+            mhz_drag(
+                ui,
+                &mut x.rf_lo_hz,
+                "The bottom of the band this transverter works, \
+                     on the dial. 144 for 2 m.",
+            );
+            mhz_drag(
+                ui,
+                &mut x.rf_hi_hz,
+                "The top of the band, on the dial. 148 for 2 m \
+                     in Regions 2 and 3, 146 in Region 1.",
+            );
+            ui.add(
+                egui::DragValue::new(&mut x.offset_hz)
+                    .speed(1000.0)
+                    .range(
+                        -sdroxide_types::CONVERTER_OFFSET_MAX_HZ
+                            ..=sdroxide_types::CONVERTER_OFFSET_MAX_HZ,
+                    )
+                    .custom_formatter(|n, _| format!("{:.4}", n / 1e6))
+                    .custom_parser(|s| s.trim().parse::<f64>().ok().map(|m| m * 1e6))
+                    .suffix(" MHz"),
+            )
+            .on_hover_text(
+                "The radio ends up on dial + offset, so a transverter that brings a band \
+                     down to an I.F. is negative: 2 m into a 28 MHz I.F. is -116, because \
+                     144 - 116 = 28. Drag to trim it a hertz at a time for an oscillator that \
+                     is slightly off.",
+            );
+            egui::ComboBox::from_id_salt(("xvtr-tx", i))
+                .selected_text(x.tx.label())
+                .width(120.0)
+                .show_styled(ui, |ui| {
+                    for opt in [Tx::Off, Tx::Transverter] {
+                        let on = std::mem::discriminant(&opt) == std::mem::discriminant(&x.tx);
+                        if ui.selectable_label(on, opt.label()).clicked() && !on {
+                            x.tx = opt;
+                        }
+                    }
+                })
+                .response
+                .on_hover_text(
+                    "Off while converting: receive only — the row is a converter, not a \
+                         transverter, and nothing is keyed on this band.\n\nThrough the same \
+                         converter: it works both ways, and transmit takes the same offset.",
+                );
+            ui.add(
+                egui::DragValue::new(&mut x.tx_drive)
+                    .speed(0.005)
+                    .range(0.0..=1.0)
+                    .custom_formatter(|n, _| format!("{:.0}", n * 100.0))
+                    .custom_parser(|s| s.trim().parse::<f64>().ok().map(|p| p / 100.0))
+                    .suffix(" %"),
+            )
+            .on_hover_text(
+                "A ceiling on transmit drive while this transverter is selected, as a \
+                     percentage of full. A transverter's I.F. input takes milliwatts and the \
+                     drive that is right for the radio's own bands will destroy it, so this is \
+                     the row's most important field. 100% is no limit.\n\nYour Drive setting \
+                     is held under this rather than moved, so the number you use on HF comes \
+                     back when the dial leaves the band.",
+            );
+            if crate::chrome::chip(ui, false, "REMOVE").clicked() {
+                remove = Some(i);
+            }
+            ui.end_row();
+        }
+    });
+    if let Some(i) = remove {
+        cfg.transverters.remove(i);
+    }
+    ui.add_space(4.0);
+    ui.horizontal(|ui| {
+        let full = cfg.transverters.len() >= MAX_TRANSVERTERS;
+        if ui
+            .add_enabled(!full, egui::Button::new("ADD TRANSVERTER"))
+            .on_disabled_hover_text(format!("{MAX_TRANSVERTERS} is the most this table holds"))
+            .clicked()
+        {
+            cfg.transverters.push(Transverter { tx: Tx::Transverter, ..Transverter::default() });
+        }
+        ui.label(
+            RichText::new("Takes effect on Apply / reconnect, like the converter offset above.")
+                .weak(),
+        );
+    });
+}
+
+/// The per-band transmit drive calibration: one trim per band, so that one
+/// Drive setting means one output power everywhere (issue #295).
+///
+/// Rows are only written for bands the operator has actually moved. A table
+/// full of zeros and one full of nothing say the same thing, and the second is
+/// what a station that has never opened this keeps in its `radio.json`.
+fn drive_trim_table(ui: &mut egui::Ui, cfg: &mut sdroxide_types::RadioConfig) {
+    use sdroxide_types::{Band, BandDriveTrim};
+
+    ui.add_space(10.0);
+    ui.separator();
+    ui.add_space(4.0);
+    ui.label(
+        RichText::new("Transmit drive by band").size(14.0).strong().color(crate::theme::CYAN()),
+    );
+    ui.add_space(2.0);
+    ui.label(
+        RichText::new(
+            "Every amplifier has a different gain on every band, so one Drive setting makes a \
+             different power on each. Measure the output on each band, then trim the bands \
+             that come out high until they all match: set Drive for the band that needs the \
+             most (usually the highest), and take the others down to it. Decibels of output \
+             power, applied to voice, digital and TUNE alike. Zero everywhere — the default — \
+             changes nothing.",
+        )
+        .weak(),
+    );
+    ui.add_space(6.0);
+
+    // Bands the station's own region actually has: a Region 1 operator has no
+    // 1.25 m to calibrate, and a row for one would be a row that can never be
+    // reached. GEN closes the table for a dial outside every ham band.
+    let bands: Vec<Band> =
+        Band::ALL.iter().copied().filter(|b| *b == Band::Gen || b.edges().is_some()).collect();
+    let mut set: Option<(Band, f32)> = None;
+    egui::Grid::new("drive-trim-grid").num_columns(8).spacing([12.0, 6.0]).striped(true).show(
+        ui,
+        |ui| {
+            for (i, band) in bands.iter().enumerate() {
+                let mut db =
+                    cfg.tx_drive_trim.iter().find(|t| t.band == *band).map(|t| t.db).unwrap_or(0.0);
+                ui.label(if *band == Band::Gen { "Other" } else { band.label() });
+                if ui
+                    .add(
+                        egui::DragValue::new(&mut db)
+                            .speed(0.1)
+                            .range(BandDriveTrim::DB_RANGE)
+                            .fixed_decimals(1)
+                            .suffix(" dB"),
+                    )
+                    .changed()
+                {
+                    set = Some((*band, db));
+                }
+                if i % 4 == 3 {
+                    ui.end_row();
+                }
+            }
+            ui.end_row();
+        },
+    );
+    if let Some((band, db)) = set {
+        cfg.tx_drive_trim.retain(|t| t.band != band);
+        if db != 0.0 {
+            cfg.tx_drive_trim.push(BandDriveTrim { band, db });
+        }
+    }
+    ui.add_space(4.0);
+    ui.horizontal(|ui| {
+        if ui
+            .add_enabled(!cfg.tx_drive_trim.is_empty(), egui::Button::new("CLEAR ALL"))
+            .on_hover_text("Back to no calibration: the Drive setting reaches every band whole.")
+            .clicked()
+        {
+            cfg.tx_drive_trim.clear();
+        }
+        ui.label(
+            RichText::new(
+                "Applies immediately, and to the band you would transmit on — behind a \
+                 transverter that is the band on the dial, and the transverter's own drive \
+                 limit still wins over anything set here.",
+            )
+            .weak(),
+        );
     });
 }
 
@@ -611,6 +857,7 @@ impl SdroxideApp {
             // radio is still on the old one, and the box should say so.
             self.converter_edit_hz = None;
             self.range_edit = None;
+            self.rx_site_edit = None;
             // The next open starts at the tab bar, not wherever the window was
             // last scrolled to — the offset is one shared egui memory for all
             // the tabs, and it outlives the process.
@@ -711,6 +958,8 @@ impl SdroxideApp {
         let mut lime_copy_report = false;
         let mut hackrf_rescan = false;
         let mut hackrf_copy_report = false;
+        let mut settings_export = false;
+        let mut settings_import = false;
         let mut airspy_rescan = false;
         let mut airspy_copy_report = false;
         let mut hydrasdr_rescan = false;
@@ -733,6 +982,7 @@ impl SdroxideApp {
         let mut radio_edit = self.radio_cfg.clone();
         let mut converter_hz = self.converter_edit_hz;
         let mut ranges = self.range_edit.clone();
+        let mut rx_site = self.rx_site_edit.clone();
         let mut ui_edit = self.ui_settings;
         // Only where the engine is in this process: see `SettingsIo`.
         let owns_server = !self.ctrl.engine_is_remote();
@@ -858,6 +1108,7 @@ impl SdroxideApp {
                             local_engine: owns_server,
                             converter_hz: &mut converter_hz,
                             ranges: &mut ranges,
+                            rx_site: &mut rx_site,
                             audio_pick: &mut audio_pick,
                             hpsdr_discover: &mut hpsdr_discover,
                             rtlsdr_rescan: &mut rtlsdr_rescan,
@@ -869,6 +1120,8 @@ impl SdroxideApp {
                             lime_rescan: &mut lime_rescan,
                             lime_copy_report: &mut lime_copy_report,
                             hackrf_rescan: &mut hackrf_rescan,
+                            settings_export: &mut settings_export,
+                            settings_import: &mut settings_import,
                             hackrf_copy_report: &mut hackrf_copy_report,
                             airspy_rescan: &mut airspy_rescan,
                             airspy_copy_report: &mut airspy_copy_report,
@@ -1116,6 +1369,7 @@ impl SdroxideApp {
         if hackrf_rescan {
             self.ask_device(ctx, P::HackRf);
         }
+        self.run_settings_transfer(settings_export, settings_import);
         if hackrf_copy_report {
             // Worth more on this backend than on the receive-only ones: a
             // transmit fault is about the *order* control transfers went out
@@ -1252,6 +1506,16 @@ impl SdroxideApp {
             if let (Some(cfg), Some(hz)) = (radio_edit.as_mut(), converter_hz) {
                 cfg.converter_offset_hz = hz;
             }
+            if let (Some(cfg), Some(site)) = (radio_edit.as_mut(), rx_site.as_ref()) {
+                // Trimmed on the way in, so a stray space is not the difference
+                // between a locator and "somewhere, nobody knows where".
+                cfg.rx_site = match site {
+                    sdroxide_types::RxSite::Elsewhere(g) => {
+                        sdroxide_types::RxSite::Elsewhere(g.trim().to_string())
+                    }
+                    other => other.clone(),
+                };
+            }
             if let (Some(cfg), Some((rx, tx))) = (radio_edit.as_mut(), ranges.as_ref()) {
                 // Anything that doesn't parse leaves that direction as it was:
                 // the box is showing the operator why in red, and applying half
@@ -1309,6 +1573,7 @@ impl SdroxideApp {
         }
         self.converter_edit_hz = converter_hz;
         self.range_edit = ranges;
+        self.rx_site_edit = rx_site;
         if radio_edit != self.radio_cfg {
             if let Some(cfg) = &radio_edit {
                 self.ctrl.set_radio_config(cfg.clone());
@@ -1528,12 +1793,20 @@ impl SdroxideApp {
                 ui.add_space(10.0);
                 ui.separator();
                 ui.add_space(6.0);
+                self.settings_transfer(ui, io.settings_export, io.settings_import);
+
+                ui.add_space(10.0);
+                ui.separator();
+                ui.add_space(6.0);
                 self.settings_swr_guard(ui, cmds);
 
                 ui.add_space(10.0);
                 ui.separator();
                 ui.add_space(6.0);
                 self.settings_user_audio(ui, io.audio_pick);
+                if let Some(cfg) = io.radio_edit.as_mut() {
+                    crate::app::settings::general::settings_rx_audio_gain(ui, cfg);
+                }
                 // The radio's own sound card is only used by the CAT / Audio
                 // interface; every other backend carries its audio in-band.
                 //
@@ -1632,6 +1905,7 @@ impl SdroxideApp {
                         sdroxide_types::format_freq_ranges(&cfg.freq_ranges_tx),
                     )
                 });
+                let site = io.rx_site.get_or_insert_with(|| cfg.rx_site.clone());
                 egui::Grid::new("iface-grid").num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
                     ui.label(RichText::new("Radio interface").strong());
                     // Switching the far end's interface is allowed: the device
@@ -1661,6 +1935,12 @@ impl SdroxideApp {
                                 sdroxide_types::format_freq_ranges(&cfg.freq_ranges_rx),
                                 sdroxide_types::format_freq_ranges(&cfg.freq_ranges_tx),
                             );
+                            // Same reseed for the same reason: `set_backend`
+                            // has just put the antenna back at the station,
+                            // because where it was belonged to the receiver
+                            // being left. The box has to show that, or Apply
+                            // would write the old receiver's square back.
+                            *site = cfg.rx_site.clone();
                         }
                     } else {
                         ui.label(backend.label()).on_hover_text(
@@ -1719,8 +1999,10 @@ impl SdroxideApp {
                     .on_hover_text(
                         "How far a converter moves the signal on its way to the receiver, in Hz \
                          — the same number and sign every converter's documentation and every \
-                         other SDR program states. Positive for an upconverter (a Ham It Up is \
-                         125000000), negative for a down-converter such as a satellite LNB. \
+                         other SDR program states. The radio ends up on dial + offset: positive \
+                         for an upconverter (a Ham It Up is 125000000), negative for anything \
+                         that brings a band down to an I.F. — a satellite LNB, or a 2 m \
+                         transverter on a 28 MHz I.F., which is -116000000 (28 − 144). \
                          0 = no converter.\n\nDrag to trim it a hertz at a time, which is what \
                          a converter whose oscillator is slightly off wants.\n\nThis is the \
                          receive path. What is in the transmit line is the row below.\n\nTakes \
@@ -1808,8 +2090,10 @@ impl SdroxideApp {
                         &mut ranges.0,
                         "Which frequencies this radio receives, in MHz: 144-146, 430-440. Leave \
                          empty to use whatever the device reports about itself.\n\nBand buttons \
-                         outside the range are greyed out and the dial will not go there.\n\nTakes \
-                         effect on Apply.",
+                         outside the range are greyed out and the dial will not go there.\n\n\
+                         These are dial frequencies. With a converter set, state the band you \
+                         tune — 144-148 for a 2 m transverter — not the I.F. the radio is really \
+                         on.\n\nTakes effect on Apply.",
                     );
                     ui.end_row();
 
@@ -1821,20 +2105,97 @@ impl SdroxideApp {
                         "Which frequencies this radio transmits on, in MHz: 144-146, 430-440. \
                          Leave empty to use whatever the device reports — and if it reports \
                          nothing, the driver is taken at its word and any frequency is \
-                         allowed.\n\nThis is a limit you set, not a licence: transmitting outside \
+                         allowed.\n\nDial frequencies, like the receive range above.\n\nThis \
+                         is a limit you set, not a licence: transmitting outside \
                          the amateur bands is refused regardless unless you have turned that off \
                          in config.toml. Nor does it give a receive-only device a \
                          transmitter.\n\nTakes effect on Apply.",
                     );
                     ui.end_row();
+
+                    // Where the antenna is. The station's locator answers that
+                    // for a radio in the shack and answers it wrongly for an
+                    // online receiver — issue #284, where a KiwiSDR in
+                    // Australia taken in a European tab posted every 2 m decode
+                    // as an intercontinental opening, because the reports went
+                    // out from the operator's square.
+                    ui.label(RichText::new("Antenna is").strong());
+                    ui.horizontal(|ui| {
+                        use sdroxide_types::RxSite;
+                        egui::ComboBox::from_id_salt("rx-site")
+                            .selected_text(site.label())
+                            .show_styled(ui, |ui| {
+                                for opt in [RxSite::Station, RxSite::Elsewhere(String::new())] {
+                                    // On the *kind*, so picking "somewhere
+                                    // else" again does not wipe the locator
+                                    // already typed beside it.
+                                    let on = std::mem::discriminant(&opt)
+                                        == std::mem::discriminant(&*site);
+                                    if ui.selectable_label(on, opt.label()).clicked() && !on {
+                                        *site = opt;
+                                    }
+                                }
+                            })
+                            .response
+                            .on_hover_text(
+                                "Where this radio listens from.\n\nAt the station: the antenna \
+                                 is yours, so your own locator says where it is. The default, \
+                                 and right for everything in the shack.\n\nSomewhere else: an \
+                                 online receiver, or your own set up on a hilltop. What it hears \
+                                 is reported to PSK Reporter, WSPRnet and FreeDV Reporter from \
+                                 the locator beside this, never from yours — and ADS-B places \
+                                 aircraft against it too.\n\nPicking a receiver under \
+                                 \"Public SDRs\" fills this in for you.\n\nTakes effect on \
+                                 Apply.",
+                            );
+                        if let RxSite::Elsewhere(g) = site {
+                            ui.add(
+                                egui::TextEdit::singleline(g)
+                                    .desired_width(90.0)
+                                    .hint_text("locator"),
+                            )
+                            .on_hover_text(
+                                "The receiver's Maidenhead locator — JN88ec, DO30db. Four or \
+                                 six characters.\n\nLeave it empty if you do not know where \
+                                 the receiver is: nothing is then reported at all, which is the \
+                                 only honest answer. Reporting from your own square would put \
+                                 somebody else's reception on the wrong continent.",
+                            );
+                        }
+                    });
+                    ui.end_row();
                 });
+                if let sdroxide_types::RxSite::Elsewhere(g) = &*site {
+                    let g = g.trim();
+                    ui.label(
+                        RichText::new(if g.is_empty() {
+                            "The antenna is somewhere else and no locator is set, so nothing \
+                             this radio hears is reported to PSK Reporter, WSPRnet or FreeDV \
+                             Reporter. Type the receiver's locator above to report from it."
+                                .to_string()
+                        } else if sdroxide_types::grid_to_latlon(g).is_some() {
+                            format!(
+                                "Receptions through this radio are reported from {g}, not from \
+                                 your own locator."
+                            )
+                        } else {
+                            format!(
+                                "{g} is not a Maidenhead locator, so nothing this radio hears is \
+                                 reported. Four or six characters: two letters, two digits, and \
+                                 optionally two more letters."
+                            )
+                        })
+                        .weak(),
+                    );
+                }
                 // The two range boxes are the only megahertz on a tab whose
                 // other frequency field is hertz, so the example says the same
                 // range both ways rather than leaving anyone to count zeros.
                 ui.label(
                     RichText::new(
                         "Ranges are in MHz, low-high, separated by commas: 144-146, 430-440 — \
-                         that is 144000000-146000000 Hz and 430000000-440000000 Hz. The \
+                         that is 144000000-146000000 Hz and 430000000-440000000 Hz. They are \
+                         dial frequencies: a converter offset does not move them. The \
                          converter offset above is the field in hertz. Leave a range empty to \
                          use whatever the device reports about itself; a device that reports \
                          nothing is taken at its word.",
@@ -1875,6 +2236,8 @@ impl SdroxideApp {
                     }
                 }
 
+                transverter_table(ui, cfg);
+
                 self.settings_panadapter(ui, cfg);
 
                 // Transmit EQ: mic/modulator-path DSP, not a device feature.
@@ -1882,6 +2245,7 @@ impl SdroxideApp {
                 // selected above, so it sits here rather than in one of the
                 // per-backend sections below.
                 if self.tx_capable() {
+                    drive_trim_table(ui, cfg);
                     ui.separator();
                     ui.label(
                         RichText::new("Transmit EQ")
@@ -1973,6 +2337,7 @@ impl SdroxideApp {
                         io.radio_edit,
                         self.caps.as_ref(),
                         &self.state.antenna_rx,
+                        self.state.rx_antenna,
                         io.can_probe,
                         cmds,
                     ),
@@ -1988,6 +2353,7 @@ impl SdroxideApp {
                         io.radio_edit,
                         self.caps.as_ref(),
                         &self.state.antenna_rx,
+                        self.state.rx_antenna,
                         io.icomnet_test,
                         io.icomnet_copy_report,
                         &self.icomnet_test_result,
@@ -2301,7 +2667,7 @@ impl SdroxideApp {
                 crate::chrome::checkbox(
                     ui,
                     &mut io.net_edit.psk.report,
-                    "Upload my FT8/FT4/FT2 decodes",
+                    "Upload my FT8/FT4/FT2/JS8 decodes",
                 )
                 .on_hover_text(
                     "Report what this station hears to pskreporter.info, so it appears \
@@ -2699,6 +3065,7 @@ impl SdroxideApp {
                     UploadTarget::QrzLogbook => &mut io.net_edit.auto_upload_qrz,
                     UploadTarget::HamQth => &mut io.net_edit.auto_upload_hamqth,
                     UploadTarget::ClubLog => &mut io.net_edit.auto_upload_clublog,
+                    UploadTarget::Wrl => &mut io.net_edit.auto_upload_wrl,
                 };
                 crate::chrome::checkbox(
                     ui,
@@ -2757,6 +3124,19 @@ impl SdroxideApp {
                         net_row(ui, "Club Log email", &mut io.net_edit.clublog.user, 200.0);
                         net_secret(ui, "Club Log pass", &mut io.net_edit.clublog.password, 140.0);
                         net_secret(ui, "Club Log key", &mut io.net_edit.clublog_api_key, 200.0);
+                    }
+                    UploadTarget::Wrl => {
+                        net_secret(ui, "WRL API key", &mut io.net_edit.wrl_api_key, 240.0);
+                        ui.label(
+                            RichText::new(
+                                "The developer API key from World Radio League → Integrations → \
+                                 Developer API. It is shown once when you generate it, so copy \
+                                 it then. Contacts go to your default logbook — set one in WRL \
+                                 if you keep more than one.",
+                            )
+                            .size(10.5)
+                            .color(crate::theme::gray(140)),
+                        );
                     }
                 }
 
@@ -3380,23 +3760,21 @@ impl SdroxideApp {
                 // somebody's panadapter, whose front end is the borrower's to
                 // hold — nor by a station that does not take the request.
                 //
-                // Lit while the radio is on, as the strip's copy of the switch
-                // is: the chip says which state the radio is in, and a chip
-                // wears the accent when what it says is in force (issue #253).
+                // Lit while the link is open, as the strip's copy of the
+                // switch is: a chip wears the accent when what it names is in
+                // force (issue #253). It names the link rather than an on/off
+                // state, because a switch reading "on/off" beside a radio is
+                // read as the radio's — see [`crate::chrome::LINK_CLOSE_TIP`].
                 if chip.switchable
                     && chip.attached_to.is_none()
                     && self.radio_roster.len() > 1
-                    && crate::chrome::chip(
-                        ui,
-                        chip.enabled,
-                        RichText::new(if chip.enabled { "ON" } else { "OFF" }).size(11.0),
-                    )
-                    .on_hover_text(if chip.enabled {
-                        crate::chrome::POWER_OFF_TIP
-                    } else {
-                        crate::chrome::POWER_ON_TIP
-                    })
-                    .clicked()
+                    && crate::chrome::chip(ui, chip.enabled, RichText::new("LINK").size(11.0))
+                        .on_hover_text(if chip.enabled {
+                            crate::chrome::LINK_CLOSE_TIP
+                        } else {
+                            crate::chrome::LINK_OPEN_TIP
+                        })
+                        .clicked()
                 {
                     requests.push(crate::app::RadioTabRequest::Power {
                         id: chip.id,

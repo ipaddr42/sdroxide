@@ -7,7 +7,7 @@
 //! here each frame from state the rest of the app maintains.
 
 use eframe::egui::Color32;
-use sdroxide_types::{SkimmerKind, SkimmerSpot, SpectrumConfig, Spot, SpotKind};
+use sdroxide_types::{Mode, SkimmerKind, SkimmerSpot, SpectrumConfig, Spot, SpotKind};
 
 use crate::time::{now_unix, now_unix_f64};
 use crate::waterfall_gpu;
@@ -524,6 +524,7 @@ impl SdroxideApp {
             now_unix: self.wf_now_pin,
             spectrum_alpha,
             palette: s.waterfall_palette,
+            smooth: s.waterfall_smooth,
             gradient,
             wf_id: u64::from(self.radio_id),
         }
@@ -684,6 +685,7 @@ impl SdroxideApp {
                     .and_then(|id| self.mem_folders.iter().find(|f| f.id == id))
                     .map(|f| f.name.as_str());
                 crate::widgets::memories::MemMark {
+                    id: m.id,
                     freq_hz: m.freq_hz,
                     text: match folder {
                         Some(f) => format!("Mem: {f} / {}", m.name),
@@ -842,6 +844,32 @@ impl SdroxideApp {
         }
     }
 
+    /// The frequency the panadapter anchors on — see [`focus_hz`], which is
+    /// where the rule lives. The dial in every mode but the handful that hold
+    /// a tone pair off it.
+    ///
+    /// The controller's offset where it has reported one, because that is the
+    /// figure the cursor and the tone markers are drawn from; the mode's own
+    /// standard stands in until it has, so the first frame after a mode change
+    /// anchors in the same place as the second rather than jumping.
+    ///
+    /// A status is only believed while it is *for* this mode. The engine's last
+    /// report outlives a mode change by a frame or two, and this is called from
+    /// the state event that carries the change — an FT8 transmit offset read as
+    /// an RTTY tone pair would anchor the window 700 Hz off the tones on the one
+    /// frame the operator is most likely to be watching it move.
+    pub(in crate::app) fn panadapter_focus_hz(&self) -> f64 {
+        let mode = self.state.rx[0].mode;
+        let audio_hz = self.digi_status.as_ref().filter(|s| s.mode == mode).map_or_else(
+            || match mode {
+                Mode::Cw => self.digi_cfg_edit.cw_pitch_hz,
+                _ => mode.standard_tone_offset_hz().unwrap_or_default(),
+            },
+            |s| s.audio_hz,
+        );
+        focus_hz(mode, self.state.active_freq_hz(), audio_hz, self.ui_settings.cw_qrg)
+    }
+
     /// Center the view on the tuned frequency after big jumps (band change,
     /// memory recall, startup) — i.e. whenever the tuning changed AND left
     /// the visible span. Deliberate pans away from the VFO are never
@@ -892,12 +920,19 @@ impl SdroxideApp {
         if self.caps.is_some() && out_span > 0.0 && self.view.span() > out_span {
             self.view.fit(out_center, out_span);
         }
+        // What has to stay on screen is what is being listened to, not the
+        // dial — in RTTY the two are 2210 Hz apart, and zoomed in past that the
+        // dial can be off the picture while the signal is dead centre. Anchored
+        // on the dial, this fired on every click-tune and threw the tone pair
+        // out of the window it had just been clicked in. `moved` stays on the
+        // dial, because that is the question it asks: did the tuning change.
+        let focus = self.panadapter_focus_hz();
         let moved = (vfo - prev_vfo).abs() > 0.5;
-        let outside = !(self.view.view_lo_hz..=self.view.view_hi_hz).contains(&vfo);
+        let outside = !(self.view.view_lo_hz..=self.view.view_hi_hz).contains(&focus);
         if (moved || first) && outside {
             let span = self.view.span().min(self.state.sample_rate);
-            self.view.view_lo_hz = vfo - span / 2.0;
-            self.view.view_hi_hz = vfo + span / 2.0;
+            self.view.view_lo_hz = focus - span / 2.0;
+            self.view.view_hi_hz = focus + span / 2.0;
         }
     }
 }
@@ -969,6 +1004,33 @@ const WIDER_THAN_PASSBAND: f64 = 1.001;
 /// frame never matches, so a deliberate zoom into part of the sweep survives.
 fn refit_on_window_growth(audio_mode: bool, prev_rate: f64, new_rate: f64, view_span: f64) -> bool {
     audio_mode && prev_rate > 0.0 && new_rate > prev_rate * 4.0 && view_span * 2.0 < new_rate
+}
+
+/// The frequency the panadapter is anchored on — what is being listened to,
+/// which in the modes that hold a tone pair off the dial is not the dial.
+///
+/// RTTY is what this exists for. Its dial sits 2210 Hz below the mark tone by
+/// convention, so clicking a signal tunes the dial *below* the picture rather
+/// than onto it. Zoom in past that offset and the dial is no longer on screen
+/// at all — and a window re-centred on it throws the picture two kilohertz
+/// down and carries the signal that was just clicked off the right-hand edge.
+/// The tone pair, the cyan cursor and the passband are all up at `dial + 2210`,
+/// and that is where the middle of the window belongs.
+///
+/// Only where the offset is a standard rather than a slot inside a sub-band
+/// ([`Mode::holds_standard_tones`] — RTTY and NAVTEX). FT8 and the rest move
+/// their tone offset by themselves, and a view that chased it would slide out
+/// from under the operator every time the engine picked a new transmit
+/// frequency. CW joins on `cw_qrg`, which is already the setting that says the
+/// signal is the frequency: it puts the readout and the tuning line on the
+/// cursor, and leaving the window centred on the dial would be the one thing
+/// still disagreeing.
+///
+/// `audio_hz` is unsigned — the distance from the dial — and
+/// [`Mode::on_air_hz`] puts it on whichever sideband the mode rides there.
+fn focus_hz(mode: Mode, dial_hz: f64, audio_hz: f32, cw_qrg: bool) -> f64 {
+    let on_cursor = mode.holds_standard_tones() || (mode == Mode::Cw && cw_qrg);
+    if on_cursor { mode.on_air_hz(dial_hz, audio_hz) } else { dial_hz }
 }
 
 #[cfg(test)]
@@ -1270,5 +1332,84 @@ mod tests {
     #[test]
     fn the_first_measurement_of_a_window_is_the_target() {
         assert_eq!(average_in(None, (-130.0, -30.0)), (-130.0, -30.0));
+    }
+}
+
+#[cfg(test)]
+mod focus_tests {
+    use super::{Mode, focus_hz};
+
+    /// The whole point: RTTY's tone pair is a couple of kilohertz above the
+    /// dial, so the window belongs on the pair. Zoomed in tighter than the
+    /// offset — the case the operator hit — the dial is not even on screen,
+    /// and anchoring the picture there takes the signal off the far edge.
+    #[test]
+    fn rtty_anchors_on_the_tone_pair_not_the_dial() {
+        let dial = 14_080_000.0;
+        let pair = focus_hz(Mode::Rtty, dial, sdroxide_types::RTTY_CENTER_HZ, false);
+        assert_eq!(pair, dial + 2210.0, "the window was anchored on the dial");
+        // A 1 kHz window centred on the pair holds it; centred on the dial it
+        // would not have held it at all.
+        assert!(!(pair - 500.0..=pair + 500.0).contains(&dial), "the dial was on screen after all");
+    }
+
+    /// A nudged offset moves the anchor with it: the pair is wherever the
+    /// operator put it, not wherever the standard says it usually is.
+    #[test]
+    fn a_nudged_rtty_offset_carries_the_anchor() {
+        let dial = 7_040_000.0;
+        assert_eq!(focus_hz(Mode::Rtty, dial, 1000.0, false), dial + 1000.0);
+    }
+
+    /// NAVTEX holds its tone by convention exactly as RTTY does — the assigned
+    /// channel is the centre of the pair, 1700 Hz up — so it comes along.
+    #[test]
+    fn navtex_anchors_on_its_tone_too() {
+        let dial = 518_000.0 - f64::from(sdroxide_types::NAVTEX_TONE_HZ);
+        assert_eq!(focus_hz(Mode::Navtex, dial, sdroxide_types::NAVTEX_TONE_HZ, false), 518_000.0);
+    }
+
+    /// The modes that pick a slot inside a sub-band stay on the dial. FT8's
+    /// tone offset moves by itself whenever the engine chooses a new transmit
+    /// frequency, and a window that followed it would slide out from under the
+    /// operator mid-QSO.
+    #[test]
+    fn the_slotted_modes_stay_on_the_dial() {
+        let dial = 14_074_000.0;
+        for m in [Mode::Ft8, Mode::Ft4, Mode::Js8, Mode::Psk, Mode::Olivia] {
+            assert_eq!(focus_hz(m, dial, 1500.0, false), dial, "{m:?} chased its own tone offset");
+        }
+    }
+
+    /// CW follows the setting that already moved its readout and its tuning
+    /// line onto the signal, and nothing changes for an operator who has not
+    /// turned it on.
+    #[test]
+    fn cw_anchors_where_its_readout_reads() {
+        let dial = 14_030_000.0;
+        assert_eq!(focus_hz(Mode::Cw, dial, 700.0, false), dial, "cw_qrg off moved the window");
+        assert_eq!(focus_hz(Mode::Cw, dial, 700.0, true), dial + 700.0);
+    }
+
+    /// The analog modes are on their dial and the offset is meaningless there,
+    /// whatever `cw_qrg` happens to be set to.
+    #[test]
+    fn the_analog_modes_are_untouched() {
+        let dial = 14_200_000.0;
+        for m in [Mode::Usb, Mode::Lsb, Mode::Am, Mode::Nfm] {
+            for qrg in [false, true] {
+                assert_eq!(focus_hz(m, dial, 700.0, qrg), dial, "{m:?} moved off its dial");
+            }
+        }
+    }
+
+    /// RTTY-FM keys the carrier itself, so the dial *is* the frequency and the
+    /// audio offset is internal to the modem. Handed the same tone figure as
+    /// its sideband cousin, it must not move — `Mode::on_air_hz` sees a
+    /// carrier-centred mode and answers with the dial.
+    #[test]
+    fn carrier_centred_rtty_stays_on_its_carrier() {
+        let dial = 145_500_000.0;
+        assert_eq!(focus_hz(Mode::RttyFm, dial, sdroxide_types::RTTY_CENTER_HZ, false), dial);
     }
 }

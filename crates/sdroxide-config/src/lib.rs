@@ -24,18 +24,119 @@ fn push_load_alert(msg: String) {
     LOAD_ALERTS.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(msg);
 }
 
+/// Files that are **there** and could not be read: locked by something else,
+/// unreadable to this user, a device error. Held by full path, so one radio's
+/// scoped `radio.json` is not confused with another's.
+///
+/// A different failure from a file that read fine and would not parse, and the
+/// difference is the whole of issue #269. There, the content is in hand and can
+/// be moved aside as `<file>.bak`; here it is still on the disk and is still the
+/// operator's only copy of it.
+///
+/// It used to be treated as the third case instead — an absent file — which is
+/// the ordinary first-run one, so it degraded to the defaults in silence. A
+/// `memories.json` that a backup or antivirus tool had open for the moment
+/// sdroxide read it therefore came up as an empty list, said nothing, and the
+/// next memory the operator stored wrote that empty list back over every
+/// channel they had. Nothing was quarantined, because nothing had failed to
+/// parse.
+///
+/// So a file in here is not written: [`write_atomic`] refuses until some load
+/// has read it successfully. A refused save is an error the operator can see
+/// and act on; a completed one is data they do not get back.
+static UNREADABLE: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+
+/// Record that `path` could not be read. Answers whether this is news, so the
+/// operator is told once rather than on every load that goes past it.
+fn mark_unreadable(path: &Path) -> bool {
+    let mut held = UNREADABLE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    if held.iter().any(|p| p == path) {
+        return false;
+    }
+    held.push(path.to_path_buf());
+    true
+}
+
+/// `path` can be read (or is honestly absent), so it may be written again.
+fn clear_unreadable(path: &Path) {
+    UNREADABLE.lock().unwrap_or_else(std::sync::PoisonError::into_inner).retain(|p| p != path);
+}
+
+fn is_unreadable(path: &Path) -> bool {
+    UNREADABLE.lock().unwrap_or_else(std::sync::PoisonError::into_inner).iter().any(|p| p == path)
+}
+
+/// Where an operator would go to see what a file holds.
+///
+/// An alert that can only name the file is half an alert, and "check Settings →
+/// Radio" is the wrong half for a memory list: nobody finds their channels
+/// there. Each of these is the window that shows what has just gone missing.
+fn where_to_look(file: &str) -> &'static str {
+    match file {
+        "memories.json" | "memory_folders.json" => "check the MEM window",
+        "qso_log.json" => "check the LOG window",
+        "contacts.json" => "check the FSQ contacts list",
+        "scanner.json" => "check the SCAN window",
+        "config.toml" => "check Settings",
+        _ => "check Settings → Radio",
+    }
+}
+
+/// What a load found on the disk.
+enum FileText {
+    /// Not there. A first run, where the defaults are the right answer and
+    /// there is nothing to report.
+    Missing,
+    Text(String),
+    /// There, and unreadable — see [`UNREADABLE`]. The defaults are what the
+    /// caller has to run on, but they are *not* what the file says, and nothing
+    /// may be written over it until it can be read.
+    Unreadable,
+}
+
+/// Read a config file, telling the two kinds of failure apart.
+fn read_config_text(dir: &Path, file: &str) -> FileText {
+    let path = dir.join(file);
+    match fs::read_to_string(&path) {
+        Ok(text) => {
+            clear_unreadable(&path);
+            FileText::Text(text)
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            clear_unreadable(&path);
+            FileText::Missing
+        }
+        Err(e) => {
+            warn!("cannot read {file}: {e}; running on defaults and refusing to overwrite it");
+            if mark_unreadable(&path) {
+                push_load_alert(format!(
+                    "{file} is there but could not be read ({e}), so sdroxide has started on \
+                     the defaults for it. Nothing will be written to it while that lasts, so \
+                     what it holds is safe: close whatever else has the file open (a backup or \
+                     antivirus tool, another copy of sdroxide) and start again. {}",
+                    where_to_look(file)
+                ));
+            }
+            FileText::Unreadable
+        }
+    }
+}
+
 /// A file was read but did not parse: keep it for inspection as `<file>.bak`
 /// (so the evidence of *what* was lost survives the reset), warn, and queue an
 /// operator-visible alert. The rename also stops the same complaint firing on
 /// every subsequent load.
 fn quarantine_unreadable(dir: &Path, file: &str, err: &dyn std::fmt::Display) {
     let kept = fs::rename(dir.join(file), dir.join(format!("{file}.bak"))).is_ok();
+    // Whatever was there is now the `.bak` (or is gone), so there is no longer
+    // anything under this name for a save to destroy.
+    clear_unreadable(&dir.join(file));
     warn!("failed to parse {file}: {err}; resetting to defaults");
     let mut msg = format!("{file} was unreadable and has been reset to defaults");
     if kept {
         msg.push_str(&format!(" — the old file is kept as {file}.bak"));
     }
-    msg.push_str("; check Settings → Radio");
+    msg.push_str(&format!("; {}", where_to_look(file)));
     push_load_alert(msg);
 }
 
@@ -44,6 +145,13 @@ fn quarantine_unreadable(dir: &Path, file: &str, err: &dyn std::fmt::Display) {
 /// instead of a truncated one — which the next load could only "reset to
 /// defaults" from, forgetting the operator's whole setup.
 fn write_atomic(dir: &Path, file: &str, text: &str) -> Result<(), ConfigError> {
+    // A file this process could not *read* still holds whatever the operator
+    // put in it, and what is about to be written is the defaults it was forced
+    // to run on. Refuse: an error they can see beats a save that quietly
+    // replaces a memory list with an empty one. See [`UNREADABLE`].
+    if is_unreadable(&dir.join(file)) {
+        return Err(ConfigError::Unreadable(file.to_string()));
+    }
     fs::create_dir_all(dir)?;
     let tmp = dir.join(format!("{file}.tmp"));
     {
@@ -62,6 +170,14 @@ fn write_atomic(dir: &Path, file: &str, text: &str) -> Result<(), ConfigError> {
 pub enum ConfigError {
     #[error("no home/config directory available")]
     NoConfigDir,
+    /// The file is there and could not be read, so it was not written either —
+    /// see [`UNREADABLE`]. Never a reason to retry: it clears when a load
+    /// finally reads the file.
+    #[error(
+        "{0} could not be read, so it has not been written over — close whatever else has it \
+         open and start again"
+    )]
+    Unreadable(String),
     #[error("I/O: {0}")]
     Io(#[from] std::io::Error),
     #[error("parse: {0}")]
@@ -438,6 +554,8 @@ pub fn save_remote_login(login: Option<&sdroxide_types::RemoteAccess>) -> Result
 mod publicsdr;
 pub use publicsdr::public_sdr_directory;
 
+pub mod transfer;
+
 pub fn config_dir() -> Result<PathBuf, ConfigError> {
     // The override exists for the integration tests, which must not write the
     // operator's real configuration, and works as a profile switch for anyone
@@ -514,15 +632,15 @@ impl Store {
     /// not a state to guess confidently in.
     fn load_checked<T: serde::de::DeserializeOwned + Default>(&self, file: &str) -> (T, bool) {
         let Ok(dir) = self.dir() else { return (T::default(), false) };
-        match fs::read_to_string(dir.join(file)) {
-            Ok(text) => match serde_json::from_str(&text) {
-                Ok(v) => (v, false),
-                Err(e) => {
-                    quarantine_unreadable(&dir, file, &e);
-                    (T::default(), true)
-                }
-            },
-            Err(_) => (T::default(), false),
+        let FileText::Text(text) = read_config_text(&dir, file) else {
+            return (T::default(), false);
+        };
+        match serde_json::from_str(&text) {
+            Ok(v) => (v, false),
+            Err(e) => {
+                quarantine_unreadable(&dir, file, &e);
+                (T::default(), true)
+            }
         }
     }
 
@@ -949,17 +1067,16 @@ impl Settings {
                 return Settings::default();
             }
         };
-        match fs::read_to_string(&path) {
-            Ok(text) => match toml::from_str(&text) {
-                Ok(s) => s,
-                Err(e) => {
-                    if let Some(dir) = path.parent() {
-                        quarantine_unreadable(dir, "config.toml", &e);
-                    }
-                    Settings::default()
-                }
-            },
-            Err(_) => Settings::default(),
+        let Some(dir) = path.parent() else { return Settings::default() };
+        let FileText::Text(text) = read_config_text(dir, "config.toml") else {
+            return Settings::default();
+        };
+        match toml::from_str(&text) {
+            Ok(s) => s,
+            Err(e) => {
+                quarantine_unreadable(dir, "config.toml", &e);
+                Settings::default()
+            }
         }
     }
 
@@ -994,8 +1111,18 @@ pub struct Session {
     /// dials, so a station left listening on B comes back listening on B rather
     /// than silently on A's frequency.
     pub active_vfo: sdroxide_types::Vfo,
-    /// Mode of the main receiver.
+    /// Mode of the main receiver — which is the mode of whichever VFO was
+    /// active, and the one `--mode` overrides.
     pub mode: sdroxide_types::Mode,
+    /// The mode each VFO was left in, `[A, B]`.
+    ///
+    /// A VFO is a whole listening position and not just a dial: CW on A while B
+    /// sits on an SSB net is what the pair is for (issue #286), and a station
+    /// that came back with both of them in yesterday's active mode had lost
+    /// half of its setup. `None` in a session written before this was
+    /// remembered, and on a first run — both then come up in
+    /// [`Self::mode`], which is where they used to be anyway.
+    pub vfo_modes: Option<[sdroxide_types::Mode; 2]>,
     /// RX antenna port, as the device names it ("LNAH", "TX/RX"). `None` on a
     /// front end that has no antenna to choose, and on every session written
     /// before this was remembered.
@@ -1018,6 +1145,13 @@ pub struct Session {
     pub tune_drive: f32,
     /// Mic gain, 0.0..=1.0.
     pub mic_gain: f32,
+    /// Controlled-envelope SSB compression, in decibels; 0 is off.
+    ///
+    /// Here with the mic gain and the EQ rather than in `config.toml`, because
+    /// it is the same kind of setting: something set by ear at the radio, per
+    /// radio, and expected to still be there next time.
+    #[serde(default)]
+    pub cessb_db: f32,
     /// Transmit parametric EQ (voice modes only). Absent in a session written
     /// before this existed, in which case `#[serde(default)]` above gives it
     /// [`sdroxide_types::TxEqState::default`], disabled and flat.
@@ -1110,6 +1244,9 @@ impl Default for Session {
             vfo_b_hz: None,
             active_vfo: sdroxide_types::Vfo::A,
             mode,
+            // No mode of its own for either VFO until one has been used, for
+            // the same reason B has no dial of its own above.
+            vfo_modes: None,
             antenna_rx: None,
             antenna_tx: None,
             volume: radio.rx[0].volume,
@@ -1119,6 +1256,7 @@ impl Default for Session {
             drive: radio.tx.drive,
             tune_drive: radio.tx.tune_drive,
             mic_gain: radio.tx.mic_gain,
+            cessb_db: radio.tx.cessb_db,
             tx_eq: radio.tx.eq,
             squelch_db: radio.rx[0].squelch_db,
             noise_reduction: radio.rx[0].noise_reduction,
@@ -1182,16 +1320,69 @@ pub type BandStacks =
 
 fn load_json<T: serde::de::DeserializeOwned + Default>(file: &str) -> T {
     let Ok(dir) = config_dir() else { return T::default() };
-    match fs::read_to_string(dir.join(file)) {
-        Ok(text) => match serde_json::from_str(&text) {
-            Ok(v) => v,
-            Err(e) => {
-                quarantine_unreadable(&dir, file, &e);
-                T::default()
-            }
-        },
-        Err(_) => T::default(),
+    let FileText::Text(text) = read_config_text(&dir, file) else { return T::default() };
+    match serde_json::from_str(&text) {
+        Ok(v) => v,
+        Err(e) => {
+            quarantine_unreadable(&dir, file, &e);
+            T::default()
+        }
     }
+}
+
+/// Load a JSON list, keeping the entries that parse when one of them does not.
+///
+/// `serde_json` fails a `Vec<T>` whole: one entry carrying a value this build
+/// cannot read takes every other entry in the file with it. For a settings
+/// struct that is the right answer — it is one document, and half of it is not
+/// a setup — but a memory list, a logbook or an address book is not a document.
+/// It is hundreds of rows entered by hand over years, each one independent of
+/// the rest, and "all of them, because one was odd" is a trade nobody would
+/// make. The one channel that will not load is the one the operator can retype.
+///
+/// So the outer list is parsed first and each row after it. What loads is
+/// returned, what does not is named in the log and counted in an alert, and the
+/// file is **copied** to `<file>.bak` before the caller can write the survivors
+/// back over it — copied, not renamed, because the survivors are already live
+/// and the next save has to land somewhere.
+fn load_json_list<T: serde::de::DeserializeOwned>(file: &str) -> Vec<T> {
+    let Ok(dir) = config_dir() else { return Vec::new() };
+    let FileText::Text(text) = read_config_text(&dir, file) else { return Vec::new() };
+    // The shape of the file itself. Something that is not a list at all is
+    // broken rather than partly readable, and is quarantined like any other.
+    let rows: Vec<serde_json::Value> = match serde_json::from_str(&text) {
+        Ok(v) => v,
+        Err(e) => {
+            quarantine_unreadable(&dir, file, &e);
+            return Vec::new();
+        }
+    };
+    let total = rows.len();
+    let mut out = Vec::with_capacity(total);
+    for (i, row) in rows.into_iter().enumerate() {
+        match serde_json::from_value(row) {
+            Ok(v) => out.push(v),
+            // Logged one by one on purpose: the count goes on screen, but which
+            // entry and why is what turns "some of my memories are missing"
+            // into a bug that can be fixed.
+            Err(e) => warn!("{file}: entry {i} will not load ({e}); keeping the other entries"),
+        }
+    }
+    let dropped = total - out.len();
+    if dropped > 0 {
+        let kept = fs::copy(dir.join(file), dir.join(format!("{file}.bak"))).is_ok();
+        let mut msg = format!(
+            "{file}: {dropped} of {total} entries could not be read and have been left out; \
+             the other {} are here",
+            out.len()
+        );
+        if kept {
+            msg.push_str(&format!(" — the file as it was is kept as {file}.bak"));
+        }
+        msg.push_str(&format!("; {}", where_to_look(file)));
+        push_load_alert(msg);
+    }
+    out
 }
 
 /// [`load_json`] with a chance to rewrite the parsed JSON first, for a file
@@ -1209,7 +1400,7 @@ fn load_json_migrated<T: serde::de::DeserializeOwned + Default>(
     migrate: fn(&mut serde_json::Value),
 ) -> T {
     let Ok(dir) = config_dir() else { return T::default() };
-    let Ok(text) = fs::read_to_string(dir.join(file)) else { return T::default() };
+    let FileText::Text(text) = read_config_text(&dir, file) else { return T::default() };
     let parsed = serde_json::from_str::<serde_json::Value>(&text).and_then(|mut v| {
         migrate(&mut v);
         serde_json::from_value(v)
@@ -1238,17 +1429,31 @@ pub fn save_bandstacks(stacks: &BandStacks) -> Result<(), ConfigError> {
 }
 
 pub fn load_memories() -> Vec<sdroxide_types::MemoryChannel> {
-    load_json("memories.json")
+    load_json_list("memories.json")
 }
 
 pub fn save_memories(memories: &[sdroxide_types::MemoryChannel]) -> Result<(), ConfigError> {
     save_json("memories.json", &memories)
 }
 
+/// The frequencies the operator has added to the digital modes' own tables.
+///
+/// Its own file for the same reason the memory list has one: it is a list the
+/// operator builds as they use the radio, and it must survive an sdroxide that
+/// knows nothing about it — a version without the feature leaves the file
+/// alone rather than writing an empty one over it.
+pub fn load_digi_presets() -> Vec<sdroxide_types::DigiPreset> {
+    load_json_list("digi_presets.json")
+}
+
+pub fn save_digi_presets(presets: &[sdroxide_types::DigiPreset]) -> Result<(), ConfigError> {
+    save_json("digi_presets.json", &presets)
+}
+
 /// The memory folders. Their own file rather than a new shape for
 /// `memories.json`, so a list written before folders existed still loads.
 pub fn load_memory_folders() -> Vec<sdroxide_types::MemoryFolder> {
-    load_json("memory_folders.json")
+    load_json_list("memory_folders.json")
 }
 
 pub fn save_memory_folders(folders: &[sdroxide_types::MemoryFolder]) -> Result<(), ConfigError> {
@@ -1338,6 +1543,17 @@ pub fn save_adsb_config(cfg: &sdroxide_types::AdsbSettings) -> Result<(), Config
 /// ISM decoders' are: a front end that hands over demodulated audio, or one too
 /// narrow to reach any of the channel plan, forces the decoder off, and that
 /// must not overwrite what the operator chose for a receiver that can run it.
+/// Kept apart from the live `RadioState.ais` for the same reason the ADS-B and
+/// VDL2 configs are: the engine forces the live one off on a front end that
+/// cannot feed it, and that must not overwrite what the operator chose.
+pub fn load_ais_config() -> sdroxide_types::AisSettings {
+    load_json::<sdroxide_types::AisSettings>("ais.json").sane()
+}
+
+pub fn save_ais_config(cfg: &sdroxide_types::AisSettings) -> Result<(), ConfigError> {
+    save_json("ais.json", cfg)
+}
+
 pub fn load_vdl2_config() -> sdroxide_types::Vdl2Settings {
     load_json::<sdroxide_types::Vdl2Settings>("vdl2.json").sane()
 }
@@ -1359,7 +1575,7 @@ pub fn save_scanner_config(cfg: &sdroxide_types::ScannerConfig) -> Result<(), Co
 
 /// FSQ contacts (address book for directed FSQCALL messaging).
 pub fn load_contacts() -> Vec<sdroxide_types::FsqContact> {
-    load_json("contacts.json")
+    load_json_list("contacts.json")
 }
 
 pub fn save_contacts(contacts: &[sdroxide_types::FsqContact]) -> Result<(), ConfigError> {
@@ -1368,7 +1584,7 @@ pub fn save_contacts(contacts: &[sdroxide_types::FsqContact]) -> Result<(), Conf
 
 /// Persistent logbook (digital + manual QSO entries).
 pub fn load_qso_log() -> Vec<sdroxide_types::QsoRecord> {
-    load_json("qso_log.json")
+    load_json_list("qso_log.json")
 }
 
 pub fn save_qso_log(log: &[sdroxide_types::QsoRecord]) -> Result<(), ConfigError> {
@@ -1894,7 +2110,7 @@ mod tests {
         assert_eq!(cfg.squelch_db, default.squelch_db);
         // A `skimmer.json` from before the CW decoder was the operator's choice
         // still opens, on the decoder it used to have.
-        assert_eq!(cfg.cw_decoder, sdroxide_types::CwSkimmerDecoder::Neural);
+        assert_eq!(cfg.cw_decoder, sdroxide_types::CwEngine::Neural);
         assert_eq!(cfg.cw_slots, default.cw_slots);
     }
 
@@ -1923,6 +2139,9 @@ mod tests {
             vfo_b_hz: Some(7_090_000.0),
             active_vfo: sdroxide_types::Vfo::B,
             mode: sdroxide_types::Mode::Ft8,
+            // A VFO left in CW while the one in use is on FT8 — the point of
+            // remembering a mode per VFO at all.
+            vfo_modes: Some([sdroxide_types::Mode::Cw, sdroxide_types::Mode::Ft8]),
             antenna_rx: Some("LNAW".into()),
             antenna_tx: Some("BAND2".into()),
             volume: 0.8,
@@ -1932,6 +2151,7 @@ mod tests {
             drive: 0.4,
             tune_drive: 0.2,
             mic_gain: 0.6,
+            cessb_db: 6.0,
             tx_eq: sdroxide_types::TxEqState {
                 enabled: true,
                 low: sdroxide_types::TxEqBand { freq_hz: 250.0, gain_db: -3.0, q: 0.8 },
@@ -2156,7 +2376,11 @@ mod tests {
     #[test]
     fn the_remote_server_address_survives_a_write() {
         let s = Settings {
-            remote_server: sdroxide_types::RemoteServer { host: "shack.local".into(), port: 4951 },
+            remote_server: sdroxide_types::RemoteServer {
+                host: "shack.local".into(),
+                port: 4951,
+                tls: true,
+            },
             tx_ham_only: false,
             server_port: 4952,
             ..Settings::default()
@@ -2166,6 +2390,7 @@ mod tests {
         assert_eq!(back, s);
         assert_eq!(back.remote_server.host, "shack.local");
         assert_eq!(back.remote_server.port, 4951);
+        assert!(back.remote_server.tls, "the secure switch is part of the address (issue #360)");
         assert!(!back.tx_ham_only, "a value below a table must not become part of it");
         assert_eq!(back.server_port, 4952, "the port we listen on is not the one we dial");
         assert_eq!(back.speech, s.speech, "the table above must survive too");
@@ -2178,6 +2403,7 @@ mod tests {
         let s: Settings = toml::from_str("server_port = 4950").unwrap();
         assert!(s.remote_server.host.is_empty());
         assert_eq!(s.remote_server.port, 4950);
+        assert!(!s.remote_server.tls, "a link that was plain before must stay plain");
     }
 
     /// A `config.toml` written before this feature existed comes up silent,

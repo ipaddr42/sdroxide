@@ -153,6 +153,7 @@ pub fn make_demod(mode: Mode, channel_rate: f64) -> Option<Box<dyn Demodulator>>
         // sideband filter.
         Mode::Rifp => Some(Box::new(FskDemod::new(channel_rate, lo, hi))),
         Mode::Am => Some(Box::new(AmDemod::new(channel_rate, lo, hi))),
+        Mode::Isb => Some(Box::new(IsbDemod::new(channel_rate, lo, hi))),
         Mode::Sam => Some(Box::new(SamDemod::new(channel_rate, lo, hi))),
         // VHF SSTV takes the NFM voice path rather than the flat packet one,
         // and deliberately: on 2 m a picture is sent through an ordinary FM
@@ -175,7 +176,7 @@ pub fn make_demod(mode: Mode, channel_rate: f64) -> Option<Box<dyn Demodulator>>
         // modulation two megahertz wide, decoded off the raw I/Q by an engine
         // lane of its own. There is nothing for this chain to demodulate, and a
         // silent receiver is the correct behaviour rather than a missing case.
-        Mode::Adsb | Mode::Vdl2 => None,
+        Mode::Adsb | Mode::Vdl2 | Mode::Ais => None,
         Mode::Spec => None,
     }
 }
@@ -240,6 +241,151 @@ impl Demodulator for SsbDemod {
 
     fn power_dbfs(&self) -> f32 {
         self.power.dbfs()
+    }
+}
+
+/// Independent sideband: two different signals on one carrier, demodulated to
+/// one ear each.
+///
+/// Two complex band-passes on the same channel-rate baseband — one over the
+/// negative frequencies, one over the positive — and the real part of each is
+/// that sideband's audio, exactly as [`SsbDemod`] produces one. Lower goes
+/// left and upper right, which is where they sit on the waterfall.
+///
+/// What comes out is *mid and side*, not left and right, because that is what
+/// the chain above carries: the sum goes through the AGC, the volume and the
+/// resampler as one signal, and the matrix back to `L = M+S`, `R = M−S`
+/// happens at the speakers. The AGC is what makes that worth doing here rather
+/// than levelling each sideband on its own — one gain trajectory across both
+/// keeps a loud announcement on one channel from ducking the teleprinter on
+/// the other into inaudibility, and the two really are one transmission.
+///
+/// The filter edges are the *outer* ones and are used symmetrically: an edge
+/// pair of ±2850 Hz gives each sideband 2850 Hz, so the signal is 5.7 kHz
+/// wide. The inner edge is [`ISB_CARRIER_GAP_HZ`] either side of the dial
+/// rather than the operator's, because what sits there is the residual carrier
+/// an ISB transmission still has — pilot enough for a receiver to tune by, and
+/// a hum in both ears if it is let through.
+pub struct IsbDemod {
+    rate: f64,
+    /// Takes the residual carrier out before the split — a 331-tap filter's
+    /// skirt does not, 200 Hz from its edge.
+    dc: ComplexDcBlock,
+    dc_buf: Vec<Complex32>,
+    lower: ComplexFir,
+    upper: ComplexFir,
+    lo_buf: Vec<Complex32>,
+    up_buf: Vec<Complex32>,
+    /// The difference channel matching the last `process`, waiting for
+    /// [`Demodulator::take_side`].
+    side: Vec<f32>,
+    stereo: bool,
+    power: PowerMeter,
+}
+
+/// How far either side of the dial an ISB demodulator's passbands start.
+///
+/// An independent-sideband transmission carries a reduced carrier — typically
+/// 20 dB down, and there to be tuned by — so the two filters have to stand
+/// clear of it or it lands as a tone in both ears. 200 Hz is below anything
+/// speech or a 170 Hz-shift teleprinter puts in the channel.
+pub const ISB_CARRIER_GAP_HZ: f32 = 200.0;
+
+impl IsbDemod {
+    pub fn new(rate: f64, lo: f32, hi: f32) -> Self {
+        let mut d = IsbDemod {
+            rate,
+            dc: ComplexDcBlock::new(ISB_CARRIER_GAP_HZ as f64, rate),
+            dc_buf: Vec::new(),
+            lower: ComplexFir::new(bandpass_taps(PASSBAND_TAPS, -1.0, 1.0, rate)),
+            upper: ComplexFir::new(bandpass_taps(PASSBAND_TAPS, -1.0, 1.0, rate)),
+            lo_buf: Vec::new(),
+            up_buf: Vec::new(),
+            side: Vec::new(),
+            stereo: true,
+            power: PowerMeter::new(),
+        };
+        d.set_filter(lo, hi);
+        d
+    }
+
+    /// The two passbands for an operator filter of `lo..hi`: the wider of the
+    /// two edges is the outer one, mirrored, with the carrier gap inside.
+    fn edges(lo: f32, hi: f32) -> (f32, f32) {
+        let outer = lo.abs().max(hi.abs()).max(ISB_CARRIER_GAP_HZ + 100.0);
+        (ISB_CARRIER_GAP_HZ, outer)
+    }
+}
+
+impl Demodulator for IsbDemod {
+    fn process(&mut self, iq: &[Complex32], out: &mut Vec<f32>) {
+        // The residual carrier first. It sits on the dial, which is 200 Hz
+        // from both passband edges — close enough that the filters' skirts
+        // leave it audible in both ears, and a null at DC is what actually
+        // removes it.
+        self.dc_buf.clear();
+        self.dc_buf.extend_from_slice(iq);
+        self.dc.process(&mut self.dc_buf);
+        self.lo_buf.clear();
+        self.up_buf.clear();
+        self.lower.process(&self.dc_buf, &mut self.lo_buf);
+        self.upper.process(&self.dc_buf, &mut self.up_buf);
+        // Power for the S-meter is the whole transmission, both sidebands: a
+        // meter that read one of them would swing with which service happened
+        // to be talking.
+        self.power.update(&self.lo_buf);
+        self.side.clear();
+        let n = self.lo_buf.len().min(self.up_buf.len());
+        out.reserve(n);
+        self.side.reserve(n);
+        for i in 0..n {
+            let l = self.lo_buf[i].re * 2.0;
+            let r = self.up_buf[i].re * 2.0;
+            out.push((l + r) * 0.5);
+            self.side.push((l - r) * 0.5);
+        }
+    }
+
+    fn set_filter(&mut self, lo: f32, hi: f32) {
+        let (inner, outer) = IsbDemod::edges(lo, hi);
+        self.lower.set_taps(bandpass_taps(
+            PASSBAND_TAPS,
+            -(outer as f64),
+            -(inner as f64),
+            self.rate,
+        ));
+        self.upper.set_taps(bandpass_taps(PASSBAND_TAPS, inner as f64, outer as f64, self.rate));
+    }
+
+    fn audio_rate(&self) -> f64 {
+        self.rate
+    }
+
+    fn power_dbfs(&self) -> f32 {
+        self.power.dbfs()
+    }
+
+    fn take_side(&mut self, out: &mut Vec<f32>) -> bool {
+        if !self.stereo || self.side.is_empty() {
+            return false;
+        }
+        out.extend_from_slice(&self.side);
+        true
+    }
+
+    /// Always: there is no pilot to lock and nothing to fail — the two
+    /// sidebands are simply there. The indicator says the two ears really are
+    /// carrying different things.
+    fn stereo_locked(&self) -> bool {
+        self.stereo
+    }
+
+    fn set_stereo_enabled(&mut self, on: bool) {
+        self.stereo = on;
+    }
+
+    fn stereo_blend(&self) -> f32 {
+        if self.stereo { 1.0 } else { 0.0 }
     }
 }
 

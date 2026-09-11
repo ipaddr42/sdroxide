@@ -358,12 +358,22 @@ impl<T: Transport> Device<T> {
     /// *transmitter* off frequency mid-transmission. [`Self::end_tx`] tunes back
     /// to whatever this last stored, so the move still lands, at the moment it
     /// becomes safe.
+    /// Move the receive dial.
+    ///
+    /// The cached centre is only updated once the radio has taken the request.
+    /// Everything that restates the frequency later — a rate change, the whole
+    /// front end being reprogrammed after an over — works from it, so a centre
+    /// recorded for a tune that was refused would put the radio back on a
+    /// frequency it never reached, every time, and go on doing so. The caller
+    /// retries the refusal (see `stream::apply`); this is what keeps the
+    /// driver's own account of where the radio is honest in the meantime.
     pub fn set_center_hz(&mut self, hz: f64) -> Result<()> {
-        self.center_hz = hz;
         if matches!(self.mode, TransceiverMode::Transmit) {
+            self.center_hz = hz;
             return Ok(());
         }
-        self.retune()
+        let prev = std::mem::replace(&mut self.center_hz, hz);
+        self.retune().inspect_err(|_| self.center_hz = prev)
     }
 
     /// Change the sample rate, and re-tune afterwards.

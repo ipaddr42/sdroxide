@@ -71,6 +71,36 @@ const RETUNE_MIN_INTERVAL: Duration = Duration::from_millis(125);
 /// what actually catches a dead link is `SpyServerHandle::silent_for`.
 const PING_INTERVAL: Duration = Duration::from_secs(3);
 
+/// Where the digital-gain loop parks the peak of an 8-bit stream: half of
+/// full scale, so 6 dB of headroom for whatever turns on next. See
+/// [`maintain_digital_gain`].
+const GAIN_TARGET_PEAK: f32 = 0.5;
+
+/// A peak at or above this is a rail, and a rail means the quantiser is being
+/// driven past full scale rather than merely close to it.
+const GAIN_CLIP_PEAK: f32 = 0.98;
+
+/// Corrections smaller than this are not worth a setting on the wire: the
+/// gain goes out as whole dB, so a tighter deadband is a client that hunts.
+const GAIN_DEADBAND_DB: f64 = 3.0;
+
+/// The most one step may add. Coming down is not limited — a clipped stream
+/// is already carrying nothing, and dawdling about it costs seconds of audio.
+const GAIN_STEP_UP_DB: f64 = 3.0;
+
+/// The floor between gain changes. The server takes about eight settings a
+/// second in total and the retune lane is already spending some of them. It is
+/// a budget and nothing more: what keeps a figure still in flight from being
+/// counted twice is that every step is measured from the gain the samples'
+/// own header states.
+const GAIN_MIN_INTERVAL: Duration = Duration::from_millis(250);
+
+/// How long the peak must stay below target before the gain is raised.
+const GAIN_QUIET_BEFORE_RAISE: Duration = Duration::from_secs(2);
+
+/// The ceiling on `IQ_DIGITAL_GAIN`, in dB.
+const GAIN_MAX_DB: f64 = 60.0;
+
 /// Bins to ask the server for.
 ///
 /// Matched to the engine's `DISPLAY_BINS`, which is what the full-band strip
@@ -155,6 +185,10 @@ pub(crate) fn probe(cfg: &SpyServerConfig, timeout: Duration) -> Result<(DeviceI
         gain_index: 0,
         auto_digital_gain: true,
         digital_gain_db: 0.0,
+        servo_db: 0.0,
+        peak: None,
+        last_gain_move: Instant::now(),
+        quiet_since: None,
         fft_enabled: false,
         fft_stage: 0,
         fft_span: 0.0,
@@ -243,6 +277,20 @@ impl Framer {
     }
 }
 
+/// The loudest thing to arrive since the loop last looked, and the gain the
+/// server said it had already applied to it.
+///
+/// The two travel together because a step is only meaningful relative to the
+/// figure that produced the peak. See [`maintain_digital_gain`].
+#[derive(Debug, Clone, Copy)]
+struct Peak {
+    /// Fraction of full scale: one is a rail.
+    fraction: f32,
+    /// The whole dB this message's own header claimed, which on a link with
+    /// anything in flight is not always what has most recently been asked for.
+    gain_db: f64,
+}
+
 /// The far end, and everything this end believes about it.
 struct Client {
     sock: TcpStream,
@@ -265,7 +313,26 @@ struct Client {
     gain_index: u32,
 
     auto_digital_gain: bool,
+    /// The operator's own figure, in dB, for when automatic is off.
     digital_gain_db: f64,
+    /// The digital gain the loop has settled on, in dB. Only an 8-bit stream
+    /// in automatic runs the loop — see [`Client::loop_runs`] — and this is
+    /// where it starts from: the reference formula's figure.
+    servo_db: f64,
+    /// The loudest sample since the loop last looked — a whole
+    /// [`GAIN_MIN_INTERVAL`] of them, not just the read that ended it — with
+    /// the gain its own message was sent under. `None` is nothing having
+    /// arrived, which is not the same thing as a `fraction` of 0.0 — that is a
+    /// stream of mid-scale having arrived, and it is the strongest possible
+    /// case for more gain.
+    peak: Option<Peak>,
+    /// When a digital gain last went out, whoever sent it. The loop waits on
+    /// this so it spends no more of the server's settings budget than
+    /// [`GAIN_MIN_INTERVAL`] allows.
+    last_gain_move: Instant,
+    /// Since when the peak has been continuously below target. Raising the
+    /// gain waits on this so a pause in the traffic does not pump it up.
+    quiet_since: Option<Instant>,
 
     fft_enabled: bool,
     fft_stage: u32,
@@ -318,6 +385,11 @@ impl Client {
             gain_index: cfg.gain_index,
             auto_digital_gain: cfg.auto_digital_gain,
             digital_gain_db: cfg.digital_gain_db,
+            // Overwritten in `plan`, once the stage is known.
+            servo_db: 0.0,
+            peak: None,
+            last_gain_move: Instant::now(),
+            quiet_since: None,
             fft_enabled: cfg.fft_enabled,
             fft_stage: cfg.fft_decimation,
             fft_span: 0.0,
@@ -466,6 +538,7 @@ impl Client {
         // The FFT starts where the dial is, clamped into whatever room the
         // window has beside the device centre.
         self.fft_center = self.clamped_fft_center(self.center);
+        self.reset_servo();
     }
 
     /// Send the whole configuration, in the order the protocol wants it.
@@ -487,10 +560,13 @@ impl Client {
 
         self.set(proto::SETTING_IQ_FORMAT, proto::format_wire(self.iq_format))?;
         self.set(proto::SETTING_IQ_DECIMATION, self.iq_stage)?;
-        self.set(proto::SETTING_IQ_FREQUENCY, proto::freq_wire(self.center))?;
+        // The FFT window before the I/Q position, because the receiver follows
+        // the window and `IQ_FREQUENCY` is only a place inside the band the
+        // receiver is on — see [`flush_retune`].
         if self.fft_enabled {
             self.send_fft_config()?;
         }
+        self.set(proto::SETTING_IQ_FREQUENCY, proto::freq_wire(self.center))?;
         self.start_stream()
     }
 
@@ -527,19 +603,47 @@ impl Client {
             if self.fft_enabled { proto::STREAM_MODE_FFT_IQ } else { proto::STREAM_MODE_IQ_ONLY };
         self.set(proto::SETTING_STREAMING_MODE, mode)?;
         self.set(proto::SETTING_GAIN, self.gain_index)?;
-        self.set(proto::SETTING_IQ_DIGITAL_GAIN, self.digital_gain_wire())?;
+        self.send_digital_gain()?;
         self.set(proto::SETTING_STREAMING_ENABLED, 1)
     }
 
-    /// The digital gain to ask for: computed from the device and the stage, or
-    /// whatever the operator pinned it to.
+    /// The digital gain to ask for: what the loop has settled on for an 8-bit
+    /// stream, the reference formula for anything wider, or whatever the
+    /// operator pinned it to.
     fn digital_gain_wire(&self) -> u32 {
-        let db = if self.auto_digital_gain {
-            self.info.digital_gain_db(self.gain_index, self.iq_stage)
-        } else {
+        let db = if !self.auto_digital_gain {
             self.digital_gain_db
+        } else if self.loop_runs() {
+            self.servo_db
+        } else {
+            self.info.digital_gain_db(self.gain_index, self.iq_stage)
         };
-        db.round().clamp(0.0, 60.0) as u32
+        db.round().clamp(0.0, GAIN_MAX_DB) as u32
+    }
+
+    /// Whether the closed loop is the authority on the digital gain: only an
+    /// 8-bit stream in automatic. Everything wider has 48 dB of room it will
+    /// never need, and moving its gain would spend the server's settings
+    /// budget for nothing in the samples. The operator's manual figure is
+    /// never touched — automatic off means a number was typed.
+    fn loop_runs(&self) -> bool {
+        self.auto_digital_gain && self.iq_format == SpyServerFormat::Uint8
+    }
+
+    /// Send the digital gain, and note when, so the loop does not judge
+    /// samples the new figure has not reached yet.
+    fn send_digital_gain(&mut self) -> Result<()> {
+        self.last_gain_move = Instant::now();
+        self.set(proto::SETTING_IQ_DIGITAL_GAIN, self.digital_gain_wire())
+    }
+
+    /// Put the loop back at its starting point and forget its evidence. For
+    /// wherever its basis moves: a fresh connection, the gain index on an R2,
+    /// automatic being switched on.
+    fn reset_servo(&mut self) {
+        self.servo_db = self.info.digital_gain_db(self.gain_index, self.iq_stage);
+        self.peak = None;
+        self.quiet_since = None;
     }
 
     fn set(&mut self, setting: u32, value: u32) -> Result<()> {
@@ -584,8 +688,22 @@ impl Client {
         want.clamp(lo, hi.max(lo))
     }
 
-    /// The FFT window centred as near `hz` as its own slack allows.
+    /// Where the FFT window should be centred for the dial to be on `hz`.
+    ///
+    /// Where this client controls the receiver that is `hz` itself: with the
+    /// FFT lane running the receiver follows this window, so the window goes
+    /// where the dial goes. Clamping it into the slack around wherever the
+    /// server happened to be sitting is what parked whole sessions on the
+    /// server's own start-up frequency — at decimation stage 0 the window
+    /// covers the entire receiver and has no slack at all, so the clamp
+    /// collapsed to exactly that frequency and never let go.
+    ///
+    /// Where another client owns the receiver the device is theirs and does not
+    /// move, and all this end may do is slide the window inside it.
     fn clamped_fft_center(&self, hz: f64) -> f64 {
+        if self.can_control {
+            return hz;
+        }
         let slack = self.info.fft_slack_hz(self.fft_span);
         hz.clamp(self.device_center - slack, self.device_center + slack)
     }
@@ -598,7 +716,14 @@ impl Client {
         if !self.fft_enabled {
             return None;
         }
-        self.info.fft_recenter(self.center, self.fft_center, self.fft_span, self.device_center)
+        self.info.fft_recenter(
+            self.center,
+            self.fft_center,
+            self.fft_span,
+            self.device_center,
+            self.can_control,
+            self.info.iq_slack_hz(self.iq_rate),
+        )
     }
 
     /// Note an I/Q message's sequence number, reporting messages the server
@@ -734,7 +859,13 @@ fn apply(client: &mut Client, p: &Pending) -> Result<()> {
         // that changes what the server sends is worth.
         client.set(proto::SETTING_STREAMING_ENABLED, 0)?;
         if on {
+            // Where the window is *now*, not where it was left when the lane
+            // was last on: nothing has been maintaining it while it was off, so
+            // sending the stale centre would drag the receiver back to whatever
+            // band the operator was in then.
+            client.fft_center = client.clamped_fft_center(client.center);
             client.send_fft_config()?;
+            client.set(proto::SETTING_IQ_FREQUENCY, proto::freq_wire(client.center))?;
         }
         client.start_stream()?;
     }
@@ -749,11 +880,14 @@ fn apply(client: &mut Client, p: &Pending) -> Result<()> {
         if let Some(v) = p.digital_gain {
             client.digital_gain_db = v;
         }
+        // The loop's starting point moves with the gain index on an R2, and a
+        // loop that has just been switched on has no evidence yet.
+        client.reset_servo();
         // Always resent alongside the gain index, never on its own. On an
         // Airspy R2 the computed digital gain is a function of the gain index,
         // so sending one without the other leaves the level wrong by as much
         // as the whole gain range.
-        client.set(proto::SETTING_IQ_DIGITAL_GAIN, client.digital_gain_wire())?;
+        client.send_digital_gain()?;
     }
     Ok(())
 }
@@ -772,20 +906,38 @@ fn flush_retune(client: &mut Client, shared: &Arc<Shared>) -> Result<()> {
     let sent = client.reachable_center(want);
     client.center = sent;
     shared.iq_center_milli_hz.store((sent * 1000.0) as i64, Ordering::Relaxed);
+
+    // The window moves first, and that ordering is load-bearing. On a server
+    // this client controls, the receiver follows the FFT window; `IQ_FREQUENCY`
+    // only places the I/Q window inside the band the receiver is already on, and
+    // a position outside it is clamped — and *stays* clamped, because the server
+    // holds it as an absolute frequency rather than as an offset. Placing the
+    // I/Q window before the receiver has moved therefore leaves it on the band
+    // being left behind.
+    move_fft_window(client)?;
     client.set(proto::SETTING_IQ_FREQUENCY, proto::freq_wire(sent))
 }
 
 /// Move the FFT window if the dial has reached its edge, or if the device
 /// moved out from under it.
 ///
-/// Runs every pass rather than only after a retune: on a server this client
-/// controls, tuning moves the *device* centre too, and the window's slack is
-/// measured against that — so a window that was in the middle of its range can
-/// find itself pinned to an edge without the dial having moved again.
+/// Runs every pass rather than only after a retune: on a shared server the
+/// owner can move the receiver with no dial move here at all, and the window's
+/// slack is measured against where they put it.
 fn maintain_fft(client: &mut Client) -> Result<()> {
     if client.last_fft_retune.elapsed() < RETUNE_MIN_INTERVAL {
         return Ok(());
     }
+    move_fft_window(client)
+}
+
+/// The move itself, without the rate limit.
+///
+/// [`flush_retune`] calls this directly: it has already paid the interval for
+/// the retune it is in the middle of, and on a server this client controls the
+/// window *is* the retune — a window held back by its own limiter would be a
+/// receiver held back with it.
+fn move_fft_window(client: &mut Client) -> Result<()> {
     let Some(target) = client.fft_target_center() else {
         return Ok(());
     };
@@ -795,6 +947,99 @@ fn maintain_fft(client: &mut Client) -> Result<()> {
     client.fft_center = target;
     client.last_fft_retune = Instant::now();
     client.set(proto::SETTING_FFT_FREQUENCY, proto::freq_wire(target))
+}
+
+/// Walk the digital gain towards a peak that fits, on the evidence of what has
+/// arrived since the last look.
+///
+/// Only an 8-bit stream in automatic — see [`Client::loop_runs`]. Nothing the
+/// loop does is visible in the level: the decoder divides by the gain the
+/// *header* states, so a stream whose gain changed mid-flight comes out at the
+/// same amplitude either side of the change. What moves is how many of the
+/// eight bits the signal is using, and that is the whole point. How much gain
+/// a band needs is a property of the band — a dead 20 m and 80 m at night are
+/// thirty decibels apart — so no fixed figure serves both, and the one that was
+/// tried clipped every band that had a signal on it.
+///
+/// Asymmetric on purpose. Down is immediate and as far as the peak says: a
+/// clipped stream is carrying nothing, and every message spent on it is lost
+/// audio. A rail hides how far past full scale it is, so a clipped stream comes
+/// down a step at a time — 6 dB, what would put a rail on target — and the next
+/// step sees an honest peak the moment the rail lets go. Up is slow and small:
+/// only after the peak has sat below target for [`GAIN_QUIET_BEFORE_RAISE`],
+/// and by no more than [`GAIN_STEP_UP_DB`], so a pause in the traffic is not
+/// mistaken for room and the next syllable does not land on a rail.
+///
+/// Every step is measured from the gain the samples' *own header* states, so
+/// what the loop does is independent of how long a setting takes to reach the
+/// stream. A rail that was sent under a figure already superseded resolves to
+/// that same figure and moves nothing, and the loop simply waits for samples
+/// the last change actually reached.
+fn maintain_digital_gain(client: &mut Client) -> Result<()> {
+    if !client.loop_runs() {
+        return Ok(());
+    }
+    if client.last_gain_move.elapsed() < GAIN_MIN_INTERVAL {
+        // Too soon to spend a setting, so do not spend the evidence either.
+        // Left where it is, the peak goes on accumulating and the next look
+        // judges the whole interval rather than whatever happened to arrive in
+        // the last few milliseconds of it.
+        return Ok(());
+    }
+    // Nothing arrived is not an argument for anything. A stream of mid-scale
+    // is: that is `Some(0.0)`, and the strongest case there is for more gain.
+    let Some(peak) = client.peak.take() else {
+        return Ok(());
+    };
+
+    // The move that would put this peak on target. Positive is room to spare;
+    // infinite when nothing in the stream cleared mid-scale, which the step
+    // limit below makes finite.
+    let want = 20.0 * f64::from(GAIN_TARGET_PEAK / peak.fraction).log10();
+    if want > 0.0 {
+        // Room to spare. Wait for it to be a settled fact rather than a gap in
+        // the traffic, and then take it a step at a time.
+        let quiet = *client.quiet_since.get_or_insert_with(Instant::now);
+        if quiet.elapsed() < GAIN_QUIET_BEFORE_RAISE || want < GAIN_DEADBAND_DB {
+            return Ok(());
+        }
+    } else {
+        // A loud moment anywhere in the interval is in the accumulated peak,
+        // so this still cancels a pending raise even though the loop now only
+        // looks at the end of one.
+        client.quiet_since = None;
+        if peak.fraction < GAIN_CLIP_PEAK && -want < GAIN_DEADBAND_DB {
+            return Ok(());
+        }
+    }
+    let step = want.min(GAIN_STEP_UP_DB);
+    // Measured from the figure the samples were *sent* under, not from the one
+    // most recently asked for. On a link with a message or two in flight the
+    // two differ for as long as the flight takes, and stepping from the latter
+    // takes the same correction twice — down towards a floor the band never
+    // needed, on exactly the slow links an 8-bit stream is chosen for.
+    let held = client.servo_db.round();
+    let ideal = (peak.gain_db + step).round().clamp(0.0, GAIN_MAX_DB);
+    // A peak may never move the gain the way it did not argue for. A rail sent
+    // under a figure already left behind resolves to that figure, which is an
+    // argument for waiting rather than for climbing back onto the rail.
+    let next = if want > 0.0 { ideal.max(held) } else { ideal.min(held) };
+    if next == held {
+        // Against a stop, or already acted on. Saying so again costs a setting.
+        return Ok(());
+    }
+    tracing::debug!(
+        "SpyServer {}: 8-bit peak at {:.0} % of full scale under {:.0} dB, \
+         digital gain {:.0} -> {:.0} dB",
+        client.endpoint,
+        peak.fraction * 100.0,
+        peak.gain_db,
+        client.servo_db,
+        next,
+    );
+    client.servo_db = next;
+    client.quiet_since = None;
+    client.send_digital_gain()
 }
 
 /// Everything one completed message does.
@@ -814,6 +1059,25 @@ fn on_message(
         proto::MSG_UINT8_IQ | proto::MSG_INT16_IQ | proto::MSG_FLOAT_IQ => {
             let pairs = iq_to_f32(client.iq_format, body, h.digital_gain(), iq_scratch);
             if pairs > 0 {
+                if client.loop_runs() {
+                    // The peak as a fraction of full scale, which is what the
+                    // loop needs and what the decoder has just divided out:
+                    // the samples are `raw / (gain * full scale)`, so putting
+                    // the gain back gives the raw fraction, in any format.
+                    // The *header's* gain — what the server did — so a message
+                    // from before the last change still reports where its own
+                    // bytes sat, and carries the figure that put them there.
+                    let fraction = iq_scratch.iter().fold(0f32, |m, v| m.max(v.abs()));
+                    let seen =
+                        Peak { fraction: fraction * h.digital_gain(), gain_db: f64::from(h.flags) };
+                    // The loudest one wins, and brings its own gain with it:
+                    // pairing a peak with a figure some other message was sent
+                    // under is the whole mistake being avoided here.
+                    client.peak = Some(match client.peak {
+                        Some(p) if p.fraction >= seen.fraction => p,
+                        _ => seen,
+                    });
+                }
                 client.note_sequence(h.sequence, stats);
                 stats.on_iq(pairs);
                 push_iq(rx, iq_scratch, stats, shared.rx_paused.load(Ordering::Relaxed));
@@ -915,6 +1179,7 @@ fn pump(
         }
         flush_retune(client, shared)?;
         maintain_fft(client)?;
+        maintain_digital_gain(client)?;
         if client.last_ping.elapsed() >= PING_INTERVAL {
             client.last_ping = Instant::now();
             client.ping()?;
@@ -1041,5 +1306,196 @@ mod tests {
         let h = header(proto::MSG_PONG, 0, 0);
         f.feed(&h[..5], &mut |_, _| panic!("not a whole header yet")).expect("partial");
         f.feed(&[], &mut |_, _| panic!("still nothing")).expect("empty");
+    }
+
+    // --- against a fake server -----------------------------------------------
+
+    /// The `(setting, value)` pairs a fake server has been sent, in order.
+    type SettingLog = std::sync::Arc<std::sync::Mutex<Vec<(u32, u32)>>>;
+
+    /// A fake SpyServer that records every setting a client sends it.
+    ///
+    /// Shaped like the one this was found on: an Airspy HF+ whose analog
+    /// bandwidth is its whole FFT stage-0 span — so the FFT window has no slack
+    /// of its own — sitting on `device_center_hz`, and which never restates its
+    /// `CLIENT_SYNC`. That last part is why nothing self-corrects: the client
+    /// only ever hears where the receiver is once.
+    fn recording_server(device_center_hz: u32, can_control: u32) -> (String, SettingLog) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr").to_string();
+        let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = std::sync::Arc::clone(&log);
+
+        std::thread::spawn(move || {
+            let Ok((mut sock, _)) = listener.accept() else { return };
+            let msg = |kind: u16, body: &[u8]| {
+                let mut out = Vec::new();
+                out.extend_from_slice(&proto::PROTOCOL_VERSION.to_le_bytes());
+                out.extend_from_slice(&u32::from(kind).to_le_bytes());
+                out.extend_from_slice(&0u32.to_le_bytes());
+                out.extend_from_slice(&0u32.to_le_bytes());
+                out.extend_from_slice(&(body.len() as u32).to_le_bytes());
+                out.extend_from_slice(body);
+                out
+            };
+            let words =
+                |ws: &[u32]| -> Vec<u8> { ws.iter().flat_map(|w| w.to_le_bytes()).collect() };
+
+            // Airspy HF+: 768 ksps, 660 kHz of analog bandwidth, 8 stages, no
+            // decimation floor, tunable across everything the server offers.
+            let info =
+                words(&[2, 0x3933_3038, 768_000, 660_000, 8, 0, 0, 0, 1_700_000_000, 16, 0, 0]);
+            let sync = words(&[
+                can_control,
+                29,
+                device_center_hz,
+                device_center_hz,
+                device_center_hz,
+                0,
+                0,
+                0,
+                0,
+            ]);
+            if sock.write_all(&msg(proto::MSG_DEVICE_INFO, &info)).is_err()
+                || sock.write_all(&msg(proto::MSG_CLIENT_SYNC, &sync)).is_err()
+            {
+                return;
+            }
+
+            // Everything after the hello is commands; record the settings.
+            let mut buf = [0u8; 4096];
+            let mut carry: Vec<u8> = Vec::new();
+            loop {
+                let Ok(n) = sock.read(&mut buf) else { return };
+                if n == 0 {
+                    return;
+                }
+                carry.extend_from_slice(&buf[..n]);
+                while carry.len() >= proto::CMD_HEADER_LEN {
+                    let w = |i: usize| {
+                        u32::from_le_bytes([carry[i], carry[i + 1], carry[i + 2], carry[i + 3]])
+                    };
+                    let (cmd, body_size) = (w(0), w(4) as usize);
+                    if carry.len() < proto::CMD_HEADER_LEN + body_size {
+                        break;
+                    }
+                    if cmd == proto::CMD_SET_SETTING && body_size == 8 {
+                        seen.lock().expect("log").push((w(8), w(12)));
+                    }
+                    carry.drain(..proto::CMD_HEADER_LEN + body_size);
+                }
+            }
+        });
+
+        (addr, log)
+    }
+
+    /// Every `(setting, value)` recorded so far, waiting up to a second for at
+    /// least `at_least` of the given setting to turn up.
+    fn settings_sent(
+        log: &std::sync::Mutex<Vec<(u32, u32)>>,
+        setting: u32,
+        at_least: usize,
+    ) -> Vec<u32> {
+        for _ in 0..200 {
+            let values: Vec<u32> = log
+                .lock()
+                .expect("log")
+                .iter()
+                .filter(|&&(s, _)| s == setting)
+                .map(|&(_, v)| v)
+                .collect();
+            if values.len() >= at_least {
+                return values;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        log.lock().expect("log").iter().filter(|&&(s, _)| s == setting).map(|&(_, v)| v).collect()
+    }
+
+    fn cfg(addr: &str) -> SpyServerConfig {
+        SpyServerConfig { address: addr.into(), ..SpyServerConfig::default() }
+    }
+
+    /// The FFT window is where the receiver *is*: with the FFT lane running, a
+    /// SpyServer tunes to `FFT_FREQUENCY` and treats `IQ_FREQUENCY` as a
+    /// position inside the band it is already on. So opening the window on the
+    /// frequency the server happened to be sitting on parks the whole session
+    /// there, whatever the operator asked for — and nothing recovers, because
+    /// this server never says where the receiver went.
+    #[test]
+    fn the_fft_window_opens_on_the_dial_not_on_the_servers_own_frequency() {
+        let (addr, log) = recording_server(100_000_000, 1);
+        let handle = SpyServerHandle::connect_wideband(&cfg(&addr), 7_100_000.0).expect("connect");
+        let sent = settings_sent(&log, proto::SETTING_FFT_FREQUENCY, 1);
+        drop(handle);
+        assert_eq!(
+            sent.first().copied(),
+            Some(7_100_000),
+            "the FFT window opened on the server's own frequency, which is where the \
+             receiver then stayed: {sent:?}"
+        );
+    }
+
+    /// ...and it follows the dial afterwards. At the top of the rate ladder the
+    /// I/Q window has no slack to slide within, so the receiver has to move,
+    /// and moving the receiver means moving this window.
+    #[test]
+    fn the_fft_window_follows_a_retune() {
+        let (addr, log) = recording_server(100_000_000, 1);
+        let handle = SpyServerHandle::connect_wideband(&cfg(&addr), 7_100_000.0).expect("connect");
+        settings_sent(&log, proto::SETTING_FFT_FREQUENCY, 1);
+        handle.set_center_hz(14_100_000.0);
+        let sent = settings_sent(&log, proto::SETTING_FFT_FREQUENCY, 2);
+        drop(handle);
+        assert_eq!(
+            sent.last().copied(),
+            Some(14_100_000),
+            "the receiver follows the FFT window, so a retune that leaves it behind is a \
+             retune that never happens: {sent:?}"
+        );
+    }
+
+    /// The opposite server: another client owns the receiver, so it does not
+    /// move for us and the window may only slide inside what they are already
+    /// receiving. At stage 0 that is nowhere at all — the window covers the
+    /// whole receiver — so it stays on their centre.
+    #[test]
+    fn a_shared_servers_fft_window_stays_inside_the_owners_band() {
+        let (addr, log) = recording_server(100_000_000, 0);
+        let handle = SpyServerHandle::connect_wideband(&cfg(&addr), 7_100_000.0).expect("connect");
+        let sent = settings_sent(&log, proto::SETTING_FFT_FREQUENCY, 1);
+        drop(handle);
+        assert_eq!(
+            sent.first().copied(),
+            Some(100_000_000),
+            "the device belongs to another client; this end cannot tune it away: {sent:?}"
+        );
+    }
+
+    /// The receiver follows the FFT window, and `IQ_FREQUENCY` is only a
+    /// position inside the band it is on — a position the server clamps if it
+    /// is outside, and then keeps. So the window has to move first, or the I/Q
+    /// is placed against a band the receiver is about to leave.
+    #[test]
+    fn a_retune_moves_the_fft_window_before_it_places_the_iq_window() {
+        let (addr, log) = recording_server(100_000_000, 1);
+        let handle = SpyServerHandle::connect_wideband(&cfg(&addr), 7_100_000.0).expect("connect");
+        settings_sent(&log, proto::SETTING_FFT_FREQUENCY, 1);
+        let before = log.lock().expect("log").len();
+        handle.set_center_hz(14_100_000.0);
+        settings_sent(&log, proto::SETTING_FFT_FREQUENCY, 2);
+        let after: Vec<(u32, u32)> = log.lock().expect("log")[before..].to_vec();
+        drop(handle);
+
+        let fft = after
+            .iter()
+            .position(|&(s, v)| s == proto::SETTING_FFT_FREQUENCY && v == 14_100_000)
+            .expect("the FFT window moved");
+        let iq = after
+            .iter()
+            .position(|&(s, v)| s == proto::SETTING_IQ_FREQUENCY && v == 14_100_000)
+            .expect("the I/Q window moved");
+        assert!(fft < iq, "the FFT window must move first: {after:?}");
     }
 }

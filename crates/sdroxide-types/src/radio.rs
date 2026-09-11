@@ -5,6 +5,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::Band;
 use crate::limerfe::LimeRfeConfig;
 
 /// Which radio backend to drive.
@@ -391,10 +392,25 @@ pub enum CatFamily {
     ///
     /// Appended after [`CatFamily::Flrig`] for the reason given there.
     QrpLabs,
+    /// HobbyPCB's RS-HFIQ, a 5 W HF transceiver whose whole control interface
+    /// is a frequency command and a transmit command (issue #383).
+    ///
+    /// Not a dialect of anything: `*F` sets the oscillator, `*X` keys, every
+    /// command opens with `*` and closes with a carriage return, and there is
+    /// no mode, power, filter or meter command because the radio has none of
+    /// those. What comes off its sound card is complex baseband — a quadrature
+    /// detector and a quadrature modulator either side of an Si5351 running at
+    /// four times the dial — so the mode, the filter and the modulation are all
+    /// sdroxide's, and the serial port carries the two things that are the
+    /// radio's.
+    ///
+    /// Appended after [`CatFamily::QrpLabs`] for the reason [`CatFamily::Flrig`]
+    /// gives.
+    RsHfiq,
 }
 
 impl CatFamily {
-    pub const ALL: [CatFamily; 9] = [
+    pub const ALL: [CatFamily; 10] = [
         CatFamily::Xiegu,
         CatFamily::Icom,
         CatFamily::Yaesu,
@@ -402,6 +418,7 @@ impl CatFamily {
         CatFamily::Elecraft,
         CatFamily::Elad,
         CatFamily::QrpLabs,
+        CatFamily::RsHfiq,
         CatFamily::Rigctld,
         CatFamily::Flrig,
     ];
@@ -420,6 +437,7 @@ impl CatFamily {
             CatFamily::Elecraft => "Elecraft",
             CatFamily::Elad => "ELAD",
             CatFamily::QrpLabs => "QRP Labs",
+            CatFamily::RsHfiq => "RS-HFIQ",
             CatFamily::Rigctld => "Hamlib rigctld (network)",
             CatFamily::Flrig => "flrig (network)",
         }
@@ -555,6 +573,35 @@ impl IcomModel {
             IcomModel::Ic7200 => Some(0x04),
             IcomModel::Ic7000 | IcomModel::Other => None,
             _ => Some(0x06),
+        }
+    }
+
+    /// How many aerial sockets this model's `0x12` selector switches between.
+    ///
+    /// The third thing on this list that CI-V cannot be asked. The command
+    /// carries a socket *number* and nothing anywhere says how many a radio
+    /// has, so sdroxide learns the rest by probing: a radio with no selector
+    /// NAKs the read, and one that answers is taken to have the two every
+    /// model with a selector has at least.
+    ///
+    /// The IC-7300MK2 is where that broke. It answers the read — but with the
+    /// *receiving antenna*'s setting, because on that radio `0x12` is not a
+    /// selector at all: one aerial socket, sub-command `00` and no other, and
+    /// the byte behind it switches the RX ANT connector in and out. sdroxide
+    /// offered it an ANT1/ANT2 chip whose second position sends `12 01 …`,
+    /// which the radio rejects (issue #229).
+    ///
+    /// Only that model is claimed, and only because its CI-V reference guide
+    /// says so in as many words. The rest keep the two they have always been
+    /// offered — which is not a claim about them but the existing floor, since
+    /// a radio without a selector never answers the read. The four-socket
+    /// IC-785x line is left at two on purpose: naming ANT3 would mean
+    /// extending `civ::ANTENNAS`, and a socket sdroxide cannot name already
+    /// reads back as no socket rather than a wrong one.
+    pub fn antenna_sockets(self) -> usize {
+        match self {
+            IcomModel::Ic7300Mk2 => 1,
+            _ => 2,
         }
     }
 }
@@ -1085,6 +1132,15 @@ pub const QMX_IQ_OFFSET_HZ: f64 = -12_000.0;
 /// the band this radio can show at once.
 pub const QMX_IQ_RATE_HZ: u32 = 48_000;
 
+/// The one baud rate an RS-HFIQ's control port has: "The serial port is running
+/// at 57600 Baud, N, 8, 1."
+///
+/// A constant rather than a default, because there is no menu in the firmware
+/// to change it. Any other rate is not a slower link, it is a silent one — so
+/// selecting the family fills this in and `sdroxide_cat::spawn` pins it
+/// (issue #383).
+pub const RS_HFIQ_CAT_BAUD: u32 = 57_600;
+
 /// Whether a rig's I/Q is corrected unless the operator says otherwise. On:
 /// see [`CatConfig::iq_correction`].
 fn default_cat_iq_correction() -> bool {
@@ -1219,17 +1275,234 @@ pub enum HpsdrFilterBoard {
     /// preamplifier, an attenuator or a transverter, and this backend has no
     /// way to know which.
     Alex,
+    /// Neither convention: the operator states the seven outputs themselves,
+    /// band by band, in [`HpsdrConfig::oc_table`] (issue #296).
+    ///
+    /// The two presets above are the boards this program can name. An operator
+    /// with anything else on those pins — an antenna switch, an amplifier's
+    /// band decoder, a transverter sequencer, a filter board neither preset
+    /// fits — knows what their hardware wants and nothing here can guess it, so
+    /// the table is theirs to fill in. Each preset can be *poured into* that
+    /// table as a starting point, which is how a board that is nearly an N2ADR
+    /// gets configured.
+    Custom,
+}
+
+/// Open-collector byte for the N2ADR filter board when tuned to `freq_hz`.
+///
+/// The board selects one-hot from its own documentation: bit 0 = 160 m LPF,
+/// 1 = 80 m, 2 = 60/40 m, 3 = 30/20 m, 4 = 17/15 m, 5 = 12/10 m, and bit 6 is a
+/// 3 MHz high-pass used on receive to keep broadcast AM out of the front end.
+/// The board switches that high-pass out itself while transmitting, so it can be
+/// asserted unconditionally above 3 MHz. Frequencies between the ham bands pick
+/// the lowest filter that still passes them, so short-wave listening is not
+/// filtered into silence.
+pub fn hpsdr_n2adr_oc(freq_hz: f64) -> u8 {
+    let lpf = match freq_hz {
+        f if f <= 2_000_000.0 => 0,
+        f if f <= 4_000_000.0 => 1,
+        f if f <= 7_300_000.0 => 2,
+        f if f <= 14_350_000.0 => 3,
+        f if f <= 21_450_000.0 => 4,
+        _ => 5,
+    };
+    let hpf = if freq_hz >= 3_000_000.0 { 1 << 6 } else { 0 };
+    (1 << lpf) | hpf
+}
+
+/// Open-collector byte for an Alex-style filter board when tuned to `freq_hz`.
+///
+/// Not one-hot like the N2ADR board above: this is the band as a four-bit
+/// number on outputs 1–4, which is the mapping a Hermes/ANAN's Alex board, a
+/// Zeus SDR, a HiQSDR and Quisk's own filter switching all share (issue #196).
+/// 160 m is 1 and the code counts upwards by band — except 60 m, which is 0,
+/// the same byte as "nothing selected", because that is what the boards
+/// expect.
+///
+/// Outputs 5–7 are left off: they carry no part of the band code, and on the
+/// boards that use this mapping they are the spare pins an operator wires to a
+/// preamplifier, an attenuator or a transverter. An operator who wants those
+/// pins driven pours this preset into [`HpsdrConfig::oc_table`] and adds them.
+///
+/// Between the bands the boundary sits in the middle of the gap, so a
+/// short-wave listener gets the nearer of the two filters rather than silence,
+/// and everything below 160 m and above 10 m is carried by the band at that
+/// end.
+pub fn hpsdr_alex_oc(freq_hz: f64) -> u8 {
+    match freq_hz {
+        f if f < 2_750_000.0 => 0x01,  // 160 m
+        f if f < 4_650_000.0 => 0x02,  // 80 m
+        f if f < 6_200_000.0 => 0x00,  // 60 m — no pins, by the board's table
+        f if f < 8_700_000.0 => 0x03,  // 40 m
+        f if f < 12_100_000.0 => 0x04, // 30 m
+        f if f < 16_200_000.0 => 0x05, // 20 m
+        f if f < 19_600_000.0 => 0x06, // 17 m
+        f if f < 23_200_000.0 => 0x07, // 15 m
+        f if f < 26_500_000.0 => 0x08, // 12 m
+        f if f < 39_900_000.0 => 0x09, // 10 m
+        _ => 0x0A,                     // 6 m
+    }
+}
+
+/// One band's open-collector control words: what the seven outputs are while
+/// receiving on that band, and what they are while transmitting on it (issue
+/// #296).
+///
+/// Two words rather than one because the outputs are not only filters. A
+/// low-pass filter has to be the same either way, but an amplifier's key line,
+/// a transverter's sequencer and a receive preamplifier's bypass are all things
+/// an operator wants asserted on exactly one side of the changeover — and
+/// Thetis's table, which this is modelled on, has offered both since the
+/// beginning.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HpsdrOcRow {
+    /// The band these words apply to, matched against the frequency on the
+    /// *dial*: an accessory board switches for the signal on the air, not for
+    /// the intermediate frequency a transverter left the radio on.
+    pub band: Band,
+    /// Outputs 1–7 as a bit mask (bit 0 = output 1) while receiving. Bit 7 is
+    /// not an output and is ignored.
+    pub rx: u8,
+    /// The same while the transmitter is keyed.
+    pub tx: u8,
+}
+
+impl HpsdrOcRow {
+    /// One of the presets poured into a table, so it can be edited from
+    /// something that works rather than from seven zeros.
+    ///
+    /// Each band is asked for at its own default entry frequency, which is
+    /// inside the band in every region. Receive and transmit come out the same:
+    /// both presets describe filters, which have to be in circuit in both
+    /// directions — the N2ADR board's receive-only 3 MHz high-pass is switched
+    /// out by the board itself, not by us. What an operator wants on one side
+    /// only is exactly what they add here afterwards.
+    pub fn from_preset(board: HpsdrFilterBoard) -> Vec<HpsdrOcRow> {
+        let Some(f) = (match board {
+            HpsdrFilterBoard::N2adr => Some(hpsdr_n2adr_oc as fn(f64) -> u8),
+            HpsdrFilterBoard::Alex => Some(hpsdr_alex_oc as fn(f64) -> u8),
+            HpsdrFilterBoard::None | HpsdrFilterBoard::Custom => None,
+        }) else {
+            return Vec::new();
+        };
+        Band::ALL
+            .iter()
+            .filter(|b| **b != Band::Gen)
+            .map(|&band| {
+                let w = f(band.default_entry().0) & 0x7F;
+                HpsdrOcRow { band, rx: w, tx: w }
+            })
+            .collect()
+    }
+}
+
+/// The open-collector outputs resolved for a whole connection: which convention
+/// is in force, and — for [`HpsdrFilterBoard::Custom`] — the operator's words
+/// for every band, ready to be indexed rather than searched.
+///
+/// Flattened out of [`HpsdrConfig`] at open time and `Copy`, because the
+/// protocol threads carry it inside a register snapshot that is copied around
+/// several hundred times a second; a `Vec` there would be a heap allocation per
+/// datagram and would cost those structs their `Copy`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HpsdrOcPlan {
+    board: HpsdrFilterBoard,
+    /// Indexed by [`Band::index`]; only read under `Custom`.
+    rx: [u8; Band::ALL.len()],
+    tx: [u8; Band::ALL.len()],
+}
+
+impl Default for HpsdrOcPlan {
+    fn default() -> Self {
+        HpsdrOcPlan {
+            board: HpsdrFilterBoard::None,
+            rx: [0; Band::ALL.len()],
+            tx: [0; Band::ALL.len()],
+        }
+    }
+}
+
+impl HpsdrOcPlan {
+    /// Nothing attached: every output stays off, whatever the dial does.
+    pub fn none() -> HpsdrOcPlan {
+        HpsdrOcPlan::default()
+    }
+
+    /// The plan a preset alone describes, for a caller that has no table.
+    pub fn preset(board: HpsdrFilterBoard) -> HpsdrOcPlan {
+        HpsdrOcPlan { board, ..HpsdrOcPlan::default() }
+    }
+
+    /// Which convention this plan drives.
+    pub fn board(&self) -> HpsdrFilterBoard {
+        self.board
+    }
+
+    /// What the log line at open calls this — the operator's only warning that
+    /// seven general-purpose outputs are about to start moving, so it names
+    /// what will move them rather than repeating a menu entry.
+    pub fn describe(&self) -> String {
+        match self.board {
+            HpsdrFilterBoard::None => "nothing (all outputs off)".into(),
+            HpsdrFilterBoard::N2adr => "an N2ADR filter board".into(),
+            HpsdrFilterBoard::Alex => "an Alex / Hermes band code".into(),
+            HpsdrFilterBoard::Custom => {
+                let bands = Band::ALL
+                    .iter()
+                    .filter(|b| {
+                        let i = b.index();
+                        self.rx[i] != 0 || self.tx[i] != 0
+                    })
+                    .count();
+                format!("a custom table ({bands} band(s) with outputs asserted)")
+            }
+        }
+    }
+
+    /// Whether anything at all is driven. A plan that asserts nothing on any
+    /// band is the same as no accessory board, and is not announced as one.
+    pub fn drives_anything(&self) -> bool {
+        match self.board {
+            HpsdrFilterBoard::None => false,
+            HpsdrFilterBoard::Custom => self.rx.iter().chain(&self.tx).any(|&w| w != 0),
+            _ => true,
+        }
+    }
+
+    /// The seven outputs for a radio on `freq_hz`, keyed or not — bit 0 is
+    /// output 1, and bit 7 is never set (there is no eighth output).
+    ///
+    /// The two presets are frequency-driven and answer the same word either
+    /// way: they describe filters, and the caller has already handed us the
+    /// transmit frequency if that is what is on the air. Only a custom table
+    /// distinguishes the two directions, which is the point of having one.
+    pub fn word(&self, freq_hz: f64, keyed: bool) -> u8 {
+        match self.board {
+            HpsdrFilterBoard::None => 0,
+            HpsdrFilterBoard::N2adr => hpsdr_n2adr_oc(freq_hz),
+            HpsdrFilterBoard::Alex => hpsdr_alex_oc(freq_hz),
+            HpsdrFilterBoard::Custom => {
+                let i = Band::containing(freq_hz).index();
+                if keyed { self.tx[i] } else { self.rx[i] }
+            }
+        }
+    }
 }
 
 impl HpsdrFilterBoard {
-    pub const ALL: [HpsdrFilterBoard; 3] =
-        [HpsdrFilterBoard::None, HpsdrFilterBoard::N2adr, HpsdrFilterBoard::Alex];
+    pub const ALL: [HpsdrFilterBoard; 4] = [
+        HpsdrFilterBoard::None,
+        HpsdrFilterBoard::N2adr,
+        HpsdrFilterBoard::Alex,
+        HpsdrFilterBoard::Custom,
+    ];
 
     pub fn label(self) -> &'static str {
         match self {
             HpsdrFilterBoard::None => "None — outputs stay off",
             HpsdrFilterBoard::N2adr => "N2ADR filter board",
             HpsdrFilterBoard::Alex => "Alex / Hermes band code (Zeus, HiQSDR, Quisk)",
+            HpsdrFilterBoard::Custom => "Custom — my own table below",
         }
     }
 }
@@ -1310,6 +1583,103 @@ pub struct HpsdrConfig {
     /// [`HpsdrConfig::default_tx_latency_ms`].
     #[serde(default = "HpsdrConfig::default_tx_latency_ms")]
     pub tx_latency_ms: f64,
+
+    // ── PureSignal: adaptive predistortion from the transmit sample ──
+    /// Linearise the transmitter from a sample of what it actually emitted —
+    /// what openHPSDR calls PureSignal (issue #283).
+    ///
+    /// The receiver is the feedback path. The board is commanded in duplex, so
+    /// its DDC keeps running through an over; give that DDC a coupled sample of
+    /// the amplifier's output and the transmitter can compare what came back
+    /// with what it meant to send, and bend the next block by the inverse of
+    /// the difference. Twenty-odd decibels of intermodulation improvement is
+    /// the usual figure, and the amplifier keeps its power.
+    ///
+    /// **It needs the sample to reach the receiver**, which on a Hermes-Lite 2
+    /// means a directional coupler and an attenuator into an input the T/R
+    /// switch does not take away on transmit — the IO board's PureSignal jack,
+    /// which is [`HpsdrIoRxInput::IoBoardPureSignal`]. With nothing coupled in
+    /// the loop simply never locks and the transmitter is left exactly as it
+    /// would have been: the table starts at unity and only measurement moves
+    /// it.
+    ///
+    /// Off by default, and only ever on the radio that owns the transmitter
+    /// (DDC 0).
+    #[serde(default)]
+    pub puresignal: bool,
+    /// Steps in the predistortion table — how finely the amplifier's curve is
+    /// modelled. Clamped to [`LimeAuxConfig::PS_MIN_BINS`] ..=
+    /// [`LimeAuxConfig::PS_MAX_BINS`], as the same processor's other caller is.
+    #[serde(default = "HpsdrConfig::default_ps_bins")]
+    pub ps_bins: u8,
+    /// How fast the table follows what the coupler reports, 0..1. Slow is
+    /// right: this is averaging an amplifier's curve, which does not move, out
+    /// of a feedback path that has noise in it.
+    #[serde(default = "HpsdrConfig::default_ps_rate")]
+    pub ps_rate: f32,
+    /// Hold the table where it is instead of adapting — for measuring, and for
+    /// an operator who has a correction they are happy with.
+    #[serde(default)]
+    pub ps_frozen: bool,
+    // ── Automatic overload protection ──────────────────────────────────────
+    /// Back the front-end gain off by itself while the board reports its ADC
+    /// overloading, and let it back up again when it stops (issue #362).
+    ///
+    /// A Hermes-Lite 2's front end is a 12-bit direct-sampling converter with
+    /// no mixer in front of it: the whole 0–38 MHz arrives at once, so a
+    /// broadcast station a band away can drive it into overflow while the
+    /// panadapter shows nothing unusual at all — everything simply
+    /// intermodulates and the noise floor climbs. The board reports the
+    /// overflow itself, in the status bytes it sends with every frame, and this
+    /// is what acts on it.
+    ///
+    /// Off by default. It moves a control the operator set, so it is theirs to
+    /// ask for; and on a station whose gain is already right it never has
+    /// anything to do.
+    #[serde(default)]
+    pub auto_gain: bool,
+    /// How much the gain moves per step, in dB. One decibel is the step the
+    /// Hermes-Lite's own gain register has and what the reference
+    /// implementations use.
+    #[serde(default = "HpsdrConfig::default_auto_gain_step_db")]
+    pub auto_gain_step_db: f64,
+    /// How often the gain may come *down* while the converter is overloading,
+    /// in ms. Fast, because every millisecond of overflow is a receiver full of
+    /// intermodulation.
+    #[serde(default = "HpsdrConfig::default_auto_gain_attack_ms")]
+    pub auto_gain_attack_ms: u32,
+    /// How often the gain may go back *up* once the overflow has cleared, in
+    /// ms. Slow, because the thing that caused it — a neighbour's transmission,
+    /// a broadcast station coming up at dusk — has not necessarily gone away,
+    /// and a loop that recovered as fast as it retreated would spend the
+    /// evening oscillating across the overflow threshold.
+    ///
+    /// The asymmetry is the whole design: fast attack, slow decay, which is
+    /// what N1GP's HermesIntf has used since 2013 and what PowerSDR's
+    /// "Auto S-Att" does.
+    #[serde(default = "HpsdrConfig::default_auto_gain_decay_ms")]
+    pub auto_gain_decay_ms: u32,
+    /// The lowest gain the loop may wind down to, in dB. Its own floor rather
+    /// than the board's, so an operator can say "never make this receiver
+    /// deafer than this" — below some point the overflow is somebody else's
+    /// problem and the answer is a filter, not another 20 dB.
+    #[serde(default = "HpsdrConfig::default_auto_gain_min_db")]
+    pub auto_gain_min_db: f64,
+    /// The highest gain the loop may return to, in dB. The gain the operator
+    /// set is the ceiling by default — the loop's job is to protect the
+    /// converter, not to decide how sensitive the receiver should be — and this
+    /// is how that ceiling is stated in its own right.
+    #[serde(default = "HpsdrConfig::default_auto_gain_max_db")]
+    pub auto_gain_max_db: f64,
+    /// The operator's own open-collector words, one row per band, used when
+    /// [`Self::filter_board`] is [`HpsdrFilterBoard::Custom`] — see
+    /// [`HpsdrOcRow`] (issue #296).
+    ///
+    /// Kept even while a preset is selected: switching to a preset to compare
+    /// and back again must not throw the table away. A band with no row
+    /// asserts nothing, which is what a fresh table is made of.
+    #[serde(default)]
+    pub oc_table: Vec<HpsdrOcRow>,
 }
 
 impl Default for HpsdrConfig {
@@ -1326,11 +1696,47 @@ impl Default for HpsdrConfig {
             ppm: 0.0,
             ddc: 0,
             tx_latency_ms: Self::default_tx_latency_ms(),
+            puresignal: false,
+            ps_bins: Self::default_ps_bins(),
+            ps_rate: Self::default_ps_rate(),
+            ps_frozen: false,
+            auto_gain: false,
+            auto_gain_step_db: Self::default_auto_gain_step_db(),
+            auto_gain_attack_ms: Self::default_auto_gain_attack_ms(),
+            auto_gain_decay_ms: Self::default_auto_gain_decay_ms(),
+            auto_gain_min_db: Self::default_auto_gain_min_db(),
+            auto_gain_max_db: Self::default_auto_gain_max_db(),
+            oc_table: Vec::new(),
         }
     }
 }
 
 impl HpsdrConfig {
+    /// The open-collector outputs this configuration asks for, flattened for
+    /// the protocol threads — see [`HpsdrOcPlan`] (issue #296).
+    pub fn oc_plan(&self) -> HpsdrOcPlan {
+        let mut plan = HpsdrOcPlan::preset(self.filter_board);
+        if self.filter_board == HpsdrFilterBoard::Custom {
+            for row in &self.oc_table {
+                let i = row.band.index();
+                plan.rx[i] = row.rx & 0x7F;
+                plan.tx[i] = row.tx & 0x7F;
+            }
+        }
+        plan
+    }
+
+    /// See [`Self::ps_bins`] — the same 32 steps the other caller of this
+    /// processor starts at.
+    pub fn default_ps_bins() -> u8 {
+        32
+    }
+
+    /// See [`Self::ps_rate`].
+    pub fn default_ps_rate() -> f32 {
+        0.5
+    }
+
     /// Range of the Hermes-Lite 2 front-end gain, in dB.
     pub const LNA_GAIN_MIN_DB: f64 = -12.0;
     pub const LNA_GAIN_MAX_DB: f64 = 48.0;
@@ -1358,6 +1764,42 @@ impl HpsdrConfig {
     /// See [`HpsdrConfig::pa_enable`].
     pub fn default_pa_enable() -> bool {
         true
+    }
+
+    /// See [`Self::auto_gain_step_db`].
+    pub fn default_auto_gain_step_db() -> f64 {
+        1.0
+    }
+
+    /// See [`Self::auto_gain_attack_ms`] — 100 ms per decibel, the figure
+    /// N1GP's HermesIntf has used since 2013.
+    pub fn default_auto_gain_attack_ms() -> u32 {
+        100
+    }
+
+    /// See [`Self::auto_gain_decay_ms`] — ten seconds per decibel, a hundred
+    /// times slower than the attack.
+    pub fn default_auto_gain_decay_ms() -> u32 {
+        10_000
+    }
+
+    /// See [`Self::auto_gain_min_db`]. The board's own floor: the loop is free
+    /// to use the whole range unless the operator narrows it.
+    pub fn default_auto_gain_min_db() -> f64 {
+        Self::LNA_GAIN_MIN_DB
+    }
+
+    /// See [`Self::auto_gain_max_db`]. The board's own ceiling.
+    pub fn default_auto_gain_max_db() -> f64 {
+        Self::LNA_GAIN_MAX_DB
+    }
+
+    /// The loop's bounds, in the order the gain register takes them and with
+    /// the operator's two figures the right way round however they were typed.
+    pub fn auto_gain_bounds(&self) -> (f64, f64) {
+        let lo = self.auto_gain_min_db.clamp(Self::LNA_GAIN_MIN_DB, Self::LNA_GAIN_MAX_DB);
+        let hi = self.auto_gain_max_db.clamp(Self::LNA_GAIN_MIN_DB, Self::LNA_GAIN_MAX_DB);
+        (lo.min(hi), lo.max(hi))
     }
 
     /// Matches the cushion every other backend gets: enough to absorb ordinary
@@ -1761,6 +2203,19 @@ pub struct SmartSdrConfig {
     /// fragmented VITA-49 packets are dropped and the spectrum simply never
     /// arrives.
     pub network_mtu: u32,
+    /// Conjugate the radio's DAX I/Q, mirroring the spectrum about the centre
+    /// of the panadapter.
+    ///
+    /// **Off by default**, which is how this backend has always read a FLEX and
+    /// what a FLEX-6600 was verified on. It is here because a mirrored stream
+    /// is the one fault that leaves the waterfall looking entirely convincing
+    /// while every sideband signal comes out inverted — which is unintelligible
+    /// speech on USB and on LSB alike, and no decodes at all, with nothing on
+    /// screen saying why (issue #368, reported on a FLEX-8400M). If that is
+    /// what a radio does, this is the one click that settles it; if it is not,
+    /// turning it on makes the fault obvious rather than subtle.
+    #[serde(default)]
+    pub swap_iq: bool,
 }
 
 impl Default for SmartSdrConfig {
@@ -1773,6 +2228,7 @@ impl Default for SmartSdrConfig {
             station: "sdroxide".into(),
             gui_client_id: String::new(),
             network_mtu: 1450,
+            swap_iq: false,
         }
     }
 }
@@ -2440,6 +2896,23 @@ pub struct KiwiConfig {
     /// Waterfall frame rate, 1 (slowest) to 4. The receiver caps this at its
     /// own `wf_fps_max`, which was 23 fps on the one this was measured against.
     pub wf_speed: u8,
+    /// How far in the receiver's waterfall is zoomed, as a power of two of its
+    /// whole band: `0` is the full 0-30 MHz, `1` half of it, and so on up to
+    /// [`Self::WF_ZOOM_MAX`].
+    ///
+    /// The waterfall is always 1024 bins wide, so the zoom is what decides how
+    /// much of the band a bin covers: 29 kHz at zoom 0, which is a band *map*
+    /// and not a picture of anything, against 458 Hz at zoom 6, where a
+    /// 469 kHz slice of a broadcast band shows its individual stations. The
+    /// window follows the dial, so what is on screen is the band around what
+    /// you are listening to either way (issue #303).
+    ///
+    /// Zero by default, which is what it always was: the whole band is what
+    /// makes the strip a thing to tune *by*, and the I/Q's 12 kHz is the
+    /// detail. An operator who wants a few hundred kilohertz of real waterfall
+    /// instead can have it here.
+    #[serde(default)]
+    pub wf_zoom: u8,
     /// The *receiver's* AGC, which sits ahead of the I/Q and so ahead of
     /// everything this program does.
     ///
@@ -2466,6 +2939,7 @@ impl Default for KiwiConfig {
             ident: String::new(),
             wide_lane: true,
             wf_speed: 3,
+            wf_zoom: 0,
             agc: true,
             man_gain: 50,
         }
@@ -2484,10 +2958,24 @@ impl KiwiConfig {
     pub const MAN_GAIN_ELEMENT: &'static str = "KIWIGAIN";
     pub const WIDE_LANE_ELEMENT: &'static str = "KIWIWF";
     pub const WF_SPEED_ELEMENT: &'static str = "KIWIWFSPD";
+    pub const WF_ZOOM_ELEMENT: &'static str = "KIWIWFZOOM";
 
     /// Slowest and fastest waterfall speeds the protocol accepts.
     pub const WF_SPEED_MIN: u8 = 1;
     pub const WF_SPEED_MAX: u8 = 4;
+
+    /// The deepest waterfall zoom this client offers.
+    ///
+    /// The receiver itself goes to 14, which on a 30 MHz Kiwi is a 1.8 kHz
+    /// window — narrower than the I/Q the panadapter already draws, and so a
+    /// band view of nothing. Ten is 29 kHz, which is where the two meet.
+    pub const WF_ZOOM_MAX: u8 = 10;
+
+    /// The span the receiver's waterfall covers at [`Self::wf_zoom`], given the
+    /// band it tunes. 1024 bins are spread across whatever this returns.
+    pub fn wf_span_hz(&self, bandwidth_hz: f64) -> f64 {
+        bandwidth_hz / f64::from(1u32 << self.wf_zoom.min(Self::WF_ZOOM_MAX))
+    }
 
     /// The configured address as `host:port`, supplying the default port when
     /// the operator typed only a host. Same rule as [`RtlTcpConfig::endpoint`],
@@ -4920,11 +5408,13 @@ impl SdrPlayModel {
         }
     }
 
-    /// Highest LNA state the model has in *any* band — the settings slider's
-    /// range. State 0 is maximum gain; each step up switches more attenuation
-    /// in front of the tuner. Some bands have fewer states than this; the
-    /// driver clamps per band and reports what it settled on, the same way the
-    /// RTL-SDR backend snaps its tuner gain.
+    /// Highest LNA state the model has in *any* band.
+    ///
+    /// A ceiling, not an offer: on an RSPdx it is 27, and only the 250–420 MHz
+    /// band has all of those — below 12 MHz there are 19. Use it where the
+    /// band is not known (a device that is not open yet); anywhere the dial is
+    /// known, [`Self::max_lna_state_on`] is the honest answer and is what the
+    /// sliders are built from.
     pub fn max_lna_state(self) -> u8 {
         match self {
             SdrPlayModel::Rsp1 => 3,
@@ -4934,6 +5424,102 @@ impl SdrPlayModel {
             SdrPlayModel::RspDx | SdrPlayModel::RspDxR2 => 27,
             // An unknown model still has the API-guaranteed minimum.
             SdrPlayModel::Unknown => 3,
+        }
+    }
+
+    /// Highest LNA state this model has **on this band**, which is the number
+    /// a control should offer.
+    ///
+    /// State 0 is maximum gain; each step up switches more attenuation in
+    /// front of the tuner. How many steps exist is a property of the band, not
+    /// of the box: the counts here are the API headers' `*_NUM_LNA_STATES_*`
+    /// defines, and the band edges are the rows of the gain tables in the API
+    /// specification (v3.15, pp. 38–39). A state past this is refused by the
+    /// service with `OutOfRange`, so the driver clamps to it — and a slider
+    /// built from [`Self::max_lna_state`] instead spends its top third moving
+    /// nothing and snapping back.
+    ///
+    /// `hiz` says the Hi-Z input is routed (RSP2 and RSPduo tuner 1 only),
+    /// which has fewer front-end states of its own. `hdr` is the RSPdx's
+    /// high-dynamic-range path, which has its own table below 2 MHz.
+    ///
+    /// Lives here rather than beside the driver so the settings UI — which is
+    /// wasm-safe and cannot link the backend — builds its slider from the same
+    /// table the clamp uses. Two copies of this drifting apart is exactly the
+    /// bug it prevents.
+    pub fn max_lna_state_on(self, freq_hz: f64, hiz: bool, hdr: bool) -> u8 {
+        let f = freq_hz;
+        match self {
+            SdrPlayModel::Rsp1 => {
+                if f >= 1_000e6 {
+                    2 // 3 states in L-band
+                } else {
+                    3 // 4 states everywhere else
+                }
+            }
+            SdrPlayModel::Rsp1a | SdrPlayModel::Rsp1b => {
+                if f < 60e6 {
+                    6 // RSPIA_NUM_LNA_STATES_AM = 7
+                } else if f >= 1_000e6 {
+                    8 // RSPIA_NUM_LNA_STATES_LBAND = 9
+                } else {
+                    9 // RSPIA_NUM_LNA_STATES = 10
+                }
+            }
+            SdrPlayModel::Rsp2 => {
+                if hiz {
+                    4 // RSPII_NUM_LNA_STATES_AMPORT = 5
+                } else if f >= 420e6 {
+                    5 // RSPII_NUM_LNA_STATES_420MHZ = 6
+                } else {
+                    8 // RSPII_NUM_LNA_STATES = 9
+                }
+            }
+            SdrPlayModel::RspDuo => {
+                if hiz {
+                    4 // RSPDUO_NUM_LNA_STATES_AMPORT = 5
+                } else if f < 60e6 {
+                    6 // RSPDUO_NUM_LNA_STATES_AM = 7
+                } else if f >= 1_000e6 {
+                    8 // RSPDUO_NUM_LNA_STATES_LBAND = 9
+                } else {
+                    9 // RSPDUO_NUM_LNA_STATES = 10
+                }
+            }
+            SdrPlayModel::RspDx | SdrPlayModel::RspDxR2 => {
+                if hdr && f < 2e6 {
+                    21 // RSPDX_NUM_LNA_STATES_DX = 22
+                } else if f < 12e6 {
+                    18 // RSPDX_NUM_LNA_STATES_AMPORT2_0_12 = 19
+                } else if f < 50e6 {
+                    19 // RSPDX_NUM_LNA_STATES_AMPORT2_12_50 = 20
+                } else if f < 60e6 {
+                    24 // RSPDX_NUM_LNA_STATES_AMPORT2_50_60 = 25
+                } else if f < 250e6 {
+                    26 // RSPDX_NUM_LNA_STATES_VHF_BAND3 = 27
+                } else if f < 420e6 {
+                    27 // RSPDX_NUM_LNA_STATES = 28
+                } else if f < 1_000e6 {
+                    20 // RSPDX_NUM_LNA_STATES_420MHZ = 21
+                } else {
+                    18 // RSPDX_NUM_LNA_STATES_LBAND = 19
+                }
+            }
+            // The API guarantees nothing about a model these bindings do not
+            // know; every RSP has at least the RSP1's four states.
+            SdrPlayModel::Unknown => 3,
+        }
+    }
+
+    /// Whether an antenna choice routes a Hi-Z input, for the LNA clamp.
+    ///
+    /// Beside the table above because it is an argument to it, and the UI
+    /// needs both for the same reason.
+    pub fn antenna_is_hiz(self, antenna: &str) -> bool {
+        match self {
+            SdrPlayModel::Rsp2 => antenna == "Hi-Z",
+            SdrPlayModel::RspDuo => antenna == "Hi-Z port",
+            _ => false,
         }
     }
 
@@ -5217,7 +5803,32 @@ pub struct SdrPlayConfig {
     /// [`SdrPlayDuo::enabled`], which of the two this radio listens on.
     pub duo_tuner: SdrPlayDuoTuner,
     /// RSPdx only: HDR mode below 2 MHz.
+    ///
+    /// **Does not work yet.** On the one RSPdx it has been tried against,
+    /// switching the path on silences the receiver — at every centre, filter,
+    /// antenna port, LNA state, level, offset, rate, IF and LO setting tried,
+    /// enabled both before `Init` and at runtime. The struct layouts match
+    /// `sdrplay_api_RspDx.h` and SoapySDRPlay3 drives it the same way, so
+    /// whatever the mode needs is not on the documented API surface. What is
+    /// known about it is in [`SdrPlayHdrBw`], and the panel says so where the
+    /// operator can see it.
     pub hdr: bool,
+    /// RSPdx only: the HDR path's analog filter. Only meaningful with
+    /// [`Self::hdr`], and only at the centre frequencies that filter is
+    /// implemented at — see [`SdrPlayHdrBw::works_at`]. Appended last, like
+    /// every config field before it.
+    #[serde(default)]
+    pub hdr_bw: SdrPlayHdrBw,
+    /// Let the IF gain reduction go below 20 dB, down to 0 — the last 20 dB of
+    /// gain the hardware has.
+    ///
+    /// Off by default, which is the API's own default (`NORMAL_MIN_GR`) and
+    /// the right one for ordinary listening: the bottom of the range is where
+    /// an RSP is easiest to overload. Worth having on for weak-signal work
+    /// with the LNA already at 0, where the AGC note calls IF gain free to
+    /// use. Turning it on also lifts the AGC set-point ceiling to 0 dBFS.
+    #[serde(default)]
+    pub extended_if_gr: bool,
     /// RSPduo only: run the other tuner too — combined with this one, or as a
     /// radio of its own. Read from `radio.json` under either name: the block
     /// was called `diversity` when combining was all it could do.
@@ -5242,8 +5853,105 @@ impl Default for SdrPlayConfig {
             antenna: String::new(),
             duo_tuner: SdrPlayDuoTuner::Tuner1,
             hdr: false,
+            hdr_bw: SdrPlayHdrBw::default(),
+            extended_if_gr: false,
             duo: SdrPlayDuo::default(),
         }
+    }
+}
+
+/// The RSPdx's HDR-path analog filter, and the only frequencies each of its
+/// settings could work at.
+///
+/// HDR is not a mode that follows the dial. The path has a fixed analog filter
+/// and the hardware only implements it centred on a short list of frequencies:
+/// tuned anywhere else the switch is accepted and does nothing useful, which
+/// reads as HDR being broken rather than as the dial being in the wrong place.
+/// The lists are from the API specification's RSPdx section.
+///
+/// *Could*, because being on one of them is necessary and not sufficient — see
+/// [`SdrPlayConfig::hdr`]. Nothing here has been seen to work on hardware.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum SdrPlayHdrBw {
+    Khz200,
+    Khz500,
+    Mhz1_2,
+    /// The API's own default, and what an RSPdx runs with when nobody sets one.
+    #[default]
+    Mhz1_7,
+}
+
+impl SdrPlayHdrBw {
+    pub const ALL: [SdrPlayHdrBw; 4] =
+        [SdrPlayHdrBw::Khz200, SdrPlayHdrBw::Khz500, SdrPlayHdrBw::Mhz1_2, SdrPlayHdrBw::Mhz1_7];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            SdrPlayHdrBw::Khz200 => "200 kHz",
+            SdrPlayHdrBw::Khz500 => "500 kHz",
+            SdrPlayHdrBw::Mhz1_2 => "1.2 MHz",
+            SdrPlayHdrBw::Mhz1_7 => "1.7 MHz",
+        }
+    }
+
+    /// Back from a [`Self::code`] carried on the pseudo-element. Anything
+    /// unrecognised lands on the API's own default rather than on a filter the
+    /// operator did not pick.
+    pub fn from_code(v: f64) -> SdrPlayHdrBw {
+        match v.round() as i32 {
+            0 => SdrPlayHdrBw::Khz200,
+            1 => SdrPlayHdrBw::Khz500,
+            2 => SdrPlayHdrBw::Mhz1_2,
+            _ => SdrPlayHdrBw::Mhz1_7,
+        }
+    }
+
+    /// The API's `sdrplay_api_RspDx_HdrModeBwT` code.
+    pub fn code(self) -> i32 {
+        match self {
+            SdrPlayHdrBw::Khz200 => 0,
+            SdrPlayHdrBw::Khz500 => 1,
+            SdrPlayHdrBw::Mhz1_2 => 2,
+            SdrPlayHdrBw::Mhz1_7 => 3,
+        }
+    }
+
+    /// The centre frequencies, in Hz, this filter is actually implemented at.
+    ///
+    /// Two lists, not four: the narrow filters share the 500 kHz set and the
+    /// wide ones share the 2 MHz set.
+    pub fn centres_hz(self) -> &'static [f64] {
+        match self {
+            SdrPlayHdrBw::Khz200 | SdrPlayHdrBw::Khz500 => {
+                &[135_000.0, 175_000.0, 220_000.0, 250_000.0, 340_000.0, 475_000.0]
+            }
+            SdrPlayHdrBw::Mhz1_2 | SdrPlayHdrBw::Mhz1_7 => {
+                &[516_000.0, 875_000.0, 1_125_000.0, 1_900_000.0]
+            }
+        }
+    }
+
+    /// Whether HDR does anything at this centre. A hertz of slack either way,
+    /// because a dial arrives here through a converter offset and a ppm trim
+    /// and need not land on an exact integer.
+    pub fn works_at(self, centre_hz: f64) -> bool {
+        self.centres_hz().iter().any(|c| (c - centre_hz).abs() < 1.0)
+    }
+
+    /// The list an operator can be pointed at when their dial is not on one.
+    pub fn centres_label(self) -> String {
+        let parts: Vec<String> = self
+            .centres_hz()
+            .iter()
+            .map(|hz| {
+                if *hz < 1e6 {
+                    format!("{:.0} kHz", hz / 1e3)
+                } else {
+                    format!("{:.3} MHz", hz / 1e6)
+                }
+            })
+            .collect();
+        parts.join(", ")
     }
 }
 
@@ -5269,6 +5977,10 @@ impl SdrPlayConfig {
     pub const RF_NOTCH_ELEMENT: &'static str = "RFNOTCH";
     pub const DAB_NOTCH_ELEMENT: &'static str = "DABNOTCH";
     pub const HDR_ELEMENT: &'static str = "HDR";
+    /// The HDR path's analog filter, as a [`SdrPlayHdrBw::code`].
+    pub const HDR_BW_ELEMENT: &'static str = "HDRBW";
+    /// Whether the IF gain reduction may go below the API's 20 dB floor.
+    pub const EXTENDED_IF_GR_ELEMENT: &'static str = "EXTGR";
     /// The RSPduo's second tuner and the diversity filter, through the same
     /// door — the filter's names being the shared ones ([`DIV_MODE_ELEMENT`]
     /// and friends). The two gains are carried negated, like the main
@@ -5285,6 +5997,51 @@ impl SdrPlayConfig {
     /// `MAX_BB_GR`).
     pub const IF_GR_MIN: i32 = 20;
     pub const IF_GR_MAX: i32 = 59;
+    /// The floor with [`Self::extended_if_gr`] on (`EXTENDED_MIN_GR`).
+    pub const IF_GR_MIN_EXTENDED: i32 = 0;
+
+    /// The lowest IF gain reduction this configuration may ask for.
+    pub fn if_gr_min(&self) -> i32 {
+        if self.extended_if_gr { Self::IF_GR_MIN_EXTENDED } else { Self::IF_GR_MIN }
+    }
+
+    /// The AGC set-point range, in dBFS, that the API will accept at a given
+    /// sample rate.
+    ///
+    /// Not one range: the converter's headroom shrinks as it trades resolution
+    /// for speed, and the API refuses a set point below what the rate can
+    /// reach. The thresholds are the specification's — under 8.064 MSPS the
+    /// full −72 dB is available, to 9.216 it is −60, and above that −48. The
+    /// ceiling is −20 unless the extended gain floor is in use, which lifts it
+    /// to 0.
+    ///
+    /// This backend offers 10 MSPS, so the narrow end is reachable in normal
+    /// use rather than being a theoretical edge.
+    pub fn agc_setpoint_range(&self) -> std::ops::RangeInclusive<i32> {
+        Self::agc_setpoint_range_at(self.sample_rate_hz, self.extended_if_gr)
+    }
+
+    /// [`Self::agc_setpoint_range`] over the two things it actually depends
+    /// on, so the driver's live path can ask the same question.
+    ///
+    /// The rate is fixed for a session but the gain floor is a switch the
+    /// operator throws mid-session, and the range the settings panel offers
+    /// has to be the range the driver will accept — otherwise a set point the
+    /// panel let the operator reach is one the driver quietly clamps away.
+    pub fn agc_setpoint_range_at(
+        sample_rate_hz: f64,
+        extended_if_gr: bool,
+    ) -> std::ops::RangeInclusive<i32> {
+        let floor = if sample_rate_hz < 8_064_000.0 {
+            -72
+        } else if sample_rate_hz < 9_216_000.0 {
+            -60
+        } else {
+            -48
+        };
+        let ceiling = if extended_if_gr { 0 } else { -20 };
+        floor..=ceiling
+    }
 
     /// Sample rates offered in the UI. Below 2 Msps the ADC still runs at
     /// 2 Msps and the API decimates; above 6.048 Msps the ADC trades
@@ -5476,6 +6233,317 @@ impl ConverterTx {
             ConverterTx::Transverter => "Through the same converter",
             ConverterTx::Own(_) => "Its own offset",
         }
+    }
+}
+
+/// One transverter: a band it works, the offset it works it at, and what it can
+/// take on transmit.
+///
+/// A station with more than one of these has more than one answer, and which
+/// one applies is decided by where the dial is — that is the whole difference
+/// between this and [`RadioConfig::converter_offset_hz`], which is one answer
+/// for every frequency (issue #278). A 2 m transverter on a 28 MHz I.F. and a
+/// 6 m one on the same I.F. sit in the same table, each with its own offset,
+/// and the radio follows the dial from one to the other.
+///
+/// The offset carries the sign rule the rest of the feature uses: **the
+/// hardware is tuned to `dial + offset_hz`**. A transverter that brings a band
+/// *down* to an I.F. therefore has a negative offset — 2 m into 28 MHz is
+/// −116 MHz, because 144 − 116 = 28.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Transverter {
+    /// What the operator calls it. Shown in the dialog and in the log line that
+    /// says which one the dial has selected; not otherwise interpreted.
+    #[serde(default)]
+    pub name: String,
+    /// Unticked leaves the row in the table and takes the transverter out of
+    /// the line — the box is switched off or unplugged, and the band goes back
+    /// to whatever the radio reaches on its own.
+    #[serde(default = "default_xvtr_enabled")]
+    pub enabled: bool,
+    /// The band this transverter works, on the *dial*, in Hz.
+    #[serde(default)]
+    pub rf_lo_hz: f64,
+    #[serde(default)]
+    pub rf_hi_hz: f64,
+    /// `hardware = dial + offset_hz`.
+    #[serde(default)]
+    pub offset_hz: f64,
+    /// What the transmit line does while this transverter is the selected one.
+    #[serde(default)]
+    pub tx: ConverterTx,
+    /// A ceiling on transmit drive while it is selected, 0.0–1.0 of full.
+    ///
+    /// The reason this is per transverter rather than per station: a
+    /// transverter's I.F. input takes milliwatts, and the drive that is right
+    /// for the radio's own bands will destroy it. 0.05 is 5 % of full drive,
+    /// which is the order most transverters want from a 100 W radio through
+    /// their built-in attenuator.
+    #[serde(default = "default_xvtr_drive")]
+    pub tx_drive: f32,
+}
+
+fn default_xvtr_enabled() -> bool {
+    true
+}
+
+fn default_xvtr_drive() -> f32 {
+    0.05
+}
+
+impl Default for Transverter {
+    fn default() -> Self {
+        Transverter {
+            name: String::new(),
+            enabled: true,
+            rf_lo_hz: 0.0,
+            rf_hi_hz: 0.0,
+            offset_hz: 0.0,
+            tx: ConverterTx::Off,
+            tx_drive: default_xvtr_drive(),
+        }
+    }
+}
+
+impl Transverter {
+    /// Whether this row describes a band at all. A pair that is not a range —
+    /// unset, inverted, not finite — selects nothing rather than everything:
+    /// a half-typed row must not take the whole dial with it.
+    pub fn is_band(&self) -> bool {
+        self.rf_lo_hz.is_finite()
+            && self.rf_hi_hz.is_finite()
+            && self.rf_lo_hz >= 0.0
+            && self.rf_hi_hz > self.rf_lo_hz
+    }
+
+    /// Whether the dial is inside this transverter's band.
+    pub fn covers(&self, dial_hz: f64) -> bool {
+        self.enabled && self.is_band() && (self.rf_lo_hz..=self.rf_hi_hz).contains(&dial_hz)
+    }
+
+    /// What to call it in a log line or a dialog row.
+    pub fn describe(&self) -> String {
+        if !self.name.trim().is_empty() {
+            return self.name.trim().to_string();
+        }
+        format!("{:.3}–{:.3} MHz", self.rf_lo_hz / 1e6, self.rf_hi_hz / 1e6)
+    }
+}
+
+/// How many transverters a station may state. Ten is more bands than any
+/// amateur station has boxes for, and the table is drawn in full.
+pub const MAX_TRANSVERTERS: usize = 10;
+
+/// One band's transmit drive calibration: how far the drive that reaches the
+/// air has to be moved on that band for the operator's Drive setting to mean
+/// the same output power everywhere (issue #295).
+///
+/// Every amplifier has a different gain on every band — a 10 m stage typically
+/// wants several decibels more drive than the same radio's 40 m one — so a
+/// single Drive number produces a different power on each. This table takes
+/// that out: the operator sets Drive for the band that needs the most, then
+/// trims every other band down by what they measure.
+///
+/// `db` is decibels of **RF output power**, negative to take power off, which
+/// is the direction a calibration runs in: the slider is already the maximum,
+/// so the bands the amplifier is happier on come *down* to meet the one it is
+/// not. A little the other way is allowed for a station whose worst band is
+/// calibrated below full — see [`BandDriveTrim::DB_RANGE`].
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct BandDriveTrim {
+    /// The band this row calibrates, matched against the *transmit* frequency
+    /// on the **dial** — where the station radiates, which is the band whose
+    /// amplifier is being calibrated. Behind a transverter that is the
+    /// converted band, not the I.F. the radio is really on; what the
+    /// transverter's own I.F. input can take is its row's drive ceiling
+    /// ([`Transverter::tx_drive`]), which still wins over anything here.
+    pub band: Band,
+    /// Decibels of output power to add on this band. `0.0` — the default, and
+    /// what an absent row means — leaves the band exactly as it was.
+    pub db: f32,
+}
+
+impl BandDriveTrim {
+    /// How far a row may trim, in dB of output power.
+    ///
+    /// Twenty decibels down is a hundredth of the power, which is more than the
+    /// spread between any two bands of one amplifier; the six the other way are
+    /// for a station that calibrated its worst band below full drive and has
+    /// somewhere to go. Drive is still a fraction of full scale afterwards, so
+    /// a positive trim runs out at the top rather than overdriving anything.
+    pub const DB_RANGE: std::ops::RangeInclusive<f32> = -20.0..=6.0;
+
+    /// The trim, held inside [`Self::DB_RANGE`] and never NaN — what a
+    /// hand-edited `radio.json` gets held to before it reaches the modulator.
+    pub fn db(&self) -> f32 {
+        if self.db.is_finite() {
+            self.db.clamp(*Self::DB_RANGE.start(), *Self::DB_RANGE.end())
+        } else {
+            0.0
+        }
+    }
+
+    /// The multiplier `db` decibels of **output power** puts on a drive
+    /// control.
+    ///
+    /// Which conversion applies depends on what drive *is* on the radio
+    /// underneath, and the two differ by a factor of two in the exponent:
+    ///
+    /// - `drive_is_power`: the control is a fraction of the radio's rated
+    ///   power — 0.5 is half its watts — the way a CAT, LAN or TCI transceiver
+    ///   takes it. A decibel of output is then a decibel of drive:
+    ///   `10^(dB/10)`.
+    /// - Otherwise drive scales the modulated I/Q, which is an *amplitude*,
+    ///   and power goes as its square: `10^(dB/20)`.
+    ///
+    /// So a row means the same change at the antenna whichever kind of radio
+    /// the operator points this configuration at, which is the whole point of
+    /// stating the table in decibels of output rather than in "drive units".
+    pub fn factor_for(db: f32, drive_is_power: bool) -> f32 {
+        if db == 0.0 || !db.is_finite() {
+            return 1.0;
+        }
+        10f32.powf(db / if drive_is_power { 10.0 } else { 20.0 })
+    }
+}
+
+#[cfg(test)]
+mod oc_table_tests {
+    use super::*;
+
+    /// The operator's own words reach the wire, and receive and transmit are
+    /// genuinely separate — which is what an amplifier key line or a receive
+    /// preamplifier bypass on one of those pins needs (issue #296).
+    #[test]
+    fn a_custom_table_answers_per_band_and_per_direction() {
+        let cfg = HpsdrConfig {
+            filter_board: HpsdrFilterBoard::Custom,
+            oc_table: vec![
+                HpsdrOcRow { band: Band::M40, rx: 0x01, tx: 0x41 },
+                HpsdrOcRow { band: Band::M20, rx: 0x02, tx: 0x02 },
+            ],
+            ..HpsdrConfig::default()
+        };
+        let plan = cfg.oc_plan();
+        assert_eq!(plan.word(7_074_000.0, false), 0x01);
+        assert_eq!(plan.word(7_074_000.0, true), 0x41, "the amplifier line is transmit-only");
+        assert_eq!(plan.word(14_074_000.0, false), 0x02);
+        assert_eq!(plan.word(14_074_000.0, true), 0x02, "a filter is the same either way");
+        // A band with no row asserts nothing, and so does a dial outside every
+        // band: an operator who has said nothing about 10 m has said nothing.
+        assert_eq!(plan.word(28_074_000.0, false), 0);
+        assert_eq!(plan.word(11_000_000.0, false), 0);
+        assert!(plan.drives_anything());
+    }
+
+    /// Selecting a preset ignores the table, and selecting nothing ignores
+    /// both — the table stays on disk either way, so switching back and forth
+    /// to compare does not throw it away.
+    #[test]
+    fn a_preset_outranks_the_table_without_destroying_it() {
+        let mut cfg = HpsdrConfig {
+            filter_board: HpsdrFilterBoard::Alex,
+            oc_table: vec![HpsdrOcRow { band: Band::M40, rx: 0x7F, tx: 0x7F }],
+            ..HpsdrConfig::default()
+        };
+        assert_eq!(cfg.oc_plan().word(7_074_000.0, false), hpsdr_alex_oc(7_074_000.0));
+        cfg.filter_board = HpsdrFilterBoard::None;
+        assert_eq!(cfg.oc_plan().word(7_074_000.0, false), 0);
+        assert!(!cfg.oc_plan().drives_anything());
+        cfg.filter_board = HpsdrFilterBoard::Custom;
+        assert_eq!(cfg.oc_plan().word(7_074_000.0, false), 0x7F, "the table was still there");
+    }
+
+    /// Pouring a preset into the table reproduces it band for band, which is
+    /// what makes "start from the N2ADR mapping and change one pin" possible.
+    #[test]
+    fn a_poured_preset_reproduces_itself() {
+        for board in [HpsdrFilterBoard::N2adr, HpsdrFilterBoard::Alex] {
+            let cfg = HpsdrConfig {
+                filter_board: HpsdrFilterBoard::Custom,
+                oc_table: HpsdrOcRow::from_preset(board),
+                ..HpsdrConfig::default()
+            };
+            let poured = cfg.oc_plan();
+            let preset = HpsdrOcPlan::preset(board);
+            for band in Band::ALL {
+                if band == Band::Gen || band.edges().is_none() {
+                    continue;
+                }
+                let hz = band.default_entry().0;
+                assert_eq!(
+                    poured.word(hz, false),
+                    preset.word(hz, false) & 0x7F,
+                    "{board:?} on {} ({hz} Hz)",
+                    band.label()
+                );
+            }
+        }
+        // "None" and "Custom" have nothing to pour.
+        assert!(HpsdrOcRow::from_preset(HpsdrFilterBoard::None).is_empty());
+        assert!(HpsdrOcRow::from_preset(HpsdrFilterBoard::Custom).is_empty());
+    }
+
+    /// A table of zeros is not an accessory board, and must not be announced as
+    /// one — the log line at open is the operator's only warning that seven
+    /// general-purpose outputs are about to start moving.
+    #[test]
+    fn an_empty_table_drives_nothing() {
+        let cfg = HpsdrConfig { filter_board: HpsdrFilterBoard::Custom, ..HpsdrConfig::default() };
+        assert!(!cfg.oc_plan().drives_anything());
+        assert_eq!(cfg.oc_plan().word(7_074_000.0, true), 0);
+    }
+}
+
+#[cfg(test)]
+mod drive_trim_tests {
+    use super::*;
+
+    /// A row applies to its own band and to nothing else, and a dial outside
+    /// every band falls on the `Gen` row if there is one.
+    #[test]
+    fn the_trim_follows_the_transmit_band() {
+        let cfg = RadioConfig {
+            tx_drive_trim: vec![
+                BandDriveTrim { band: Band::M10, db: 0.0 },
+                BandDriveTrim { band: Band::M40, db: -6.0 },
+                BandDriveTrim { band: Band::Gen, db: -12.0 },
+            ],
+            ..RadioConfig::default()
+        };
+        assert_eq!(cfg.drive_trim_db(7_074_000.0), -6.0);
+        assert_eq!(cfg.drive_trim_db(28_074_000.0), 0.0, "a row set to zero is no trim at all");
+        assert_eq!(cfg.drive_trim_db(14_074_000.0), 0.0, "a band with no row is untouched");
+        assert_eq!(cfg.drive_trim_db(11_000_000.0), -12.0, "outside every ham band");
+        // The station that has never opened the table, which is nearly all of
+        // them: nothing is looked up and nothing is changed.
+        assert_eq!(RadioConfig::default().drive_trim_db(7_074_000.0), 0.0);
+    }
+
+    /// A hand-edited `radio.json` cannot drive the transmitter through the
+    /// roof — or produce a NaN that would silence it.
+    #[test]
+    fn an_impossible_row_is_held_to_the_range() {
+        assert_eq!(BandDriveTrim { band: Band::M20, db: 40.0 }.db(), 6.0);
+        assert_eq!(BandDriveTrim { band: Band::M20, db: -100.0 }.db(), -20.0);
+        assert_eq!(BandDriveTrim { band: Band::M20, db: f32::NAN }.db(), 0.0);
+    }
+
+    /// The same decibels of output, on the two kinds of drive control.
+    #[test]
+    fn a_decibel_means_the_same_at_the_antenna_either_way() {
+        // Six decibels down is a quarter of the power, which is half the
+        // amplitude — and a quarter of a rig's power setting.
+        let amplitude = BandDriveTrim::factor_for(-6.0, false);
+        let power = BandDriveTrim::factor_for(-6.0, true);
+        assert!((amplitude - 0.5011872).abs() < 1e-4, "{amplitude}");
+        assert!((power - 0.2511886).abs() < 1e-4, "{power}");
+        // …and squaring the amplitude gets back to the power fraction, which is
+        // the identity the pair exists to keep.
+        assert!((amplitude * amplitude - power).abs() < 1e-4);
+        // No trim is exactly no change, not a rounding of one.
+        assert_eq!(BandDriveTrim::factor_for(0.0, false), 1.0);
+        assert_eq!(BandDriveTrim::factor_for(0.0, true), 1.0);
     }
 }
 
@@ -5984,6 +7052,50 @@ impl FobosConfig {
     ];
 }
 
+/// Where the antenna this radio listens on actually is.
+///
+/// The station's locator says where the *operator* is, and for a radio in the
+/// shack that is also where the antenna is. It is not where a public KiwiSDR or
+/// SpyServer is: issue #284, where an online receiver in Australia taken in a
+/// tab in Europe reported 2 m FT8 decodes as an intercontinental opening,
+/// because everything heard was still posted from the operator's own square.
+///
+/// So a radio says which. Reception reports — PSK Reporter, WSPRnet, FreeDV
+/// Reporter — and the ADS-B receiver position are taken from here rather than
+/// from [`crate::DigiConfig::my_grid`].
+///
+/// Externally tagged (serde's default shape), like [`ConverterTx`] above and
+/// for the same reason: this config crosses the remote link as postcard, which
+/// is not self-describing and refuses an internally or adjacently tagged enum
+/// outright.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RxSite {
+    /// The antenna is the station's own, so the operator's locator describes
+    /// it. The default, and what every radio configured before this existed
+    /// gets — which is right, because until public receivers could be taken in
+    /// a tab it was the only possibility.
+    #[default]
+    Station,
+    /// Somewhere else, at this Maidenhead locator: an online receiver, or the
+    /// operator's own set on a hilltop.
+    ///
+    /// **Empty means somewhere else and nobody knows where** — a directory
+    /// entry that published no position. Nothing is reported then, because a
+    /// report has to say where it was heard and there is no honest answer.
+    Elsewhere(String),
+}
+
+impl RxSite {
+    /// What the settings dialog calls this.
+    pub fn label(&self) -> &'static str {
+        match self {
+            RxSite::Station => "At the station",
+            RxSite::Elsewhere(_) => "Somewhere else",
+        }
+    }
+}
+
 /// Tuning ranges an operator stated for an interface this radio is not on at
 /// the moment.
 ///
@@ -6017,6 +7129,23 @@ pub struct RadioConfig {
     pub radio_audio_in: Option<String>,
     /// Sound-card device (cpal name) carrying the TX audio PC → radio.
     pub radio_audio_out: Option<String>,
+    /// A fixed gain, in dB, on everything this radio sends to the speakers.
+    ///
+    /// The AF volume rail's top is unity: it can turn a radio down and never
+    /// up. That is right for a front end whose audio this program made, and
+    /// wrong for one that arrives already made — a transceiver's USB codec puts
+    /// out what the rig's own AF stage decided, and several of them (Yaesu's
+    /// among them) are quiet enough that full volume here *and* in the operating
+    /// system is still not loud (issue #315). This is the trim that makes up the
+    /// difference, and it belongs to the radio because what it corrects is that
+    /// radio's interface rather than how loudly anyone wants to listen.
+    ///
+    /// `0.0` — the default, and what every `radio.json` written before this
+    /// existed loads as — leaves the path exactly as it was. Applied at the one
+    /// funnel every receive path goes through, so it reaches a demodulated
+    /// front end as well; the recorder's tap is deliberately not in that funnel,
+    /// which keeps an archived recording independent of it.
+    pub rx_audio_gain_db: f32,
     /// External frequency converter in the antenna line: the hardware is tuned
     /// this far from the operator's dial, in Hz. So `+125_000_000` is a Ham It
     /// Up HF upconverter and the dial reads the real on-air frequency, and a
@@ -6039,6 +7168,20 @@ pub struct RadioConfig {
     /// Ignored when there is no converter: with the offset at zero the transmit
     /// path was never touched to begin with.
     pub converter_tx: ConverterTx,
+    /// The station's transverters, each with its own band and its own offset —
+    /// see [`Transverter`].
+    ///
+    /// Where [`Self::converter_offset_hz`] is one answer for the whole dial
+    /// (an upconverter, an LNB: a box in front of *everything*), this is the
+    /// station whose 2 m, 6 m and 23 cm come from three different boxes on one
+    /// I.F. The dial decides which applies; a frequency no row covers falls
+    /// through to the single offset above, and to the bare radio when that is
+    /// zero too (issue #278).
+    ///
+    /// Appended last, and `#[serde(default)]`, so a `radio.json` written before
+    /// this existed loads with an empty table and behaves exactly as it did.
+    #[serde(default)]
+    pub transverters: Vec<Transverter>,
     /// Tuning ranges the operator states for this radio, in Hz, replacing what
     /// the device publishes about itself. Empty (the default) leaves the
     /// device's own answer alone.
@@ -6115,9 +7258,75 @@ pub struct RadioConfig {
     /// `Command::SetRadioConfig` whole, so a peer one field short reads the
     /// tail of every one of them out of step).
     pub fobos: FobosConfig,
+    /// Where this radio's antenna is — see [`RxSite`]. Appended after `fobos`,
+    /// for the same reason as every field above it: the layout is positional,
+    /// so a new block goes on the end and nowhere else, and `RadioConfig` rides
+    /// `ServerMsg::RadioConfig` and `Command::SetRadioConfig` whole (issue
+    /// #284).
+    pub rx_site: RxSite,
+    /// Per-band transmit drive calibration — see [`BandDriveTrim`]. Appended
+    /// after `rx_site`, for the same reason as every field above it: the
+    /// layout is positional, so a new block goes on the end and nowhere else,
+    /// and `RadioConfig` rides `ServerMsg::RadioConfig` and
+    /// `Command::SetRadioConfig` whole (issue #295).
+    ///
+    /// Empty in a configuration written before this existed, and empty is
+    /// exactly right: no row means no trim, and the radio transmits at the
+    /// operator's Drive setting on every band as it always did.
+    pub tx_drive_trim: Vec<BandDriveTrim>,
 }
 
 impl RadioConfig {
+    /// The converter offset that is actually in force at `dial_hz`, to be
+    /// changed in place.
+    ///
+    /// A measurement made *through* a converter — the QO-100 beacon's, above
+    /// all — corrects the box the dial is currently looking through, and on a
+    /// station with a transverter table that is not necessarily
+    /// [`Self::converter_offset_hz`]. The engine resolves the same precedence
+    /// when it tunes (`ConverterPlan`: a band-limited row first, the single
+    /// offset behind it), so a correction written anywhere else is written
+    /// into a number nothing reads, the beacon does not move, and a closed
+    /// loop watching for it to move never stops correcting.
+    ///
+    /// Falls through to [`Self::converter_offset_hz`] when no row covers the
+    /// dial, which is the bare radio and the single-converter station both.
+    pub fn converter_offset_at_mut(&mut self, dial_hz: f64) -> &mut f64 {
+        match self.transverters.iter_mut().find(|x| x.covers(dial_hz)) {
+            Some(x) => &mut x.offset_hz,
+            None => &mut self.converter_offset_hz,
+        }
+    }
+
+    /// The drive calibration in force at `tx_dial_hz`, in dB of output power,
+    /// or `0.0` where the operator has set none (issue #295).
+    ///
+    /// The *dial* transmit frequency, which behind a transverter is the
+    /// converted band rather than the I.F. the radio is really on: the table
+    /// calibrates the amplifier that puts the signal on the air, and on a
+    /// transverter station that is the transverter. What its I.F. input can
+    /// take is a separate and harder limit — [`Transverter::tx_drive`] — and
+    /// the engine applies that after this.
+    ///
+    /// A band with more than one row takes the first: rows are the operator's
+    /// and a duplicate is a mistake, not an instruction to add them up.
+    pub fn drive_trim_db(&self, tx_dial_hz: f64) -> f32 {
+        if self.tx_drive_trim.is_empty() {
+            return 0.0;
+        }
+        let band = Band::containing(tx_dial_hz);
+        self.tx_drive_trim.iter().find(|t| t.band == band).map(BandDriveTrim::db).unwrap_or(0.0)
+    }
+
+    /// The converter offset in force at `dial_hz`, read-only.
+    pub fn converter_offset_at(&self, dial_hz: f64) -> f64 {
+        self.transverters
+            .iter()
+            .find(|x| x.covers(dial_hz))
+            .map(|x| x.offset_hz)
+            .unwrap_or(self.converter_offset_hz)
+    }
+
     /// Point this radio at another interface, carrying the stated tuning
     /// ranges with the interface they were stated for.
     ///
@@ -6152,7 +7361,30 @@ impl RadioConfig {
             self.freq_ranges_rx = p.rx;
             self.freq_ranges_tx = p.tx;
         }
+        // The antenna's whereabouts belong to the receiver being left, not to
+        // the tab: a KiwiSDR in Alberta swapped for the transceiver in the
+        // shack must not go on posting the shack's decodes from Alberta. Back
+        // to the station, which is the only thing that can be assumed about a
+        // device that has just been plugged in. Picking a public receiver from
+        // the directory sets it again afterwards — `PublicSdrEntry::radio_config`
+        // calls this first and states the site second, in that order.
+        self.rx_site = RxSite::Station;
         self.backend = backend;
+    }
+
+    /// The Maidenhead locator receptions through this radio are reported under,
+    /// given the station's own — or `None` when the antenna is somebody else's
+    /// and the directory did not say where it is.
+    ///
+    /// `None` is not "fall back on the operator's square": that is exactly the
+    /// wrong answer, and the one issue #284 was about. A caller with nothing to
+    /// report from reports nothing.
+    pub fn report_grid<'a>(&'a self, station_grid: &'a str) -> Option<&'a str> {
+        match &self.rx_site {
+            RxSite::Station => Some(station_grid.trim()),
+            RxSite::Elsewhere(g) if !g.trim().is_empty() => Some(g.trim()),
+            RxSite::Elsewhere(_) => None,
+        }
     }
 }
 
@@ -6240,12 +7472,16 @@ mod tests {
     /// disappears from the dialog instead of failing to build.
     #[test]
     fn every_cat_family_is_offered_and_labelled() {
-        assert_eq!(CatFamily::ALL.len(), 9);
+        assert_eq!(CatFamily::ALL.len(), 10);
         for f in CatFamily::ALL {
             assert!(!f.label().is_empty(), "{f:?}");
         }
         assert!(CatFamily::ALL.contains(&CatFamily::Elad));
         assert!(CatFamily::ALL.contains(&CatFamily::QrpLabs));
+        assert!(CatFamily::ALL.contains(&CatFamily::RsHfiq));
+        // An RS-HFIQ's control link is a serial port on the board itself
+        // (issue #383).
+        assert!(!CatFamily::RsHfiq.is_network());
         // ELAD is a serial family: the FDM-DUO's CAT port is an FTDI bridge,
         // not a socket.
         assert!(!CatFamily::Elad.is_network());
@@ -6496,6 +7732,37 @@ mod tests {
         assert!(!off.invert_spectrum);
     }
 
+    /// A `radio.json` written before the overload loop existed loads with it off
+    /// and the whole gain range available to it, which is exactly how the
+    /// station behaved before (issue #362).
+    #[test]
+    fn an_older_config_gets_the_overload_loop_switched_off() {
+        let cfg: HpsdrConfig = serde_json::from_str(r#"{}"#).expect("parses");
+        assert!(!cfg.auto_gain);
+        assert_eq!(cfg.auto_gain_step_db, 1.0);
+        assert_eq!(cfg.auto_gain_attack_ms, 100);
+        assert_eq!(cfg.auto_gain_decay_ms, 10_000);
+        assert_eq!(
+            cfg.auto_gain_bounds(),
+            (HpsdrConfig::LNA_GAIN_MIN_DB, HpsdrConfig::LNA_GAIN_MAX_DB)
+        );
+        // Bounds typed the wrong way round are still bounds, and neither escapes
+        // the board's own range.
+        let wide: HpsdrConfig =
+            serde_json::from_str(r#"{"auto_gain_min_db": 40.0, "auto_gain_max_db": -900.0}"#)
+                .expect("parses");
+        assert_eq!(wide.auto_gain_bounds(), (HpsdrConfig::LNA_GAIN_MIN_DB, 40.0));
+    }
+
+    /// The FlexRadio I/Q swap likewise: a config that predates it loads off,
+    /// which is how every FLEX this backend has met has been read.
+    #[test]
+    fn an_older_flex_config_does_not_suddenly_mirror_its_spectrum() {
+        let cfg: SmartSdrConfig = serde_json::from_str(r#"{}"#).expect("parses");
+        assert!(!cfg.swap_iq);
+        assert!(!SmartSdrConfig::default().swap_iq);
+    }
+
     /// The sound-card rig's copy of the same setting goes the other way: every
     /// CAT rig already working is on the convention this end assumes, so the
     /// only safe value for a config that predates the checkbox is off.
@@ -6552,6 +7819,40 @@ mod tests {
             assert_eq!(cfg.converter_offset_hz, 0.0, "converter offset after loading {json}");
         }
         assert_eq!(RadioConfig::default().converter_offset_hz, 0.0);
+    }
+
+    /// A correction measured through a converter has to reach the offset the
+    /// dial is actually looking through. On a station with a transverter row
+    /// covering the band, that is the row — the single offset is behind it and
+    /// nothing reads it there (issue #291).
+    #[test]
+    fn the_offset_in_force_is_the_row_covering_the_dial_then_the_single_one() {
+        const QO100: f64 = 10_489_750_000.0;
+        let mut cfg = RadioConfig { converter_offset_hz: -9_750_000_000.0, ..Default::default() };
+
+        // No table: the single offset, as it has always been.
+        assert_eq!(cfg.converter_offset_at(QO100), -9_750_000_000.0);
+        *cfg.converter_offset_at_mut(QO100) += 3_000.0;
+        assert_eq!(cfg.converter_offset_hz, -9_749_997_000.0);
+
+        // A row covering the beacon takes precedence, and takes the correction.
+        cfg.transverters.push(Transverter {
+            name: "LNB".into(),
+            rf_lo_hz: 10_489_000_000.0,
+            rf_hi_hz: 10_500_000_000.0,
+            offset_hz: -9_750_000_000.0,
+            ..Default::default()
+        });
+        assert_eq!(cfg.converter_offset_at(QO100), -9_750_000_000.0);
+        *cfg.converter_offset_at_mut(QO100) += 3_000.0;
+        assert_eq!(cfg.transverters[0].offset_hz, -9_749_997_000.0, "the row is corrected");
+        assert_eq!(cfg.converter_offset_hz, -9_749_997_000.0, "the single offset is left alone");
+
+        // A row for another band does not: 2 m through a transverter must not
+        // catch a correction measured on 3 cm.
+        cfg.transverters[0].rf_lo_hz = 144_000_000.0;
+        cfg.transverters[0].rf_hi_hz = 146_000_000.0;
+        assert_eq!(cfg.converter_offset_at(QO100), cfg.converter_offset_hz);
         let up: RadioConfig =
             serde_json::from_str(r#"{"converter_offset_hz": 125000000.0}"#).expect("parses");
         assert_eq!(up.converter_offset_hz, 125_000_000.0);
@@ -6841,6 +8142,108 @@ mod tests {
         assert!(SdrPlayModel::Rsp1b.has_dab_notch());
         assert!(!SdrPlayModel::Rsp1b.has_hdr());
         assert!(SdrPlayModel::RspDx.has_hdr());
+    }
+
+    /// The RSPdx's ladder, band by band, against the gain tables in the API
+    /// specification (v3.15 p. 39). The model-wide ceiling is 27 and only
+    /// 250–420 MHz has all of it — everywhere else a slider built from the
+    /// ceiling offers states the service refuses.
+    #[test]
+    fn the_rspdx_ladder_follows_the_band() {
+        let dx = SdrPlayModel::RspDx;
+        let at = |hz: f64| dx.max_lna_state_on(hz, false, false);
+        assert_eq!(at(7.295e6), 18, "0-12 MHz has 19 states");
+        assert_eq!(at(14.1e6), 19, "12-50 MHz has 20");
+        assert_eq!(at(52e6), 24, "50-60 MHz has 25");
+        assert_eq!(at(145e6), 26, "60-250 MHz has 27");
+        assert_eq!(at(300e6), 27, "250-420 MHz is the only band with all 28");
+        assert_eq!(at(435e6), 20, "420-1000 MHz has 21");
+        assert_eq!(at(1296e6), 18, "L-band has 19");
+        // The HDR path has a table of its own, and only below 2 MHz.
+        assert_eq!(dx.max_lna_state_on(1e6, false, true), 21);
+        assert_eq!(dx.max_lna_state_on(3e6, false, true), 18, "HDR is a sub-2 MHz path");
+        // The ceiling is a ceiling: no band exceeds it, and one reaches it.
+        for mhz in [0.5, 7.0, 14.0, 52.0, 145.0, 300.0, 435.0, 1296.0] {
+            assert!(at(mhz * 1e6) <= dx.max_lna_state());
+        }
+    }
+
+    /// HDR is not a mode that follows the dial: each filter is built at a
+    /// fixed set of centres and does nothing elsewhere. The lists are from the
+    /// API specification's RSPdx section, and the two narrow filters share one
+    /// while the two wide ones share the other.
+    #[test]
+    fn the_hdr_path_only_works_at_its_own_centres() {
+        use SdrPlayHdrBw::*;
+        // 500 kHz set.
+        assert!(Khz500.works_at(135_000.0));
+        assert!(Khz500.works_at(475_000.0));
+        assert!(Khz200.works_at(220_000.0), "the narrow filters share a set");
+        // 2 MHz set.
+        assert!(Mhz1_7.works_at(516_000.0));
+        assert!(Mhz1_7.works_at(1_900_000.0));
+        assert!(Mhz1_2.works_at(875_000.0), "the wide filters share a set");
+        // The sets are not interchangeable.
+        assert!(!Khz500.works_at(516_000.0));
+        assert!(!Mhz1_7.works_at(135_000.0));
+        // And nothing else works at all — including the LF/MF frequencies an
+        // operator would most reasonably expect to.
+        for hz in [0.0, 153_000.0, 198_000.0, 600_000.0, 1_000_000.0, 1_395_000.0] {
+            assert!(!Mhz1_7.works_at(hz), "{hz} Hz is not an HDR centre");
+        }
+        // A hertz of slack, because a dial arrives through a ppm trim.
+        assert!(Mhz1_7.works_at(1_900_000.4));
+        assert!(!Mhz1_7.works_at(1_900_002.0));
+    }
+
+    /// The AGC set point's floor is a property of the sample rate: the
+    /// converter trades headroom for speed, and this backend offers rates on
+    /// both sides of each threshold.
+    #[test]
+    fn the_agc_set_point_range_follows_the_rate() {
+        let at = |hz: f64| {
+            let c = SdrPlayConfig { sample_rate_hz: hz, ..SdrPlayConfig::default() };
+            let r = c.agc_setpoint_range();
+            (*r.start(), *r.end())
+        };
+        assert_eq!(at(2_000_000.0), (-72, -20));
+        assert_eq!(at(8_000_000.0), (-72, -20), "8 Msps is still under the 8.064 threshold");
+        assert_eq!(at(8_064_000.0), (-60, -20));
+        assert_eq!(at(9_216_000.0), (-48, -20), "above 9.216 the floor is -48");
+        assert_eq!(at(10_000_000.0), (-48, -20), "a rate this backend actually offers");
+        // The extended gain floor lifts the ceiling to 0.
+        let ext = SdrPlayConfig {
+            sample_rate_hz: 2_000_000.0,
+            extended_if_gr: true,
+            ..SdrPlayConfig::default()
+        };
+        assert_eq!(*ext.agc_setpoint_range().end(), 0);
+    }
+
+    /// The IF gain floor is the API's 20 dB unless the operator opens the last
+    /// of the range.
+    #[test]
+    fn the_extended_range_opens_the_last_twenty_db() {
+        let normal = SdrPlayConfig::default();
+        assert_eq!(normal.if_gr_min(), SdrPlayConfig::IF_GR_MIN);
+        assert_eq!(normal.if_gr_min(), 20);
+        let ext = SdrPlayConfig { extended_if_gr: true, ..SdrPlayConfig::default() };
+        assert_eq!(ext.if_gr_min(), 0);
+    }
+
+    /// A Hi-Z input has fewer front-end states than the 50 Ω socket beside it,
+    /// and only two models have one at all.
+    #[test]
+    fn a_hi_z_port_has_its_own_ladder() {
+        let duo = SdrPlayModel::RspDuo;
+        assert!(duo.antenna_is_hiz("Hi-Z port"));
+        assert!(!duo.antenna_is_hiz("50 Ohm port"));
+        assert_eq!(duo.max_lna_state_on(7e6, true, false), 4);
+        assert_eq!(duo.max_lna_state_on(7e6, false, false), 6);
+        assert!(SdrPlayModel::Rsp2.antenna_is_hiz("Hi-Z"));
+        // Every other model routes no Hi-Z, whatever the port is called.
+        assert!(!SdrPlayModel::RspDx.antenna_is_hiz("Antenna C"));
+        assert!(!SdrPlayModel::Rsp1b.antenna_is_hiz("Hi-Z"));
         // Antenna lists: single-port models hide the selector entirely.
         assert!(SdrPlayModel::Rsp1b.antennas(SdrPlayDuoTuner::Tuner1).is_empty());
         assert_eq!(SdrPlayModel::Rsp2.antennas(SdrPlayDuoTuner::Tuner1).len(), 3);

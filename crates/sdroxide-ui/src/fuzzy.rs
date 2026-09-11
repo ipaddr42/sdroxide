@@ -69,6 +69,27 @@ pub fn score(haystack: &str, term: &str) -> Option<i32> {
     Some(total - (h.len() as i32) / 8)
 }
 
+/// Whether every whitespace-separated term of `query` appears in `haystack` as
+/// a plain, contiguous substring — a literal match rather than a scattered
+/// subsequence one.
+///
+/// Subsequence matching is generous by design, and on a long haystack it is
+/// generous to a fault: a callsign typed into a list of eleven hundred
+/// receiver names is a subsequence of dozens of them by accident, which is not
+/// what somebody who typed a callsign wanted. Callers use this to keep the
+/// literal matches when there are any and fall back to the fuzzy ones only
+/// when there are none. An all-whitespace query has nothing to fail, so it is
+/// literally matched by everything.
+pub fn contains_terms(haystack: &str, query: &str) -> bool {
+    query.split_whitespace().all(|term| contains(haystack, term))
+}
+
+/// One term, ASCII-case-insensitively, as a contiguous run.
+fn contains(haystack: &str, term: &str) -> bool {
+    let (h, n) = (haystack.as_bytes(), term.as_bytes());
+    n.len() <= h.len() && h.windows(n.len()).any(|w| w.eq_ignore_ascii_case(n))
+}
+
 /// Score a whole query: every whitespace-separated term has to match somewhere,
 /// and the scores add up. That makes `bbc asc` find the BBC transmission from
 /// Ascension without caring which order the two words appear in.
@@ -142,6 +163,28 @@ mod tests {
         let tight = score("Radio Nikkei", "nikkei").unwrap();
         let loose = score("Radio Nacional Inconfidencia Kilo Kilo Echo India", "nikkei").unwrap();
         assert!(tight > loose, "{tight} should beat {loose}");
+    }
+
+    #[test]
+    fn a_literal_match_is_told_apart_from_a_scattered_one() {
+        // Both of these are subsequence matches for the callsign...
+        assert!(score_terms("KiwiSDR DL1ABC Hamburg", "dl1abc").is_some());
+        assert!(score_terms("Dresden L-antenna 1 Ansbach Bad Camberg", "dl1abc").is_some());
+        // ...and only the first is what somebody typing a callsign meant.
+        assert!(contains_terms("KiwiSDR DL1ABC Hamburg", "dl1abc"));
+        assert!(!contains_terms("Dresden L-antenna 1 Ansbach Bad Camberg", "dl1abc"));
+    }
+
+    #[test]
+    fn every_term_has_to_be_there_literally() {
+        assert!(contains_terms("BBC World Service Ascension", "bbc asc"));
+        assert!(contains_terms("BBC World Service Ascension", "asc bbc"));
+        assert!(!contains_terms("BBC World Service Ascension", "bbc nowhere"));
+        // An empty box has nothing to fail on.
+        assert!(contains_terms("BBC World Service", ""));
+        assert!(contains_terms("BBC World Service", "   "));
+        // A term longer than the haystack cannot be in it.
+        assert!(!contains_terms("BBC", "BBC World Service"));
     }
 
     #[test]

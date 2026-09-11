@@ -77,6 +77,47 @@ fn radio_antenna_row(
     ui.end_row();
 }
 
+/// The radio's separate *receiving* antenna, for a control link that carries
+/// one (issue #229).
+///
+/// Not the same thing as the row above, and the difference is the whole reason
+/// it exists: that one picks between the sockets a transmitter can also use,
+/// while this switches an extra receive-only input into the path and leaves the
+/// main aerial on transmit throughout. An IC-7300MK2 has one aerial socket and
+/// this; an IC-7610 has both.
+///
+/// Whether the radio has one is learned rather than claimed — the flag rides
+/// behind the socket in its antenna reply, and a radio without the connector
+/// answers the socket alone — so the row appears a round trip after the session
+/// opens, or not at all.
+fn radio_rx_antenna_row(
+    ui: &mut egui::Ui,
+    caps: Option<&sdroxide_types::DeviceCaps>,
+    rx_antenna: bool,
+    cmds: &mut Vec<Command>,
+) {
+    if !caps.is_some_and(|c| c.has_rx_antenna) {
+        return;
+    }
+    ui.label("Receive antenna").on_hover_text(
+        "The radio's separate receiving antenna — RX ANT on the back — switched \
+         into the receive path or out of it. Its own setting, the same one as \
+         the radio's RX ANT button.\n\n\
+         The aerial on the main socket stays on transmit either way: this is an \
+         extra input for receiving, a loop or a beverage, not a choice of \
+         socket.\n\n\
+         Unlike the antenna above, this is *not* remembered here. The radio \
+         holds it per band itself, so sdroxide reads it back after every band \
+         change and shows what the radio says; ticking this box is the only \
+         thing that moves it.",
+    );
+    let mut on = rx_antenna;
+    if ui.checkbox(&mut on, "In the receive path").changed() {
+        cmds.push(Command::SetRxAntenna(on));
+    }
+    ui.end_row();
+}
+
 /// The radio's own power switch, for a control link that carries one.
 ///
 /// Two buttons rather than a toggle, because there is nothing here that *reads*
@@ -94,8 +135,9 @@ fn radio_power_row(
     }
     ui.label("Radio power").on_hover_text(
         "Switch the radio itself off, and back on again, over the control \
-         link — not sdroxide's own on/off, which closes the interface and \
-         leaves the radio running.\n\n\
+         link. This is the one true on/off in the program — not sdroxide's own \
+         LINK switch, which closes sdroxide's end and leaves the radio \
+         running.\n\n\
          For the switch back on to reach anything, the radio's control end has \
          to stay awake while it is off. Over the network that is what \
          Network Control does. Over a serial cable it is the radio's CI-V \
@@ -124,16 +166,18 @@ pub(in crate::app) fn settings_cat_tab(
     radio_edit: &mut Option<sdroxide_types::RadioConfig>,
     caps: Option<&sdroxide_types::DeviceCaps>,
     // Which antenna socket the radio says it is receiving on — for the
-    // families here whose rigs have two.
+    // families here whose rigs have two — and whether its separate receiving
+    // antenna, where it has one, is in the receive path.
     antenna_rx: &str,
+    rx_antenna: bool,
     can_probe: bool,
     cmds: &mut Vec<Command>,
 ) {
     use sdroxide_types::{
         CAT_SCOPE_MIN_BAUD, CatFamily, CwKeying, DigiMode, Direction, ELAD_CAT_BAUDS,
         ELAD_DEFAULT_CAT_BAUD, EladAntenna, EladTxInput, IcomModel, IcomScopeSpan, KenwoodSend,
-        LineState, ModeControl, Parity, PttMethod, QMX_IQ_OFFSET_HZ, QMX_IQ_RATE_HZ, SoundFormat,
-        StopBits,
+        LineState, ModeControl, Parity, PttMethod, QMX_IQ_OFFSET_HZ, QMX_IQ_RATE_HZ,
+        RS_HFIQ_CAT_BAUD, SoundFormat, StopBits,
     };
     let Some(cfg) = radio_edit.as_mut() else {
         ui.label("Waiting for the configuration of the machine the radio is attached to.");
@@ -296,6 +340,21 @@ pub(in crate::app) fn settings_cat_tab(
         if arrived_at_qmx_iq {
             cfg.cat.iq_offset_hz = QMX_IQ_OFFSET_HZ;
             cfg.cat.iq_rate_hz = QMX_IQ_RATE_HZ;
+        }
+
+        // An RS-HFIQ, for the same reason and more of it. Its sound card is
+        // complex baseband and nothing else, its serial port is 57600 8N1 in
+        // the firmware with no menu to change it, and its only transmit switch
+        // is the `*X` command — so all three are facts about the radio rather
+        // than preferences, and every one of them left at a default would be a
+        // link that does not work or an audio path that is noise (issue #383).
+        // The oscillator is on the dial, so the I/Q offset goes to zero:
+        // whatever the previous radio needed is not what this one does.
+        if cfg.cat.family == CatFamily::RsHfiq && cfg.cat.family != family_before {
+            cfg.cat.format = SoundFormat::Iq;
+            cfg.cat.serial.baud = RS_HFIQ_CAT_BAUD;
+            cfg.cat.ptt = PttMethod::Cat;
+            cfg.cat.iq_offset_hz = 0.0;
         }
 
         // A network family reaches the radio over a socket, so every serial
@@ -463,15 +522,31 @@ pub(in crate::app) fn settings_cat_tab(
         enum_combo(ui, "modectl", &mut cfg.cat.mode_control, &ModeControl::ALL, ModeControl::label);
         ui.end_row();
 
-        ui.label("Digimode mode");
+        ui.label("Digimode mode").on_hover_text(
+            "What to put the radio in for a mode sdroxide modulates through its sound \
+             card. \"DIGI\" selects the rig's DATA/PKT position, which takes the \
+             transmit audio from the USB or ACC input with the microphone path's \
+             speech processing out of it; \"USB\" leaves it on the plain sideband, for \
+             a radio already set to modulate SSB from its data input or one with no \
+             DATA position at all.\n\n\
+             It covers every digital mode — FT8, FT4, PSK, RTTY, SSTV and the rest — \
+             and CW sent as \"Sound card\", and it overrides Mode control for them. \
+             SSTV is the one whose sideband follows the band, so there it means the \
+             DATA position on that sideband: USB-D above 40 m, LSB-D at and below it. \
+             SSTV-FM is not part of it — an FM carrier has no sideband to choose.",
+        );
         enum_combo(ui, "digimode", &mut cfg.cat.digi_mode, &DigiMode::ALL, DigiMode::label);
         ui.end_row();
 
         ui.label("CW keying").on_hover_text(
             "How the CW panel's keyer transmits. \"Rig keyer\" puts the radio in CW \
              and hands it the text to send with its own keyer. It uses the rig's \
-             keyer speed (set from the panel's WPM), needs break-in on, and on Yaesu \
+             keyer speed (set from the panel's WPM), and on Yaesu \
              it sends by way of keyer memory 1, overwriting whatever was stored in it.\n\n\
+             It needs break-in on at the radio, which sdroxide turns on itself with each \
+             message on Icom, Yaesu and Kenwood — a rig with break-in off takes the message \
+             and transmits nothing. It is left on afterwards, and a full break-in is never \
+             turned down to semi.\n\n\
              \"Sound card\" sends the keyed sidetone as audio instead (MCW), a tone at \
              dial + pitch — and because a rig in CW would ignore its sound card \
              entirely, selecting CW then follows the Digimode mode setting (USB, DATA, \
@@ -680,6 +755,51 @@ pub(in crate::app) fn settings_cat_tab(
             }
         }
 
+        if cfg.cat.family == CatFamily::RsHfiq {
+            ui.label("Radio");
+            ui.label(RichText::new("RS-HFIQ (5 W HF transceiver)").weak()).on_hover_text(
+                "HobbyPCB's RS-HFIQ. There is nothing to pick here: the profile \
+                 is the whole of the radio's command set, and the firmware \
+                 version is logged when the port opens.\n\n\
+                 The control link carries two things and no more — where to put \
+                 the oscillator, and whether to transmit. There is no mode, \
+                 power, filter, squelch or meter command, because the radio has \
+                 none of them. Everything else is sdroxide's: what comes off \
+                 the sound card is complex baseband centred on the dial, so the \
+                 mode, the filter and the modulation all happen on this side.\n\n\
+                 The frequency command covers 3–30 MHz. Ask for anything \
+                 outside that and the radio refuses it and stays where it is; \
+                 the log says so.\n\n\
+                 CW is keyed as audio through the transmit chain — this radio \
+                 has no keyer that takes text. (It has an internal CW \
+                 generator; sdroxide never uses it, on the firmware's own \
+                 advice.)",
+            );
+            ui.end_row();
+
+            ui.label("");
+            ui.label(
+                RichText::new("Sound format, baud and PTT are the radio's, not settings").weak(),
+            )
+            .on_hover_text(
+                "All three have been filled in and none of them is a \
+                 preference:\n\n\
+                 • Sound format is I/Q (stereo) — the card carries complex \
+                 baseband and nothing else.\n\
+                 • 57600 baud, 8N1 — the firmware's one rate, with no menu to \
+                 change it. Any other is a silent link, so it is pinned when \
+                 the port opens.\n\
+                 • PTT over CAT — the *X command is the only transmit switch \
+                 the interface has.\n\n\
+                 The centre offset has been set to zero: the synthesiser runs \
+                 at four times the dial into a quadrature detector, so the \
+                 middle of the span is the dial. Set the sample rate above to \
+                 whatever your sound card is actually running at; that is what \
+                 makes the panadapter as wide as it is.",
+            );
+            ui.end_row();
+        }
+
         if cfg.cat.family == CatFamily::Icom {
             ui.label("Radio model").on_hover_text(
                 "Which Icom, for the two things CI-V does not do the same way \
@@ -711,6 +831,7 @@ pub(in crate::app) fn settings_cat_tab(
 
         if cfg.cat.family == CatFamily::Icom {
             radio_antenna_row(ui, caps, antenna_rx, "cat_icom_antenna", cmds);
+            radio_rx_antenna_row(ui, caps, rx_antenna, cmds);
             radio_power_row(ui, caps, cmds);
         }
 
@@ -903,12 +1024,103 @@ pub(in crate::app) fn settings_hpsdr_tab(
         }
         ui.end_row();
 
+        ui.label("Overload protection").on_hover_text(
+            "Back the LNA gain off by itself while the board reports its ADC overflowing, and \
+             let it back up once it stops.\n\n\
+             A Hermes-Lite 2 samples the whole of 0-38 MHz onto one 12-bit converter with no \
+             mixer and no preselector in front of it, so a broadcast station a band away can \
+             drive it into overflow while the band you are looking at shows nothing wrong at \
+             all — the noise floor climbs, everything intermodulates and the decoders stop. \
+             The board knows, and this is what acts on it.\n\n\
+             Off by default: it moves a control you set. Nothing happens while transmitting.",
+        );
+        crate::chrome::checkbox(
+            ui,
+            &mut cfg.hpsdr.auto_gain,
+            "Wind the gain back when the ADC overflows",
+        )
+        .on_hover_text(
+            "Applies on Apply / reconnect. The main window's Gain rail reads the gain the \
+             board is actually running, so it follows the loop and you can watch what it \
+             does; the slider above is the level the radio starts at, and the loop does not \
+             rewrite it.",
+        );
+        ui.end_row();
+
+        if cfg.hpsdr.auto_gain {
+            ui.label("  Step").on_hover_text(
+                "How far the gain moves each time, in dB. One is the step the board's own \
+                 gain register has.",
+            );
+            ui.add(
+                egui::DragValue::new(&mut cfg.hpsdr.auto_gain_step_db)
+                    .range(0.5..=12.0)
+                    .speed(0.5)
+                    .suffix(" dB"),
+            );
+            ui.end_row();
+
+            ui.label("  Attack / decay").on_hover_text(
+                "How often the gain may come down while the converter is overflowing, and how \
+                 often it may go back up once it has stopped.\n\n\
+                 The two are deliberately a hundred times apart. Retreat immediately: every \
+                 millisecond of overflow is a receiver full of intermodulation. Return slowly: \
+                 whatever caused it — a neighbour keying, a broadcaster coming up at dusk — has \
+                 usually not gone away, and a loop that recovered as fast as it retreated would \
+                 spend the evening oscillating across the threshold. 100 ms and 10 s per \
+                 decibel is what PowerSDR's Auto S-Att and N1GP's HermesIntf have both used.",
+            );
+            ui.horizontal(|ui| {
+                ui.add(
+                    egui::DragValue::new(&mut cfg.hpsdr.auto_gain_attack_ms)
+                        .range(20..=5_000)
+                        .speed(10)
+                        .suffix(" ms"),
+                );
+                ui.label("/");
+                ui.add(
+                    egui::DragValue::new(&mut cfg.hpsdr.auto_gain_decay_ms)
+                        .range(100..=120_000)
+                        .speed(100)
+                        .suffix(" ms"),
+                );
+            });
+            ui.end_row();
+
+            ui.label("  Range").on_hover_text(
+                "The lowest and highest gain the loop may use, in dB. The ceiling is what stops \
+                 it deciding how sensitive your receiver should be; the floor is where you say \
+                 that below some point the overload is somebody else's problem and the answer \
+                 is a filter, not another twenty decibels.",
+            );
+            ui.horizontal(|ui| {
+                ui.add(
+                    egui::DragValue::new(&mut cfg.hpsdr.auto_gain_min_db)
+                        .range(HpsdrConfig::LNA_GAIN_MIN_DB..=HpsdrConfig::LNA_GAIN_MAX_DB)
+                        .speed(1.0)
+                        .suffix(" dB"),
+                );
+                ui.label("…");
+                ui.add(
+                    egui::DragValue::new(&mut cfg.hpsdr.auto_gain_max_db)
+                        .range(HpsdrConfig::LNA_GAIN_MIN_DB..=HpsdrConfig::LNA_GAIN_MAX_DB)
+                        .speed(1.0)
+                        .suffix(" dB"),
+                );
+            });
+            ui.end_row();
+        }
+
         ui.label("Filter board").on_hover_text(
             "Accessory board on the Hermes-Lite 2's J16 header (or the open-collector \
-             outputs of any other openHPSDR board). \"N2ADR\" picks one relay per band; \
-             \"Alex / Hermes band code\" puts the band number on outputs 1-4, which is what \
-             an ANAN's Alex board, a Zeus SDR, a HiQSDR and Quisk expect. Leave this at \
-             \"None\" unless a filter board is actually fitted: those seven pins are \
+             outputs of any other openHPSDR board — Protocol 2 included). \"N2ADR\" picks \
+             one relay per band; \"Alex / Hermes band code\" puts the band number on \
+             outputs 1-4, which is what an ANAN's Alex board, a Zeus SDR, a HiQSDR and \
+             Quisk expect. \"Custom\" opens a table below where you state the seven \
+             outputs yourself, band by band, on receive and on transmit — for an antenna \
+             switch, an amplifier's band decoder or anything else neither preset fits; \
+             either preset can be poured into it as a starting point. Leave this at \
+             \"None\" unless something really is fitted: those seven pins are \
              general-purpose open-collector outputs, and operators also wire them to \
              amplifier PTT, antenna relays and transverter switching. Driving them from \
              band data would start operating whatever is connected. Applies on \
@@ -996,7 +1208,65 @@ pub(in crate::app) fn settings_hpsdr_tab(
              latency. Takes effect on APPLY, which reconnects to the board.",
         );
         ui.end_row();
+
+        // ── PureSignal ──
+        ui.label("PureSignal").on_hover_text(
+            "Adaptive predistortion: linearise the transmitter from a sample of what it actually \
+             emitted, for twenty-odd decibels less intermodulation at the same power. The \
+             receiver is the feedback path — the board keeps receiving through an over — so a \
+             directional coupler and an attenuator have to put a sample of the amplifier's \
+             output into an input the T/R switch does not take away on transmit. On a \
+             Hermes-Lite 2 that means the IO board's PureSignal jack, and the receive input \
+             above set to match. With nothing coupled in, the loop never locks and the \
+             transmitter is left exactly as it would have been. Applies on Apply / reconnect, \
+             and only on the radio that owns the transmitter (DDC1).",
+        );
+        crate::chrome::checkbox(
+            ui,
+            &mut cfg.hpsdr.puresignal,
+            "Correct the transmitter from the receiver's own feedback",
+        );
+        ui.end_row();
+
+        ui.add_enabled_ui(cfg.hpsdr.puresignal, |ui| {
+            ui.label("  Table steps").on_hover_text(
+                "How finely the amplifier's curve is modelled. More steps follow a sharper knee \
+                 and take longer to fill in; 32 is a sensible start.",
+            );
+        });
+        ui.add_enabled_ui(cfg.hpsdr.puresignal, |ui| {
+            let mut bins = i32::from(cfg.hpsdr.ps_bins);
+            if ui
+                .add(egui::DragValue::new(&mut bins).range(
+                    i32::from(sdroxide_types::LimeAuxConfig::PS_MIN_BINS)
+                        ..=i32::from(sdroxide_types::LimeAuxConfig::PS_MAX_BINS),
+                ))
+                .changed()
+            {
+                cfg.hpsdr.ps_bins = bins as u8;
+            }
+        });
+        ui.end_row();
+
+        ui.add_enabled_ui(cfg.hpsdr.puresignal, |ui| {
+            ui.label("  Adaptation").on_hover_text(
+                "How fast the correction follows what the coupler reports. Slow is right — this \
+                 is averaging an amplifier's curve, which does not move, out of a feedback path \
+                 that has noise in it.",
+            );
+        });
+        ui.add_enabled_ui(cfg.hpsdr.puresignal, |ui| {
+            ui.horizontal(|ui| {
+                ui.add(egui::Slider::new(&mut cfg.hpsdr.ps_rate, 0.0..=1.0).show_value(false));
+                crate::chrome::checkbox(ui, &mut cfg.hpsdr.ps_frozen, "Hold").on_hover_text(
+                    "Stop adapting and keep the correction where it is — for measuring, and for \
+                     an operator happy with what it has learned.",
+                );
+            });
+        });
+        ui.end_row();
     });
+    hpsdr_oc_table(ui, cfg);
     ui.add_space(6.0);
     ui.label(
         RichText::new(
@@ -1004,6 +1274,151 @@ pub(in crate::app) fn settings_hpsdr_tab(
         )
         .weak(),
     );
+}
+
+/// The per-band open-collector table, shown when **Filter board** is *Custom*
+/// (issue #296).
+///
+/// Seven general-purpose outputs, two words per band — one asserted on receive,
+/// one while keyed — which is what drives the filter boards, antenna switches,
+/// band decoders and transverter sequencers that follow neither the N2ADR nor
+/// the Alex convention. Written in hexadecimal because that is how the
+/// hardware's documentation states a control word, with the bits spelled out
+/// beside it so nobody has to convert in their head.
+fn hpsdr_oc_table(ui: &mut egui::Ui, cfg: &mut sdroxide_types::RadioConfig) {
+    use sdroxide_types::{Band, HpsdrFilterBoard, HpsdrOcRow};
+
+    if cfg.hpsdr.filter_board != HpsdrFilterBoard::Custom {
+        return;
+    }
+    ui.add_space(8.0);
+    ui.separator();
+    ui.add_space(4.0);
+    ui.label(
+        RichText::new("Open-collector outputs by band")
+            .size(14.0)
+            .strong()
+            .color(crate::theme::CYAN()),
+    );
+    ui.add_space(2.0);
+    ui.label(
+        RichText::new(
+            "One control word per band, as your hardware's documentation states it: bit 0 is \
+             output 1, bit 6 is output 7. RX is asserted while receiving on that band and TX \
+             while the transmitter is keyed — give them the same value for a filter, and \
+             different ones for anything that belongs on one side of the changeover only \
+             (an amplifier's key line, a receive preamplifier's bypass). Bands left at 00 \
+             assert nothing. Applies on Apply / reconnect.",
+        )
+        .weak(),
+    );
+    ui.add_space(6.0);
+
+    ui.horizontal(|ui| {
+        for (preset, name) in
+            [(HpsdrFilterBoard::N2adr, "N2ADR"), (HpsdrFilterBoard::Alex, "ALEX BAND CODE")]
+        {
+            if ui
+                .button(format!("FILL FROM {name}"))
+                .on_hover_text(
+                    "Replace the table with what this preset would send on every band, as a \
+                     starting point to edit. Nothing else in the configuration changes.",
+                )
+                .clicked()
+            {
+                cfg.hpsdr.oc_table = HpsdrOcRow::from_preset(preset);
+            }
+        }
+        if ui
+            .add_enabled(!cfg.hpsdr.oc_table.is_empty(), egui::Button::new("CLEAR"))
+            .on_hover_text("Every output off on every band, which is what \"None\" does.")
+            .clicked()
+        {
+            cfg.hpsdr.oc_table.clear();
+        }
+    });
+    ui.add_space(6.0);
+
+    // Only the bands the station's own region has: a row for one the operator
+    // can never reach is a row that can never do anything. The last row is
+    // everything *outside* the ham bands, which is where a short-wave listener
+    // sits — without it a custom table would leave them with no filter at all
+    // where a preset gives them the nearest one.
+    let bands: Vec<Band> =
+        Band::ALL.iter().copied().filter(|b| *b == Band::Gen || b.edges().is_some()).collect();
+    egui::Grid::new("hpsdr-oc-grid").num_columns(4).spacing([12.0, 4.0]).striped(true).show(
+        ui,
+        |ui| {
+            for h in ["Band", "RX", "TX", "Outputs asserted"] {
+                ui.label(RichText::new(h).weak().size(10.0));
+            }
+            ui.end_row();
+            for band in bands {
+                let i = cfg.hpsdr.oc_table.iter().position(|r| r.band == band);
+                let (mut rx, mut tx) = i
+                    .map(|i| (cfg.hpsdr.oc_table[i].rx, cfg.hpsdr.oc_table[i].tx))
+                    .unwrap_or((0, 0));
+                if band == Band::Gen {
+                    ui.label("Other").on_hover_text(
+                        "Everywhere outside the amateur bands — short-wave listening, and \
+                         anything a transverter's dial lands on that no band covers.",
+                    );
+                } else {
+                    ui.label(band.label());
+                }
+                let a = oc_byte_edit(ui, ("oc-rx", band), &mut rx);
+                let b = oc_byte_edit(ui, ("oc-tx", band), &mut tx);
+                ui.label(RichText::new(oc_pins(rx, tx)).weak());
+                if a || b {
+                    match i {
+                        Some(i) if rx == 0 && tx == 0 => {
+                            cfg.hpsdr.oc_table.remove(i);
+                        }
+                        Some(i) => {
+                            cfg.hpsdr.oc_table[i] = HpsdrOcRow { band, rx, tx };
+                        }
+                        None => cfg.hpsdr.oc_table.push(HpsdrOcRow { band, rx, tx }),
+                    }
+                }
+                ui.end_row();
+            }
+        },
+    );
+}
+
+/// One control word, typed and shown as two hexadecimal digits. Held to seven
+/// bits, because there is no eighth output.
+fn oc_byte_edit(
+    ui: &mut egui::Ui,
+    id: impl std::hash::Hash + std::fmt::Debug,
+    word: &mut u8,
+) -> bool {
+    let mut v = *word as u16;
+    let changed = ui
+        .push_id(id, |ui| {
+            ui.add(
+                DragValue::new(&mut v)
+                    .speed(1.0)
+                    .range(0..=0x7F)
+                    .hexadecimal(2, false, true)
+                    .prefix("0x"),
+            )
+            .changed()
+        })
+        .inner;
+    *word = (v & 0x7F) as u8;
+    changed
+}
+
+/// "1, 3, 7" for the outputs a pair of words asserts — TX in parentheses when
+/// it differs, so the two directions can be read at a glance.
+fn oc_pins(rx: u8, tx: u8) -> String {
+    let list = |w: u8| -> String {
+        let pins: Vec<String> =
+            (0..7).filter(|b| w & (1 << b) != 0).map(|b| (b + 1).to_string()).collect();
+        if pins.is_empty() { "—".into() } else { pins.join(", ") }
+    };
+    if rx == tx { list(rx) } else { format!("{} / TX {}", list(rx), list(tx)) }
 }
 
 /// RTL-SDR interface: which dongle, sample rate, gain/AGC, frequency
@@ -1711,12 +2126,15 @@ pub(in crate::app) fn settings_spyserver_tab(
 
         ui.label("Digital gain").on_hover_text(
             "How far the server scales its samples up before quantising them \
-             for the wire. Automatic computes it the way every other client \
-             does — from the receiver type, the gain index and the decimation \
-             stage — and is almost always right.\n\n\
-             It matters most at 8 bits: a signal sitting far below full scale \
-             loses its lower bits to the quantiser, and the scaling is what \
-             puts it back. Applies immediately.",
+             for the wire. Automatic watches what actually arrives and holds \
+             the peak at half of full scale, which is the only thing that can \
+             be right on both a dead band and a crowded one — the two are \
+             thirty decibels apart and no fixed figure serves both.\n\n\
+             It matters only at 8 bits, where a signal far below full scale \
+             loses its lower bits to the quantiser and one above it is clipped \
+             flat. Wider formats have room to spare and get the figure every \
+             other client computes, from the gain index and the decimation \
+             stage. Applies immediately.",
         );
         ui.horizontal(|ui| {
             let mut auto = cfg.auto_digital_gain;
@@ -2011,6 +2429,42 @@ pub(in crate::app) fn settings_kiwisdr_tab(
         }
         ui.end_row();
 
+        ui.label("Band view span").on_hover_text(
+            "How much band the receiver's waterfall covers. Its full 0-30 MHz \
+             at the left of the slider, halving with each step to the right.\n\n\
+             The waterfall is always 1024 bins wide however wide the window is, \
+             so this is really a resolution control: the whole band is 29 kHz to \
+             a bin, which is a band *map* rather than a picture of anything, \
+             while a few hundred kilohertz shows individual stations in a \
+             broadcast band. Zoomed in, the window follows your dial.\n\n\
+             The whole band is the default and is what makes the strip a thing \
+             to tune by; the panadapter below it is the ~12 kHz of I/Q. \
+             Applies immediately.",
+        );
+        let mut zoom = cfg.wf_zoom.min(KiwiConfig::WF_ZOOM_MAX);
+        let span_label = |z: u8, bw: f64| {
+            let hz = bw / f64::from(1u32 << z);
+            if hz >= 1e6 { format!("{:.1} MHz", hz / 1e6) } else { format!("{:.0} kHz", hz / 1e3) }
+        };
+        if ui
+            .add_enabled(
+                cfg.wide_lane,
+                egui::Slider::new(&mut zoom, 0..=KiwiConfig::WF_ZOOM_MAX)
+                    // The receiver's own band is not known until it answers, so
+                    // the label is against the commonest one: a 30 MHz Kiwi.
+                    .custom_formatter(|z, _| span_label(z as u8, 30e6)),
+            )
+            .changed()
+        {
+            cfg.wf_zoom = zoom;
+            cmds.push(Command::SetGain {
+                dir: Direction::Rx,
+                element: KiwiConfig::WF_ZOOM_ELEMENT.to_string(),
+                db: f64::from(zoom),
+            });
+        }
+        ui.end_row();
+
         ui.label("Receiver AGC").on_hover_text(
             "The *receiver's* AGC, which is on the far side of the link and \
              ahead of the I/Q — so it acts before anything sdroxide does.\n\n\
@@ -2194,6 +2648,7 @@ pub(in crate::app) fn settings_icomnet_tab(
     radio_edit: &mut Option<sdroxide_types::RadioConfig>,
     caps: Option<&sdroxide_types::DeviceCaps>,
     antenna_rx: &str,
+    rx_antenna: bool,
     test: &mut bool,
     copy_report: &mut bool,
     test_result: &Option<crate::app::settings::TestOutcome>,
@@ -2261,6 +2716,7 @@ pub(in crate::app) fn settings_icomnet_tab(
         ui.end_row();
 
         radio_antenna_row(ui, caps, antenna_rx, "icomnet_antenna", cmds);
+        radio_rx_antenna_row(ui, caps, rx_antenna, cmds);
         radio_power_row(ui, caps, cmds);
 
         ui.label("Audio sample rate");
@@ -3033,6 +3489,18 @@ pub(in crate::app) fn settings_smartsdr_tab(
             egui::TextEdit::singleline(&mut cfg.smartsdr.gui_client_id)
                 .desired_width(280.0)
                 .hint_text("optional, e.g. a UUID of your own"),
+        );
+        ui.end_row();
+
+        ui.label("Invert spectrum");
+        crate::chrome::checkbox(ui, &mut cfg.smartsdr.swap_iq, "Swap I/Q").on_hover_text(
+            "Mirror the radio's I/Q about the centre of the panadapter. Off by default, \
+             which is how a FLEX-6600 was verified.\n\n\
+             Try it if receive audio is unintelligible on USB *and* on LSB and nothing \
+             decodes, while the waterfall looks entirely convincing — that is what a \
+             mirrored stream looks like, and it is the one fault with no other symptom \
+             (issue #368). If it is not that, turning this on makes it obvious rather \
+             than subtle. Applies on Apply / reconnect.",
         );
         ui.end_row();
 
@@ -5920,7 +6388,7 @@ pub(in crate::app) fn settings_sdrplay_tab(
     can_probe: bool,
     cmds: &mut Vec<Command>,
 ) {
-    use sdroxide_types::{SdrPlayAgc, SdrPlayConfig, SdrPlayDuoTuner, SdrPlayModel};
+    use sdroxide_types::{SdrPlayAgc, SdrPlayConfig, SdrPlayDuoTuner, SdrPlayHdrBw, SdrPlayModel};
     let Some(cfg) = radio_edit.as_mut() else {
         ui.label("Waiting for the configuration of the machine the radio is attached to.");
         return;
@@ -6000,8 +6468,14 @@ pub(in crate::app) fn settings_sdrplay_tab(
     }
 
     // Same story as the ports: an RSPdx guessed to be an RSP1B would lose two
-    // thirds of its LNA range. The open device publishes the real one. Hoisted
-    // out of the grid because the second tuner's ladder is the same ladder.
+    // thirds of its LNA range. The open device publishes the real one — and
+    // publishes it *per band*, re-sent on every retune, so this follows the
+    // dial rather than offering a ladder the current band does not have.
+    // Hoisted out of the grid because the second tuner's ladder is the same
+    // ladder.
+    //
+    // The fallback is the model's widest, which is all that can be said about
+    // a receiver that is not open: there is no band yet to narrow it to.
     let max_lna = open
         .and_then(|c| c.gains.iter().find(|g| g.name == SdrPlayConfig::LNA_ELEMENT))
         .map(|g| (-g.min_db).round().clamp(0.0, 255.0) as u8)
@@ -6137,11 +6611,20 @@ pub(in crate::app) fn settings_sdrplay_tab(
         if cfg.sdrplay.agc != SdrPlayAgc::Off {
             ui.label("AGC set point").on_hover_text(
                 "Signal level the loop holds the ADC at. Lower leaves more \
-                 headroom for signals off-channel.",
+                 headroom for signals off-channel. How low it may go depends on \
+                 the sample rate — above 8.064 Msps the converter has less \
+                 headroom to give, and above 9.216 Msps less still.",
             );
+            // The range the *rate* allows, not the widest any rate allows: the
+            // converter trades headroom for speed, and the API refuses a set
+            // point below what the rate can reach. At 10 Msps the floor is
+            // -48, and this backend offers 10 Msps.
+            let sp = cfg.sdrplay.agc_setpoint_range();
+            let (sp_lo, sp_hi) = (*sp.start(), *sp.end());
+            cfg.sdrplay.agc_setpoint_dbfs = cfg.sdrplay.agc_setpoint_dbfs.clamp(sp_lo, sp_hi);
             if crate::chrome::slider(
                 ui,
-                Slider::new(&mut cfg.sdrplay.agc_setpoint_dbfs, -72..=-20).suffix(" dBFS"),
+                Slider::new(&mut cfg.sdrplay.agc_setpoint_dbfs, sp_lo..=sp_hi).suffix(" dBFS"),
             )
             .changed()
             {
@@ -6155,18 +6638,19 @@ pub(in crate::app) fn settings_sdrplay_tab(
         }
 
         ui.label("IF gain reduction").on_hover_text(
-            "The RSP's native gain unit: 20 dB is maximum gain, 59 dB minimum. \
+            "The RSP's native gain unit: 20 dB is maximum gain (0 with the extended \
+             range below), 59 dB minimum. \
              Applies immediately. Ignored while the AGC is running — the loop \
              owns this value then, and the S-meter shows what it settled on.",
         );
+        // Read before the borrow below: the floor is a property of the whole
+        // config, and the slider takes one field of it mutably.
+        let if_gr_min = cfg.sdrplay.if_gr_min();
         ui.add_enabled_ui(cfg.sdrplay.agc == SdrPlayAgc::Off, |ui| {
             if crate::chrome::slider(
                 ui,
-                Slider::new(
-                    &mut cfg.sdrplay.if_gr_db,
-                    SdrPlayConfig::IF_GR_MIN..=SdrPlayConfig::IF_GR_MAX,
-                )
-                .suffix(" dB"),
+                Slider::new(&mut cfg.sdrplay.if_gr_db, if_gr_min..=SdrPlayConfig::IF_GR_MAX)
+                    .suffix(" dB"),
             )
             .changed()
             {
@@ -6179,15 +6663,50 @@ pub(in crate::app) fn settings_sdrplay_tab(
         });
         ui.end_row();
 
+        ui.label("Extended IF range").on_hover_text(
+            "Lets the IF gain reduction go below 20 dB, down to 0 — the last 20 dB \
+             of gain the receiver has. Off is the API's own default and the right \
+             one for ordinary listening, because the bottom of the range is where \
+             an RSP is easiest to overload. Worth having on for weak signals with \
+             the LNA already at 0. It also lets the AGC set point go up to 0 dBFS. \
+             Applies immediately.",
+        );
+        {
+            let mut on = cfg.sdrplay.extended_if_gr;
+            if ui.checkbox(&mut on, "Allow IF gain reduction below 20 dB").changed() {
+                cfg.sdrplay.extended_if_gr = on;
+                // The floor moves under the value, so put it back in range
+                // before the slider above redraws with the new bound.
+                let min = cfg.sdrplay.if_gr_min();
+                cfg.sdrplay.if_gr_db = cfg.sdrplay.if_gr_db.max(min);
+                cmds.push(Command::SetGain {
+                    dir: Direction::Rx,
+                    element: SdrPlayConfig::EXTENDED_IF_GR_ELEMENT.to_string(),
+                    db: if on { 1.0 } else { 0.0 },
+                });
+            }
+        }
+        ui.end_row();
+
         ui.label("LNA state").on_hover_text(
             "Front-end attenuation in steps: 0 is maximum gain, each step up \
              switches more attenuation in. Some bands have fewer steps — the \
-             driver clamps and keeps your choice for when you tune back. \
-             Applies immediately.",
+             driver clamps and keeps your choice for when you tune back, and \
+             the rail here ends at what the band the radio is on will take. A \
+             higher choice made on another band is kept and still shown beside \
+             it. Applies immediately.",
         );
-        if crate::chrome::slider(ui, Slider::new(&mut cfg.sdrplay.lna_state, 0..=max_lna))
-            .on_hover_text("0 = max gain")
-            .changed()
+        // Clamped on edit only. The rail is this band's, but the value is a
+        // stored preference that outlives the band: clamping it on sight would
+        // have merely opening this tab on 40 m quietly trim a setting chosen
+        // for 2 m — against the promise in the hover text right above.
+        if crate::chrome::slider(
+            ui,
+            Slider::new(&mut cfg.sdrplay.lna_state, 0..=max_lna)
+                .clamping(egui::SliderClamping::Edits),
+        )
+        .on_hover_text("0 = max gain")
+        .changed()
         {
             cmds.push(Command::SetGain {
                 dir: Direction::Rx,
@@ -6321,8 +6840,16 @@ pub(in crate::app) fn settings_sdrplay_tab(
             if ui
                 .checkbox(&mut on, "Enable below 2 MHz")
                 .on_hover_text(
-                    "The RSPdx's high-dynamic-range path for LF/MF. Not yet \
-                     verified against hardware. Applies immediately.",
+                    "The RSPdx's high-dynamic-range path for LF/MF. Applies \
+                     immediately.\n\nIt does not work yet: on the one RSPdx it has been \
+                     tried against, switching it on silences the receiver — at every \
+                     centre, filter, port, gain and rate tried. Whatever the mode needs \
+                     is not on the documented API surface, and finding it is somebody's \
+                     next job. Leave this off unless you are the one looking.\n\nWhat is \
+                     known: it is not a mode that follows the dial. The path has a fixed \
+                     analog filter, built only at the centres listed under the filter \
+                     below, so tuning anywhere else could not work even once the rest \
+                     does.",
                 )
                 .changed()
             {
@@ -6334,6 +6861,32 @@ pub(in crate::app) fn settings_sdrplay_tab(
                 });
             }
             ui.end_row();
+
+            // Only with the path switched on: the filter is a property of a
+            // mode that is otherwise off, and a control that does nothing is
+            // worse than one that is not there.
+            if cfg.sdrplay.hdr {
+                ui.label("HDR filter").on_hover_text(format!(
+                    "The analog filter in front of the HDR path — a different control \
+                     from the receiver's own bandwidth. Each setting is built at a \
+                     fixed set of centres and can do nothing elsewhere; this one is \
+                     built at {}. Applies immediately.\n\nThe path itself does not work \
+                     yet — see the switch above — so this chooses a filter for a mode \
+                     that is currently silent.",
+                    cfg.sdrplay.hdr_bw.centres_label(),
+                ));
+                let mut bw = cfg.sdrplay.hdr_bw;
+                enum_combo(ui, "sdrplay_hdr_bw", &mut bw, &SdrPlayHdrBw::ALL, SdrPlayHdrBw::label);
+                if bw != cfg.sdrplay.hdr_bw {
+                    cfg.sdrplay.hdr_bw = bw;
+                    cmds.push(Command::SetGain {
+                        dir: Direction::Rx,
+                        element: SdrPlayConfig::HDR_BW_ELEMENT.to_string(),
+                        db: f64::from(bw.code()),
+                    });
+                }
+                ui.end_row();
+            }
         }
 
         if model.has_bias_tee() {
@@ -6462,9 +7015,16 @@ pub(in crate::app) fn settings_sdrplay_tab(
                          a distorted copy of the interference — which cannot be subtracted \
                          from an undistorted one. Applies immediately.",
                     );
-                    if crate::chrome::slider(ui, Slider::new(&mut div.lna_state, 0..=max_lna))
-                        .on_hover_text("0 = max gain")
-                        .changed()
+                    // Clamped on edit only, for the same reason as the first
+                    // tuner's above: the rail is this band's, the value is a
+                    // preference that outlives it.
+                    if crate::chrome::slider(
+                        ui,
+                        Slider::new(&mut div.lna_state, 0..=max_lna)
+                            .clamping(egui::SliderClamping::Edits),
+                    )
+                    .on_hover_text("0 = max gain")
+                    .changed()
                     {
                         push_gain(cmds, SdrPlayConfig::AUX_LNA_ELEMENT, -(div.lna_state as f64));
                     }

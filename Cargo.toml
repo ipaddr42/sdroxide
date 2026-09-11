@@ -26,7 +26,7 @@ ewebsock = { path = "vendor/ewebsock" }
 soapysdr = { path = "vendor/soapysdr" }
 
 [workspace.package]
-version = "1.6.3"
+version = "1.6.6"
 edition = "2024"
 # The native binary links mfsk-core (GPL-3.0-or-later) for FT8/FT4 and the
 # DeepCW model (AGPL-3.0-only) for CW, so the built binary carries both. AGPL is
@@ -70,6 +70,12 @@ opt-level = 2
 # that alone outweighs the rest of the receive chain, exactly as the ISM gate
 # does.
 [profile.dev.package.sdroxide-vdl2]
+opt-level = 2
+
+# Both AIS channels get a down-converter, a burst gate and a receive filter over
+# the same window, and the filter is a dot product per sample; unoptimized that
+# alone outweighs the rest of the receive chain, exactly as the VDL2 lane does.
+[profile.dev.package.sdroxide-ais]
 opt-level = 2
 
 # RADE's per-frame buffer shuffling sits between two C libraries that are
@@ -130,6 +136,7 @@ sdroxide-ism = { path = "crates/sdroxide-ism" }
 sdroxide-aprs = { path = "crates/sdroxide-aprs" }
 sdroxide-adsb = { path = "crates/sdroxide-adsb" }
 sdroxide-vdl2 = { path = "crates/sdroxide-vdl2" }
+sdroxide-ais = { path = "crates/sdroxide-ais" }
 
 serde = { version = "1", features = ["derive"] }
 num-complex = "0.4"

@@ -859,6 +859,20 @@ pub enum Command {
     /// Appended for the usual reason — postcard numbers variants by position.
     SetRigPower(bool),
 
+    /// Switch the radio's separate *receiving* antenna into the receive path
+    /// (`true`), or out of it (`false`) — an IC-7300MK2's RX ANT IN/OUT, an
+    /// IC-7610's RX ANT (issue #229). The transmit aerial is not touched.
+    ///
+    /// The one time sdroxide writes that setting: everywhere else it is read
+    /// from the radio and adopted, because the radio recalls it per band and
+    /// switching a receive aerial nobody asked about takes it out of use with
+    /// nothing on screen to say so.
+    ///
+    /// Ignored where [`crate::DeviceCaps::has_rx_antenna`] is false.
+    ///
+    /// Appended for the usual reason — postcard numbers variants by position.
+    SetRxAntenna(bool),
+
     /// Add channels to the memory list — a repeater directory or a channel
     /// table read from a file (issue #234).
     ///
@@ -909,6 +923,18 @@ pub enum Command {
     /// Appended for the usual reason — postcard numbers variants by position.
     SetRelayConfig(Box<crate::RelayConfig>),
 
+    /// Set how the AIS decoder behaves: which of the two channels to listen on,
+    /// how hard a slot has to be, how long a vessel stays on the map and how
+    /// much trail it leaves.
+    ///
+    /// The engine persists it to `ais.json` and echoes it back in
+    /// [`crate::RadioState::ais`], so there is no apply step and no way for the
+    /// panel's copy and the engine's to drift apart — the same bargain
+    /// [`Command::SetAdsbConfig`] strikes.
+    ///
+    /// Appended for the usual reason — postcard numbers variants by position.
+    SetAisConfig(crate::AisSettings),
+
     /// Close one of the T/R switch's contacts briefly, so the operator can hear
     /// the relay and check their wiring with the transmitter cold.
     ///
@@ -921,4 +947,80 @@ pub enum Command {
     TestRelay {
         channel: u8,
     },
+
+    /// Replace the operator's own additions to the digital modes' frequency
+    /// tables (issue #268), saved to `digi_presets.json` and echoed back in
+    /// [`crate::RadioEvent::StationConfig`].
+    ///
+    /// The whole list rather than one entry: it is short, the picker edits it
+    /// in place, and sending it whole means a client and the station cannot
+    /// come to disagree about what is in it — the same latest-wins rule the
+    /// rest of the station's configuration follows.
+    ///
+    /// Appended for the usual reason — postcard numbers variants by position.
+    SetDigiPresets(Vec<crate::DigiPreset>),
+
+    /// Controlled-envelope SSB: how hard voice is driven into the envelope
+    /// processor, in decibels, 0 being off (issue #283). Clamped to
+    /// `0..=`[`crate::CESSB_MAX_DB`], and ignored by every mode but USB and LSB.
+    ///
+    /// Appended for the usual reason — postcard numbers variants by position.
+    SetCessb(f32),
+
+    /// Point the front end so that a *wideband* decoder's window is centred
+    /// here — the ISM window's band buttons, and anything else that means "go
+    /// to this band" rather than "listen to this frequency".
+    ///
+    /// Not [`Command::SetVfo`], and the difference is not cosmetic. The dial is
+    /// where the demodulator listens; the wideband lanes are placed from the
+    /// front end's own centre frequency, and on a zero-IF receiver those are
+    /// not the same place — a PlutoSDR parks its local oscillator a quarter of
+    /// a span above the dial. Tuning the dial to a band centre therefore lands
+    /// the window a quarter-span above the band, and on a receiver with no
+    /// slack to slide the window back — one whose whole stream is barely wider
+    /// than the plan — it stays there. That is issue #310: pressing **868 MHz
+    /// EU** on a 2.5 Msps PlutoSDR put the window on 869.275 MHz and left
+    /// 868.300 MHz outside it.
+    ///
+    /// The engine subtracts its own LO offset, so on a front end that has none
+    /// this is exactly [`Command::SetVfo`] on the active VFO, and unlike a dial
+    /// move it always retunes rather than only when the old centre had drifted
+    /// out of span.
+    ///
+    /// Appended for the usual reason — postcard numbers variants by position.
+    TuneWidebandTo(f64),
+
+    /// A contact was entered in the log by hand — pass it on to whatever is
+    /// listening for logged QSOs (issue #341).
+    ///
+    /// The digital modes' own contacts do not come this way: the sequencer logs
+    /// them inside the engine, which broadcasts them there. What this carries
+    /// is everything else — an SSB or CW contact typed into the log window —
+    /// which until now reached the operator's own logbook and nothing beyond
+    /// it, so a station forwarding to MacLoggerDX or N1MM saw its FT8 and
+    /// nothing else.
+    ///
+    /// Deliberately not sent for an ADIF *import*: a file of last year's
+    /// contacts is not a contact being made, and pushing a few thousand of them
+    /// at a logger would be worse than useless. Nor for an *edit* — the
+    /// protocol has no message for one, and re-sending the record would log it
+    /// twice.
+    ///
+    /// Appended for the usual reason — postcard numbers variants by position.
+    LogQso(Box<crate::QsoRecord>),
+
+    /// SSTV: abandon the picture being received and listen for the next header.
+    ///
+    /// A receiver that has locked on is committed for the whole length of the
+    /// mode it locked on to, and Scottie DX is four and a half minutes. A VIS
+    /// misread as a slow mode therefore takes the receiver off the air until it
+    /// runs out, and on QO-100 — where one station follows another over the
+    /// same transponder — that is the next few pictures gone (issue #397).
+    ///
+    /// Receive only. It does not touch a transmission in progress, which is
+    /// what [`Command::DigiAbortTx`] is for, and it does not put the mode
+    /// selection back to Auto.
+    ///
+    /// Appended for the usual reason — postcard numbers variants by position.
+    SstvRestartRx,
 }

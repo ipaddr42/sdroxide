@@ -20,6 +20,8 @@
 //! operator mid-message.
 
 use std::collections::{HashMap, VecDeque};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
 use std::time::SystemTime;
 
@@ -113,6 +115,96 @@ struct DecodeJob {
     speed: Js8Speed,
 }
 
+/// Jobs allowed to be waiting for the decode worker before a new slot is
+/// dropped instead of queued.
+///
+/// One speed cannot outrun the worker — a slot's decode takes far less than a
+/// slot — but four of them on a slow machine could, and a queue that grows
+/// without bound turns a busy minute into a receiver permanently minutes
+/// behind the band. Two per speed: enough that a slot arriving while the
+/// previous one is still being decoded waits rather than being thrown away,
+/// and few enough that the backlog can never become the problem.
+const MAX_JOBS_PER_SPEED: usize = 2;
+
+/// One speed's own slot clock and the audio accumulating for it.
+///
+/// The four JS8 speeds are not four settings of one receiver: they are four
+/// waveforms on four different slot clocks, 30 / 15 / 10 / 6 seconds long, and
+/// a slot of one is not a slot of any other. So decoding more than one at a
+/// time is not a matter of running the decoder twice over the same audio —
+/// each speed needs its own boundary, its own buffer, and its own submission
+/// (issue #358).
+struct SpeedSlot {
+    speed: Js8Speed,
+    scheduler: SlotScheduler,
+    /// The audio since this speed's last boundary, at [`DECODE_RATE`].
+    buf: Vec<i16>,
+    /// Which slot the buffer is filling. `i64::MIN` before the first boundary,
+    /// which is the one slot that is thrown away — it started mid-slot and is
+    /// not a whole transmission of anything.
+    last_idx: i64,
+}
+
+impl SpeedSlot {
+    fn new(speed: Js8Speed) -> SpeedSlot {
+        let params = DigiParams::for_js8(speed);
+        SpeedSlot {
+            speed,
+            scheduler: SlotScheduler::new(params.slot_s, params.tx_offset_s),
+            buf: Vec::new(),
+            last_idx: i64::MIN,
+        }
+    }
+
+    fn slot_samples(&self) -> usize {
+        (self.speed.slot_s() * DECODE_RATE) as usize
+    }
+
+    /// Take the resampled tap. A slot and a quarter is plenty of slack for a
+    /// late boundary; more just costs memory.
+    fn push(&mut self, samples: &[f32]) {
+        self.buf.extend(samples.iter().map(|&s| (s.clamp(-1.0, 1.0) * 28_000.0) as i16));
+        let cap = self.slot_samples() * 5 / 4;
+        if self.buf.len() > cap {
+            let drop = self.buf.len() - cap;
+            self.buf.drain(..drop);
+        }
+    }
+
+    /// The finished slot, when `now` has crossed this speed's boundary.
+    ///
+    /// Half a slot is the floor: a buffer shorter than that is what a speed
+    /// switched on mid-slot, or a receive path that was paused, leaves behind,
+    /// and there is no transmission of this speed inside it to find.
+    fn take_finished(&mut self, now: SystemTime) -> Option<DecodeJob> {
+        let idx = self.scheduler.slot_index(now);
+        if idx == self.last_idx {
+            return None;
+        }
+        let job =
+            (self.last_idx != i64::MIN && self.buf.len() >= self.slot_samples() / 2).then(|| {
+                DecodeJob {
+                    audio: std::mem::take(&mut self.buf),
+                    slot_utc: self.scheduler.slot_start_unix(self.last_idx) as i64,
+                    speed: self.speed,
+                }
+            });
+        self.buf.clear();
+        self.last_idx = idx;
+        job
+    }
+}
+
+/// The speeds a station is listening on: all four when the operator asked for
+/// multi-speed decoding, otherwise only the one being worked (issue #358).
+fn listening_speeds(cfg: &DigiConfig) -> Vec<SpeedSlot> {
+    if cfg.js8_multi_decode {
+        Js8Speed::ALL.into_iter().map(SpeedSlot::new).collect()
+    } else {
+        vec![SpeedSlot::new(cfg.js8_speed)]
+    }
+}
+
 pub struct Js8Controller {
     cfg: DigiConfig,
     speed: Js8Speed,
@@ -120,9 +212,14 @@ pub struct Js8Controller {
     scheduler: SlotScheduler,
 
     resampler: Option<MonoResampler>,
-    slot_buf: Vec<i16>,
+    /// One per speed being listened for — one entry normally, four with
+    /// multi-speed decoding on. See [`SpeedSlot`].
+    rx_slots: Vec<SpeedSlot>,
     tap_scratch: Vec<f32>,
-    last_slot_idx: i64,
+    /// Slots handed to the worker and not yet decoded, so four speeds cannot
+    /// queue up faster than one thread can get through them. See
+    /// [`MAX_JOBS_PER_SPEED`].
+    jobs_queued: Arc<AtomicUsize>,
 
     dial_hz: f64,
     audio_hz: f32,
@@ -167,6 +264,8 @@ impl Js8Controller {
         let params = DigiParams::for_js8(speed);
         let (job_tx, job_rx) = std::sync::mpsc::channel::<DecodeJob>();
         let (res_tx, res_rx) = std::sync::mpsc::channel::<(i64, Vec<Js8Decode>)>();
+        let jobs_queued = Arc::new(AtomicUsize::new(0));
+        let worker_jobs = Arc::clone(&jobs_queued);
 
         // Belief propagation must not run on the audio thread; a Slow slot is
         // 28 s of spectrogram and even Turbo is far more than one 10 ms block.
@@ -180,6 +279,10 @@ impl Js8Controller {
                     // turns most candidates away long before the FEC. There is
                     // no reason to make an operator opt into it.
                     let decodes = decode_slot_for(job.speed, &job.audio, Js8Depth::BpOsd);
+                    // Counted down after the decode, not after the result is
+                    // taken: what the cap is protecting is this thread's
+                    // backlog, and the slot stops being part of it here.
+                    worker_jobs.fetch_sub(1, Ordering::Relaxed);
                     if res_tx.send((job.slot_utc, decodes)).is_err() {
                         break;
                     }
@@ -196,9 +299,9 @@ impl Js8Controller {
             params,
             scheduler: SlotScheduler::new(params.slot_s, params.tx_offset_s),
             resampler: MonoResampler::new(tap_rate, DECODE_RATE),
-            slot_buf: Vec::new(),
+            rx_slots: listening_speeds(&cfg),
             tap_scratch: Vec::new(),
-            last_slot_idx: i64::MIN,
+            jobs_queued,
             dial_hz: 0.0,
             audio_hz: 1500.0,
             job_tx,
@@ -242,10 +345,6 @@ impl Js8Controller {
             status: self.cfg.js8_status.clone(),
             hearing: self.heard.iter().take(4).map(|h| h.call.clone()).collect(),
         }
-    }
-
-    fn slot_samples(&self) -> usize {
-        (self.params.slot_s * DECODE_RATE) as usize
     }
 
     /// Queue the frames for a message, replacing anything already waiting.
@@ -708,6 +807,32 @@ fn grid_of(msg: &Js8Msg) -> Option<String> {
     })
 }
 
+/// The reception report a completed message is worth, or `None` when it names
+/// nobody (issue #357).
+///
+/// Once per completed message rather than once per frame, which is the
+/// difference between JS8 and every slotted mode here: a JS8 decode is
+/// seventy-two bits, a station's message can be a dozen of them, and only the
+/// last one to arrive has a whole message — and therefore a callsign — behind
+/// it. Reporting per frame would post a twelve-frame message as twelve
+/// receptions of the same station in the same minute.
+///
+/// Whether it is *our own* callsign is not decided here: the engine holds the
+/// station identity, and it applies the same test to every mode's reports.
+fn heard_report(msg: &Js8Msg, grid: Option<&str>) -> Option<DigiAction> {
+    let call = msg.from.trim();
+    if call.is_empty() {
+        return None;
+    }
+    Some(DigiAction::Heard {
+        call: call.to_string(),
+        grid: grid.unwrap_or_default().to_string(),
+        audio_hz: msg.audio_hz,
+        snr_db: msg.snr_db,
+        slot_utc: msg.last_slot_utc,
+    })
+}
+
 impl DigiEngine for Js8Controller {
     fn mode(&self) -> Mode {
         Mode::Js8
@@ -717,14 +842,11 @@ impl DigiEngine for Js8Controller {
         let Some(rs) = self.resampler.as_mut() else { return };
         self.tap_scratch.clear();
         rs.push(tap, &mut self.tap_scratch);
-        self.slot_buf
-            .extend(self.tap_scratch.iter().map(|&s| (s.clamp(-1.0, 1.0) * 28_000.0) as i16));
-        // A slot and a quarter is plenty of slack for a late boundary; more
-        // just costs memory.
-        let cap = self.slot_samples() * 5 / 4;
-        if self.slot_buf.len() > cap {
-            let drop = self.slot_buf.len() - cap;
-            self.slot_buf.drain(..drop);
+        // Resampled once and handed to each speed being listened for: the
+        // 12 kHz stream is the same for all of them, only the slot boundaries
+        // differ.
+        for slot in &mut self.rx_slots {
+            slot.push(&self.tap_scratch);
         }
     }
 
@@ -753,7 +875,16 @@ impl DigiEngine for Js8Controller {
             for d in &decodes {
                 if let Some(msg) = self.assembler.push(d, slot_utc) {
                     let grid = grid_of(&msg);
-                    self.note_heard(&msg.from, grid, msg.snr_db, msg.audio_hz, msg.last_slot_utc);
+                    self.note_heard(
+                        &msg.from,
+                        grid.clone(),
+                        msg.snr_db,
+                        msg.audio_hz,
+                        msg.last_slot_utc,
+                    );
+                    // ...and to the reporting networks, which is the same fact
+                    // said outwards (issue #357).
+                    actions.extend(heard_report(&msg, grid.as_deref()));
                     // Answer before storing, so a reply is queued even if the
                     // conversation list is already full.
                     let policy = ReplyPolicy {
@@ -816,20 +947,24 @@ impl DigiEngine for Js8Controller {
             self.status_dirty = true;
         }
 
-        // 2. Slot boundary — hand the finished slot to the worker.
-        let idx = self.scheduler.slot_index(now);
-        if idx != self.last_slot_idx {
-            if self.last_slot_idx != i64::MIN && self.slot_buf.len() >= self.slot_samples() / 2 {
-                let audio = std::mem::take(&mut self.slot_buf);
-                let slot_utc = self.scheduler.slot_start_unix(self.last_slot_idx) as i64;
-                // A dropped job costs one slot of decodes; a queue that grows
-                // without bound costs the whole session.
-                let _ = self.job_tx.send(DecodeJob { audio, slot_utc, speed: self.speed });
-            } else {
-                self.slot_buf.clear();
+        // 2. Slot boundaries — hand each speed's finished slot to the worker.
+        //    One speed normally; all four when the operator asked to hear the
+        //    whole band rather than one quarter of it (issue #358), each on its
+        //    own clock, because a Turbo slot is not a sixth of a Normal one.
+        let cap = self.rx_slots.len() * MAX_JOBS_PER_SPEED;
+        for slot in &mut self.rx_slots {
+            let Some(job) = slot.take_finished(now) else { continue };
+            // A dropped job costs one slot of decodes; a queue that grows
+            // without bound costs the whole session.
+            if self.jobs_queued.load(Ordering::Relaxed) >= cap {
+                continue;
             }
-            self.last_slot_idx = idx;
+            self.jobs_queued.fetch_add(1, Ordering::Relaxed);
+            if self.job_tx.send(job).is_err() {
+                self.jobs_queued.fetch_sub(1, Ordering::Relaxed);
+            }
         }
+        let idx = self.scheduler.slot_index(now);
 
         // 3. Periodic heartbeat, if the operator asked for one.
         self.tick_heartbeat(unix_now);
@@ -906,7 +1041,9 @@ impl DigiEngine for Js8Controller {
 
     fn abort(&mut self) {
         self.abort_tx();
-        self.slot_buf.clear();
+        for slot in &mut self.rx_slots {
+            slot.buf.clear();
+        }
     }
 
     fn abort_tx(&mut self) {
@@ -923,6 +1060,14 @@ impl DigiEngine for Js8Controller {
         self.speed = cfg.js8_speed;
         self.params = DigiParams::for_js8(self.speed);
         self.scheduler = SlotScheduler::new(self.params.slot_s, self.params.tx_offset_s);
+        // Which speeds are being listened for is the one thing here that can
+        // change without the controller being rebuilt, so it is rebuilt in
+        // place — and only when it really changed, or every config write would
+        // throw away a slot that was half collected.
+        let want: Vec<Js8Speed> = listening_speeds(&cfg).into_iter().map(|s| s.speed).collect();
+        if self.rx_slots.iter().map(|s| s.speed).ne(want.iter().copied()) {
+            self.rx_slots = want.into_iter().map(SpeedSlot::new).collect();
+        }
         self.assembler.set_my_call(&Self::call_of(&cfg));
         self.assembler.set_timeout(i64::from(cfg.js8_assembly_timeout_s));
         self.assembler.set_my_groups(cfg.js8_groups.clone());
@@ -1021,6 +1166,11 @@ impl DigiEngine for Js8Controller {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A `SystemTime` at `unix` seconds, for the slot-boundary arithmetic.
+    fn at(unix: f64) -> SystemTime {
+        std::time::UNIX_EPOCH + std::time::Duration::from_secs_f64(unix)
+    }
 
     fn cfg() -> DigiConfig {
         DigiConfig {
@@ -1149,6 +1299,62 @@ mod tests {
         c.set_config(DigiConfig { js8_speed: Js8Speed::Turbo, ..cfg() });
         assert_eq!(c.params.slot_s, 6.0);
         assert_eq!(c.status().js8.expect("js8 status").speed, Js8Speed::Turbo);
+    }
+
+    /// MULTI listens on all four speeds at once; without it a station on any
+    /// other speed is simply not there, which is why an exchange between two
+    /// speeds could not happen at all (issue #358). The transmit speed is
+    /// untouched by it: what goes out is still the one chip that is lit.
+    #[test]
+    fn multi_decode_listens_on_every_speed_without_changing_what_is_transmitted() {
+        let mut c = Js8Controller::new(cfg(), 48_000.0);
+        assert_eq!(c.rx_slots.iter().map(|s| s.speed).collect::<Vec<_>>(), [Js8Speed::Normal]);
+
+        c.set_config(DigiConfig { js8_multi_decode: true, ..cfg() });
+        assert_eq!(c.rx_slots.iter().map(|s| s.speed).collect::<Vec<_>>(), Js8Speed::ALL);
+        assert_eq!(c.speed, Js8Speed::Normal, "the transmit speed is not what MULTI changes");
+        assert_eq!(c.params.slot_s, 15.0, "and neither is the transmit slot clock");
+
+        // Each speed keeps its own boundary, which is the whole difficulty: a
+        // Turbo slot is six seconds and a Slow one thirty, so one clock cannot
+        // serve both.
+        for slot in &c.rx_slots {
+            assert_eq!(slot.scheduler.slot_index(at(60.0)), (60.0 / slot.speed.slot_s()) as i64);
+        }
+
+        // Turning it back off leaves the one speed being worked.
+        c.set_config(cfg());
+        assert_eq!(c.rx_slots.iter().map(|s| s.speed).collect::<Vec<_>>(), [Js8Speed::Normal]);
+    }
+
+    /// A speed's slot is submitted on *its own* boundary, with the audio that
+    /// arrived inside it, and the first partial slot is thrown away rather than
+    /// decoded — it started mid-transmission and holds a whole frame of
+    /// nothing.
+    #[test]
+    fn each_speed_hands_over_its_own_slot_and_only_a_whole_one() {
+        let mut slot = SpeedSlot::new(Js8Speed::Turbo);
+        let full = slot.slot_samples();
+
+        // Opening mid-slot: the boundary passes, and what was collected before
+        // it goes nowhere.
+        slot.push(&vec![0.1; full]);
+        assert!(slot.take_finished(at(6.0)).is_none(), "the first boundary only starts the clock");
+        assert!(slot.buf.is_empty());
+
+        // A slot too short to hold a transmission is dropped, not decoded.
+        slot.push(&vec![0.1; full / 4]);
+        assert!(slot.take_finished(at(12.0)).is_none(), "a quarter slot has nothing in it to find");
+
+        // A whole one is handed over, stamped with the slot it filled.
+        slot.push(&vec![0.1; full]);
+        let job = slot.take_finished(at(18.0)).expect("a full slot is decoded");
+        assert_eq!(job.speed, Js8Speed::Turbo);
+        assert_eq!(job.slot_utc, 12, "the slot it filled, not the one it was handed over in");
+        assert_eq!(job.audio.len(), full);
+        // ...and taking it leaves nothing behind for the next slot to inherit.
+        assert!(slot.buf.is_empty());
+        assert!(slot.take_finished(at(18.0)).is_none(), "the same boundary twice is one slot");
     }
 
     #[test]
@@ -1328,6 +1534,7 @@ mod tests {
                 frames: 1,
                 complete: true,
                 to_me: true,
+                speed: Js8Speed::Normal,
             };
             let reply = auto_reply(&msg, &c.station(), ReplyPolicy::default())
                 .unwrap_or_else(|| panic!("{cmd} went unanswered"));
@@ -1370,6 +1577,51 @@ mod tests {
         }
     }
 
+    /// A station heard is reported outwards as well as listed on screen, so a
+    /// JS8 station appears on the PSK Reporter map like an FT8 one — issue #357
+    /// is that it never did, because a JS8 *decode* is one frame of a message
+    /// and names nobody.
+    #[test]
+    fn a_completed_message_is_worth_one_reception_report() {
+        let msg = Js8Msg {
+            from: "KN4CRD".into(),
+            to: "@ALLCALL".into(),
+            text: "EM73".into(),
+            cmd: Some("HB".into()),
+            snr_db: -11,
+            audio_hz: 1234.0,
+            first_slot_utc: 1000,
+            last_slot_utc: 1030,
+            frames: 12,
+            complete: true,
+            to_me: false,
+            speed: Js8Speed::Normal,
+        };
+        let Some(DigiAction::Heard { call, grid, audio_hz, snr_db, slot_utc }) =
+            heard_report(&msg, grid_of(&msg).as_deref())
+        else {
+            panic!("a named station has to be reported");
+        };
+        assert_eq!(call, "KN4CRD");
+        assert_eq!(grid, "EM73");
+        assert_eq!(audio_hz, 1234.0);
+        assert_eq!(snr_db, -11);
+        assert_eq!(slot_utc, 1030, "the slot it finished in, not the one it opened in");
+
+        // A grid nobody sent is no grid; PSK Reporter places the station from
+        // its own database rather than from one we invented.
+        let plain = Js8Msg { text: "HELLO".into(), ..msg.clone() };
+        assert!(matches!(
+            heard_report(&plain, grid_of(&plain).as_deref()),
+            Some(DigiAction::Heard { ref grid, .. }) if grid.is_empty()
+        ));
+
+        // A message whose sender the assembler never recovered names nobody,
+        // and a report with no callsign in it is not a report.
+        let anon = Js8Msg { from: String::new(), ..msg };
+        assert!(heard_report(&anon, None).is_none());
+    }
+
     #[test]
     fn a_station_that_sent_a_grid_is_remembered_with_it() {
         let hb = |text: &str, cmd: &str| Js8Msg {
@@ -1384,6 +1636,7 @@ mod tests {
             frames: 1,
             complete: true,
             to_me: true,
+            speed: Js8Speed::Normal,
         };
         assert_eq!(grid_of(&hb("EM73", "HB")).as_deref(), Some("EM73"));
         assert_eq!(grid_of(&hb("QF22", "CQ")).as_deref(), Some("QF22"));
@@ -1411,6 +1664,7 @@ mod tests {
             frames: 1,
             complete: true,
             to_me: true,
+            speed: Js8Speed::Normal,
         }
     }
 

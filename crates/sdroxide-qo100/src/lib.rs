@@ -6,5 +6,8 @@
 
 pub mod bpsk;
 mod controller;
+pub mod fec;
+pub mod rs;
+pub mod rx;
 
 pub use controller::Qo100Controller;

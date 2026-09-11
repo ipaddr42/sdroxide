@@ -101,6 +101,11 @@ struct Shared {
     remap_pipeline: wgpu::RenderPipeline,
     remap_layout: wgpu::BindGroupLayout,
     linear: wgpu::Sampler,
+    /// The same, unfiltered — what the waterfall is drawn through when the
+    /// operator has turned smoothing off. See [`UiSettings::waterfall_smooth`].
+    ///
+    /// [`UiSettings::waterfall_smooth`]: sdroxide_types::UiSettings::waterfall_smooth
+    nearest: wgpu::Sampler,
     lut_sampler: wgpu::Sampler,
     remap_sampler: wgpu::Sampler,
     /// The same, unfiltered — for the case a moving window makes the common
@@ -271,6 +276,8 @@ struct WaterfallResources {
     tex_w: u32,
     /// One render bind group per history texture; index by `active`.
     bind_group: [wgpu::BindGroup; 2],
+    /// The same pair bound to the unfiltered sampler — see [`Shared::nearest`].
+    bind_group_nearest: [wgpu::BindGroup; 2],
     /// `seq` of the last frame whose rows were appended.
     ///
     /// The same `Arc<SpectrumFrame>` is handed to every repaint until a new one
@@ -338,6 +345,14 @@ pub fn init(rs: &RenderState) {
         address_mode_v: wgpu::AddressMode::Repeat,
         mag_filter: wgpu::FilterMode::Linear,
         min_filter: wgpu::FilterMode::Linear,
+        ..Default::default()
+    });
+    // Both axes: a column is one FFT bin and a row is one transform, so
+    // interpolating either invents detail that was never measured.
+    let nearest = device.create_sampler(&wgpu::SamplerDescriptor {
+        label: Some("waterfall-sampler-nearest"),
+        address_mode_u: wgpu::AddressMode::ClampToEdge,
+        address_mode_v: wgpu::AddressMode::Repeat,
         ..Default::default()
     });
     let lut_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
@@ -509,6 +524,7 @@ pub fn init(rs: &RenderState) {
             remap_pipeline,
             remap_layout,
             linear,
+            nearest,
             lut_sampler,
             remap_sampler,
             remap_nearest,
@@ -573,7 +589,7 @@ impl WaterfallResources {
         });
 
         let lut_view = lut_tex.create_view(&Default::default());
-        let make_bg = |i: usize| {
+        let make_bg = |i: usize, hist_samp: &wgpu::Sampler| {
             device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("waterfall-bg"),
                 layout: &shared.layout,
@@ -585,7 +601,7 @@ impl WaterfallResources {
                     },
                     wgpu::BindGroupEntry {
                         binding: 2,
-                        resource: wgpu::BindingResource::Sampler(&shared.linear),
+                        resource: wgpu::BindingResource::Sampler(hist_samp),
                     },
                     wgpu::BindGroupEntry {
                         binding: 3,
@@ -598,7 +614,8 @@ impl WaterfallResources {
                 ],
             })
         };
-        let bind_group = [make_bg(0), make_bg(1)];
+        let bind_group = [make_bg(0, &shared.linear), make_bg(1, &shared.linear)];
+        let bind_group_nearest = [make_bg(0, &shared.nearest), make_bg(1, &shared.nearest)];
 
         let row_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("waterfall-rows"),
@@ -641,6 +658,7 @@ impl WaterfallResources {
         WaterfallResources {
             tex_w,
             bind_group,
+            bind_group_nearest,
             row_buf,
             hist,
             hist_view,
@@ -675,6 +693,8 @@ pub struct WaterfallCallback {
     pub rows_to_write: u32,
     /// Draw the newest row at the bottom, scrolling upwards.
     pub flip: bool,
+    /// Interpolate between bins and rows rather than drawing each as a block.
+    pub smooth: bool,
     /// Which radio's history to scroll — see [`WaterfallRegistry`].
     pub wf_id: u64,
     /// Columns the history should hold: the width the client has settled on
@@ -948,7 +968,8 @@ impl CallbackTrait for WaterfallCallback {
         let Some(reg) = resources.get::<WaterfallRegistry>() else { return };
         let Some(r) = reg.per.get(&self.wf_id) else { return };
         pass.set_pipeline(&reg.shared.pipeline);
-        pass.set_bind_group(0, &r.bind_group[r.active], &[]);
+        let bg = if self.smooth { &r.bind_group } else { &r.bind_group_nearest };
+        pass.set_bind_group(0, &bg[r.active], &[]);
         pass.draw(0..3, 0..1);
     }
 }

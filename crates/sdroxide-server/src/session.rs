@@ -180,6 +180,7 @@ async fn run_session(
         ism_status,
         adsb_status,
         vdl2_status,
+        ais_status,
         drm,
         relay,
     ) = {
@@ -203,6 +204,7 @@ async fn run_session(
             latest.ism_status.clone(),
             latest.adsb_status.clone(),
             latest.vdl2_status.clone(),
+            latest.ais_status.clone(),
             latest.drm.clone(),
             latest.relay.clone(),
         )
@@ -261,6 +263,12 @@ async fn run_session(
     // not an event that has already happened to somebody else.
     if let Some(st) = vdl2_status {
         let _ = socket.send(msg(&ServerMsg::Vdl2Status(st))).await;
+    }
+    // ...and the vessel table, most of all: at three minutes between reports
+    // from a ship at anchor, a client that had to wait for one would sit in
+    // front of a blank chart long enough to conclude the decoder was broken.
+    if let Some(st) = ais_status {
+        let _ = socket.send(msg(&ServerMsg::AisStatus(st))).await;
     }
     // And the transmit-image presets, for the same reason. The received
     // galleries are not replayed: a panel lists its store when it opens, which

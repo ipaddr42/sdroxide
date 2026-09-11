@@ -103,6 +103,13 @@ impl RigState {
 /// air: upper sideband with data in the audio. See [`from_hamlib_mode`] for why
 /// that matters. RIFP is the exception — its CPFSK profile keys the carrier —
 /// so it reports `PKTFM`.
+///
+/// From the mode alone, so it cannot see the two whose sideband follows the
+/// band (`Mode::sideband_follows_band`): SSTV and RADE on 160/80/40 m really
+/// are on the lower sideband and are still reported here as `PKTUSB`. What the
+/// radio does is unaffected — the sideband is decided in the engine and at the
+/// rig's own control layer — and the no-op rule in `set_mode` compares against
+/// whatever this says, so a client echoing the mode back still changes nothing.
 pub fn to_hamlib_mode(m: Mode) -> &'static str {
     match m {
         Mode::Lsb => "LSB",
@@ -120,10 +127,14 @@ pub fn to_hamlib_mode(m: Mode) -> &'static str {
         Mode::Rifp | Mode::Packet | Mode::Aprs | Mode::SstvFm | Mode::RttyFm => "PKTFM",
         // No rig has an ADS-B mode; a remote hamlib client asking is told the
         // widest FM there is, which is at least the right kind of receiver.
-        Mode::Wfm | Mode::Adsb | Mode::Vdl2 => "WFM",
+        Mode::Wfm | Mode::Adsb | Mode::Vdl2 | Mode::Ais => "WFM",
         Mode::Digu => "PKTUSB",
         Mode::Digl => "PKTLSB",
         Mode::Dsb => "DSB",
+        // Hamlib has no independent-sideband mode. AM is the nearest true
+        // statement about the signal — carrier on the dial, both sidebands
+        // wanted — and it is the setting an outboard decoder would want.
+        Mode::Isb => "AM",
         Mode::Spec => "SPEC",
         Mode::Rtty => "RTTY",
         Mode::Ft8

@@ -29,6 +29,26 @@ fn scale_h() -> f32 {
 /// Tuning rounds to this step on click-tune, unless the operator has changed
 /// [`WheelSettings::click_tune_step_hz`].
 const CLICK_TUNE_STEP: f64 = 10.0;
+/// Whether this drag is asking to move one filter edge on its own.
+///
+/// AM, FM and their relatives hold the two edges together, because in those
+/// modes the halves of the passband carry the same signal and narrowing one
+/// alone throws away half of it — see [`Mode::filter_symmetric`] and issue
+/// #256. That is the right default and it is what the presets do.
+///
+/// It is not always what the operator wants. A station splattering on one side
+/// of an AM carrier is answered by closing the passband on *that* side and
+/// leaving the other open: half the audio for none of the interference, which
+/// is a trade a listener is entitled to make (issue #335). So the rule is held
+/// for as long as a modifier is not, and released while it is.
+///
+/// Ctrl — Cmd on a Mac, which is what `command` means — because Shift is spoken
+/// for twice over on this widget already: held, it measures bandwidth, and with
+/// a click it places the second receiver.
+fn one_edge_at_a_time(ui: &egui::Ui) -> bool {
+    ui.input(|i| i.modifiers.command)
+}
+
 /// Pixel distance for grabbing a filter edge with a mouse, and the floor a
 /// touched layout's wider zone is never squeezed below. See `edge_grab`.
 const EDGE_GRAB_PX: f32 = 6.0;
@@ -156,8 +176,28 @@ impl WindowPan {
 
     /// The window the view may be zoomed and panned inside: the full-band lane
     /// where there is one, else the I/Q passband.
+    ///
+    /// Widened to take the passband in whenever the lane does not already
+    /// cover it. A lane is a picture of where the receiver was when its last
+    /// frame was analysed, and a retune moves the passband before the next one
+    /// arrives — an RX-888 crossing from HF to VHF is still publishing its
+    /// 0-32.4 MHz strip for a sweep or two after the dial has gone to 106 MHz.
+    /// Bounded by that stale lane, the view is dragged off the dial to the top
+    /// of HF, and [`follow_view_into_the_band`] reads the result as a request
+    /// to tune there: the jump lands just under half the ADC clock and has to
+    /// be made again (issue #298). Whatever the front end is streaming is
+    /// always worth looking at, so it is always inside the bounds.
     fn view_bounds(&self, dev_center: f64, dev_span: f64) -> (f64, f64) {
-        self.outer.unwrap_or((dev_center, dev_span))
+        let Some((wide_center, wide_span)) = self.outer else { return (dev_center, dev_span) };
+        let (wide_lo, wide_hi) = (wide_center - wide_span / 2.0, wide_center + wide_span / 2.0);
+        let (dev_lo, dev_hi) = (dev_center - dev_span / 2.0, dev_center + dev_span / 2.0);
+        // Untouched in the ordinary case, to the last bit: a lane that holds
+        // the passband is the answer it always was.
+        if wide_lo <= dev_lo && wide_hi >= dev_hi {
+            return (wide_center, wide_span);
+        }
+        let (lo, hi) = (wide_lo.min(dev_lo), wide_hi.max(dev_hi));
+        ((lo + hi) / 2.0, hi - lo)
     }
 }
 
@@ -335,6 +375,9 @@ pub struct WfTuning {
     pub spectrum_alpha: f32,
     /// Waterfall colour-palette index (from `UiSettings`).
     pub palette: usize,
+    /// Whether the waterfall is interpolated between bins and rows — see
+    /// [`sdroxide_types::UiSettings::waterfall_smooth`].
+    pub smooth: bool,
     /// Rows a second the 3D spectrum flows away from the viewer, from the SPEC
     /// popup's **flow** row. Zero while the stream is stalled, which is what
     /// holds the surface still — the same rule that stops the waterfall
@@ -1092,6 +1135,31 @@ pub struct AudioCursor {
     /// the pitch being listened at, and clicking a signal means "put that one
     /// here", not "move my pitch to the far side of the passband".
     pub click_sets_offset: bool,
+    /// Draw the receiver's tuning line on the cursor rather than on the dial.
+    ///
+    /// The dial in CW sits a sidetone pitch below the signal, so the tuning
+    /// line lands at the *edge* of a passband the engine has already centred
+    /// on the pitch — the line, the shading and the signal all disagree about
+    /// where the receiver is pointed. With this set the line moves onto the
+    /// cursor, where the passband is already centred and the signal already
+    /// is, and the three finally say the same thing.
+    ///
+    /// Display only: the dial is unchanged and everything that tunes, stores
+    /// or checks a band edge still uses it.
+    pub line_on_cursor: bool,
+    /// Centre the window on the cursor rather than on the dial.
+    ///
+    /// Set for the modes whose offset is a standard the whole band keeps —
+    /// RTTY's tone pair sits 2210 Hz up, and zoomed in tighter than that the
+    /// dial is off the picture entirely, so centring on it takes the signal
+    /// with it. Not set where the offset is a slot the operator (or the
+    /// engine) picks inside a sub-band: an FT8 window that chased its own
+    /// transmit tone would slide every time the engine moved it.
+    ///
+    /// The app applies the same rule to the re-centring that follows a retune
+    /// — see `SdroxideApp::panadapter_focus_hz`, where it is written out — so
+    /// the two paths agree about where the middle of the window is.
+    pub center_on_cursor: bool,
 }
 
 /// The panadapter: spectrum trace, frequency scale and waterfall, with the
@@ -1143,9 +1211,10 @@ pub fn show_ext(
     // a "this one, there" annotation.
     ism: &[IsmLabel],
     // Stored memories whose dial lands on the visible span, marked along the
-    // waterfall's oldest edge under the band-plan strip. Like the ISM labels,
-    // an annotation and not a control: the memory list is where a channel is
-    // recalled from.
+    // waterfall's oldest edge under the band-plan strip. Unlike the ISM
+    // labels, these are controls: clicking one recalls that channel whole —
+    // dial, mode and filter — as pressing it in the memory window does
+    // (issue #320).
     mem: &[crate::widgets::memories::MemMark],
     // Operator's pointer preferences: what the wheel does (plain and with
     // Shift), whether left-drag tunes, and the click-tune rounding.
@@ -1248,6 +1317,13 @@ pub fn show_ext(
     let spot_boxes = layout_spots(&painter, view, &rect, &lanes_rect, skimmer, click_sets_offset);
     let net_boxes = layout_net_spots(&painter, view, &rect, &lanes_rect, net_spots);
     let ism_boxes = layout_ism_labels(&painter, view, &rect, &lanes_rect, ism);
+    // The memory marks, laid out here for the same reason: a click has to be
+    // tested against them, and the pointer is dealt with long before the
+    // waterfall is painted. The strip depth they stack inwards from is asked
+    // for separately rather than taken from the draw call's return.
+    let mem_strip_h = crate::widgets::bandplan::height(view, &wf_rect, panel_below);
+    let mem_boxes =
+        crate::widgets::memories::layout(&painter, view, &wf_rect, mem, mem_strip_h, panel_below);
 
     // --- interactions -----------------------------------------------------
     // Model: grabbing a filter edge (left button, spectrum strip) always
@@ -1320,6 +1396,10 @@ pub fn show_ext(
     let sub_drag_id = ui.id().with("sub-drag");
     let mut sub_drag: bool = ui.data(|d| d.get_temp(sub_drag_id)).unwrap_or(false);
     let hover_sub = resp.hover_pos().map(sub_grab_at).unwrap_or(false) && hover_edge.is_none();
+    // Which memory mark the pointer is over, if any. Drives the cursor, the
+    // mark's own highlight, and what a click on it does (issue #320).
+    let hover_mem =
+        resp.hover_pos().and_then(|p| mem_boxes.iter().position(|b| b.rect.contains(p)));
 
     // The frequency-scale strip doubles as the spectrum/waterfall resize grip
     // and as the frequency axis: a vertical drag there changes the spectrum
@@ -1458,6 +1538,8 @@ pub fn show_ext(
     }
     if measuring.is_some() || (resp.hovered() && ui.input(|i| i.modifiers.shift)) {
         ui.ctx().set_cursor_icon(CursorIcon::Crosshair);
+    } else if hover_mem.is_some() {
+        ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
     } else if hover_edge.is_some() || edge.is_some() {
         ui.ctx().set_cursor_icon(CursorIcon::ResizeHorizontal);
     } else if sub_drag {
@@ -1573,7 +1655,10 @@ pub fn show_ext(
             let r = &mut state.rx[rx.index()];
             let max_hz = r.mode.max_filter_hz() as f64;
             let (mut lo, mut hi) = (r.filter_lo as f64, r.filter_hi as f64);
-            if r.mode.filter_symmetric() {
+            // Ctrl (Cmd on a Mac) frees the grip from its opposite number for
+            // the length of one drag — see [`one_edge_at_a_time`].
+            let alone = one_edge_at_a_time(ui);
+            if r.mode.filter_symmetric() && !alone {
                 // AM and FM carve a channel out about the carrier, so the grip
                 // being dragged sets the *half* width and the other edge
                 // follows it (issue #256). Read from whichever grip was
@@ -1715,10 +1800,16 @@ pub fn show_ext(
                     // That matters most in FT8, where a plain click moves the
                     // transmit offset instead of tuning: without this there
                     // would be no way to park the sub on a signal at all.
-                    let hz = net_boxes
+                    let hz = mem_boxes
                         .iter()
                         .find(|b| b.rect.contains(pos))
-                        .map(|b| net_spots[b.idx].freq_hz)
+                        .map(|b| mem[b.idx].freq_hz)
+                        .or_else(|| {
+                            net_boxes
+                                .iter()
+                                .find(|b| b.rect.contains(pos))
+                                .map(|b| net_spots[b.idx].freq_hz)
+                        })
                         .or_else(|| {
                             spot_boxes
                                 .iter()
@@ -1734,6 +1825,13 @@ pub fn show_ext(
                         state.vfo_b_hz = hz;
                         cmds.push(Command::TuneInSpan { vfo: Vfo::B, hz });
                     }
+                } else if let Some(mb) = mem_boxes.iter().find(|b| b.rect.contains(pos)) {
+                    // A memory mark: recall the channel it stands for — dial,
+                    // mode and filter together, exactly as pressing it in the
+                    // memory window does (issue #320). Ahead of the spot boxes
+                    // and of click-to-tune because the operator is pointing at
+                    // a named thing, not at a frequency.
+                    cmds.push(Command::RecallMemory(mem[mb.idx].id));
                 } else if let Some(nb) = net_boxes.iter().find(|b| b.rect.contains(pos)) {
                     // Network spot: tune + set mode, and hand the spot back so the
                     // app can pre-fill a log entry (and optionally look it up).
@@ -1914,7 +2012,12 @@ pub fn show_ext(
     let centring_id = ui.id().with("centre-on-vfo");
     let centred_at: Option<f64> = ui.data(|d| d.get_temp(centring_id)).unwrap_or(None);
     if view.center_on_vfo {
-        let vfo = state.active_freq_hz();
+        // The cursor rather than the dial in the modes that hold their tones
+        // off it — see [`AudioCursor::center_on_cursor`]. Memoised on the
+        // anchor itself, not on the dial, so nudging an RTTY offset by 5 Hz
+        // brings the window along exactly as turning the dial does.
+        let vfo = state.active_freq_hz()
+            + cursor.filter(|c| c.center_on_cursor).map_or(0.0, |c| f64::from(c.hz));
         if centred_at.is_none_or(|was| (was - vfo).abs() > 0.5) {
             let over = center_on_dial(view, vfo, zoom_center, zoom_span, rect.width());
             pan_center(&mut dev_center, state, over, pan, cmds);
@@ -2087,6 +2190,7 @@ pub fn show_ext(
             lut: wf.palette,
             rows_to_write: wf.rows_to_write,
             flip: view.waterfall_flip,
+            smooth: wf.smooth,
             wf_id: wf.wf_id,
             tex_w: wf.tex_w,
         },
@@ -2095,8 +2199,8 @@ pub fn show_ext(
     // Bandplan strip along the bottom of the waterfall (over the GPU layer),
     // with the stored memories marked on the same edge, stacked inwards from
     // however deep the strip ended up.
-    let strip_h = crate::widgets::bandplan::overlay(&painter, view, &wf_rect, panel_below);
-    crate::widgets::memories::overlay(&painter, view, &wf_rect, mem, strip_h, panel_below);
+    crate::widgets::bandplan::overlay(&painter, view, &wf_rect, panel_below);
+    crate::widgets::memories::draw(&painter, &mem_boxes, hover_mem);
 
     // --- VFO markers + passband shading -----------------------------------
     let in_view = |hz: f64| (view.view_lo_hz..=view.view_hi_hz).contains(&hz);
@@ -2141,8 +2245,11 @@ pub fn show_ext(
         }
     }
 
-    if in_view(vfo_hz) {
-        let x = view.freq_to_x(vfo_hz, &rect);
+    // Where the receiver is actually pointed, which in CW read as the signal
+    // is a sidetone pitch up from the dial — see [`AudioCursor::line_on_cursor`].
+    let line_hz = vfo_hz + cursor.filter(|c| c.line_on_cursor).map_or(0.0, |c| f64::from(c.hz));
+    if in_view(line_hz) {
+        let x = view.freq_to_x(line_hz, &rect);
         painter.vline(x, spec_marks.y_range(), Stroke::new(1.0, Color32::from_rgb(255, 60, 60)));
         painter.vline(
             x,
@@ -2595,19 +2702,27 @@ pub fn show_ext(
             };
             let ytop = if spec_h > 1.0 { spec_rect.top() } else { wf_rect.top() };
             let tint = if rx == RxId::Main { Color32::from_rgb(255, 190, 120) } else { SUB_COLOR };
-            label_box(
-                &painter,
-                pos2(edge_x + 7.0, ytop + 3.0),
-                &format!("{:+} Hz", off.round() as i64),
-                tint,
-                rect,
-            );
+            // `±` where this grip carries its opposite number with it, a plain
+            // sign where it moves alone — so the mode's rule and the modifier
+            // that suspends it are both readable off the number itself, with
+            // no chrome to hold them (issues #256, #335).
+            let together = r.mode.filter_symmetric() && !one_edge_at_a_time(ui);
+            let text = if together {
+                format!("±{} Hz", off.abs().round() as i64)
+            } else {
+                format!("{:+} Hz", off.round() as i64)
+            };
+            label_box(&painter, pos2(edge_x + 7.0, ytop + 3.0), &text, tint, rect);
         } else if (spec_rect.contains(p) || wf_rect.contains(p))
             && edge.is_none()
             && !resizing
             && !resp.dragged()
             && !spot_boxes.iter().any(|b| b.rect.contains(p))
             && !net_boxes.iter().any(|b| b.rect.contains(p))
+            // A memory mark answers the crosshair's question already, and with
+            // the frequency that clicking it will actually reach rather than
+            // the one under the pointer.
+            && hover_mem.is_none()
         {
             // Item 6: crosshair + click-tune frequency readout.
             let line = Color32::from_rgba_unmultiplied(185, 205, 225, 70);
@@ -3769,6 +3884,53 @@ mod tests {
         let mut cmds = Vec::new();
         follow_view_into_the_band(&view, &state, DEV_C, DEV_SPAN, pan, &mut cmds);
         assert_eq!(cmds, vec![Command::SetVfo { vfo: Vfo::A, hz: 15_000_000.0 }]);
+    }
+
+    /// A jump the full-band lane has not caught up with yet must not be undone
+    /// by it — issue #298, where 6 MHz to 106 MHz on an RX-888 landed just
+    /// under half the ADC clock and had to be made a second time.
+    ///
+    /// The lane is built from samples, so it goes on describing HF for a sweep
+    /// or two after the receiver has crossed into VHF. Measured on the
+    /// hardware: `dev_center=106000000` with the view clamped to
+    /// `30375000..32400000`, the top of the stale strip, and the next line of
+    /// the log `dev_center=31387500` — the middle of that view, asked for by
+    /// `follow_view_into_the_band` and tuned to.
+    #[test]
+    fn a_stale_full_band_lane_never_drags_the_view_off_a_new_dial() {
+        // An RX-888 at 64.8 Msps: 2.025 MHz of I/Q, and a strip of the whole
+        // of HF still centred where the receiver was a moment ago.
+        const DEV_SPAN: f64 = 2_025_000.0;
+        const DEV_C: f64 = 106_000_000.0;
+        let (lo, hi) = (DEV_C - DEV_SPAN / 2.0, DEV_C + DEV_SPAN / 2.0);
+        let pan = WindowPan::default().with_outer(Some((16_200_000.0, 32_400_000.0)), DEV_SPAN);
+        let state = RadioState { vfo_a_hz: DEV_C, active_vfo: Vfo::A, ..RadioState::default() };
+        // Where the app puts the view when a tune leaves the window behind: on
+        // the new dial, as wide as the passband.
+        let mut view = ViewState { view_lo_hz: lo, view_hi_hz: hi, ..Default::default() };
+
+        let (c, span) = pan.view_bounds(DEV_C, DEV_SPAN);
+        view.clamp_to(c, span);
+        assert_eq!(
+            (view.view_lo_hz, view.view_hi_hz),
+            (lo, hi),
+            "the stale HF strip pulled the view back to {:.3} MHz",
+            (view.view_lo_hz + view.view_hi_hz) / 2e6
+        );
+
+        let mut cmds = Vec::new();
+        follow_view_into_the_band(&view, &state, DEV_C, DEV_SPAN, pan, &mut cmds);
+        assert!(cmds.is_empty(), "the receiver was tuned back off the jump: {cmds:?}");
+
+        // The lane is still reachable while it is on screen — the bounds took
+        // the passband in, they did not throw the strip away.
+        assert_eq!(pan.view_bounds(DEV_C, DEV_SPAN), (53_506_250.0, 107_012_500.0));
+
+        // And once the lane has caught up it is the whole answer again, to the
+        // last bit: nothing about an ordinary front end changes.
+        let vhf = (DEV_C, 8_040_000.0);
+        let caught_up = WindowPan::default().with_outer(Some(vhf), DEV_SPAN);
+        assert_eq!(caught_up.view_bounds(DEV_C, DEV_SPAN), vhf);
     }
 
     /// Still zoomed out: panning about the band view must not retune anything.

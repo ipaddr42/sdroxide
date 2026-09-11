@@ -15,7 +15,7 @@ use std::sync::Arc;
 use rustfft::{Fft, FftPlanner};
 use sdroxide_deepcw::Pool;
 use sdroxide_dsp::{Complex32 as C32, CwDecoder};
-use sdroxide_types::{CwSkimmerDecoder, SkimmerKind, SkimmerSettings, SkimmerSpot, is_cw_segment};
+use sdroxide_types::{CwEngine, SkimmerKind, SkimmerSettings, SkimmerSpot, is_cw_segment};
 
 use crate::callsign::find_callsign;
 use crate::deep::DeepFront;
@@ -246,7 +246,7 @@ pub struct CwSkimmer {
     /// skimmer still finds and marks signals but reports no text for them.
     deep: Option<(DeepFront, Pool)>,
     /// Which decoder reads the signals, and how many the neural one may read.
-    decoder: CwSkimmerDecoder,
+    decoder: CwEngine,
     slots: usize,
     /// Centers seen last frame, so a track spawns only on a peak that persists
     /// (a single-frame noise blip never becomes a track).
@@ -317,8 +317,8 @@ impl CwSkimmer {
             tracks: Vec::new(),
             next_id: 1,
             deep: match cfg.cw_decoder {
-                CwSkimmerDecoder::Neural => build_deep(skim_rate, cfg.cw_slots as usize),
-                CwSkimmerDecoder::Timing => None,
+                CwEngine::Neural => build_deep(skim_rate, cfg.cw_slots as usize),
+                CwEngine::Timing => None,
             },
             decoder: cfg.cw_decoder,
             slots: cfg.cw_slots as usize,
@@ -359,8 +359,8 @@ impl CwSkimmer {
             // fails and the thread returns. A decode already in flight finishes
             // and finds nowhere to send its result, which is exactly right.
             self.deep = match self.decoder {
-                CwSkimmerDecoder::Neural => build_deep(self.skim_rate, slots),
-                CwSkimmerDecoder::Timing => None,
+                CwEngine::Neural => build_deep(self.skim_rate, slots),
+                CwEngine::Timing => None,
             };
             self.reset();
             return;
@@ -645,7 +645,7 @@ impl CwSkimmer {
                     hits: 0,
                     frames: 0,
                     confirmed: false,
-                    dec: (self.decoder == CwSkimmerDecoder::Timing).then(|| {
+                    dec: (self.decoder == CwEngine::Timing).then(|| {
                         let mut d = CwDecoder::new(1000.0 / self.frame_ms);
                         d.set_hop_s(TRACK_HOP_S);
                         Box::new(d)
@@ -727,8 +727,8 @@ impl CwSkimmer {
                 // measured from how fast text arrived, so a station that pauses
                 // reads slower than its fist.
                 let plausible = match self.decoder {
-                    CwSkimmerDecoder::Neural => NEURAL_WPM,
-                    CwSkimmerDecoder::Timing => TIMING_WPM,
+                    CwEngine::Neural => NEURAL_WPM,
+                    CwEngine::Timing => TIMING_WPM,
                 };
                 if !plausible.contains(&t.wpm) || text.is_empty() {
                     return None;
@@ -951,7 +951,7 @@ mod tests {
         // and then listen. Everything above it transmits without pause, which is
         // the worst case for cost and the one that says nothing about how much
         // the activity gate is worth.
-        use CwSkimmerDecoder::{Neural, Timing};
+        use CwEngine::{Neural, Timing};
         for (k, over_s, decoder) in [
             (0usize, 0.0, Neural),
             (1, 0.0, Neural),
@@ -1063,7 +1063,7 @@ mod tests {
     }
 
     /// A skimmer running the named decoder, everything else default.
-    fn skimmer(rate: f64, center: f64, decoder: CwSkimmerDecoder) -> CwSkimmer {
+    fn skimmer(rate: f64, center: f64, decoder: CwEngine) -> CwSkimmer {
         let cfg = SkimmerSettings { cw_decoder: decoder, ..SkimmerSettings::default() };
         CwSkimmer::with_config(rate, center, &cfg)
     }
@@ -1079,7 +1079,7 @@ mod tests {
         let rate = 192_000.0;
         let center = 14_020_000.0;
         let off = 5_000.0;
-        for decoder in CwSkimmerDecoder::ALL {
+        for decoder in CwEngine::ALL {
             let iq = synth("CQ DE W1AW", off, 20.0, rate, 0.02);
             let mut sk = skimmer(rate, center, decoder);
             feed(&mut sk, &iq);
@@ -1129,7 +1129,7 @@ mod tests {
             *m += C32::new(0.02 * r(), 0.02 * r());
         }
 
-        let mut sk = skimmer(rate, center, CwSkimmerDecoder::Timing);
+        let mut sk = skimmer(rate, center, CwEngine::Timing);
         feed(&mut sk, &mixed);
         settle(&mut sk);
         sk.debug_dump();
@@ -1163,7 +1163,7 @@ mod tests {
 
         // The front end is 40 kHz down the window, so that is where the notch
         // belongs and the station in the middle is read normally.
-        let mut sk = skimmer(rate, center, CwSkimmerDecoder::Timing);
+        let mut sk = skimmer(rate, center, CwEngine::Timing);
         sk.set_dc_offset_hz(-40_000.0);
         feed(&mut sk, &iq);
         settle(&mut sk);
@@ -1176,7 +1176,7 @@ mod tests {
         // ...and with the spike declared in the middle — a window still sitting
         // on the hardware centre, which is where one with nobody watching stays
         // — the same station is inside the notch and is not read at all.
-        let mut pinned = skimmer(rate, center, CwSkimmerDecoder::Timing);
+        let mut pinned = skimmer(rate, center, CwEngine::Timing);
         feed(&mut pinned, &iq);
         settle(&mut pinned);
         let spots = pinned.spots();
@@ -1202,7 +1202,7 @@ mod tests {
             *a += *b;
         }
 
-        let mut sk = skimmer(rate, center, CwSkimmerDecoder::Timing);
+        let mut sk = skimmer(rate, center, CwEngine::Timing);
         sk.set_view(Some((center + seen - 2_000.0, center + seen + 2_000.0)));
         feed(&mut sk, &iq);
         settle(&mut sk);
@@ -1225,7 +1225,7 @@ mod tests {
         let off = 5_000.0;
         let iq = synth("CQ DE W1AW", off, 20.0, rate, 0.02);
 
-        let mut sk = skimmer(rate, center, CwSkimmerDecoder::Timing);
+        let mut sk = skimmer(rate, center, CwEngine::Timing);
         feed(&mut sk, &iq);
         settle(&mut sk);
         assert!(!sk.spots().is_empty(), "nothing was tracked, so nothing to drop");
@@ -1249,12 +1249,12 @@ mod tests {
 
         // The same signal on 20 m, to show the test is of the band and not of
         // the signal.
-        let mut ham = skimmer(rate, 14_020_000.0, CwSkimmerDecoder::Timing);
+        let mut ham = skimmer(rate, 14_020_000.0, CwEngine::Timing);
         feed(&mut ham, &iq);
         settle(&mut ham);
         assert!(!ham.spots().is_empty(), "the control case decoded nothing");
 
-        let mut fm = skimmer(rate, 96_300_000.0, CwSkimmerDecoder::Timing);
+        let mut fm = skimmer(rate, 96_300_000.0, CwEngine::Timing);
         feed(&mut fm, &iq);
         settle(&mut fm);
         assert!(fm.spots().is_empty(), "tracked a station on the broadcast FM band");
@@ -1268,7 +1268,7 @@ mod tests {
         let off = 5_000.0;
         let iq = synth("CQ DE W1AW", off, 20.0, rate, 0.02);
 
-        let mut sk = skimmer(rate, 96_300_000.0, CwSkimmerDecoder::Timing);
+        let mut sk = skimmer(rate, 96_300_000.0, CwEngine::Timing);
         feed(&mut sk, &iq);
         settle(&mut sk);
         assert!(sk.spots().is_empty(), "tracked a station off any CW allocation");
@@ -1288,7 +1288,7 @@ mod tests {
         let off = 5_000.0;
         let iq = synth("CQ DE W1AW", off, 20.0, rate, 0.02);
 
-        let mut sk = skimmer(rate, center, CwSkimmerDecoder::Timing);
+        let mut sk = skimmer(rate, center, CwEngine::Timing);
         sk.set_view(Some((center + 50_000.0, center + 90_000.0)));
         sk.set_view(None);
         feed(&mut sk, &iq);

@@ -13,7 +13,7 @@
 //! nothing to keep in step.
 
 use eframe::egui::{self, Color32, RichText};
-use sdroxide_types::Command;
+use sdroxide_types::{Command, CwEngine};
 
 use crate::app::{SdroxideApp, tx_gated};
 use crate::theme::ThemedScroll;
@@ -57,6 +57,36 @@ impl SdroxideApp {
                 cmds.push(Command::SetDigiAudioFreq((pitch + 10.0).clamp(200.0, 3000.0)));
             }
             crate::app::panels::on_air_readout(ui, on_air);
+
+            // Whether the *main* readout says that number too, instead of the
+            // dial a sidetone below it. Kept here rather than in the settings
+            // window because it belongs with the pitch it is derived from: the
+            // two are read together and adjusted together.
+            // QRG: the Q-code for "your frequency is", which is exactly the
+            // number this puts in the readout — and exactly the question a CW
+            // dial cannot answer on its own. Named for the thing rather than
+            // for the switch: an operator reads the label to find out what the
+            // number will mean, not to learn that something has been turned on.
+            let qrg = self.ui_settings.cw_qrg;
+            if crate::chrome::chip(ui, qrg, "QRG")
+                .on_hover_text(if qrg {
+                    "QRG: the main readout and the tuning line are on the frequency being \
+                     worked. Click for the dial instead, a sidetone pitch below it — what \
+                     most radios show."
+                } else {
+                    "Put the main readout and the tuning line on the signal rather than on \
+                     the dial, so the frequency shown is the one both operators would quote \
+                     and the tuning line sits in the middle of the passband. Tuning is \
+                     unchanged; only the numbers move.\n\nClicking a signal lands it on \
+                     the cursor only as closely as the click step allows — Controls → \
+                     click-to-tune rounding, 10 Hz by default. A coarse step leaves the \
+                     signal off the pitch by up to half of it, and the readout will say so."
+                })
+                .clicked()
+            {
+                self.ui_settings.cw_qrg = !qrg;
+                crate::app::persist::persist_ui_settings(&self.ui_settings);
+            }
             ui.add_space(8.0);
 
             // Copy state. A CW decoder that is not locked is not "quiet", it is
@@ -118,7 +148,18 @@ impl SdroxideApp {
         let input_h = 56.0;
         let gap = 5.0;
         let bottom_pad = 12.0;
-        let rx_h = (content_bottom - ui.cursor().top() - btn_h - input_h - 2.0 * gap - bottom_pad)
+        // The message-button row underneath, which is there whether or not any
+        // buttons have been made — the MSG chip that makes them lives on it.
+        // Counted here or the row would be laid out past the bottom of the
+        // panel, where it does not clip: it paints over whatever is below.
+        let macro_h = 4.0 + crate::chrome::chip_height(ui, None);
+        let rx_h = (content_bottom
+            - ui.cursor().top()
+            - btn_h
+            - macro_h
+            - input_h
+            - 2.0 * gap
+            - bottom_pad)
             .max(24.0);
 
         ui.allocate_ui(egui::vec2(ui.available_width(), rx_h), |ui| {
@@ -339,7 +380,215 @@ impl SdroxideApp {
                 );
             });
         });
+        self.cw_macro_row(ui, cmds, tx_ok, &my_call);
         ui.add_space(bottom_pad);
+    }
+
+    /// The operator's own message buttons, and the chip that edits them.
+    ///
+    /// Each one sends its whole text in a single message rather than keying it
+    /// as if it had been typed, which is the point of them on a radio that keys
+    /// itself from text: one hand-off to the rig's keyer instead of one per
+    /// word, exactly as SEND ON RETURN does for a typed line (issue #374).
+    ///
+    /// **F1–F9 press them** while the CW panel is up and nothing on screen holds
+    /// the keyboard. That exclusion matters: an operator part-way through a
+    /// callsign has the caret in the transmit box, and a function key that fired
+    /// a message from under them would put the wrong thing on the air. The test
+    /// is deliberately the blunt one — *any* focused widget, not just that box —
+    /// because a message going out unbidden is the expensive mistake and a
+    /// function key that does nothing is the cheap one.
+    fn cw_macro_row(
+        &mut self,
+        ui: &mut egui::Ui,
+        cmds: &mut Vec<Command>,
+        tx_ok: bool,
+        my_call: &str,
+    ) {
+        let macros = self.digi_cfg_edit.cw_macros.clone();
+        // Something on screen has the keyboard — the transmit box, a settings
+        // field, a callsign being typed into the logbook. The function keys are
+        // the operator's then, not ours.
+        let typing = ui.memory(|m| m.focused().is_some());
+        let mut fire: Option<usize> = None;
+        if !typing && tx_ok {
+            const KEYS: [egui::Key; 9] = [
+                egui::Key::F1,
+                egui::Key::F2,
+                egui::Key::F3,
+                egui::Key::F4,
+                egui::Key::F5,
+                egui::Key::F6,
+                egui::Key::F7,
+                egui::Key::F8,
+                egui::Key::F9,
+            ];
+            for (i, key) in KEYS.iter().enumerate().take(macros.len()) {
+                if ui.input_mut(|input| input.consume_key(egui::Modifiers::NONE, *key)) {
+                    fire = Some(i);
+                }
+            }
+        }
+        ui.add_space(4.0);
+        ui.horizontal_wrapped(|ui| {
+            // A row with nothing in it yet is one the operator has added and
+            // not filled in: it keeps its place and its function key in the
+            // editor, but there is nothing for a chip on the panel to send.
+            for (i, m) in macros.iter().enumerate().filter(|(_, m)| !m.text.trim().is_empty()) {
+                let hint = if i < 9 {
+                    format!("F{}: sends “{}”", i + 1, m.text.trim())
+                } else {
+                    format!("Sends “{}”", m.text.trim())
+                };
+                if tx_gated(ui, tx_ok, |ui| {
+                    crate::chrome::chip(ui, false, m.chip_label()).on_hover_text(&hint)
+                })
+                .clicked()
+                {
+                    fire = Some(i);
+                }
+            }
+            crate::chrome::row_tail(ui, |ui| {
+                if crate::chrome::chip(ui, self.cw_macro_edit, "MSG")
+                    .on_hover_text(
+                        "Your own message buttons — a contest exchange, a name-and-QTH reply, \
+                         TNX 73 GL. Each sends its whole text in one go, and F1–F9 press the \
+                         first nine. They travel with the station's configuration, so a \
+                         remote client has them too.",
+                    )
+                    .clicked()
+                {
+                    self.cw_macro_edit = !self.cw_macro_edit;
+                }
+            });
+        });
+        if let Some(m) = fire.and_then(|i| macros.get(i)) {
+            let call = if my_call.is_empty() { "NOCALL" } else { my_call };
+            let grid = self.digi_cfg_edit.my_grid.clone();
+            let text = m.expand(call, &grid);
+            if !text.trim().is_empty() {
+                // The same three steps CALL CQ takes, and in the same order:
+                // whatever was going out is abandoned, the box shows what is
+                // being sent, and the message goes as one piece.
+                cmds.push(Command::DigiAbortTx);
+                self.text_tx = text.clone();
+                cmds.push(Command::DigiTxText(text));
+                cmds.push(Command::DigiTxActive(true));
+            }
+        }
+    }
+
+    /// The editor: one row per button, plus somewhere to add another.
+    ///
+    /// A window rather than a fold-out inside the panel. The panel's receive
+    /// pane is sized against the real panel bottom, so anything that can grow
+    /// under it has to be budgeted for — and a table that grows by a row every
+    /// time ADD is pressed cannot be. A window also survives the panel being
+    /// short, which is the case an operator setting these up on a laptop is in.
+    pub(in crate::app) fn cw_macro_window(&mut self, ctx: &egui::Context, cmds: &mut Vec<Command>) {
+        use sdroxide_types::CwMacro;
+
+        if !self.cw_macro_edit {
+            return;
+        }
+        let mut open = true;
+        let mut changed = false;
+        let mut remove = None;
+        let resp = egui::Window::new("CW MESSAGES")
+            .id(crate::layout::salted_id(ctx, "CwMacros"))
+            .open(&mut open)
+            .frame(crate::chrome::window_frame())
+            .resizable(false)
+            .default_width(crate::layout::window_w(ctx, 560.0))
+            .show(ctx, |ui| {
+                crate::chrome::window_body_bg(ui);
+                // Claimed before the grid, because a `TextEdit` is never wider
+                // than the space it is given however wide it asks to be — and
+                // an auto-sized window takes its width from its widest child,
+                // which without this is the paragraph below.
+                ui.set_min_width(crate::layout::window_w(ctx, 520.0));
+                ui.label(
+                    RichText::new(
+                        "Each button sends its whole text in one go, at the panel's WPM. \
+                         F1–F9 press the first nine, so long as nothing on screen has the \
+                         keyboard.",
+                    )
+                    .size(10.5)
+                    .color(crate::theme::gray(150)),
+                );
+                ui.add_space(6.0);
+                egui::Grid::new("cw-macros").num_columns(4).spacing([6.0, 4.0]).show(ui, |ui| {
+                    ui.label(RichText::new("key").size(10.0).color(crate::theme::gray(140)));
+                    ui.label(RichText::new("button").size(10.0).color(crate::theme::gray(140)));
+                    ui.label(RichText::new("sends").size(10.0).color(crate::theme::gray(140)));
+                    ui.label("");
+                    ui.end_row();
+                    for (i, m) in self.digi_cfg_edit.cw_macros.iter_mut().enumerate() {
+                        ui.label(
+                            RichText::new(if i < 9 {
+                                format!("F{}", i + 1)
+                            } else {
+                                String::new()
+                            })
+                            .size(10.5)
+                            .color(crate::theme::gray(150)),
+                        );
+                        // Sized rather than asked for: inside a `Grid` a
+                        // `TextEdit`'s `desired_width` is clamped to a column
+                        // that has not been measured yet, and both boxes come
+                        // out a few characters wide.
+                        changed |= crate::chrome::field_sized(
+                            ui,
+                            [80.0, 22.0],
+                            egui::TextEdit::singleline(&mut m.label).hint_text("label"),
+                        )
+                        .changed();
+                        changed |= crate::chrome::field_sized(
+                            ui,
+                            [320.0, 22.0],
+                            egui::TextEdit::singleline(&mut m.text).hint_text("5NN 5NN {MYCALL}"),
+                        )
+                        .changed();
+                        if crate::chrome::chip(ui, false, "×")
+                            .on_hover_text("Remove this button")
+                            .clicked()
+                        {
+                            remove = Some(i);
+                        }
+                        ui.end_row();
+                    }
+                });
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    let full = self.digi_cfg_edit.cw_macros.len() >= CwMacro::MAX;
+                    if ui
+                        .add_enabled(!full, egui::Button::new("ADD"))
+                        .on_disabled_hover_text(format!("{} is the most", CwMacro::MAX))
+                        .clicked()
+                    {
+                        self.digi_cfg_edit.cw_macros.push(CwMacro::default());
+                        changed = true;
+                    }
+                    ui.label(
+                        RichText::new(
+                            "{MYCALL} and {MYGRID} are filled in as the message goes out.",
+                        )
+                        .size(10.5)
+                        .color(crate::theme::gray(140)),
+                    );
+                });
+            });
+        if let Some(r) = &resp {
+            crate::chrome::paint_window_border(ctx, &r.response);
+        }
+        if let Some(i) = remove {
+            self.digi_cfg_edit.cw_macros.remove(i);
+            changed = true;
+        }
+        if changed && self.digi_cfg_seeded {
+            cmds.push(Command::SetDigiConfig(self.digi_cfg_edit.clone()));
+        }
+        self.cw_macro_edit = open;
     }
 
     /// Transmit speed, Farnsworth spacing, and whether the decoder is allowed to
@@ -360,6 +609,35 @@ impl SdroxideApp {
             .clicked()
         {
             cfg.cw_speed_lock = !locked;
+            changed = true;
+        }
+
+        // Which decoder copies the receive window. Two values, so a chip that
+        // cycles rather than a picker — and the label says which one is
+        // running, not which one it would switch to.
+        let engine = cfg.cw_engine;
+        if crate::chrome::chip(
+            ui,
+            engine == CwEngine::Timing,
+            RichText::new(engine.label()).size(10.5),
+        )
+        .on_hover_text(format!(
+            "{}\n\nClick for the {} decoder. The neural one copies further down and \
+                 reads hand-sent CW a timing fit will not accept; the timing one is the \
+                 only one that copies the accented letters — Ä, Ö, Å, Ü, É — because the \
+                 model has no output class for them.",
+            engine.hint(),
+            match engine {
+                CwEngine::Neural => "timing",
+                CwEngine::Timing => "neural",
+            }
+        ))
+        .clicked()
+        {
+            cfg.cw_engine = match engine {
+                CwEngine::Neural => CwEngine::Timing,
+                CwEngine::Timing => CwEngine::Neural,
+            };
             changed = true;
         }
 

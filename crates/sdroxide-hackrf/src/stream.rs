@@ -38,11 +38,28 @@ use crate::protocol::{
     BULK_IN, BULK_OUT, BULK_PACKET, BYTES_PER_SAMPLE, GainSetter, TUNING_RANGE_HZ,
 };
 use crate::trace::{self, Trace};
-use crate::usb::UsbDev;
+use crate::usb::{Transport, UsbDev};
 
 /// How long a first completion may block before the loop goes back to serve
 /// control. Bounds how long a dial drag waits when the stream has gone quiet.
 const COMPLETE_TIMEOUT: Duration = Duration::from_millis(20);
+
+/// How long to wait before trying a refused control change again. Long enough
+/// that a radio saying no to everything costs forty control transfers a second
+/// rather than one per pass of the stream loop, short enough that a retune
+/// which takes on the second attempt is imperceptible.
+const CTRL_RETRY_EVERY: Duration = Duration::from_millis(25);
+
+/// One complaint per this many consecutive refusals, so a change the radio will
+/// never take says so without filling the log with the same line.
+const CTRL_COMPLAINT_EVERY: u64 = 200;
+
+/// Consecutive refusals before the operator is told, in
+/// [`crate::handle::Shared::ctrl_stuck`], that the radio and the screen may
+/// have parted company. At [`CTRL_RETRY_EVERY`] apiece this is a fifth of a
+/// second of the radio saying no — long past a hiccup, and still quick enough
+/// to explain a dial that has stopped meaning anything.
+const CTRL_STUCK_AFTER: u64 = 8;
 
 /// How long to wait for cancelled transfers to come back before dropping an
 /// endpoint. Generous: the alternative is releasing an endpoint with transfers
@@ -293,7 +310,8 @@ fn run(
             return;
         }
     };
-    let superspeed = usb.is_superspeed();
+    let slow_link = !usb.is_high_speed_or_better();
+    let speed_name = usb.speed_name();
     let serial = usb.serial().map(str::to_string);
 
     let mut dev = match Device::open(usb, &cfg, center_hz) {
@@ -311,13 +329,16 @@ fn run(
     shared.set_gain(GainSetter::TxVga, txvga);
 
     let rate = dev.rate_hz();
-    // 20 Msps is 40 MB/s. A high-speed link tops out at 60 MB/s in theory and
-    // well under it in practice, so this is worth saying at open rather than
-    // leaving somebody to diagnose dropped samples.
-    let link_warning = (!superspeed && rate > 8.0e6).then(|| {
+    // Only when the link is slower than the board's own. A HackRF is a
+    // High-Speed USB 2.0 device and there is no other kind, so high speed is
+    // not a shortfall to complain about — 20 Msps is 40 MB/s and that is what
+    // the link is rated for. Landing below it means a cable or a hub is at
+    // fault, and no rate will work until that is sorted (issue #349).
+    let link_warning = slow_link.then(|| {
         format!(
-            "{:.1} Msps is {:.0} MB/s and this radio is on a high-speed (USB 2.0) link — \
-             expect dropped samples. Move it to a SuperSpeed port or pick a lower rate.",
+            "this radio has enumerated at {speed_name} rather than the high speed (USB 2.0) \
+             every HackRF uses — {:.1} Msps is {:.0} MB/s and nothing like that will fit. \
+             Check the cable and the hub.",
             rate / 1e6,
             rate * BYTES_PER_SAMPLE as f64 / 1e6
         )
@@ -375,28 +396,63 @@ fn pump(
     let mut carry: Option<u8> = None;
     let mut tx_bytes: Vec<u8> = Vec::with_capacity(transfer_bytes);
 
+    // Outside the loop, because what did not reach the radio has to survive to
+    // the next pass — see the retry note below.
+    let mut pending = Pending::default();
+    let mut refused: u64 = 0;
+    let mut retry_at: Option<Instant> = None;
     loop {
         // 1. Collapse the whole control channel, then apply each field once.
-        let mut pending = Pending::default();
         while let Ok(c) = ctrl.try_recv() {
             pending.absorb(c);
         }
         if pending.shutdown {
             break;
         }
-        if !pending.is_empty()
-            && let Err(e) = apply(dev, &pending, shared)
-        {
-            // A setting that cannot be applied is worth saying out loud, but it
-            // is not a reason to tear the stream down — the operator can pick
-            // another value.
-            tracing::warn!("HackRF: {e}");
-            trace.note(format!("control change failed: {e}"));
+        // A control change that the radio would not take is *tried again*
+        // rather than dropped. Nothing upstream is in a position to notice a
+        // lost one: `HackRfSource::set_center_hz` hands the frequency to this
+        // thread and returns `Ok` before anything has been sent, so the engine
+        // has already moved its dial, relabelled the panadapter and told every
+        // screen the tune succeeded. Dropping the message there leaves a radio
+        // sitting on the old frequency with everything on screen insisting
+        // otherwise, and nothing that will ever put it right short of
+        // restarting the program (issue #352). `apply` clears each field only
+        // once it has landed, so whatever is left is retried — throttled, so a
+        // radio that keeps refusing cannot turn this into a spin.
+        if !pending.is_empty() && retry_at.is_none_or(|t| Instant::now() >= t) {
+            match apply(dev, &mut pending, shared) {
+                Ok(()) => {
+                    if refused > 0 {
+                        trace.note(format!("control change took, after {refused} refusal(s)"));
+                        refused = 0;
+                        shared.ctrl_stuck.store(false, Ordering::Relaxed);
+                    }
+                    retry_at = None;
+                }
+                Err(e) => {
+                    // Worth saying out loud, but not a reason to tear the
+                    // stream down — the operator can pick another value, and
+                    // the retry may well carry this one.
+                    if refused % CTRL_COMPLAINT_EVERY == 0 {
+                        tracing::warn!("HackRF: {e}; retrying");
+                        trace.note(format!("control change failed: {e}; retrying"));
+                    }
+                    refused += 1;
+                    // Not on the first refusal: a single one that the next
+                    // attempt carries is a hiccup, not something to put in
+                    // front of the operator.
+                    if refused > CTRL_STUCK_AFTER {
+                        shared.ctrl_stuck.store(true, Ordering::Relaxed);
+                    }
+                    retry_at = Some(Instant::now() + CTRL_RETRY_EVERY);
+                }
+            }
         }
 
         // 2. Direction changes, in the order they were asked for. Never
         //    collapsed; see `Pending`.
-        for t in pending.tx.iter().copied() {
+        for t in std::mem::take(&mut pending.tx) {
             lane = match transition(dev, lane, t, tx, shared, trace, in_flight, transfer_bytes) {
                 Ok(l) => l,
                 Err(e) => {
@@ -453,41 +509,58 @@ fn pump(
     Ok(())
 }
 
-/// Apply the collapsible settings, in dependency order.
+/// Apply the collapsible settings, in dependency order, clearing each one from
+/// `p` as it lands.
 ///
 /// ppm first because every frequency is computed against the corrected crystal;
 /// then the rate, which reprograms the filter and re-tunes; then an explicit
 /// filter override, which must win over what the rate chose; then the dial.
 /// Gains and switches last — they depend on nothing.
-fn apply(dev: &mut Device<UsbDev>, p: &Pending, shared: &Arc<Shared>) -> Result<()> {
+///
+/// Each field is cleared *after* its request has been accepted, so a refusal
+/// returns with that field and everything after it still set, and the caller
+/// tries the lot again. That is the whole point: on this backend a refused
+/// change has already been reported to the engine as a success, so a change
+/// that is merely dropped here is one nothing else will ever put right.
+fn apply<T: Transport>(dev: &mut Device<T>, p: &mut Pending, shared: &Arc<Shared>) -> Result<()> {
     if let Some(v) = p.ppm {
         dev.set_ppm(v)?;
+        p.ppm = None;
     }
     if let Some(v) = p.rate {
         dev.set_rate(v)?;
+        p.rate = None;
     }
     if let Some(v) = p.filter_bw {
         dev.set_filter_pref(v)?;
+        p.filter_bw = None;
     }
     if let Some(v) = p.center {
         dev.set_center_hz(v)?;
+        p.center = None;
     }
-    for (stage, want) in
-        [(GainSetter::Lna, p.lna), (GainSetter::Vga, p.vga), (GainSetter::TxVga, p.txvga)]
-    {
-        if let Some(db) = want {
+    for (stage, want) in [
+        (GainSetter::Lna, &mut p.lna),
+        (GainSetter::Vga, &mut p.vga),
+        (GainSetter::TxVga, &mut p.txvga),
+    ] {
+        if let Some(db) = *want {
             let applied = dev.set_gain(stage, db)?;
             shared.set_gain(stage, applied);
+            *want = None;
         }
     }
     if let Some(v) = p.amp {
         dev.set_amp(false, v)?;
+        p.amp = None;
     }
     if let Some(v) = p.tx_amp {
         dev.set_amp(true, v)?;
+        p.tx_amp = None;
     }
     if let Some(v) = p.bias_tee {
         dev.set_bias_tee(v)?;
+        p.bias_tee = None;
     }
     Ok(())
 }
@@ -957,6 +1030,43 @@ fn close(lane: Lane) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A refused control change is kept and tried again, and everything after
+    /// it in the dependency order waits its turn.
+    ///
+    /// This is issue #352 in miniature: `HackRfSource::set_center_hz` posts the
+    /// frequency to this thread and answers `Ok` on the spot, so by the time a
+    /// `SET_FREQ` is refused the engine has already relabelled the panadapter
+    /// and told every screen the radio moved. A change dropped here is one
+    /// nothing else can ever notice or put right.
+    #[test]
+    fn a_refused_control_change_is_kept_and_tried_again() {
+        use crate::protocol::Request;
+        use crate::usb::fake::FakeTransport;
+
+        let cfg = HackRfConfig { sample_rate_hz: 2.0e6, ..Default::default() };
+        let mut dev = Device::open(FakeTransport::new(), &cfg, 100.0e6).expect("the fake opens");
+        let shared = Arc::new(Shared::new());
+        dev.io().refuse(Request::SetFreq);
+
+        let mut pending = Pending::default();
+        pending.absorb(Ctrl::Center(145.0e6));
+        pending.absorb(Ctrl::Gain(GainSetter::Lna, 24.0));
+
+        // The radio says no, so neither the tune nor the gain behind it is
+        // forgotten — the gain must not jump the queue past a frequency the
+        // radio has not reached yet.
+        apply(&mut dev, &mut pending, &shared).expect_err("the fake refuses SET_FREQ");
+        assert_eq!(pending.center, Some(145.0e6), "the tune is still owed");
+        assert_eq!(pending.lna, Some(24.0), "and so is everything behind it");
+        assert_eq!(dev.center_hz(), 100.0e6, "and the driver knows where the radio really is");
+
+        // Once it stops refusing, the same pending change lands and clears.
+        dev.io().accept(Request::SetFreq);
+        apply(&mut dev, &mut pending, &shared).expect("the radio takes it now");
+        assert!(pending.is_empty(), "nothing is owed once it has all landed");
+        assert_eq!(dev.center_hz(), 145.0e6);
+    }
 
     /// Transfer lengths must be whole packets, and the clamps must hold against
     /// a hand-edited config file.

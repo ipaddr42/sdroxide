@@ -20,6 +20,18 @@ use sdroxide_types::{
 use crate::clock::ClockMonitor;
 use crate::modem::{ApHints, Ft8Modem};
 use crate::params::{DECODE_RATE, DigiParams};
+
+/// How much of a slot's audio has to arrive before the period counts as whole.
+///
+/// Not 100%: a slot legitimately ends a few blocks short, because the boundary
+/// is noticed on a poll rather than on a sample, and the tap is handed over in
+/// blocks of a few tens of milliseconds. Five per cent of a 15 s slot is 750 ms
+/// — far more slack than that, and far less than the gap that costs a decode.
+const SLOT_COMPLETE_FRAC: f64 = 0.95;
+
+/// How often a run of short periods says so again — every tenth, which at
+/// fifteen seconds a slot is about once every two and a half minutes.
+const SHORT_SLOT_REPORT_EVERY: u64 = 10;
 use crate::qso::QsoMachine;
 use crate::scheduler::SlotScheduler;
 
@@ -82,6 +94,21 @@ pub enum DigiAction {
     /// the operator has a hand on the tuning — a beacon and its operator
     /// fighting over the dial is the failure this must not have.
     SetDial(f64),
+    /// A station this mode heard and could name, for the reception-report
+    /// networks — PSK Reporter's upload, in particular (issue #357).
+    ///
+    /// Its own action rather than a [`DigiAction::Decodes`] entry, because in
+    /// JS8 the two are genuinely different things. A JS8 decode is one *frame*:
+    /// seventy-two bits of a message that may run to a dozen of them, and only
+    /// the assembler — which sees the whole run — knows whose it was. The
+    /// activity list wants every frame as it lands and the reporting networks
+    /// want the station, once, when there is a callsign to give them, so the
+    /// two are reported separately rather than one being made to carry the
+    /// other.
+    ///
+    /// `audio_hz` is the tone offset, not a frequency: the engine knows the
+    /// dial and adds it, as it does for a slotted mode's decodes.
+    Heard { call: String, grid: String, audio_hz: f32, snr_db: i16, slot_utc: i64 },
     /// RADE: a remote station's callsign, recovered from its End-of-Over frame,
     /// with the SNR at the end of the over and the dial it was heard on.
     ///
@@ -134,6 +161,41 @@ pub struct DigiController {
     slot_buf: Vec<i16>,
     tap_scratch: Vec<f32>,
     last_slot_idx: i64,
+    /// The first slot this controller was alive for the whole of.
+    ///
+    /// A mode is selected at some arbitrary moment inside a period, so the
+    /// period that was already running when the controller was built holds only
+    /// the tail of itself — a second and a half of a fifteen-second slot, if the
+    /// operator happened to press the button then. That is not a fault and must
+    /// not be reported as one: it was doing exactly what it should
+    /// (issues #363, #367). `i64::MAX` until the first boundary says which slot
+    /// that is.
+    first_whole_slot: i64,
+    /// Receive periods that arrived short of a full slot — see
+    /// [`DigiController::check_slot_arrived_whole`].
+    short_slots: u64,
+    /// Consecutive receive periods that carried no audio *at all*, and whether
+    /// the run has been reported yet.
+    ///
+    /// A different fault from a short period and it needs saying differently:
+    /// nothing is arriving, rather than something arriving with holes in it.
+    /// Counted separately so it is reported once per run instead of every
+    /// fifteen seconds for as long as the radio stays off (issue #393).
+    silent_slots: u64,
+    silent_reported: bool,
+    /// Whether any audio has reached this controller yet.
+    ///
+    /// The slot clock starts when the controller is built, but the audio tap
+    /// does not necessarily start with it — the device may still be opening, or
+    /// there may be no radio on the other end at all. Until something arrives
+    /// there is no "short period" to report, only an absent one.
+    heard_audio: bool,
+    /// Slots handed to the decode worker and not yet answered for — see
+    /// [`DigiController::decoding`].
+    ///
+    /// A plain counter and not an atomic: both ends of it are in
+    /// [`DigiController::poll`], which is one thread.
+    decoding: usize,
     dial_hz: f64,
     audio_hz: f32,
     /// Which slot period we transmit in (even/odd), and a per-slot guard so
@@ -257,9 +319,15 @@ impl DigiController {
             slot_buf: Vec::with_capacity(params.slot_samples()),
             tap_scratch: Vec::new(),
             last_slot_idx: i64::MIN,
+            short_slots: 0,
+            silent_slots: 0,
+            silent_reported: false,
+            heard_audio: false,
+            decoding: 0,
             dial_hz: 0.0,
             audio_hz: 1500.0,
             tx_even,
+            first_whole_slot: i64::MAX,
             tx_fired_slot: i64::MIN,
             last_heard: std::collections::HashMap::new(),
             recent_activity: Vec::new(),
@@ -484,6 +552,24 @@ impl DigiController {
     /// Feed one block of demodulated audio (at `tap_rate`) into the current
     /// receive slot after resampling to 12 kHz.
     pub fn on_rx_audio(&mut self, tap: &[f32]) {
+        if !tap.is_empty() {
+            if !self.heard_audio {
+                self.heard_audio = true;
+                // The period audio *started* in holds only the tail of itself,
+                // exactly as the period the mode was selected in does — and it
+                // is not necessarily the same period. A tap that comes up two
+                // seconds late reported the first whole slot as thirteen
+                // seconds short of itself, every time the mode was selected
+                // (issue #393).
+                if self.last_slot_idx != i64::MIN {
+                    self.first_whole_slot =
+                        self.first_whole_slot.max(self.last_slot_idx.saturating_add(1));
+                }
+            }
+            // A run of silence has ended; the next one is worth reporting again.
+            self.silent_slots = 0;
+            self.silent_reported = false;
+        }
         self.tap_scratch.clear();
         match &mut self.resampler {
             Some(r) => r.push(tap, &mut self.tap_scratch),
@@ -496,6 +582,98 @@ impl DigiController {
                 self.slot_buf.push((s.clamp(-1.0, 1.0) * 28_000.0) as i16);
             }
         }
+    }
+
+    /// Say so when a slot's audio arrived short, because a slot that is short
+    /// is a slot that will not decode.
+    ///
+    /// The buffer is filled by *arrival*: whatever the sound card handed over
+    /// during the slot, spliced end to end. So a capture stream that loses
+    /// samples — a virtual audio cable that is not keeping pace, a machine that
+    /// is not emptying the card — does not merely make the audio shorter, it
+    /// moves every symbol after the gap earlier than the moment it was actually
+    /// sent. The decoder aligns what it is given to the slot it belongs to, so
+    /// a gap anywhere in the middle costs the whole slot.
+    ///
+    /// That failure is invisible from the operator's side: the waterfall is
+    /// full of signals, the panel says nothing, and no decodes appear
+    /// (issue #338). The audio layer reports the glitch, but nothing there
+    /// knows it has cost a decode — and nothing here knew the audio had a hole
+    /// in it. This is the join between the two.
+    ///
+    /// A slot this station transmitted in is skipped: the receiver is stood
+    /// down for the length of an over on a half-duplex radio, and its buffer is
+    /// legitimately a fraction of a slot.
+    fn check_slot_arrived_whole(&mut self) {
+        if self.last_slot_idx == self.tx_fired_slot {
+            return;
+        }
+        // The period the mode was selected in holds only the tail of itself,
+        // however healthy the audio device is — see [`Self::first_whole_slot`],
+        // which the first audio to arrive pushes forward if the tap started
+        // later than the clock did.
+        if self.last_slot_idx < self.first_whole_slot {
+            return;
+        }
+        let want = (self.params.slot_s * DECODE_RATE) as usize;
+        let got = self.slot_buf.len();
+        if want == 0 {
+            return;
+        }
+        // Nothing at all is a different fault from something with a hole in
+        // it, and the sample-loss message is simply untrue about it: there is
+        // no audio device losing samples, there is no audio. That is what a
+        // radio that is switched off looks like, or a tap that has not been
+        // connected — and reported as sample loss it produced one warning
+        // every fifteen seconds, for hours, in a mode the operator was not
+        // even in (issue #393). Said once per run instead, and re-armed by
+        // [`Self::on_rx_audio`] when audio comes back.
+        if got == 0 {
+            self.silent_slots = self.silent_slots.saturating_add(1);
+            if !self.silent_reported {
+                self.silent_reported = true;
+                tracing::warn!(
+                    "{}: no receive audio is reaching the decoder — a whole {:.1} s period                      arrived empty, so nothing can decode. Check that the radio is on and                      that the audio device sdroxide is listening to is the one it is feeding.                      Said once until audio returns.",
+                    self.params.mode.label(),
+                    self.params.slot_s,
+                );
+            }
+            return;
+        }
+        if got >= (want as f64 * SLOT_COMPLETE_FRAC) as usize {
+            return;
+        }
+        self.short_slots = self.short_slots.saturating_add(1);
+        // One line per run of them, not one per slot: this fires every fifteen
+        // seconds for as long as the fault lasts, and the log has to stay
+        // readable enough to find the rest of the session in.
+        if self.short_slots == 1 || self.short_slots.is_multiple_of(SHORT_SLOT_REPORT_EVERY) {
+            tracing::warn!(
+                "{}: the last receive period arrived {:.1} s short of the {:.1} s it should be —                  the audio device is losing samples, which moves every tone after the gap and                  costs the whole period. Nothing will decode while this lasts. {} such period(s)                  so far; look for the audio glitch warnings above and at the device feeding                  sdroxide (a virtual audio cable is the usual one).",
+                self.params.mode.label(),
+                (want - got) as f64 / DECODE_RATE,
+                self.params.slot_s,
+                self.short_slots,
+            );
+        }
+    }
+
+    /// How many receive periods have been handed to the decode worker and not
+    /// yet come back.
+    ///
+    /// Zero means the decoder has caught up: every slot dispatched so far has
+    /// been through the modem and whatever it found — including nothing — has
+    /// already been folded in by [`Self::poll`].
+    ///
+    /// The distinction that makes this worth exposing is that a slot which
+    /// decodes to nothing produces no [`DigiAction::Decodes`] at all, so
+    /// "have any decodes arrived?" cannot answer "has the decoder finished?".
+    /// They come apart in both directions — a busy slot still being worked on
+    /// looks the same as an empty one that is already done — and anything
+    /// waiting for the decoder has to ask this instead of watching the actions
+    /// and guessing.
+    pub fn decoding(&self) -> usize {
+        self.decoding
     }
 
     /// Whether a TX burst is currently on the air (drives the engine's PTT
@@ -602,6 +780,9 @@ impl DigiController {
         loop {
             match self.res_rx.try_recv() {
                 Ok((slot_idx, decodes)) => {
+                    // Answered for, whether or not it found anything: an empty
+                    // slot is a finished slot.
+                    self.decoding = self.decoding.saturating_sub(1);
                     if !decodes.is_empty() {
                         let slot_utc = self.scheduler.slot_start_unix(slot_idx) as i64;
                         // Remember which slot we heard each station in (reply
@@ -648,6 +829,7 @@ impl DigiController {
         let idx = self.scheduler.slot_index(now);
         if idx != self.last_slot_idx {
             if self.last_slot_idx != i64::MIN {
+                self.check_slot_arrived_whole();
                 let min_samples = (self.params.slot_s * DECODE_RATE * 0.5) as usize;
                 if self.slot_buf.len() >= min_samples {
                     let audio = std::mem::take(&mut self.slot_buf);
@@ -658,14 +840,22 @@ impl DigiController {
                         dx_call: self.qso.dx_call().map(str::to_string),
                         eu_vhf: self.qso.contest_selected(),
                     };
-                    let _ = self.job_tx.send(DecodeJob {
-                        audio,
-                        slot_idx,
-                        slot_utc,
-                        ap,
-                        audio_hz: self.audio_hz,
-                    });
+                    if self
+                        .job_tx
+                        .send(DecodeJob { audio, slot_idx, slot_utc, ap, audio_hz: self.audio_hz })
+                        .is_ok()
+                    {
+                        self.decoding += 1;
+                    }
                 }
+            }
+            if self.last_slot_idx == i64::MIN {
+                // Not a boundary at all: the first poll, landing wherever
+                // inside period `idx` the operator happened to select the mode.
+                // What this controller ends up holding for `idx` is whatever
+                // was left of it — so the first period it hears all of is the
+                // next one.
+                self.first_whole_slot = idx.saturating_add(1);
             }
             self.slot_buf.clear();
             self.last_slot_idx = idx;
@@ -821,6 +1011,69 @@ mod tests {
         }
     }
 
+    /// A mode selected part way through a period must not report that period
+    /// as a fault.
+    ///
+    /// It is short because it started late, not because anything lost samples,
+    /// and saying "the audio device is losing samples … nothing will decode
+    /// while this lasts" at every start sent two reporters looking for a fault
+    /// in their sound card that was never there (issues #363, #367).
+    #[test]
+    fn the_period_a_mode_was_selected_inside_is_not_a_short_period() {
+        // 1_609_459_200 is a 15 s boundary; start 1.6 s into the slot after it,
+        // which is where issue #367's log has the engine coming up.
+        let t = |secs: f64| UNIX_EPOCH + Duration::from_secs_f64(1_609_459_200.0 + secs);
+        let mut c = DigiController::new(Mode::Ft8, cfg(), 12_000.0);
+        c.poll(t(1.6), 14_074_000.0);
+        // Whatever was left of that period, and then the boundary that ends it.
+        c.on_rx_audio(&vec![0.0f32; (13.4 * 12_000.0) as usize]);
+        c.poll(t(15.1), 14_074_000.0);
+        assert_eq!(c.short_slots, 0, "the period we joined late is not a fault");
+
+        // The next one is this controller's own, and a hole in it is real.
+        c.on_rx_audio(&vec![0.0f32; (2.0 * 12_000.0) as usize]);
+        c.poll(t(30.1), 14_074_000.0);
+        assert_eq!(c.short_slots, 1, "a period that lost thirteen seconds is");
+
+        // ...and a whole one is not.
+        c.on_rx_audio(&vec![0.0f32; (15.0 * 12_000.0) as usize]);
+        c.poll(t(45.1), 14_074_000.0);
+        assert_eq!(c.short_slots, 1);
+    }
+
+    /// Issue #393: a controller with no audio reaching it at all reported one
+    /// "the audio device is losing samples" every fifteen seconds — a thousand
+    /// of them in one log, on a machine whose radio was not even switched on.
+    /// Nothing was losing samples; nothing was arriving.
+    #[test]
+    fn periods_with_no_audio_at_all_are_not_reported_as_lost_samples() {
+        let t = |secs: f64| UNIX_EPOCH + Duration::from_secs_f64(1_609_459_200.0 + secs);
+        let mut c = DigiController::new(Mode::Ft8, cfg(), 12_000.0);
+        c.poll(t(0.1), 14_074_000.0);
+        // Four empty periods running.
+        for i in 1..=4 {
+            c.poll(t(15.0 * f64::from(i) + 0.1), 14_074_000.0);
+        }
+        assert_eq!(c.short_slots, 0, "silence is not sample loss");
+        // Three, not four: the period the mode was selected inside is skipped
+        // whatever it holds, exactly as it is for a short period.
+        assert_eq!(c.silent_slots, 3, "but it is counted");
+        assert!(c.silent_reported, "and said once");
+
+        // Audio arrives part way through a period. That period is short
+        // because the tap started late, which is the same thing as joining a
+        // period late and equally not a fault.
+        c.on_rx_audio(&vec![0.0f32; (5.0 * 12_000.0) as usize]);
+        c.poll(t(90.1), 14_074_000.0);
+        assert_eq!(c.short_slots, 0, "the period the audio started in is not a fault");
+        assert!(!c.silent_reported, "and the silence report is re-armed");
+
+        // From the next one on, short means short.
+        c.on_rx_audio(&vec![0.0f32; (2.0 * 12_000.0) as usize]);
+        c.poll(t(105.1), 14_074_000.0);
+        assert_eq!(c.short_slots, 1);
+    }
+
     #[test]
     fn call_cq_keys_an_aligned_burst() {
         let mut c = DigiController::new(Mode::Ft8, cfg(), 12_000.0);
@@ -878,6 +1131,46 @@ mod tests {
             (peak - declared).abs() < 0.02,
             "the burst peaks at {peak} against the {declared} it declares"
         );
+    }
+
+    /// The burst is 48 kHz audio whatever the receive tap runs at, and
+    /// [`crate::DigiEngine::tx_rate`] says so.
+    ///
+    /// The engine rate-matches this audio to whatever the radio plays, and it
+    /// has to be told the right rate to match *from*. An Icom on its 12 kHz IF
+    /// hands audio back at 24 kHz while taking transmit audio at 48: taking the
+    /// receive tap for the modem's rate resampled a burst that was already
+    /// 48 kHz up by a factor of two, and every FT8/FT4 over went out at half
+    /// speed and twice the length (issue #359).
+    #[test]
+    fn the_burst_is_48_khz_whatever_the_tap_runs_at() {
+        use crate::DigiEngine;
+
+        let burst_samples = |tap: f64| {
+            let mut c = DigiController::new(Mode::Ft8, cfg(), tap);
+            assert_eq!(DigiEngine::tx_rate(&c), 48_000.0, "at a {tap} Hz tap");
+            c.call_cq();
+            let now = UNIX_EPOCH + Duration::from_secs_f64(1_609_459_201.0);
+            c.poll(now, 14_074_000.0);
+            assert!(c.tx_burst_active(), "no burst to measure at a {tap} Hz tap");
+            let mut block = [0.0f32; 480];
+            let mut n = 0usize;
+            while !DigiController::fill_tx_block(&mut c, &mut block) {
+                n += block.len();
+                assert!(n < 48_000 * 60, "the burst never ended at a {tap} Hz tap");
+            }
+            n
+        };
+
+        // The tap an Icom on its 12 kHz IF gives, and the one every other rig
+        // gives. The transmission is the same length either way.
+        let at_24k = burst_samples(24_000.0);
+        assert_eq!(at_24k, burst_samples(48_000.0), "the tap rate changed the burst");
+        // FT8 is 79 symbols of 1920 samples at 12 kHz: 12.64 s on the air.
+        // Counted in whole blocks, so a hair under — the point of the figure is
+        // that it is one over and not two.
+        let secs = at_24k as f64 / 48_000.0;
+        assert!((secs - 12.64).abs() < 0.05, "the burst runs {secs:.3} s, not FT8's 12.64 s");
     }
 
     #[test]

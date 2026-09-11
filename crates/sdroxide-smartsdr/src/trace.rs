@@ -36,6 +36,19 @@ pub struct StreamCounters {
     /// Class code of the most recent packet — a stream that changes it (a DAX
     /// IQ rate change, say) is worth seeing.
     pub class_code: u16,
+    /// I/Q sample pairs actually decoded off this stream, where it is a DAX IQ
+    /// one. Zero for every other stream type.
+    ///
+    /// Here so the dump can state the rate the radio is *really* streaming at,
+    /// measured, rather than the rate its class code claims. A receive chain
+    /// running at a rate the samples do not arrive at sounds like a badly
+    /// detuned receiver rather than like an error — "unintelligible" is the
+    /// word every report of it has used — and there is nothing else in a trace
+    /// that would tell the two apart (issue #368).
+    pub iq_pairs: u64,
+    /// When the first packet of this stream arrived, so the measurement above
+    /// has an interval and not just a count.
+    pub first_at: Option<Instant>,
 }
 
 #[derive(Debug, Default)]
@@ -112,6 +125,9 @@ impl Trace {
             let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
             let e = g.streams.entry(stream_id).or_default();
             let first = e.packets == 0;
+            if first {
+                e.first_at = Some(Instant::now());
+            }
             e.packets += 1;
             e.bytes += bytes as u64;
             e.lost += lost as u64;
@@ -130,6 +146,13 @@ impl Trace {
                 "first packet on stream"
             );
         }
+    }
+
+    /// Record how many I/Q pairs came out of one DAX IQ packet, which is what
+    /// [`StreamCounters::iq_pairs`] measures the real rate from.
+    pub fn iq_pairs(&self, stream_id: u32, pairs: usize) {
+        let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        g.streams.entry(stream_id).or_default().iq_pairs += pairs as u64;
     }
 
     /// A snapshot of the per-stream counters.
@@ -166,6 +189,36 @@ impl Trace {
                 "0x{id:08X}  class=0x{:04X}  packets={}  bytes={}  lost={}\n",
                 c.class_code, c.packets, c.bytes, c.lost
             ));
+            // The measured rate against the declared one. A DAX IQ stream whose
+            // two disagree is a receive chain running at the wrong rate, which
+            // is heard as unintelligible audio and is invisible everywhere else
+            // (issue #368).
+            let (Some(first), Some(declared)) =
+                (c.first_at, crate::protocol::dax_iq_rate(c.class_code))
+            else {
+                continue;
+            };
+            let secs = first.elapsed().as_secs_f64();
+            if c.iq_pairs == 0 || secs < 1.0 {
+                continue;
+            }
+            let measured = c.iq_pairs as f64 / secs;
+            let off = (measured - f64::from(declared)) / f64::from(declared);
+            out.push_str(&format!(
+                "              {:.1} kHz measured over {secs:.1} s ({} pairs), declared {:.0} \
+                 kHz{}\n",
+                measured / 1000.0,
+                c.iq_pairs,
+                f64::from(declared) / 1000.0,
+                if off.abs() > 0.02 {
+                    format!(
+                        "  ⚠ {:+.0}% — the receive chain is running at the wrong rate",
+                        off * 100.0
+                    )
+                } else {
+                    String::new()
+                },
+            ));
         }
         out.push_str("\n--- control ---\n");
         for line in &g.lines {
@@ -188,6 +241,30 @@ impl Trace {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The dump states the rate a DAX IQ stream is *really* running at, and
+    /// says so loudly when that is not the rate its class code claims.
+    ///
+    /// Nothing else in a trace can tell a receive chain running at the wrong
+    /// rate from one being sent nonsense, and both are heard as unintelligible
+    /// audio (issue #368).
+    #[test]
+    fn a_dax_iq_stream_reports_the_rate_it_is_really_running_at() {
+        let t = Trace::new();
+        // A 192 kHz stream that is actually delivering 96 kHz. One packet to
+        // start the clock, then the pairs a second and a bit would carry.
+        t.packet(0x2000_0000, crate::protocol::pcc::DAX_IQ_192K, 1440, 0);
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        t.iq_pairs(0x2000_0000, 96_000 * 11 / 10);
+        let d = t.dump();
+        assert!(d.contains("declared 192 kHz"), "{d}");
+        assert!(d.contains("the receive chain is running at the wrong rate"), "{d}");
+
+        // A stream that is not DAX IQ has no rate to measure and says nothing.
+        let t2 = Trace::new();
+        t2.packet(0x4000_0001, crate::protocol::pcc::FFT, 144, 0);
+        assert!(!t2.dump().contains("declared"));
+    }
 
     #[test]
     fn dump_reports_both_directions_and_streams() {

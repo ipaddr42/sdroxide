@@ -12,9 +12,29 @@
 # id looks correct and fails every time, because the upload happens through the
 # first one.
 #
-# TAG+="uaccess" hands an ACL to whoever is logged in at the active seat. That
-# is better than the older GROUP="plugdev" recipe, which needs a group to exist,
-# the user to be added to it, and a full re-login before it takes effect.
+# TAG+="uaccess" hands an ACL to whoever is logged in at the active seat, which
+# needs no group to exist and no re-login. It is the better half of this rule
+# and it is not the whole of it: uaccess grants nothing where there is no seat
+# to be logged in at — WSL2, a headless box reached over ssh, a container, or
+# sdroxide running as a systemd service — and the device stays root-owned and
+# unreachable for reasons nothing on screen explains (issue #350).
+#
+# So GROUP="plugdev" comes along as a fallback, taking effect for anyone in
+# that group when the ACL does not. To use it:
+#
+#   sudo groupadd -f plugdev && sudo usermod -aG plugdev $USER
+#
+# then log out and back in (`newgrp plugdev` for the current shell).
+#
+# That fallback is why the permissions below are applied on their own lines
+# rather than appended to each id. udev resolves GROUP at parse time, and a
+# group that does not exist on this machine — plugdev ships on Debian and
+# Ubuntu, but not on Arch or Fedora — discards THE WHOLE RULE LINE, not just
+# the GROUP token. Written the obvious way, as one line per id carrying MODE,
+# GROUP and TAG together, a missing plugdev takes uaccess down with it and the
+# receiver stays root-owned on exactly the distros that never had the group
+# (issue #350 again, from the other side). Keeping GROUP alone on the last
+# line means only that line is dropped and the ACL still lands.
 #
 # Install:
 #   sudo cp 60-sdroxide-rx888.rules /usr/lib/udev/rules.d/
@@ -22,7 +42,10 @@
 # then unplug and replug the receiver.
 
 # Cypress FX3 boot ROM — how every RX-888 appears before it is programmed.
-SUBSYSTEM=="usb", ATTRS{idVendor}=="04b4", ATTRS{idProduct}=="00f3", MODE="0660", TAG+="uaccess"
+SUBSYSTEM=="usb", ATTRS{idVendor}=="04b4", ATTRS{idProduct}=="00f3", ENV{SDROXIDE_RX888}="1"
 
 # The programmed receiver, product string "RX888mk2".
-SUBSYSTEM=="usb", ATTRS{idVendor}=="04b4", ATTRS{idProduct}=="00f1", MODE="0660", TAG+="uaccess"
+SUBSYSTEM=="usb", ATTRS{idVendor}=="04b4", ATTRS{idProduct}=="00f1", ENV{SDROXIDE_RX888}="1"
+
+ENV{SDROXIDE_RX888}=="1", MODE="0660", TAG+="uaccess"
+ENV{SDROXIDE_RX888}=="1", GROUP="plugdev"

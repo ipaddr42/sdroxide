@@ -168,6 +168,13 @@ pub struct ViewState {
     /// anything while a target is selected.
     #[serde(default = "adsb_card_default")]
     pub adsb_card_fraction: f32,
+    /// Fraction of the AIS panel's width given to the vessel list; the rest is
+    /// the chart.
+    #[serde(default = "ais_split_default")]
+    pub ais_split_fraction: f32,
+    /// ...and of its height given to the detail card, while one is open.
+    #[serde(default = "ais_card_default")]
+    pub ais_card_fraction: f32,
     /// Fraction of the QSO area's height given to the world map; the rest is the
     /// station card + transcript + buttons. User-draggable.
     ///
@@ -548,6 +555,8 @@ impl Default for ViewState {
             js8_split_fraction: js8_split_default(),
             adsb_split_fraction: adsb_split_default(),
             adsb_card_fraction: adsb_card_default(),
+            ais_split_fraction: ais_split_default(),
+            ais_card_fraction: ais_card_default(),
             digi_map_fraction: 0.6,
             digi_pane: 0,
             sstv_tx_fraction: 0.38,
@@ -723,6 +732,20 @@ fn adsb_split_default() -> f32 {
 /// Default for [`ViewState::adsb_card_fraction`].
 fn adsb_card_default() -> f32 {
     0.40
+}
+
+/// Default for [`ViewState::ais_split_fraction`]. A little wider than the
+/// aircraft table's share: a vessel's name is twenty characters where a
+/// callsign is seven.
+fn ais_split_default() -> f32 {
+    0.46
+}
+
+/// Default for [`ViewState::ais_card_fraction`]. Deeper than the aircraft
+/// card's, because a ship's card has a dozen more rows in it — a name, a call
+/// sign, an IMO number, dimensions, a draught, a destination and an ETA.
+fn ais_card_default() -> f32 {
+    0.45
 }
 
 /// Default for [`ViewState::js8_split_fraction`].

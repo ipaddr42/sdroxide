@@ -6,7 +6,7 @@
 //!                                                    │ bits
 //!                        Lfsr (one per burst) ◀───────┤
 //!                                                    ▼
-//!                          header::decode ─▶ block::decode ─▶ avlc::parse
+//!          header::decode ─▶ block::decode ─▶ hdlc::unframe ─▶ avlc::parse
 //! ```
 //!
 //! # The counters are the diagnosis
@@ -21,10 +21,13 @@
 //! - `bursts` up, `syncs` zero — something is arriving and it is not VDL2.
 //! - `syncs` up, `header_ok` zero — it *is* VDL2, and the bits are being read
 //!   wrongly. A decoder problem, not a propagation one.
-//! - `header_ok` up, `rs_fail` high — real frames, arriving damaged.
-//! - `rs_ok` up, `fcs_bad` high — the error correction is fine and something
-//!   above it is not. The sharpest single signal there is that this decoder,
-//!   rather than the radio path, is what is wrong.
+//! - `header_ok` up, `hdlc_bad` high — the header reads and the data field does
+//!   not unwrap. A decoder problem too, one layer further in.
+//! - `header_ok` up, `rs_fail` high — see [`ChannelRx::decode_from`]: on real
+//!   traffic this is *every* block, because the Reed-Solomon parameters here do
+//!   not fit what is on the air, and the frame check sequence is what admits a
+//!   frame instead.
+//! - `frames` up, `fcs_bad` high — real frames, arriving damaged.
 //!
 //! # The bit stream is continuous
 //!
@@ -93,9 +96,54 @@ pub struct Counters {
     pub rs_corrected: u64,
     pub multiblock: u64,
     pub multiblock_ok: u64,
+    /// The data field did not unwrap as an HDLC frame: no flags, an abort, or
+    /// a destuffed length that is not a whole number of octets.
+    pub hdlc_bad: u64,
+    /// Frames the Reed-Solomon layer refused and the frame check sequence then
+    /// accepted — see [`ChannelRx::decode_from`] for why that is allowed and
+    /// what it says about the code as implemented here.
+    pub fec_bypassed: u64,
     pub fcs_bad: u64,
     pub malformed: u64,
     pub frames: u64,
+}
+
+/// Why a data field yielded no frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FieldError {
+    /// It did not unwrap as an HDLC frame at all.
+    Hdlc,
+    /// It did, and the frame check sequence says it is damaged.
+    BadFcs,
+    /// It did, and what came out is not an AVLC frame.
+    Malformed,
+}
+
+/// Take the AVLC frame out of one reading of a data field: unwrap the HDLC
+/// frame the `trlen` bits hold, then parse and check what is inside.
+///
+/// A function rather than a block because it is run twice on the same
+/// transmission — once on the Reed-Solomon layer's repair and once on the
+/// octets as they arrived — and the two must be tried the same way.
+fn frame_from_field(data: &[u8], trlen: usize) -> Result<(Vec<u8>, avlc::Frame), FieldError> {
+    // The data field is an HDLC frame — two `0x7E` flags with the AVLC frame
+    // bit-stuffed between them — and the header's length is the length of
+    // *that*, in bits. Reading the field as the bare frame put every octet one
+    // out and failed every check sequence, which is what issue #265 was.
+    if data.len() * 8 < trlen {
+        return Err(FieldError::Malformed);
+    }
+    let bits: Vec<u8> =
+        data.iter().flat_map(|&o| (0..8).map(move |k| (o >> k) & 1)).take(trlen).collect();
+    let raw = crate::hdlc::unframe(&bits).map_err(|_| FieldError::Hdlc)?;
+    if raw.len() < avlc::MIN_LEN {
+        return Err(FieldError::Malformed);
+    }
+    match avlc::parse(&raw) {
+        Ok(f) => Ok((raw, f)),
+        Err(avlc::FrameError::BadFcs) => Err(FieldError::BadFcs),
+        Err(_) => Err(FieldError::Malformed),
+    }
 }
 
 /// One channel's receiver.
@@ -264,9 +312,8 @@ impl ChannelRx {
         lfsr.apply(&mut self.bits[header::HEADER_BITS..need]);
         debug_assert!(done >= header::HEADER_BITS);
 
-        // Least significant bit first, which is what makes the Reed-Solomon
-        // syndromes come out — the check that would say so if it were the other
-        // way round.
+        // Least significant bit first within the octet, which is HDLC's order
+        // and the order the frame check sequence comes out on.
         self.field.clear();
         for i in 0..l.total_octets {
             let base = header::HEADER_BITS + i * 8;
@@ -280,36 +327,79 @@ impl ChannelRx {
         if l.is_multiblock() {
             self.counters.multiblock += 1;
         }
-        let fec = match block::decode(&self.field, data_octets, self.order) {
-            Ok(f) => f,
+        // The Reed-Solomon layer is *advisory*, and deliberately so.
+        //
+        // Not one transmission in the issue #265 recording satisfies the code
+        // as written here. The parity octets are a deterministic function of
+        // the data field — two identical transmissions carry identical parity —
+        // so they are error correction of some kind, but no first consecutive
+        // root, no root step and no field polynomial makes a syndrome of them,
+        // in any of the thirty degree-8 fields there are. Something about the
+        // parameters or the symbol basis is wrong and that recording cannot say
+        // what. Meanwhile 195 of its transmissions come out of this decoder with
+        // a *correct frame check sequence*, which is the standard's own test
+        // for whether a frame is good — and every one of them the second way.
+        //
+        // So both readings are tried: the block as the code repaired it, and
+        // the block exactly as it arrived. The check sequence decides between
+        // them, which is what keeps a *miscorrection* — a wrong repair by a
+        // code that does not fit — from costing a frame that was fine. What is
+        // lost meanwhile is the correction itself: a genuinely damaged frame
+        // that the right code would have repaired is dropped instead.
+        // `fec_bypassed` counts the frames that came through the second way, so
+        // what the FEC is worth here stays a number rather than an assumption.
+        let repaired = match block::decode(&self.field, data_octets, self.order) {
+            Ok(f) => {
+                self.counters.rs_ok += 1;
+                self.counters.rs_corrected += f.corrected as u64;
+                if l.is_multiblock() {
+                    self.counters.multiblock_ok += 1;
+                }
+                Some(f)
+            }
             Err(_) => {
                 self.counters.rs_fail += 1;
-                return None;
+                None
             }
         };
-        self.counters.rs_ok += 1;
-        self.counters.rs_corrected += fec.corrected as u64;
-        if l.is_multiblock() {
-            self.counters.multiblock_ok += 1;
+        let trlen = h.trlen_bits as usize;
+        let mut outcome = None;
+        let mut worst = FieldError::Malformed;
+        for (attempt, data) in
+            [repaired.as_ref().map(|f| f.data.as_slice()), Some(&self.field[..data_octets])]
+                .into_iter()
+                .flatten()
+                .enumerate()
+        {
+            match frame_from_field(data, trlen) {
+                Ok(v) => {
+                    outcome = Some((v, attempt));
+                    break;
+                }
+                // A check sequence that failed is a sharper answer than a field
+                // that would not unwrap, so it is the one reported.
+                Err(e) => {
+                    if worst != FieldError::BadFcs {
+                        worst = e;
+                    }
+                }
+            }
         }
-
-        let frame_len = (h.trlen_bits as usize) / 8;
-        if frame_len < avlc::MIN_LEN || frame_len > fec.data.len() {
-            self.counters.malformed += 1;
+        let Some(((raw, frame), attempt)) = outcome else {
+            match worst {
+                FieldError::BadFcs => self.counters.fcs_bad += 1,
+                FieldError::Hdlc => self.counters.hdlc_bad += 1,
+                FieldError::Malformed => self.counters.malformed += 1,
+            }
             return None;
-        }
-        let raw = fec.data[..frame_len].to_vec();
-        let frame = match avlc::parse(&raw) {
-            Ok(f) => f,
-            Err(avlc::FrameError::BadFcs) => {
-                self.counters.fcs_bad += 1;
-                return None;
-            }
-            Err(_) => {
-                self.counters.malformed += 1;
-                return None;
-            }
         };
+        // The first attempt is the repaired block where there was one.
+        let bypassed = repaired.is_none() || attempt > 0;
+        let rs_corrected = if bypassed { 0 } else { repaired.map_or(0, |f| f.corrected) };
+
+        if bypassed {
+            self.counters.fec_bypassed += 1;
+        }
 
         let end = reader.pos().max(0.0) as usize + 1;
         Some((
@@ -318,7 +408,7 @@ impl ChannelRx {
                 center_hz: self.center_hz,
                 snr_db: burst.snr_db,
                 rssi_dbfs: burst.peak_dbfs,
-                rs_corrected: fec.corrected,
+                rs_corrected,
                 evm_deg: reader.evm_deg(),
                 freq_err_hz: reader.freq_hz(),
                 raw,

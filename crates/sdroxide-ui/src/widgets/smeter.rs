@@ -161,6 +161,87 @@ fn swr_frac(swr: f32) -> f32 {
 /// widget that draws it.
 pub use sdroxide_types::SmeterStyle;
 
+/// What the meter is showing right now, in words, for the hover.
+///
+/// The face is dense by design — a chip, a right-hand figure, one or two bars
+/// and a scale — and none of it says what it *is*. An operator seeing a needle
+/// at 50 during an over has no way to tell whether that is half the radio's
+/// power, half its modulation, or something else entirely, and an operator
+/// looking for SWR has no way to tell a radio that has no bridge from a reading
+/// that is missing (issue #373). So every line here names the quantity and its
+/// units, and the transmit case says outright when the radio measures nothing.
+pub fn hover_text(meters: Option<&Meters>) -> String {
+    let mut out = String::new();
+    if let Some(tx) = meters.and_then(|m| m.tx.as_ref()) {
+        out.push_str(
+            "ALC — how hard the transmitter is being driven, as a percentage of the most it \
+             can put out. 100 % is full scale, not full power in watts: what that is worth at \
+             the antenna depends on the radio and on Drive.",
+        );
+        match tx.fwd_w {
+            Some(w) => out.push_str(&format!(
+                "\n\nForward power — {w:.1} W, measured by the radio's own sensor.",
+            )),
+            None => out.push_str(
+                "\n\nThis radio reports no forward power, so the figure beside ALC is the \
+                 ALC reading again rather than watts.",
+            ),
+        }
+        if let Some(po) = tx.po {
+            out.push_str(&format!(
+                "\n\nPO — the radio's own power-output meter, at {:.0} % of its full scale. A \
+                 needle position as the radio reports it, not a calibrated wattage; what to \
+                 watch is whether it falls while Drive stays put.",
+                po.clamp(0.0, 1.0) * 100.0,
+            ));
+        }
+        match tx.swr {
+            Some(swr) => out.push_str(&format!(
+                "\n\nSWR — {swr:.1}:1, the match the antenna is presenting, as the radio \
+                 measures it. Under 2:1 is unremarkable; past 3:1 the scale turns red.",
+            )),
+            None => out.push_str(
+                "\n\nNo SWR: this radio has no bridge to measure it with, and sdroxide will \
+                 not invent one — it can only show what the radio itself reports. A rig with \
+                 an SWR meter (over CAT, TCI or a LAN link) and an HPSDR board both fill this \
+                 in; a plain SDR transmitter cannot.",
+            ),
+        }
+        return out;
+    }
+
+    let Some(m) = meters else {
+        return "No signal report yet — the receiver has not delivered a meter reading.".into();
+    };
+    let (s, over) = m.s_units();
+    if over > 0.0 {
+        out.push_str(&format!(
+            "Received signal strength: S9 + {over:.0} dB ({:.0} dBm in the passband).",
+            m.s_dbm,
+        ));
+    } else {
+        out.push_str(&format!(
+            "Received signal strength: S{s} ({:.0} dBm in the passband).",
+            m.s_dbm,
+        ));
+    }
+    out.push_str(
+        "\n\nS9 is −73 dBm and each S-unit below it is 6 dB. The dBm figure is only as \
+         honest as the front end's calibration — an uncalibrated receiver reports dBFS with a \
+         dBm label.",
+    );
+    if m.adc_overloaded() {
+        out.push_str(
+            "\n\nOVLD: the converter is into its rails, so the level shown understates the \
+             signal. Wind the front-end gain back.",
+        );
+    }
+    if let Some(t) = m.pa_temp_c {
+        out.push_str(&format!("\n\nThe radio reports {t:.0} °C."));
+    }
+    out
+}
+
 /// Draw the S-meter in the selected style, filling the box's full interior.
 /// Returns the (clickable) response so the caller can cycle the style.
 pub fn show(ui: &mut Ui, meters: Option<&Meters>, style: SmeterStyle) -> Response {
@@ -664,6 +745,45 @@ fn face(ui: &mut Ui, size: Vec2, tx: bool) -> (Rect, Response) {
     (rect, resp)
 }
 
+/// The board temperature above which the tag stops being subdued, and the one
+/// above which it turns red, in degrees Celsius.
+///
+/// A Hermes-Lite 2 idles in the thirties and settles somewhere in the forties
+/// under a duty cycle it is happy with; the fifties are the point at which an
+/// operator would want to know, and past seventy the board is being asked for
+/// more than its heatsinking can carry away. Neither figure is a limit the
+/// radio enforces — this is an instrument, not a protection circuit, and the
+/// colours are there to catch the eye rather than to make a claim.
+const TEMP_WARM_C: f32 = 55.0;
+const TEMP_HOT_C: f32 = 70.0;
+
+/// The radio's own temperature, in the face's bottom-left corner, where the
+/// board reports one (issue #333).
+///
+/// Down there rather than on the header strip because it is not the reading
+/// this instrument is for: the signal or the power is, and neither may give up
+/// its place. It is a background fact about the hardware that happens to be
+/// worth a corner of the one panel an operator already watches — which is why
+/// it says nothing at all when the radio has no sensor, and why it is
+/// subdued until it is worth noticing.
+fn temperature(p: &Painter, rect: Rect, meters: Option<&Meters>, k: f32) {
+    let Some(deg) = meters.and_then(|m| m.pa_temp_c) else { return };
+    let ink = if deg >= TEMP_HOT_C {
+        RED()
+    } else if deg >= TEMP_WARM_C {
+        hot(c(0xffc03a), c(0xc88a00), c(0xffff00))
+    } else {
+        SUBDUED()
+    };
+    p.text(
+        pos2(rect.left() + 6.0 * k, rect.bottom() - 3.0 * k),
+        Align2::LEFT_BOTTOM,
+        format!("{deg:.0}°C"),
+        FontId::monospace(9.0 * k.max(0.85)),
+        ink,
+    );
+}
+
 /// Draw the box border on top of the finished meter (the meter face already
 /// covers the whole rect, so the frame's own border would be hidden).
 fn border(ui: &Ui, rect: Rect) {
@@ -893,6 +1013,7 @@ fn show_bar(ui: &mut Ui, meters: Option<&Meters>, size: Vec2) -> Response {
     let left = rect.left() + 6.0 * k;
     let right = rect.right() - 6.0 * k;
     header(&p, rect, &r, k);
+    temperature(&p, rect, meters, k);
 
     if let Some(tx) = tx {
         // Two stacked rows: the engine's drive on top, and below it whichever
@@ -1086,6 +1207,7 @@ fn show_needle(ui: &mut Ui, meters: Option<&Meters>, size: Vec2) -> Response {
 
     // Readouts along the top edge, where the arc has dipped out of the way.
     header(&p, rect, &r, k);
+    temperature(&p, rect, meters, k);
     border(ui, rect);
     resp
 }
@@ -1240,6 +1362,7 @@ fn show_trace(ui: &mut Ui, meters: Option<&Meters>, size: Vec2) -> Response {
         Color32::TRANSPARENT,
     );
     header(&p, rect, &r, k);
+    temperature(&p, rect, meters, k);
     border(ui, rect);
     resp
 }

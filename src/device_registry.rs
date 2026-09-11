@@ -29,9 +29,16 @@ pub enum DeviceKey {
     Hpsdr(std::net::Ipv4Addr),
     /// A PlutoSDR, by the address dialed (`host[:port]`).
     Pluto(String),
-    /// An SDRplay RSP, by the serial the API service reports — or the empty
-    /// string for "the first one found", which is the same device to every
-    /// radio that says it.
+    /// An SDRplay RSP, by the serial the API service reports.
+    ///
+    /// Always the *resolved* serial — `SdrPlaySource::open` turns "the first
+    /// one found" into the receiver it actually found before keying on it.
+    /// Keyed on the configured string instead, two radios meaning one RSPduo
+    /// missed each other whenever one of them named the board and the other
+    /// did not, and the second went off to open a session on a device this
+    /// process already held (issue #392). Falls back to the configured string
+    /// only when nothing is there to resolve against, where the open is going
+    /// to fail anyway and should say so itself.
     SdrPlay(String),
 }
 

@@ -286,6 +286,12 @@ pub struct SdroxideApp {
     /// a half-typed range and never a limit the radio is briefly held to.
     /// `None` = not being edited.
     range_edit: Option<(String, String)>,
+    /// Where this radio's antenna is, being edited on the Radio tab. Buffered
+    /// until Apply for the same reason as the two above: it decides the square
+    /// every reception report goes out under, and a locator half-typed into
+    /// `radio.json` would be a square somewhere else entirely. `None` = not
+    /// being edited.
+    rx_site_edit: Option<sdroxide_types::RxSite>,
     serial_ports: Vec<String>,
     /// HPSDR devices found by the last "Discover" scan in the settings dialog.
     hpsdr_devices: Vec<sdroxide_types::HpsdrDevice>,
@@ -424,6 +430,9 @@ pub struct SdroxideApp {
     navtex_open: Option<usize>,
     nr_popup_since: Option<f64>,
     rec_popup_since: Option<f64>,
+    /// Fade clock for the receive-filter popup behind the BW chip, like
+    /// `nr_popup_since`.
+    bw_popup_since: Option<f64>,
     /// Fade clocks for the repeater popups in the VFO box — the DUPLEX shift
     /// and the TONE encoder — like `tone_popup_since`.
     duplex_popup_since: Option<f64>,
@@ -473,6 +482,10 @@ pub struct SdroxideApp {
     /// by the round-tripped status echo. Seeded once from the first status.
     digi_cfg_edit: sdroxide_types::DigiConfig,
     digi_cfg_seeded: bool,
+    /// Whether the CW panel's message-button editor is open (issue #374).
+    /// Screen state, not the operator's: the buttons themselves live in
+    /// `DigiConfig`.
+    cw_macro_edit: bool,
     /// The FT8/FT4 transmit-offset box, as typed. Kept as text rather than a
     /// number so a half-finished figure survives between frames: parsing every
     /// keystroke would rewrite "8" to 200 before the 2 was pressed.
@@ -546,6 +559,20 @@ pub struct SdroxideApp {
     show_adsb_setup: bool,
     adsb_sort: panels::adsb::AdsbSort,
     adsb_sort_desc: bool,
+    /// AIS: the vessel table and everything the decoder is seeing, as the
+    /// engine last sent it. Boxed for the reason the ADS-B one is — a busy
+    /// estuary's table, each row carrying a trail, is far larger than anything
+    /// else held here.
+    ais_status: Option<Box<sdroxide_types::AisStatus>>,
+    /// AIS: the chart's pan/zoom and which vessel is selected.
+    ais_map: crate::ais_map::AisMapState,
+    /// AIS: filter for the vessel list; matches a name, a call sign, a
+    /// destination or an MMSI.
+    ais_filter: String,
+    /// AIS: the decoder's own settings window is open.
+    show_ais_setup: bool,
+    ais_sort: panels::ais::AisSort,
+    ais_sort_desc: bool,
     /// VDL2: everything the decoder has, as the engine last sent it. Boxed
     /// because it carries a whole message log and is far larger than anything
     /// else held here.
@@ -555,6 +582,15 @@ pub struct SdroxideApp {
     vdl2_filter: String,
     /// VDL2: index into the log of the message whose card is open.
     vdl2_selected: Option<usize>,
+    /// VDL2: the log frozen where the operator stopped it, and the frame count
+    /// at that moment so the panel can say how much has arrived since.
+    ///
+    /// The *log* rather than the whole status: a busy channel plate is unreadable
+    /// — a message an operator is trying to read is pushed up the screen by the
+    /// next one before they finish it — but the counters and the channel strip
+    /// beside it are what say the receiver is still working, and freezing those
+    /// too would look exactly like a decoder that had stopped.
+    vdl2_hold: Option<(Vec<sdroxide_types::Vdl2Message>, u64)>,
     /// VDL2: the decoder's own settings window is open.
     show_vdl2_setup: bool,
     vdl2_sort: panels::vdl2::Vdl2Sort,
@@ -713,6 +749,16 @@ pub struct SdroxideApp {
     /// "Import" button — its own, beside the ADIF one, so a log import and a
     /// channel import cannot land in each other's parser.
     chirp_import_inbox: crate::download::LoadInbox,
+    /// Inbox for a settings bundle chosen on the General tab (issue #356).
+    /// Native only — the browser has no filesystem to pick one from, and the
+    /// settings it would replace are on the engine's machine anyway.
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+    settings_import_inbox: crate::download::LoadInbox,
+    /// What the last settings export or import did, shown beside the buttons
+    /// until the dialog is closed. Not persisted: it describes an action, not a
+    /// setting, and one from a previous session would be a lie about this one.
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+    settings_transfer_note: Option<String>,
     /// Callsigns queued for lookup, drained into commands each frame.
     pending_lookups: Vec<String>,
     /// Everything callsign lookup has resolved this session, by callsign. Kept
@@ -1056,6 +1102,7 @@ impl SdroxideApp {
         );
         crate::theme::set_spot_colors(&ui_settings.spot_colors);
         crate::theme::set_bandplan_colors(&ui_settings.bandplan_colors);
+        crate::theme::set_map_cities(ui_settings.map_cities);
         crate::theme::apply(egui_ctx);
         // What this renderer will carry. Gathered here because it is the one
         // place that holds the render state and the controller at once, and
@@ -1147,6 +1194,7 @@ impl SdroxideApp {
             radio_cfg: None,
             converter_edit_hz: None,
             range_edit: None,
+            rx_site_edit: None,
             serial_ports: Vec::new(),
             hpsdr_devices: Vec::new(),
             rtlsdr_devices: Vec::new(),
@@ -1213,6 +1261,7 @@ impl SdroxideApp {
             navtex_open: None,
             nr_popup_since: None,
             rec_popup_since: None,
+            bw_popup_since: None,
             duplex_popup_since: None,
             rpt_tone_popup_since: None,
             // Corrected on the first frame, once the viewport size is known.
@@ -1255,9 +1304,16 @@ impl SdroxideApp {
             show_adsb_setup: false,
             adsb_sort: panels::adsb::AdsbSort::default(),
             adsb_sort_desc: true,
+            ais_status: None,
+            ais_map: crate::ais_map::AisMapState::default(),
+            ais_filter: String::new(),
+            show_ais_setup: false,
+            ais_sort: panels::ais::AisSort::default(),
+            ais_sort_desc: true,
             vdl2_status: None,
             vdl2_filter: String::new(),
             vdl2_selected: None,
+            vdl2_hold: None,
             show_vdl2_setup: false,
             vdl2_sort: panels::vdl2::Vdl2Sort::default(),
             vdl2_sort_desc: true,
@@ -1273,6 +1329,7 @@ impl SdroxideApp {
             aprs_lat_buf: String::new(),
             aprs_lon_buf: String::new(),
             digi_cfg_seeded: false,
+            cw_macro_edit: false,
             digi_tx_hz_edit: String::new(),
             digi_preview: None,
             map_view: Default::default(),
@@ -1336,6 +1393,8 @@ impl SdroxideApp {
             login_tests: std::collections::HashMap::new(),
             login_tests_pending: std::collections::HashSet::new(),
             adif_import_inbox: Arc::new(Mutex::new(None)),
+            settings_import_inbox: Arc::new(Mutex::new(None)),
+            settings_transfer_note: None,
             chirp_import_inbox: Arc::new(Mutex::new(None)),
             pending_lookups: Vec::new(),
             callsign_cache: Default::default(),
@@ -1510,16 +1569,16 @@ impl SdroxideApp {
         self.radio_roster.iter().find(|c| c.id == self.radio_id)?.attached_to
     }
 
-    /// Whether this radio is switched on — what the top bar's power chip
-    /// shows. `None` when there is no switch to draw: the roster is empty, the
-    /// radio is at the far end of a station that holds no switch a client may
-    /// throw, or its front end is lent out as somebody's panadapter receiver —
-    /// the same radios the strip offers no switch for.
+    /// Whether sdroxide's link to this radio is open — what the top bar's LINK
+    /// chip shows. `None` when there is no switch to draw: the roster is empty,
+    /// the radio is at the far end of a station that holds no switch a client
+    /// may throw, or its front end is lent out as somebody's panadapter
+    /// receiver — the same radios the strip offers no switch for.
     ///
     /// Read from the shell's roster either way, so a radio of this machine's
     /// own and one at a station are answered the same: the shell is what knows
     /// which of the two this tab is, and it has already asked the station.
-    pub(crate) fn own_power_state(&self) -> Option<bool> {
+    pub(crate) fn own_link_state(&self) -> Option<bool> {
         let chip = self.radio_roster.iter().find(|c| c.id == self.radio_id)?;
         (chip.switchable && chip.attached_to.is_none()).then_some(chip.enabled)
     }
@@ -1780,6 +1839,18 @@ impl SdroxideApp {
     /// the top bar leaves its PTT out until the engine has said what it has.
     pub(in crate::app) fn tx_capable(&self) -> bool {
         self.caps.as_ref().is_some_and(|c| c.is_transmit_capable())
+    }
+
+    /// The CW tone being copied, in Hz — the cursor the CW panel moves and the
+    /// pitch the engine keeps the passband centred on.
+    ///
+    /// The controller's figure where there is one, because the operator moves
+    /// it by clicking the waterfall; the stored default only stands in before
+    /// the CW engine has reported. Same rule as the engine's own
+    /// `cw_pitch_hz`, and the two have to agree or the readout and the
+    /// passband would disagree about where the signal is.
+    pub(in crate::app) fn cw_pitch_hz(&self) -> f32 {
+        self.digi_status.as_ref().map_or(self.digi_cfg_edit.cw_pitch_hz, |s| s.audio_hz)
     }
 
     /// The frequency actually being worked, which in CW and the digital modes

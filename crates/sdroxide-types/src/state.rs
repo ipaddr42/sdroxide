@@ -8,6 +8,18 @@ pub enum Vfo {
     B,
 }
 
+impl Vfo {
+    /// 0 for A, 1 for B — for the per-VFO arrays the engine keeps alongside the
+    /// two dials (the mode each one was left in, and its filter).
+    #[must_use]
+    pub fn index(self) -> usize {
+        match self {
+            Vfo::A => 0,
+            Vfo::B => 1,
+        }
+    }
+}
+
 /// Receiver slot: the main receiver or the sub receiver.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum RxId {
@@ -39,6 +51,24 @@ impl OffsetState {
 
 /// Squelch fully open (slider minimum).
 pub const SQUELCH_OPEN_DB: f32 = -150.0;
+
+/// Squelch fully closed (slider maximum): the top of the scale the threshold is
+/// measured on, which is full scale.
+///
+/// [`RxState::squelch_db`] is compared against the *post-filter passband power
+/// in dBFS*, and that runs all the way to 0 for a signal filling the converter.
+/// The rail used to stop at −30, which is more travel than an ordinary SDR
+/// needs — its noise floor is far below that — but not a threshold an ordinary
+/// SDR is the only kind of front end there is.
+///
+/// A stream that carries the *radio's* AGC sits an order of magnitude higher:
+/// an Icom's 12 kHz IF over the LAN is a levelled IF, so on a quiet band its
+/// noise arrives near the top of the scale, above anything the old rail could
+/// reach, and the gate never closed at any setting the operator could ask for
+/// (issue #394). The extra 30 dB costs the rail a quarter of its resolution
+/// and is the difference between a control that works there and one that does
+/// not.
+pub const SQUELCH_CLOSED_DB: f32 = 0.0;
 
 /// Ceiling for [`RxState::manual_gain_db`], matching the AGC's own maximum.
 pub const MAX_MANUAL_GAIN_DB: f32 = 120.0;
@@ -138,7 +168,32 @@ pub struct TxState {
     /// acknowledgement and can grey out transmit for the right reason. Matching
     /// on a human-readable string would break the moment the wording changed.
     pub swr_tripped: Option<f32>,
+    /// Controlled-envelope SSB: how hard the voice is driven into the envelope
+    /// processor, in decibels. Zero is off, and off is the default.
+    ///
+    /// One number rather than a switch and a level, because that is the control
+    /// it is: the processor with nothing driven into it cannot do anything, so
+    /// "how much" already answers "whether". Voice single sideband only — the
+    /// engine applies it to USB and LSB and to nothing else, since every
+    /// digital mode carries its information in the envelope this would be
+    /// flattening (issue #283).
+    ///
+    /// Clamped by the engine to `0..=`[`crate::CESSB_MAX_DB`], so a client that
+    /// sends a wild figure gets a sane one back.
+    #[serde(default)]
+    pub cessb_db: f32,
 }
+
+/// The most controlled-envelope compression the control offers, in decibels.
+///
+/// Beyond this the clipper is doing more than controlling an envelope: speech
+/// driven fifteen decibels into a limiter sounds like speech driven fifteen
+/// decibels into a limiter, whatever is done about its bandwidth afterwards.
+///
+/// Here rather than in the DSP crate so there is one number: the engine clamps
+/// to it, the settings slider offers exactly this range, and the processor
+/// itself clamps to it again — none of the three can come to disagree.
+pub const CESSB_MAX_DB: f32 = 12.0;
 
 /// The range a configured SWR limit is clamped to, wherever it arrives from.
 ///
@@ -488,6 +543,27 @@ pub struct RadioState {
     /// Appended last: postcard numbers fields by position.
     #[serde(default)]
     pub vdl2: crate::Vdl2Settings,
+    /// How the AIS decoder behaves, and whether it can run at all.
+    ///
+    /// Here rather than only in `ais.json` for the reason [`Self::adsb`] is: a
+    /// remote client edits it, and the engine's reply is this field coming back
+    /// changed. It is also where the engine says no — a front end handing over
+    /// demodulated audio cannot feed a GMSK demodulator, and
+    /// [`crate::AisSettings::OFF`] arriving back is how the panel learns that.
+    /// Appended last: postcard numbers fields by position.
+    #[serde(default)]
+    pub ais: crate::AisSettings,
+    /// Whether the radio's separate receiving antenna is switched into the
+    /// receive path.
+    ///
+    /// Meaningful only where [`crate::DeviceCaps::has_rx_antenna`]. Adopted
+    /// from the radio and re-read whenever the radio may have moved it — it
+    /// recalls the setting per band on its own — rather than asserted: writing
+    /// a receive-only input nobody asked about takes an aerial out of use with
+    /// nothing on screen to say so. Appended last: postcard numbers fields by
+    /// position.
+    #[serde(default)]
+    pub rx_antenna: bool,
 }
 
 impl Default for RadioState {
@@ -532,6 +608,8 @@ impl Default for RadioState {
             rig_squelch: 0.0,
             qo100: crate::Qo100Settings::default(),
             vdl2: crate::Vdl2Settings::default(),
+            ais: crate::AisSettings::default(),
+            rx_antenna: false,
         }
     }
 }

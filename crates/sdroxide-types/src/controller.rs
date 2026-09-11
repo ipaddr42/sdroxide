@@ -7,7 +7,20 @@ use crate::{
 /// Events flowing engine → UI.
 #[derive(Debug, Clone, PartialEq)]
 pub enum RadioEvent {
+    /// A front end this screen has not been looking at: an engine starting, a
+    /// source adopted at runtime, a link that has just come up. Everything the
+    /// screen holds about the radio belongs to the one before it.
     Capabilities(DeviceCaps),
+    /// The *same* front end, revising what it said about itself.
+    ///
+    /// Some of what a device can do is not known when it is opened, and some
+    /// of it is not a constant. A rig on a control port only answers whether
+    /// it has an antenna selector once the link has been round; an RSP's LNA
+    /// ladder is as long as the *band* allows, so it changes under the dial.
+    /// Both have to reach the screen, and neither is a new radio — read as
+    /// one, a tune across a band edge would wipe the wideband waterfall,
+    /// re-read every image store and silence the announcer mid-QSY.
+    CapabilitiesUpdated(DeviceCaps),
     /// Full state snapshot on any change (latest-wins).
     State(RadioState),
     Spectrum(SpectrumFrame),
@@ -332,6 +345,18 @@ pub enum RadioEvent {
     ///
     /// Appended last, for the usual reason.
     RelayStatus(Box<crate::RelayStatus>),
+    /// Everything the AIS decoder has: the vessel table, what both channels are
+    /// doing, and why it is not running when it is not. A whole snapshot, a
+    /// couple of times a second.
+    ///
+    /// One message rather than a stream of decoded reports, for the reason
+    /// [`RadioEvent::AdsbStatus`] is one — and boxed for the same reason as
+    /// well: a busy estuary's vessel table, each row carrying a trail, is far
+    /// larger than anything else in this enum, and an enum is as big as its
+    /// largest variant everywhere it is held.
+    ///
+    /// Appended last, for the usual reason.
+    AisStatus(Box<crate::AisStatus>),
 }
 
 /// Snapshot of the frontend's switchable sound devices (native clients).

@@ -254,6 +254,11 @@ pub(crate) struct Latest {
     /// are standing conditions, and a client that attaches without them would
     /// show an empty panel in front of a working decoder.
     pub vdl2_status: Option<Box<sdroxide_types::Vdl2Status>>,
+    /// What the AIS decoder has heard. Replayed on connect for the same reason
+    /// the aircraft table is, and rather more so: a ship at anchor reports once
+    /// every three minutes, so a client that attached without the table would
+    /// show an empty sea for minutes in front of a working decoder.
+    pub ais_status: Option<Box<sdroxide_types::AisStatus>>,
     /// What the DRM decoder has made of the broadcast currently tuned. Replayed
     /// on connect for the same reason as `rds`: a station's label and the
     /// transmission's parameters are standing conditions, and a client that
@@ -1020,6 +1025,16 @@ fn handle_event(shared: &Shared, ev: RadioEvent) {
                 latest.caps = c.clone();
                 Some(ServerMsg::Capabilities(c))
             }
+            // The same radio, revising what it said about itself. Cached like
+            // the above — a client arriving after the dial crossed a band edge
+            // must be told the ladder that band has, not the one the session
+            // opened on — but forwarded as its own message, so nobody reads it
+            // as a radio that changed underneath them. It cannot rename
+            // anything: only the label does that, and a revision leaves it.
+            RadioEvent::CapabilitiesUpdated(c) => {
+                latest.caps = c.clone();
+                Some(ServerMsg::CapabilitiesUpdated(c))
+            }
             RadioEvent::State(s) => {
                 latest.state = s.clone();
                 Some(ServerMsg::State(s))
@@ -1085,6 +1100,10 @@ fn handle_event(shared: &Shared, ev: RadioEvent) {
             RadioEvent::Vdl2Status(st) => {
                 latest.vdl2_status = Some(st.clone());
                 Some(ServerMsg::Vdl2Status(st))
+            }
+            RadioEvent::AisStatus(st) => {
+                latest.ais_status = Some(st.clone());
+                Some(ServerMsg::AisStatus(st))
             }
             // Native-only for now: every station this shipped for runs its
             // own hardware locally, so there is no `ServerMsg` variant for

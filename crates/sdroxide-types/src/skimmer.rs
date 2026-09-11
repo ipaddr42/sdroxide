@@ -45,7 +45,8 @@ impl SkimmerKind {
     }
 }
 
-/// Which decoder reads the CW the skimmer finds.
+/// Which of the two decoders copies CW — for the skimmer, and for the CW panel
+/// (see [`crate::DigiConfig::cw_engine`]).
 ///
 /// Finding the signals and reading them are separate jobs, and only the second
 /// one is expensive. The neural decoder copies several dB below where a timing
@@ -54,8 +55,14 @@ impl SkimmerKind {
 /// work. The timing decoder reads the envelope the detector has already
 /// computed, so it costs almost nothing on top of finding the signal at all —
 /// and it needs about 8 dB SNR, where the model reaches −6.
+///
+/// They also do not copy the same alphabet. DeepCW's output layer has 41
+/// classes — the letters, the digits, four marks and the space — and no room
+/// for anything else, so the accented letters ITU-R M.1677-1 lists (Ä, Ö, Å, Ü,
+/// É …) can only ever come out of the timing decoder, which reads the element
+/// string and looks it up (issue #382).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub enum CwSkimmerDecoder {
+pub enum CwEngine {
     /// DeepCW, the neural decoder.
     #[default]
     Neural,
@@ -63,23 +70,29 @@ pub enum CwSkimmerDecoder {
     Timing,
 }
 
-impl CwSkimmerDecoder {
+impl CwEngine {
     /// Every decoder, in UI order.
-    pub const ALL: [CwSkimmerDecoder; 2] = [CwSkimmerDecoder::Neural, CwSkimmerDecoder::Timing];
+    pub const ALL: [CwEngine; 2] = [CwEngine::Neural, CwEngine::Timing];
 
     /// The tag the chips wear.
     pub fn label(self) -> &'static str {
         match self {
-            CwSkimmerDecoder::Neural => "NEURAL",
-            CwSkimmerDecoder::Timing => "TIMING",
+            CwEngine::Neural => "NEURAL",
+            CwEngine::Timing => "TIMING",
         }
     }
 
     /// What the hover text says the choice costs.
     pub fn hint(self) -> &'static str {
         match self {
-            CwSkimmerDecoder::Neural => "Reads weak and hand-sent CW; costs real CPU per station",
-            CwSkimmerDecoder::Timing => "Nearly free, but needs a clean signal (~8 dB SNR)",
+            CwEngine::Neural => {
+                "Reads weak and hand-sent CW; costs real CPU per station, and copies no \
+                 accented letters"
+            }
+            CwEngine::Timing => {
+                "Nearly free and copies the accented letters, but needs a clean signal \
+                 (~8 dB SNR)"
+            }
         }
     }
 }
@@ -103,7 +116,7 @@ pub struct SkimmerSettings {
     /// before it is reported as a spot. `0` reports whatever decodes.
     pub squelch_db: [i16; 3],
     /// Which decoder reads the CW skimmer's signals.
-    pub cw_decoder: CwSkimmerDecoder,
+    pub cw_decoder: CwEngine,
     /// How many stations the neural decoder reads at once. Ignored by the
     /// timing decoder, which reads every track it is given.
     pub cw_slots: u8,
@@ -118,7 +131,7 @@ impl Default for SkimmerSettings {
         SkimmerSettings {
             enabled: [true; 3],
             squelch_db: [0; 3],
-            cw_decoder: CwSkimmerDecoder::Neural,
+            cw_decoder: CwEngine::Neural,
             cw_slots: CW_SLOTS_DEFAULT,
         }
     }
@@ -134,7 +147,7 @@ impl SkimmerSettings {
     pub const OFF: SkimmerSettings = SkimmerSettings {
         enabled: [false; 3],
         squelch_db: [0; 3],
-        cw_decoder: CwSkimmerDecoder::Neural,
+        cw_decoder: CwEngine::Neural,
         cw_slots: CW_SLOTS_DEFAULT,
     };
 

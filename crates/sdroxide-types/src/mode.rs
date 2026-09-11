@@ -36,8 +36,10 @@ pub enum Mode {
     /// RF Paint (Spectrum Painting) — USB underneath; paints text/images
     /// directly onto the receiver's waterfall. Transmit-only (no decode).
     RfPaint,
-    /// FreeDV RADE V1 (Radio Autoencoder) digital voice — USB underneath, a
-    /// neural codec over an OFDM waveform occupying ~1000–1900 Hz of audio.
+    /// FreeDV RADE V1 (Radio Autoencoder) digital voice — a neural codec over
+    /// an OFDM waveform occupying ~1000–1900 Hz of audio. A sideband
+    /// underneath, and which one follows the band the way phone does: see
+    /// [`Mode::sideband_follows_band`].
     Rade,
     /// Hellschreiber — USB underneath, a facsimile mode that paints a 7×14 dot
     /// matrix per character straight onto the channel. No sync, no framing, no
@@ -187,7 +189,7 @@ pub enum Mode {
     /// same bargain RTTY strikes with its tone pair (issue #212).
     Navtex,
     /// VDL Mode 2 — the VHF datalink airliners and ground stations exchange
-    /// ACARS over, on seven 25 kHz channels around 136.8 MHz.
+    /// ACARS over, on fourteen 25 kHz channels between 136.650 and 136.975 MHz.
     ///
     /// D8PSK at 10 500 symbols a second, Reed–Solomon coded, carrying AVLC
     /// frames: company messages, position reports, link handoffs, ATC datalink.
@@ -204,21 +206,66 @@ pub enum Mode {
     /// listened to while it runs. Appended for the same reason as
     /// [`Mode::Hell`].
     Vdl2,
+    /// Independent sideband — two different signals on one carrier, the lower
+    /// sideband carrying one and the upper another.
+    ///
+    /// Still on the air: broadcasters send two language services on one
+    /// transmitter, and utility stations pair voice on one sideband with a
+    /// teleprinter on the other. Demodulating it as USB or LSB gets one of the
+    /// two and calls the other interference; there is no single audio signal to
+    /// produce, which is why this is a mode rather than a filter setting.
+    ///
+    /// Both sidebands are demodulated and handed to the *ears*: lower on the
+    /// left, upper on the right, the way they sit on the waterfall. That rides
+    /// the same mid/side path WFM stereo uses ([`crate::Mode::stereo_audio`]),
+    /// so nothing downstream needs to know there are two of them.
+    ///
+    /// Receive only. Independent-sideband transmit is a linear-amplifier
+    /// arrangement with two modulators, and no radio sdroxide drives has one.
+    /// Appended for the same reason as [`Mode::Hell`] (issue #280).
+    Isb,
+    /// AIS — the Automatic Identification System every ship of any size
+    /// transmits: its identity, its position, its course and its destination,
+    /// on two 25 kHz channels either side of 162.000 MHz.
+    ///
+    /// GMSK at 9600 bit/s in a self-organising TDMA frame, carrying HDLC
+    /// frames: position reports every two to ten seconds, the ship's name and
+    /// dimensions every six minutes, buoys and base stations alongside them.
+    /// [`Mode::Adsb`] is the same idea in the air.
+    ///
+    /// Receive only — an amateur transmitting on AIS would be putting false
+    /// vessel traffic on a safety-of-life service — and, like ADS-B and VDL2,
+    /// decoded off the raw I/Q by an engine lane of its own rather than by
+    /// anything downstream of the receive chain's downconverter, because both
+    /// channels are listened to at once. There is no audio, so its demodulator
+    /// is `None`.
+    ///
+    /// A `Mode` rather than a window for the reason ADS-B is one: it is a thing
+    /// to point the radio *at*. It owns the dial and nothing else can be
+    /// listened to while it runs. Appended for the same reason as
+    /// [`Mode::Hell`].
+    Ais,
 }
 
-/// The bands on which analog SSTV rides the lower sideband, as (low, high) Hz.
+/// The bands on which a mode that keeps phone practice rides the lower
+/// sideband, as (low, high) Hz — see [`Mode::sideband_follows_band`].
 ///
 /// Written as frequency ranges rather than [`crate::Band`] values on purpose:
 /// the edges differ by region (80 m runs to 4.0 MHz in Region 2, 40 m to 7.3),
 /// and the widest edges are the right answer here — a station tuned to 3.845
 /// from Europe is still on 80 m as far as which sideband to use is concerned.
-const SSTV_LSB_BANDS: [(f64, f64); 3] =
+///
+/// 160, 80 and 40 m and nothing else. 60 m is deliberately absent though it is
+/// a low band: the 5 MHz channels are worked upper sideband the world over,
+/// which is what the licence says in most of it. Everything from 30 m up is
+/// USB by the same convention.
+const PHONE_LSB_BANDS: [(f64, f64); 3] =
     [(1_800_000.0, 2_000_000.0), (3_500_000.0, 4_000_000.0), (7_000_000.0, 7_300_000.0)];
 
 impl Mode {
     /// Every mode, in the order they cycle and appear in the picker — which is
     /// deliberately *not* the enum's declaration order (see [`Mode::Hell`]).
-    pub const ALL: [Mode; 36] = [
+    pub const ALL: [Mode; 38] = [
         Mode::Lsb,
         Mode::Usb,
         Mode::Cw,
@@ -229,9 +276,11 @@ impl Mode {
         Mode::Drm,
         Mode::Adsb,
         Mode::Vdl2,
+        Mode::Ais,
         Mode::Digu,
         Mode::Digl,
         Mode::Dsb,
+        Mode::Isb,
         Mode::Spec,
         Mode::Ft8,
         Mode::Ft4,
@@ -353,6 +402,17 @@ impl Mode {
         matches!(self, Mode::Vdl2)
     }
 
+    /// True for AIS on the two 162 MHz ship-reporting channels.
+    ///
+    /// Not [`Mode::is_digital`], for the reason [`Mode::is_adsb`] is not: every
+    /// caller of that one means "the digi engine drives this", and the digi
+    /// engine works in 48 kHz audio. AIS is decoded from the raw I/Q by an
+    /// engine lane of its own, transmits nothing, and shares none of the
+    /// digital modes' configuration.
+    pub fn is_ais(self) -> bool {
+        matches!(self, Mode::Ais)
+    }
+
     /// True for the modes that own the bottom panel.
     ///
     /// [`Mode::is_digital`] used to answer this on its own, which was true
@@ -360,17 +420,17 @@ impl Mode {
     /// questions are separate: this one decides whether the panadapter shares
     /// the window, and that one decides who is being handed audio.
     pub fn has_bottom_panel(self) -> bool {
-        self.is_digital() || self.is_adsb() || self.is_vdl2()
+        self.is_digital() || self.is_adsb() || self.is_vdl2() || self.is_ais()
     }
 
     /// True for the modes decoded by a wideband engine lane off the raw I/Q
-    /// rather than by the receive chain — ADS-B and VDL2.
+    /// rather than by the receive chain — ADS-B, VDL2 and AIS.
     ///
     /// What they have in common is everything the rest of the receiver assumes
     /// and they break: no audio, no transmitter, no receive filter, and a
     /// bandwidth set by the decoder rather than by the operator.
     pub fn is_wideband_lane(self) -> bool {
-        self.is_adsb() || self.is_vdl2()
+        self.is_adsb() || self.is_vdl2() || self.is_ais()
     }
 
     /// True for the modes whose transmit waveform is not single-sideband audio
@@ -557,7 +617,10 @@ impl Mode {
         // service belongs to coast stations, and an amateur transmitting on it
         // would be putting false safety information on a distress-adjacent
         // channel.
-        matches!(self, Mode::Wefax | Mode::Adsb | Mode::Navtex | Mode::Vdl2)
+        // ISB is receive-only by capability: transmitting it wants two
+        // modulators driving one linear amplifier, and no radio sdroxide
+        // drives is wired that way.
+        matches!(self, Mode::Wefax | Mode::Adsb | Mode::Navtex | Mode::Vdl2 | Mode::Isb | Mode::Ais)
     }
 
     /// True for Hellschreiber. Forks the digi panel to the scrolling raster UI:
@@ -627,6 +690,8 @@ impl Mode {
             Mode::Drm => "DRM",
             Mode::Adsb => "ADS-B",
             Mode::Vdl2 => "VDL2",
+            Mode::Isb => "ISB",
+            Mode::Ais => "AIS",
         }
     }
 
@@ -657,9 +722,17 @@ impl Mode {
             // drawn on the panadapter so an operator can see that all of
             // it is being listened to.
             Mode::Vdl2 => (-162_500.0, 162_500.0),
+            // Likewise: the two AIS channels sit 25 kHz either side of the
+            // dial, and this is the pair of slots drawn on the panadapter so
+            // an operator can see that both are being listened to.
+            Mode::Ais => (-37_500.0, 37_500.0),
             Mode::Digu => (200.0, 3200.0),
             Mode::Digl => (-3200.0, -200.0),
             Mode::Dsb => (-2850.0, 2850.0),
+            // Both sidebands, drawn as one passband: the edges are the outer
+            // ones, and the demodulator keeps its own gap either side of the
+            // carrier (see `IsbDemod`).
+            Mode::Isb => (-2850.0, 2850.0),
             Mode::Spec => (-5000.0, 5000.0),
             // FT8/FT4 occupy the whole USB audio passband (tones 0..~3500 Hz).
             // PSK/RTTY/Olivia/Thor/FSQ/Hell do the same (the modem filters
@@ -720,30 +793,43 @@ impl Mode {
 
     /// True for modes that place the displayed carrier below the passband.
     ///
-    /// Answers for the mode alone, so it cannot see SSTV's band-dependent
-    /// sideband — prefer [`Self::is_lower_sideband_at`] wherever a dial
-    /// frequency is at hand.
+    /// Answers for the mode alone, so it cannot see a band-dependent sideband
+    /// ([`Self::sideband_follows_band`]) — prefer [`Self::is_lower_sideband_at`]
+    /// wherever a dial frequency is at hand.
     pub fn is_lower_sideband(self) -> bool {
         matches!(self, Mode::Lsb | Mode::Digl)
+    }
+
+    /// True for the modes whose sideband is a property of the *band* rather
+    /// than of the mode, so it cannot be answered without a dial.
+    ///
+    /// Both are phone emissions and keep phone practice rather than the other
+    /// digital modes' fixed USB: analog SSTV, and FreeDV RADE, which carries
+    /// speech and is worked on the phone segments alongside it. On 160, 80 and
+    /// 40 m both ride the lower sideband — a picture or an over sent on USB
+    /// there arrives at everybody else's receiver inverted, and an inverted
+    /// RADE signal does not decode at all — and USB on every band above.
+    ///
+    /// `Mode::Sstv` by name rather than [`Self::is_sstv`]: sideband is a
+    /// question about a sideband emission, and [`Mode::SstvFm`] is not one.
+    pub fn sideband_follows_band(self) -> bool {
+        matches!(self, Mode::Sstv | Mode::Rade)
     }
 
     /// True for modes that place the displayed carrier below the passband at
     /// `dial_hz`.
     ///
-    /// Sideband is a fixed property of every mode but one. Analog SSTV is a
-    /// phone emission and follows phone practice: LSB on 160, 80 and 40 m —
-    /// where a picture sent on USB comes out of everybody else's receiver
-    /// inverted — and USB on every band above.
+    /// Sideband is a fixed property of every mode but the two
+    /// [`Self::sideband_follows_band`] names, which take theirs from the band
+    /// they are being worked on.
     pub fn is_lower_sideband_at(self, dial_hz: f64) -> bool {
-        // `Mode::Sstv` by name rather than [`Self::is_sstv`]: sideband is a
-        // question about a sideband emission, and [`Mode::SstvFm`] is not one.
         self.is_lower_sideband()
-            || (matches!(self, Mode::Sstv)
-                && SSTV_LSB_BANDS.iter().any(|&(lo, hi)| dial_hz >= lo && dial_hz <= hi))
+            || (self.sideband_follows_band()
+                && PHONE_LSB_BANDS.iter().any(|&(lo, hi)| dial_hz >= lo && dial_hz <= hi))
     }
 
     /// [`Self::default_filter`] at a dial frequency: the same passband, mirrored
-    /// onto the lower sideband where the mode rides one there (SSTV on
+    /// onto the lower sideband where the mode rides one there (SSTV and RADE on
     /// 160/80/40 m). Sideband is carried entirely in the sign of the edges, so
     /// this is what actually puts the demodulator on the right side.
     pub fn default_filter_at(self, dial_hz: f64) -> (f32, f32) {
@@ -812,6 +898,26 @@ impl Mode {
         self.standard_tone_offset_hz().is_some()
     }
 
+    /// True where the audio offset belongs to the *mode* rather than to the
+    /// band the dial is on, so [`crate::DigiConfig::tx_audio_hz`] neither
+    /// supplies it nor learns from it.
+    ///
+    /// Two sorts of mode qualify, for the same underlying reason. RTTY and
+    /// NAVTEX hold a tone pair fixed by convention — see
+    /// [`Self::standard_tone_offset_hz`]. And CW, where the offset is the
+    /// operator's sidetone pitch: one number for the whole station, kept in
+    /// [`crate::DigiConfig::cw_pitch_hz`], and the frequency the passband is
+    /// centred on as well as the one the keyer sends at.
+    ///
+    /// Letting the band memory have either of them costs both directions
+    /// (issue #336). A pitch written there is handed to FT8 as a transmit
+    /// offset the next time that band comes round; and an FT8 or PSK offset
+    /// stored there is handed back to CW, which puts the keyer outside its own
+    /// passband — 2069 Hz where the operator copies at 700.
+    pub fn keeps_own_tx_offset(self) -> bool {
+        self == Mode::Cw || self.holds_standard_tones()
+    }
+
     /// Which carrier position a transceiver puts this mode at, for the per-mode
     /// I.F. offsets of [`crate::PanadapterConfig`].
     ///
@@ -828,13 +934,16 @@ impl Mode {
             Mode::Cw => C::Cw,
             // DRM sits on the dial like AM does, and a receiver with an
             // I.F. output offers no separate DRM setting to differ from.
-            Mode::Am | Mode::Sam | Mode::Dsb | Mode::Drm => C::Am,
+            // ISB joins them for the same reason DSB does: the carrier is on
+            // the dial and a rig with an I.F. output has no separate setting
+            // for it.
+            Mode::Am | Mode::Sam | Mode::Dsb | Mode::Drm | Mode::Isb => C::Am,
             // WFM is FM's carrier position too; a rig with an I.F. output has
             // no such mode, so nothing here is lost by grouping them.
             // ADS-B joins them for the same reason WFM does: no radio with an
             // I.F. output has this mode, so there is no separate offset for it
             // to have, and FM's is the one a wideband receiver already uses.
-            Mode::Nfm | Mode::Wfm | Mode::Adsb | Mode::Vdl2 => C::Fm,
+            Mode::Nfm | Mode::Wfm | Mode::Adsb | Mode::Vdl2 | Mode::Ais => C::Fm,
             // Everything a rig would be put into DATA (or DIGI) for, on either
             // sideband — including RIFP and VHF packet, which the rig carries
             // as FM data rather than SSB but still through its data input.
@@ -878,7 +987,7 @@ impl Mode {
         // ADS-B is here because it produces no audio at all — its receive
         // chain has no demodulator, so there is nothing for an AGC to be in
         // front of.
-        !matches!(self, Mode::Nfm | Mode::Wfm | Mode::Drm | Mode::Adsb | Mode::Vdl2)
+        !matches!(self, Mode::Nfm | Mode::Wfm | Mode::Drm | Mode::Adsb | Mode::Vdl2 | Mode::Ais)
     }
 
     /// Whether this mode offers binaural (pseudo-stereo) audio — the receive
@@ -924,6 +1033,10 @@ impl Mode {
             // past it — for the same reason ADS-B has one: the number
             // does not narrow anything, it only says what is being read.
             Mode::Vdl2 => 250_000.0,
+            // Room to shade both AIS channels and a little past them, for the
+            // same reason: the number does not narrow anything, it only says
+            // what is being read.
+            Mode::Ais => 60_000.0,
             _ => 24_000.0,
         }
     }
@@ -952,6 +1065,10 @@ impl Mode {
             Mode::Am
                 | Mode::Sam
                 | Mode::Dsb
+                // Both sidebands, always the same width: dragging one edge
+                // has to move the other, or one ear ends up wider than the
+                // other with nothing on screen saying so.
+                | Mode::Isb
                 | Mode::Nfm
                 | Mode::Wfm
                 | Mode::SstvFm
@@ -985,6 +1102,16 @@ impl Mode {
             Mode::Am | Mode::Sam => {
                 &[("6k", -3000.0, 3000.0), ("10k", -5000.0, 5000.0), ("16k", -8000.0, 8000.0)]
             }
+            // Both sidebands at once, so the label is the width of *each* one
+            // — an ISB channel described as "2.7 kHz per sideband" is 5.4 kHz
+            // of spectrum, and calling it 5.4k would read as half of what the
+            // operator gets in either ear.
+            Mode::Isb => &[
+                ("1.8k", -2000.0, 2000.0),
+                ("2.4k", -2600.0, 2600.0),
+                ("2.7k", -2850.0, 2850.0),
+                ("3.3k", -3400.0, 3400.0),
+            ],
             // VHF SSTV joins NFM rather than packet's wider pair: it is a voice
             // channel with a picture on it, and the deviation is a voice
             // channel's.
@@ -1002,6 +1129,10 @@ impl Mode {
             // the group can still take the Common Signalling Channel, and
             // this is how the shading says which of the two it is doing.
             Mode::Vdl2 => &[("25k", -12_500.0, 12_500.0), ("325k", -162_500.0, 162_500.0)],
+            // One channel, or both. A receiver too narrow for the pair still
+            // hears whichever it is over, and this is how the shading says
+            // which of the two it is doing.
+            Mode::Ais => &[("25k", -12_500.0, 12_500.0), ("75k", -37_500.0, 37_500.0)],
             // The one digital mode with a real filter choice: 1200 Bell 202
             // occupies about 10 kHz and 9600 G3RUH about 16 kHz, so the
             // operator wants the narrower one when running 1200 on a busy
@@ -1461,7 +1592,7 @@ mod tests {
                 assert!(all_symmetric, "{m:?} mirrors its edges but has an off-centre preset");
             } else if !m.filter_presets().is_empty() {
                 assert!(
-                    !all_symmetric || m == Mode::Adsb || m == Mode::Vdl2,
+                    !all_symmetric || m == Mode::Adsb || m == Mode::Vdl2 || m == Mode::Ais,
                     "{m:?} has only symmetric presets — should its edges mirror?"
                 );
             }
@@ -1515,6 +1646,8 @@ mod tests {
             (Mode::RttyFm, 33),
             (Mode::Navtex, 34),
             (Mode::Vdl2, 35),
+            (Mode::Isb, 36),
+            (Mode::Ais, 37),
         ];
         for (mode, index) in pinned {
             assert_eq!(mode as u8, index, "{} moved", mode.label());
@@ -1559,7 +1692,9 @@ mod tests {
         // `Mode::ALL`'s length is checked by the array type; what needs
         // checking is that it is a permutation of the enum, with nothing
         // dropped and nothing listed twice.
-        let last = Mode::Vdl2 as u8;
+        // The last variant *by discriminant*, which is the one appended most
+        // recently — not the one that reads last in the picker.
+        let last = Mode::Ais as u8;
         for i in 0..=last {
             let present = Mode::ALL.iter().filter(|m| **m as u8 == i).count();
             assert_eq!(present, 1, "discriminant {i} appears {present} times in Mode::ALL");
@@ -1727,38 +1862,45 @@ mod tests {
         assert_eq!(ft4.slot_s, 2.0 * ft2.slot_s);
     }
 
-    /// SSTV follows phone practice: the low bands are LSB, everything above is
-    /// USB, and no other mode's sideband moves with the dial.
+    /// SSTV and RADE follow phone practice: the low bands are LSB, everything
+    /// above is USB, and no other mode's sideband moves with the dial.
     #[test]
-    fn sstv_takes_the_low_bands_lower_sideband() {
-        for dial in [1_890_000.0, 3_730_000.0, 3_845_000.0, 7_165_000.0, 7_171_000.0] {
-            assert!(Mode::Sstv.is_lower_sideband_at(dial), "SSTV at {dial} should be LSB");
-            let (lo, hi) = Mode::Sstv.default_filter_at(dial);
-            assert!(
-                lo < 0.0 && hi <= 0.0,
-                "SSTV at {dial}: passband {lo}..{hi} is not below the dial"
-            );
-            // Mirrored, not redesigned: the same picture bandwidth either way.
-            let (ulo, uhi) = Mode::Sstv.default_filter();
-            assert_eq!((hi - lo), (uhi - ulo));
-        }
-        for dial in [14_230_000.0, 21_340_000.0, 28_680_000.0, 144_500_000.0] {
-            assert!(!Mode::Sstv.is_lower_sideband_at(dial), "SSTV at {dial} should be USB");
-            assert_eq!(Mode::Sstv.default_filter_at(dial), Mode::Sstv.default_filter());
+    fn the_phone_modes_take_the_low_bands_lower_sideband() {
+        for mode in [Mode::Sstv, Mode::Rade] {
+            for dial in [1_890_000.0, 3_730_000.0, 3_845_000.0, 7_165_000.0, 7_177_000.0] {
+                assert!(mode.is_lower_sideband_at(dial), "{mode:?} at {dial} should be LSB");
+                let (lo, hi) = mode.default_filter_at(dial);
+                assert!(
+                    lo < 0.0 && hi <= 0.0,
+                    "{mode:?} at {dial}: passband {lo}..{hi} is not below the dial"
+                );
+                // Mirrored, not redesigned: the same occupied bandwidth either
+                // way — a picture's, or the autoencoder's carrier set.
+                let (ulo, uhi) = mode.default_filter();
+                assert_eq!((hi - lo), (uhi - ulo));
+            }
+            // 60 m is a low band worked upper sideband, and 30 m is the first
+            // of the ones nothing argues about.
+            for dial in [5_357_000.0, 10_130_000.0, 14_236_000.0, 21_340_000.0, 144_500_000.0] {
+                assert!(!mode.is_lower_sideband_at(dial), "{mode:?} at {dial} should be USB");
+                assert_eq!(mode.default_filter_at(dial), mode.default_filter());
+            }
         }
     }
 
-    /// The band-aware answer differs from the mode-only one for SSTV alone —
-    /// 40 m does not turn FT8 or PSK31 upside down. [`Mode::SstvFm`] is not in
+    /// The band-aware answer differs from the mode-only one for those two alone
+    /// — 40 m does not turn FT8 or PSK31 upside down. [`Mode::SstvFm`] is not in
     /// it either: an FM carrier has no sideband to be on the wrong side of.
     #[test]
-    fn only_sstv_changes_sideband_with_the_band() {
+    fn only_the_phone_modes_change_sideband_with_the_band() {
         for mode in Mode::ALL {
             for dial in [1_890_000.0, 3_730_000.0, 7_171_000.0, 14_230_000.0, 145_500_000.0] {
                 let differs = mode.is_lower_sideband_at(dial) != mode.is_lower_sideband();
-                let want = mode == Mode::Sstv && dial < 10_000_000.0;
+                let want = mode.sideband_follows_band() && dial < 10_000_000.0;
                 assert_eq!(differs, want, "{mode:?} at {dial}");
             }
         }
+        assert!(Mode::Sstv.sideband_follows_band() && Mode::Rade.sideband_follows_band());
+        assert!(!Mode::SstvFm.sideband_follows_band());
     }
 }

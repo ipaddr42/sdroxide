@@ -223,11 +223,19 @@ pub struct IcomNetSource {
     /// answer that crossed a command on the wire, which would otherwise put the
     /// rail back where the radio was before the operator moved it.
     squelch_set: bool,
-    /// Which antenna socket the radio says it is on, and whether it has a
-    /// selector at all: empty until it has answered the read `configure` sends,
-    /// which a radio with one connector NAKs instead — see
+    /// What the radio last said its break-in was set to, from the read
+    /// `configure` sends and from this end's own writes. `None` until it has
+    /// answered. See [`Self::send_cw`] for why it is worth knowing.
+    break_in: Option<civ::BreakIn>,
+    /// Which socket the radio says it is on, as the command numbers them:
+    /// `None` until it has answered the read `configure` sends, which a radio
+    /// with neither a selector nor a receiving antenna NAKs instead — see
     /// [`civ::read_antenna_frame`].
-    antenna: Option<&'static str>,
+    socket: Option<u8>,
+    /// Whether the radio's separate *receiving* antenna is switched into the
+    /// receive path. `None` on a radio whose antenna reply was the socket
+    /// alone, which is how it says it has no such connector (issue #229).
+    rx_ant: Option<bool>,
     /// How many more times to ask, and when the last ask went out. See where
     /// they are spent in [`Self::pump`].
     antenna_probes_left: u8,
@@ -249,6 +257,19 @@ pub struct IcomNetSource {
 }
 
 impl IcomNetSource {
+    /// The sockets this model's selector has, by name. Empty on a radio with
+    /// one, whose `0x12` is not a selector at all — see
+    /// `IcomModel::antenna_sockets`, which this mirrors.
+    fn antennas(&self) -> &'static [&'static str] {
+        let n = self.dev.info().model.antenna_sockets;
+        if n > 1 { &civ::ANTENNAS[..n.min(civ::ANTENNAS.len())] } else { &[] }
+    }
+
+    /// How many sockets this model has, selector or not.
+    fn antenna_sockets(&self) -> usize {
+        self.dev.info().model.antenna_sockets
+    }
+
     /// Connect, then put the radio into the state this session needs.
     pub fn open(cfg: &IcomNetConfig) -> anyhow::Result<IcomNetSource> {
         let rx_source = cfg.effective_rx_source();
@@ -362,7 +383,9 @@ impl IcomNetSource {
             last_telem: None,
             transmitting: false,
             squelch_set: false,
-            antenna: None,
+            break_in: None,
+            socket: None,
+            rx_ant: None,
             antenna_probes_left: ANTENNA_PROBE_RETRIES,
             last_antenna_probe: Instant::now(),
             simplex_dial: None,
@@ -408,6 +431,11 @@ impl IcomNetSource {
         // connector NAKs this rather than answering it, whether there is a
         // selector here to offer at all (issue #238).
         self.send(civ::read_antenna_frame(self.civ_addr));
+        // Whether break-in is on, which is what decides whether a CW message
+        // handed to the radio's own keyer is transmitted at all. Not adopted —
+        // `send_cw` asserts it — but read so an operator running full break-in
+        // is not knocked down to semi by their own first message (issue #282).
+        self.send(civ::read_break_in_frame(self.civ_addr));
 
         // Which Set-mode menu items this session has to put its own value in,
         // collected before any of them is written: they are read back first,
@@ -680,13 +708,23 @@ impl IcomNetSource {
         // selector, so a *lost* reply is indistinguishable from that and leaves
         // the panel with no antenna control at all until the next reconnect
         // (issue #258). A few more chances, then let it go.
-        if self.antenna.is_none()
+        if self.socket.is_none()
             && self.antenna_probes_left > 0
             && self.last_antenna_probe.elapsed() >= ANTENNA_PROBE_RETRY
         {
             self.antenna_probes_left -= 1;
             self.last_antenna_probe = Instant::now();
             self.send(civ::read_antenna_frame(self.civ_addr));
+        }
+
+        // A tune the radio has not agreed to, sent again. A CI-V frame on this
+        // link is a UDP datagram, and one lost on the way is a band change that
+        // never happened and that nothing here would otherwise notice — see
+        // [`Dial::retry`], and issue #297.
+        if !self.transmitting
+            && let Some(f) = self.dial.retry()
+        {
+            self.send(civ::set_freq_frame(self.civ_addr, f));
         }
 
         if self.last_poll.elapsed() >= POLL_PERIOD {
@@ -760,13 +798,28 @@ impl IcomNetSource {
                     self.pending.push(ControlUpdate::Mode(m));
                 }
             }
-            // Which antenna socket the radio is on, asked for once when the
-            // session opens. Adopted, and its arrival is also what says the
-            // radio has a selector — see `Self::learned_antennas`.
+            // The antenna: which socket the radio is on, and behind it the
+            // receiving antenna's own in/out setting. Both adopted, and the
+            // reply's arrival — and its *shape* — is what says which of the two
+            // this radio has; see `Self::learned_antennas` and
+            // [`civ::antenna_frame`].
             0x12 => {
-                if let Some(name) = civ::parse_antenna_reply(&reply.data) {
-                    self.antenna = Some(name);
-                    self.pending.push(ControlUpdate::Antenna(name));
+                if let Some(r) = civ::parse_antenna_reply(&reply.data) {
+                    self.socket = Some(r.socket);
+                    if let Some(on) = r.rx_ant
+                        && self.rx_ant != Some(on)
+                    {
+                        self.rx_ant = Some(on);
+                        self.pending.push(ControlUpdate::RxAntenna(on));
+                    }
+                    // Not reported on a radio with one socket: there is no
+                    // selector there, and a panel told "ANT1" would draw a chip
+                    // whose other position that radio rejects.
+                    if self.antenna_sockets() > 1
+                        && let Some(name) = civ::antenna_name(r.socket, self.antenna_sockets())
+                    {
+                        self.pending.push(ControlUpdate::Antenna(name));
+                    }
                 }
             }
             // The transmit power the radio is set to, asked for once when the
@@ -783,6 +836,15 @@ impl IcomNetSource {
                         self.squelch_set = true;
                         self.pending.push(ControlUpdate::Squelch(frac));
                     }
+                }
+            }
+            // The "various settings" block, of which this session asks for one
+            // thing only: whether break-in is on (issue #282). Not surfaced to
+            // the app — it is not a control here, it is what `send_cw` needs to
+            // know before it asserts semi break-in over an operator's QSK.
+            0x16 => {
+                if let Some(bk) = civ::parse_break_in_reply(&reply.data) {
+                    self.break_in = Some(bk);
                 }
             }
             0x15 => {
@@ -978,6 +1040,11 @@ impl IqSource for IcomNetSource {
         true
     }
 
+    /// From the dial this backend already tracks — see [`Self::set_control_mode`].
+    fn resolves_band_sideband(&self) -> bool {
+        true
+    }
+
     fn set_control_mode(&mut self, mode: Mode) -> Result<()> {
         // CW keyed as audio (MCW) rides a sideband: a rig put in CW keys its
         // own transmitter and ignores the modulator input, so the keyed
@@ -987,6 +1054,13 @@ impl IqSource for IcomNetSource {
         // so the rig's USB report matches what was commanded.
         let mode = match mode {
             Mode::Cw if matches!(self.cw_keying, CwKeying::Audio) => Mode::Usb,
+            // Analog SSTV's sideband follows the band, and RADE's does too, and
+            // the engine leaves that to us (see `IqSource::resolves_band_sideband`)
+            // because `mode_to_civ` is a table with no dial in it. DATA on both
+            // sidebands: the picture — or the over — is modulated here and
+            // arrives at the radio's data input, which is what these modes
+            // already ask this family for on the bands where they ride USB.
+            m if m.sideband_follows_band() && m.is_lower_sideband_at(self.dial.vfo) => Mode::Digl,
             m => m,
         };
         self.mode_cmd = Some((civ::mode_to_civ(mode), Instant::now()));
@@ -1013,9 +1087,19 @@ impl IqSource for IcomNetSource {
         matches!(self.cw_keying, CwKeying::Audio)
     }
     fn send_cw(&mut self, text: &str) {
-        if let Some(f) = civ::send_cw_frame(self.civ_addr, text) {
-            self.send(f);
+        let Some(f) = civ::send_cw_frame(self.civ_addr, text) else { return };
+        // Break-in first, or the radio takes the message and never transmits
+        // it: its own reference sends a message from a PC only while
+        // `[TRANSMIT]` is on, an external TX switch is closed, or break-in is
+        // on — and over a network link there is no front panel to reach for.
+        // That was issue #282 on an IC-9700. Semi is what a computer-sent
+        // message wants, but never *down* from a full break-in the operator
+        // chose: the read in `configure` is what tells this end which.
+        if self.break_in != Some(civ::BreakIn::Full) {
+            self.break_in = Some(civ::BreakIn::Semi);
+            self.send(civ::set_break_in_frame(self.civ_addr, civ::BreakIn::Semi));
         }
+        self.send(f);
     }
     fn abort_cw(&mut self) {
         self.send(civ::stop_cw_frame(self.civ_addr));
@@ -1057,18 +1141,53 @@ impl IqSource for IcomNetSource {
     /// relay for both directions, so there is no transmit port to pick
     /// separately (issue #238).
     fn set_antenna(&mut self, name: &str) -> Result<()> {
-        // A name from whatever front end was on this radio before is dropped
-        // rather than turned into a socket number by accident.
-        let Some(frame) = civ::set_antenna_frame(self.civ_addr, name) else {
+        // A name from whatever front end was on this radio before — or a socket
+        // this model has not got — is dropped rather than turned into a socket
+        // number by accident.
+        let Some(n) = self.antennas().iter().position(|a| a.eq_ignore_ascii_case(name)) else {
             return Ok(());
         };
-        self.send(frame);
-        self.antenna = civ::ANTENNAS.iter().find(|a| a.eq_ignore_ascii_case(&name)).copied();
+        // The receiving antenna's setting rides out with the socket, because
+        // the same command writes both: a zero here would switch the operator's
+        // receive aerial out of circuit (issue #229). `None` — a radio whose
+        // reply carried no such byte, which is every receiver — sends the
+        // socket alone, because the longer frame is one it answers NAK to and
+        // the antenna would never move (issue #334).
+        self.send(civ::antenna_frame(self.civ_addr, n as u8, self.rx_ant));
+        self.socket = Some(n as u8);
+        // And on an IC-7610 the flag belongs to the socket being selected
+        // rather than to the one being left, so ask what it is now.
+        self.send(civ::read_antenna_frame(self.civ_addr));
         Ok(())
     }
 
     fn current_antenna(&self) -> String {
-        self.antenna.unwrap_or_default().to_string()
+        self.socket
+            .and_then(|n| civ::antenna_name(n, self.antenna_sockets()))
+            .unwrap_or_default()
+            .to_string()
+    }
+
+    fn rx_antenna(&self) -> Option<bool> {
+        self.rx_ant
+    }
+
+    /// The same command with the socket held still. Nothing goes out until the
+    /// radio has said which socket that is, and that it has a receiving antenna
+    /// at all — see `civ::antenna_frame`.
+    fn set_rx_antenna(&mut self, on: bool) -> Result<()> {
+        let (Some(socket), true) = (self.socket, self.rx_ant.is_some()) else {
+            return Ok(());
+        };
+        self.rx_ant = Some(on);
+        self.send(civ::antenna_frame(self.civ_addr, socket, Some(on)));
+        Ok(())
+    }
+
+    /// Ask the radio again, after something it recalls per band. Never an
+    /// assertion: what comes back is adopted.
+    fn reread_rx_antenna(&mut self) {
+        self.send(civ::read_antenna_frame(self.civ_addr));
     }
 
     /// ANT1/ANT2, once the radio has answered the opening read — and nothing
@@ -1093,10 +1212,7 @@ impl IqSource for IcomNetSource {
     }
 
     fn learned_antennas(&self) -> Option<&'static [&'static str]> {
-        Some(match self.antenna {
-            Some(_) => &civ::ANTENNAS,
-            None => &[],
-        })
+        Some(if self.socket.is_some() { self.antennas() } else { &[] })
     }
 
     fn tx_begin(&mut self, center_hz: f64, _rate: f64) -> Result<f64> {
@@ -1213,6 +1329,8 @@ mod tests {
     use super::*;
     use sdroxide_icomnet::sim::{Sim, SimOptions};
 
+    use crate::dial::FREQ_SETTLE;
+
     fn cfg(sim: &Sim) -> IcomNetConfig {
         IcomNetConfig {
             address: "127.0.0.1".into(),
@@ -1246,6 +1364,73 @@ mod tests {
                 .unwrap();
         let src = IcomNetSource::open(&cfg(&sim)).expect("open");
         assert_eq!(src.center_hz(), 7_074_000.0, "the radio's own dial, not 0");
+    }
+
+    /// Issue #297: a band change on a networked Icom took three to five clicks
+    /// to stick.
+    ///
+    /// A CI-V frame on this link is a UDP datagram with nothing above it that
+    /// says the radio acted on it, so a set-frequency lost on the way is a
+    /// tune that simply never happened — and one poll period later the radio
+    /// answers from where it always was, the settling guard runs out, and the
+    /// dial snaps back. The operator's own remedy was to click again; this is
+    /// sdroxide doing it for them. The simulator swallows the first tune, which
+    /// is exactly what that loss looks like from this end.
+    #[test]
+    fn a_tune_the_radio_never_took_is_sent_again_until_it_sticks() {
+        let sim = Sim::start(SimOptions {
+            freq_hz: 14_074_000.0,
+            ignore_tunes: 1,
+            scope: false,
+            ..Default::default()
+        })
+        .unwrap();
+        let mut src = IcomNetSource::open(&cfg(&sim)).expect("open");
+        assert_eq!(src.center_hz(), 14_074_000.0);
+
+        // The operator picks 40 m for FT8. That frame is the one the radio
+        // never sees.
+        src.set_center_hz(7_074_000.0).expect("tune");
+        wait_for("the radio to be tuned to the band that was asked for", || {
+            let _ = src.poll_control();
+            sim.dial() == 7_074_000.0
+        });
+        // And it has to stay there: the radio's answers from before it moved
+        // must not be folded back in on top of the tune.
+        let deadline = Instant::now() + FREQ_SETTLE * 2;
+        while Instant::now() < deadline {
+            let _ = src.poll_control();
+            assert_eq!(src.center_hz(), 7_074_000.0, "the band the operator chose did not stick");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    /// And the resend is a recovery, not a habit: a radio that takes the tune
+    /// is not asked over and over for the rest of the settling time.
+    ///
+    /// At most twice, rather than exactly once, because the radio's agreement
+    /// arrives on the next frequency poll — and a poll that had only just gone
+    /// out when the operator clicked leaves a full period before the next one.
+    /// One redundant set-frequency costs a frame on a link that already sends
+    /// four every poll; a stream of them would be this end arguing with a radio
+    /// that never disagreed.
+    #[test]
+    fn a_tune_the_radio_takes_is_not_asked_for_over_and_over() {
+        let sim =
+            Sim::start(SimOptions { freq_hz: 14_074_000.0, scope: false, ..Default::default() })
+                .unwrap();
+        let mut src = IcomNetSource::open(&cfg(&sim)).expect("open");
+        src.set_center_hz(7_074_000.0).expect("tune");
+        // Past the settling time, after which nothing is re-asked at all.
+        let deadline = Instant::now() + FREQ_SETTLE * 2;
+        while Instant::now() < deadline {
+            let _ = src.poll_control();
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(sim.dial(), 7_074_000.0);
+        assert_eq!(src.center_hz(), 7_074_000.0);
+        let tunes = sim.civ_frames().iter().filter(|f| f.get(4) == Some(&0x05)).count();
+        assert!(tunes <= 2, "a radio that answered was asked {tunes} times");
     }
 
     /// Two Icoms on one LAN, each keeping its own session trace.

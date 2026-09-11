@@ -632,7 +632,7 @@ impl SdroxideApp {
         self.sstv.ensure_preview(dims, &ctx);
         crate::repaint::after_ms(&ctx, 120);
 
-        let st = self.sstv.status;
+        let st = self.sstv.status.clone();
         let (signal, tx_active, progress) = if rifp {
             (self.sstv.rifp.signal, self.sstv.rifp.tx_active, self.sstv.rifp.tx_progress)
         } else {
@@ -756,6 +756,54 @@ impl SdroxideApp {
                                     ui.label(RichText::new("listening…").size(10.0).weak());
                                 }
 
+                                // Issue #397. A receiver that has locked on is
+                                // committed for the whole length of the mode it
+                                // locked on to, and Scottie DX is four and a
+                                // half minutes — so a VIS misread as a slow
+                                // mode costs every picture sent while it runs
+                                // out. On QO-100, where one station follows
+                                // another over the same transponder, that is
+                                // the next few overs.
+                                //
+                                // Offered whether or not a picture is under
+                                // way: re-arming an idle hunt costs nothing,
+                                // and a chip that appears only once the mistake
+                                // has been made is one the operator has to find
+                                // in a hurry. The half-picture goes with it,
+                                // here as well as in the decoder — leaving the
+                                // abandoned frame on screen would say the
+                                // button had not worked.
+                                if crate::chrome::chip(ui, false, "Restart RX")
+                                    .on_hover_text(
+                                        "Abandon the picture being received and listen for the                                          next header. For a transmission that started decoding                                          in the wrong mode — the receiver is otherwise committed                                          until that mode runs out.",
+                                    )
+                                    .clicked()
+                                {
+                                    cmds.push(Command::SstvRestartRx);
+                                    self.sstv.rx_color = None;
+                                    self.sstv.rx_tex = None;
+                                }
+
+                                // Who sent it. The FSK ID arrives in tones a
+                                // fraction of a second after the picture, which
+                                // is exactly when the operator is looking at the
+                                // frame and wondering whose it is — and unlike a
+                                // banner drawn into the image, this is the
+                                // station's own machine-readable identification.
+                                if let Some(id) = st.rx_id.as_deref() {
+                                    ui.add_space(8.0);
+                                    ui.label(
+                                        RichText::new(format!("ID {id}"))
+                                            .size(11.0)
+                                            .strong()
+                                            .color(crate::theme::CYAN_DIM()),
+                                    )
+                                    .on_hover_text(
+                                        "The callsign the last station sent as an FSK ID after \
+                                         its picture.",
+                                    );
+                                }
+
                                 ui.add_space(12.0);
                                 ui.separator();
                                 ui.label(RichText::new("TX slant").size(10.0).weak()).on_hover_text(
@@ -779,6 +827,58 @@ impl SdroxideApp {
                                         .clicked()
                                     {
                                         self.digi_cfg_edit.sstv_tx_ppm = 0.0;
+                                        cmds.push(Command::SetDigiConfig(self.digi_cfg_edit.clone()));
+                                    }
+                                    ui.separator();
+                                    // The callsign in tones after the picture.
+                                    // Beside the slant trim rather than in the
+                                    // banner window: the banner identifies the
+                                    // station to a person looking at the
+                                    // picture, this identifies it to the
+                                    // repeater decoding it, and the two are set
+                                    // for different reasons.
+                                    if crate::chrome::checkbox(
+                                        ui,
+                                        &mut self.digi_cfg_edit.sstv_fsk_id,
+                                        "FSK ID",
+                                    )
+                                    .on_hover_text(
+                                        "Send your callsign in tones after each picture — the \
+                                         identification SSTV repeaters and other programs read. \
+                                         Adds about 2.5 seconds, and sends nothing at all until \
+                                         you have set a callsign.",
+                                    )
+                                    .changed()
+                                    {
+                                        cmds.push(Command::SetDigiConfig(self.digi_cfg_edit.clone()));
+                                    }
+                                    ui.separator();
+                                    // Dead air before the calibration header, so
+                                    // the rig is really on the air by the time
+                                    // the VIS code goes out. Here rather than in
+                                    // the setup window because it is the same
+                                    // kind of per-station trim as the slant
+                                    // beside it, and the operator who needs it
+                                    // finds out by transmitting.
+                                    ui.label(RichText::new("TX lead").size(10.0).weak());
+                                    if ui
+                                        .add(
+                                            egui::DragValue::new(
+                                                &mut self.digi_cfg_edit.sstv_txdelay_ms,
+                                            )
+                                            .range(0..=3000)
+                                            .speed(10.0)
+                                            .suffix(" ms"),
+                                        )
+                                        .on_hover_text(
+                                            "Silence sent after keying and before the picture's \
+                                             leader and VIS code. A decoder that misses any of \
+                                             that header shows no picture at all, so this covers \
+                                             the gap between asking a rig for PTT and it really \
+                                             being on the air. 0 for an SDR that keys instantly.",
+                                        )
+                                        .changed()
+                                    {
                                         cmds.push(Command::SetDigiConfig(self.digi_cfg_edit.clone()));
                                     }
                                 });

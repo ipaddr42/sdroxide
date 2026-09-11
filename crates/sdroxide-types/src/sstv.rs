@@ -84,7 +84,7 @@ impl SstvMode {
 
 /// Broadcast status for the SSTV panel: what's being sent/received and how far
 /// along. Rides the wire as part of the digital-mode event stream.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SstvStatus {
     /// The mode selected for the next transmission.
     pub tx_mode: SstvMode,
@@ -100,6 +100,16 @@ pub struct SstvStatus {
     /// Smoothed in-band receive signal level (~0..1), for an activity meter so
     /// the operator can confirm audio is reaching the decoder.
     pub signal: f32,
+    /// The callsign the last station to transmit sent in its FSK ID, if it sent
+    /// one.
+    ///
+    /// The identification arrives in tones a fraction of a second *after* the
+    /// picture, so it cannot ride on the image it belongs to; it lands here and
+    /// stays until the next station sends one. Held rather than shown once
+    /// because that is how it is read — the operator looks at the picture, then
+    /// looks for who sent it.
+    #[serde(default)]
+    pub rx_id: Option<String>,
 }
 
 impl Default for SstvStatus {
@@ -111,6 +121,7 @@ impl Default for SstvStatus {
             detected: None,
             progress: 0.0,
             signal: 0.0,
+            rx_id: None,
         }
     }
 }

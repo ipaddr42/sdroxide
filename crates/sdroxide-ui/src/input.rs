@@ -12,7 +12,7 @@ use std::collections::HashMap;
 
 use sdroxide_types::{
     Action, ActionInput, ActionKind, BindingTuning, ButtonMode, Command, InputSettings, KeyChord,
-    MAX_MANUAL_GAIN_DB, MouseButton, RadioState, RxId, SQUELCH_OPEN_DB, Vfo,
+    MAX_MANUAL_GAIN_DB, MouseButton, RadioState, RxId, SQUELCH_CLOSED_DB, SQUELCH_OPEN_DB, Vfo,
 };
 
 use crate::view::ViewState;
@@ -24,8 +24,9 @@ const ACCEL_IDLE_S: f64 = 0.2;
 /// Ceiling for RIT/XIT offsets, matching the rig-like range reported to
 /// external control clients.
 const MAX_OFFSET_HZ: f32 = 9999.0;
-/// Narrowest a filter may be squeezed by a knob.
-const MIN_FILTER_HZ: f32 = 50.0;
+/// Narrowest a filter may be squeezed — by a knob, by the panadapter's grips
+/// or by the numeric fields behind the BW chip.
+pub(crate) const MIN_FILTER_HZ: f32 = 50.0;
 
 /// Side effects an action can have that are purely local to this client and
 /// never become a [`Command`]. The app lends the flags it owns.
@@ -111,7 +112,7 @@ fn absolute_range(act: Action, state: &RadioState, rig_squelch: bool) -> Option<
         // dBFS for the engine's own gate, and the rig's own `0..1` where the
         // radio is the one squelching.
         Squelch if rig_squelch => (0.0, 1.0),
-        Squelch => (SQUELCH_OPEN_DB, 0.0),
+        Squelch => (SQUELCH_OPEN_DB, SQUELCH_CLOSED_DB),
         AgcMaxGain => (0.0, 120.0),
         ManualGain => (0.0, MAX_MANUAL_GAIN_DB),
         RitOffset | XitOffset => (-MAX_OFFSET_HZ, MAX_OFFSET_HZ),
@@ -221,7 +222,7 @@ pub(crate) fn apply_action(
             }
             Squelch => {
                 let cur = state.rx[0].squelch_db;
-                let db = target.unwrap_or(cur + delta).clamp(SQUELCH_OPEN_DB, 0.0);
+                let db = target.unwrap_or(cur + delta).clamp(SQUELCH_OPEN_DB, SQUELCH_CLOSED_DB);
                 state.rx[0].squelch_db = db;
                 cmds.push(Command::SetSquelch { rx, db });
             }
@@ -1349,8 +1350,12 @@ mod tests {
         assert_eq!(step_band(Band::M2, true), Some(Band::M70));
         assert_eq!(step_band(Band::M70, true), Some(Band::Cm23));
         assert_eq!(step_band(Band::Cm23, false), Some(Band::M70));
-        // Wraps within the ham bands only, from the highest to the lowest.
-        assert_eq!(step_band(Band::Cm6, true), Some(Band::M160));
+        // Wraps within the ham bands only, from the highest to the lowest —
+        // 3 cm being the highest since the IC-905 got its own 10 GHz band
+        // (issue #326).
+        assert_eq!(step_band(Band::Cm6, true), Some(Band::Cm3));
+        assert_eq!(step_band(Band::Cm3, true), Some(Band::M160));
+        assert_eq!(step_band(Band::Cm3, false), Some(Band::Cm6));
         assert_eq!(step_band(Band::Gen, true), None);
     }
 

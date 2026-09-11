@@ -344,14 +344,20 @@ impl UsbDev {
         }
     }
 
-    /// Whether the link can actually carry the top sample rates.
+    /// Whether the link can carry the rates this board offers.
     ///
-    /// 20 Msps is 40 MB/s, which a high-speed link cannot sustain — its
-    /// theoretical ceiling is 60 MB/s and real throughput is well under that.
-    /// Worth saying at open rather than leaving somebody to diagnose dropped
-    /// samples.
-    pub fn is_superspeed(&self) -> bool {
-        matches!(self.speed, Some(nusb::Speed::Super) | Some(nusb::Speed::SuperPlus))
+    /// High speed is the ceiling, not the floor: every HackRF ever built — the
+    /// One and all its revisions, the Jawbreaker, the rad1o, and the Pro with
+    /// its USB-C socket — is a High-Speed USB 2.0 device, so a board that is
+    /// *not* on a high-speed link is on a broken cable or a USB 1.1 hub, and
+    /// nothing it offers will fit. Asking after SuperSpeed would be asking
+    /// after a port no HackRF can use (issue #349); the 20 Msps top rate is
+    /// 40 MB/s, which is what high speed is for.
+    pub fn is_high_speed_or_better(&self) -> bool {
+        matches!(
+            self.speed,
+            Some(nusb::Speed::High) | Some(nusb::Speed::Super) | Some(nusb::Speed::SuperPlus)
+        )
     }
 
     /// Borrow the interface so the streaming code can open the bulk endpoints.
@@ -545,6 +551,20 @@ pub(crate) mod fake {
         pub fn stalling(self, req: Request) -> FakeTransport {
             self.stalls.lock().unwrap().push(req.code());
             self
+        }
+
+        /// Start refusing `req` on an already-open device. [`Self::stalling`]
+        /// consumes the transport because it is used at construction; this is
+        /// for a test that has to get the radio open first and only then have
+        /// it start saying no.
+        pub fn refuse(&self, req: Request) {
+            self.stalls.lock().unwrap().push(req.code());
+        }
+
+        /// Stop refusing `req`, so a test can watch a change land once the
+        /// radio stops saying no.
+        pub fn accept(&self, req: Request) {
+            self.stalls.lock().unwrap().retain(|&c| c != req.code());
         }
 
         fn stalls(&self, req: Request) -> bool {

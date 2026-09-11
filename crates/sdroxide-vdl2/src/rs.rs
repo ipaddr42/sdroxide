@@ -29,6 +29,27 @@
 //! a way nothing downstream can see, and with only two parity symbols on a
 //! short block, miscorrections are not rare.
 //!
+//! # These parameters do not fit what is on the air
+//!
+//! Stated plainly because it matters more than anything else in this file. Not
+//! one transmission in the recording contributed on issue #265 — 195 frames
+//! across six channels, every one of them with a *correct* AVLC frame check
+//! sequence — has a data field this code accepts. Their parity octets are a
+//! deterministic function of the data (two identical transmissions carry
+//! identical parity), so they are error correction of some kind; but no first
+//! consecutive root, no root step and no field polynomial makes a syndrome of
+//! them, in any of the thirty degree-8 fields there are, with the octets in
+//! either bit order and in either direction. Whatever is wrong is in the
+//! parameters or in the basis the octets map onto the field through, and that
+//! recording cannot say which.
+//!
+//! So `crate::channel` treats this layer as advisory: a block that fails is
+//! tried again exactly as it arrived, and the frame check sequence decides. The
+//! code below is left as the standard reads because it is the best available
+//! transcription of it and because the transmitter in `crate::tx` needs a
+//! matching encoder — but nothing here has ever repaired a real frame, and
+//! `Counters::fec_bypassed` is what will say when that changes.
+//!
 //! Sources: ETSI EN 301 841-1 for the parameters; the decoder is
 //! Berlekamp-Massey, Chien and Forney as they are given in any coding text.
 

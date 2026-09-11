@@ -1,6 +1,6 @@
 //! Waterfall colormap LUTs: 256×1 RGBA8.
 
-pub const NAMES: [&str; 10] = [
+pub const NAMES: [&str; 11] = [
     "Classic",
     "Viridis",
     "Gray",
@@ -11,6 +11,7 @@ pub const NAMES: [&str; 10] = [
     "Tron",
     "Amber",
     "Rainbow",
+    "Blue",
 ];
 
 /// Piecewise-linear gradient through (position, RGB) anchor points.
@@ -137,6 +138,25 @@ pub fn lut(index: usize) -> [u8; 256 * 4] {
             (0.90, [255, 70, 30]),
             (1.00, [255, 255, 255]),
         ]),
+        // Blue — the palette SDR# has used since the beginning and SDR++
+        // inherited, and what most operators mean by "the traditional blue
+        // waterfall" (issue #375). Two things set it apart from Classic above:
+        // the floor is a navy rather than black, so the noise still has visible
+        // texture in it instead of going flat, and the top half runs white →
+        // yellow → orange → red → dark red, which puts *two* readable steps
+        // above the point where every other ramp here has already saturated.
+        10 => gradient(&[
+            (0.00, [0, 0, 32]),
+            (0.15, [0, 0, 80]),
+            (0.28, [0, 0, 145]),
+            (0.38, [30, 144, 255]),
+            (0.46, [255, 255, 255]),
+            (0.54, [255, 255, 0]),
+            (0.66, [254, 109, 22]),
+            (0.78, [255, 0, 0]),
+            (0.89, [198, 0, 0]),
+            (1.00, [117, 0, 0]),
+        ]),
         // Gray (index 2) and any out-of-range fallback.
         _ => gradient(&[(0.0, [0, 0, 0]), (1.0, [255, 255, 255])]),
     }
@@ -190,15 +210,19 @@ pub fn prop_ramp_at(t: f32) -> [u8; 3] {
 pub fn band_color(band: sdroxide_types::Band) -> [u8; 3] {
     use sdroxide_types::Band;
     match band {
-        Band::M160 => [176, 40, 40],  // deep red
-        Band::M80 => [214, 92, 32],   // orange
-        Band::M60 => [222, 150, 40],  // amber
-        Band::M40 => [226, 208, 52],  // yellow
-        Band::M30 => [150, 214, 60],  // yellow-green
-        Band::M20 => [58, 200, 96],   // green
-        Band::M17 => [46, 200, 170],  // teal
-        Band::M15 => [52, 168, 226],  // sky
-        Band::M12 => [70, 116, 232],  // blue
+        Band::M160 => [176, 40, 40], // deep red
+        Band::M80 => [214, 92, 32],  // orange
+        Band::M60 => [222, 150, 40], // amber
+        Band::M40 => [226, 208, 52], // yellow
+        Band::M30 => [150, 214, 60], // yellow-green
+        Band::M20 => [58, 200, 96],  // green
+        Band::M17 => [46, 200, 170], // teal
+        Band::M15 => [52, 168, 226], // sky
+        Band::M12 => [70, 116, 232], // blue
+        // 11 m sits between them in frequency but not in the rotation: it is
+        // not an amateur band, and a swatch in the run would say it was. A
+        // desaturated slate, out of the sequence on purpose.
+        Band::M11 => [104, 114, 156],
         Band::M10 => [122, 92, 236],  // indigo
         Band::M6 => [176, 84, 226],   // violet
         Band::M4 => [202, 78, 224],   // purple
@@ -211,6 +235,7 @@ pub fn band_color(band: sdroxide_types::Band) -> [u8; 3] {
         Band::Cm13 => [226, 224, 140], // pale straw
         Band::Cm9 => [160, 220, 172],  // pale green
         Band::Cm6 => [150, 204, 236],  // pale sky
+        Band::Cm3 => [166, 178, 240],  // pale blue
         // Not a band: nothing is ever binned here.
         Band::Gen => [128, 128, 128],
     }

@@ -5,6 +5,7 @@
 //! panel:
 //!
 //! - [`adsb`] — the aircraft list and the 1090 MHz radar picture
+//! - [`ais`] — the vessel list and the 162 MHz marine chart
 //! - [`vdl2`] — the VDL Mode 2 message log and station list
 //! - [`aprs`] — the APRS station list, map and messages
 //! - [`cw`] — the Morse decode/keyboard panel, the one non-digital mode here
@@ -18,6 +19,7 @@
 //! - [`widgets`] — the row and station-card widgets several panels draw
 
 pub(in crate::app) mod adsb;
+pub(in crate::app) mod ais;
 pub(in crate::app) mod aprs;
 pub(in crate::app) mod cw;
 pub(in crate::app) mod decodes;
@@ -77,6 +79,9 @@ pub(in crate::app) fn panel_panes(mode: Mode) -> &'static [&'static str] {
         // it. No map: VDL2 carries a position only occasionally, so one would be
         // mostly empty of the traffic this panel exists to show.
         Mode::Vdl2 => &["MESSAGES", "STATIONS"],
+        // Two, for the reason ADS-B has two: a safety broadcast nobody answers,
+        // and the only two questions about it are what is out there and where.
+        Mode::Ais => &["VESSELS", "CHART"],
         Mode::Wefax => &["CHART", "SAVED"],
         Mode::Navtex => &["MESSAGES", "READING"],
         Mode::RfPaint => &["TEXT", "IMAGE"],
@@ -261,6 +266,11 @@ pub(in crate::app) fn on_air_readout(ui: &mut egui::Ui, hz: f64) {
 /// of.
 pub(in crate::app) fn digi_freq_for_band(mode: Mode, band: Band) -> Option<f64> {
     let shared = sdroxide_types::digi_channels_in(mode, band);
+    // Published conventions only. A frequency this station saved for itself is
+    // offered in the ⇵ picker and honoured when the dial is already on it, but
+    // a band button is a jump to where the *band* is worked, and answering it
+    // with one station's own note would be a surprise (issue #268).
+    let shared: Vec<_> = shared.into_iter().filter(|c| !c.mine).collect();
     if !shared.is_empty() {
         // The plain calling frequency, which is the one with no note. Not
         // simply the lowest: FT8's DXpedition frequency is *below* the calling
@@ -331,7 +341,9 @@ fn digi_dial_freqs(mode: Mode) -> &'static [(&'static str, f64)] {
             ("12m", 24_923_000.0),
             ("10m", 28_184_000.0),
         ],
-        // FreeDV calling frequencies (USB dial).
+        // FreeDV calling frequencies. Dial, on whichever sideband the band is
+        // worked: 80 m and 40 m are LSB, everything above USB — the switch is
+        // sdroxide's to make, not the operator's (`Mode::sideband_follows_band`).
         Mode::Rade => &[
             ("80m", 3_625_000.0),
             ("40m", 7_177_000.0),
@@ -429,6 +441,21 @@ fn digi_dial_freqs(mode: Mode) -> &'static [(&'static str, f64)] {
         ],
         // RF Paint has no defined calling frequency — offer no band presets.
         Mode::RfPaint => &[],
+        // The AX.25 modes, which have no business anywhere in the list below.
+        //
+        // APRS is one channel per region and `APRS_DIALS` names every one of
+        // them, so the shared table has already answered for the two bands it
+        // is worked in; there is no APRS anywhere else. Packet is the same
+        // waveform without even that much of a convention — a node, a BBS or a
+        // Winlink gateway is on whatever channel its keeper picked.
+        //
+        // Falling through to the default below gave all three FT8's dials,
+        // which is issue #260: pressing 20 m in APRS tuned to 14.074 and left
+        // the mode alone, so an IC-7610 went to FM-D1 on the FT8 watering hole
+        // and the band button looked broken. Landing an FM packet transmitter
+        // on top of the busiest frequency in the band is the part of that
+        // worth being sure about.
+        Mode::Aprs | Mode::Packet | Mode::PacketHf => &[],
         // RIFP assigns no frequency at all: 433.92 MHz is the deployment
         // example the draft names, and the others are the middle of the
         // segments where a 25 kHz channel is a realistic thing to ask for
@@ -701,10 +728,17 @@ impl SdroxideApp {
     /// entries are under the cursor when the popup opens, and the rest follow
     /// in frequency order.
     ///
-    /// Absent only for a mode with no convention of its own — CW, SSB, and the
-    /// ones whose frequency is a property of what they are pointed at rather
-    /// than of the mode (RF Paint, RADE, WEFAX, which has its own station
-    /// picker instead).
+    /// Absent only for a mode with no convention of its own, and nothing the
+    /// operator has saved for it — CW, SSB, and the ones whose frequency is a
+    /// property of what they are pointed at rather than of the mode (RF Paint,
+    /// RADE, WEFAX, which has its own station picker instead).
+    ///
+    /// The list is also the operator's own. The net that meets on 3.585 every
+    /// Tuesday is not in anybody's global table and never will be, so the
+    /// picker saves the dial you are on and offers it back under this mode
+    /// afterwards (issue #268). Those entries are marked, and they are the only
+    /// ones that can be removed — a published convention is not this station's
+    /// to edit.
     ///
     /// The dial is what moves. These are dial frequencies, and the audio
     /// offset within the passband is a separate control that must not be
@@ -714,9 +748,10 @@ impl SdroxideApp {
         let dial = self.state.active_freq_hz();
         let here_band = sdroxide_types::Band::containing(dial);
         let channels = sdroxide_types::digi_channels(mode);
-        if channels.is_empty() {
-            return;
-        }
+        // No early return for an empty list any more: a mode the tables have no
+        // convention for is exactly the one an operator needs to save a
+        // frequency *under*, and a chip that only appears once there is
+        // something in it can never be the place they save the first one.
         // "On" when the dial is already sitting on one of them, so the chip
         // doubles as a readout of whether you are where the mode expects.
         let here = channels.iter().find(|c| (c.dial_hz - dial).abs() < 1.0);
@@ -725,11 +760,19 @@ impl SdroxideApp {
             None => "⇵ FREQ".to_string(),
         };
         let btn = crate::chrome::chip(ui, here.is_some(), RichText::new(face).size(11.0))
-            .on_hover_text(format!(
-                "The {} frequencies agreed for {} — picking one tunes the dial",
-                channels.len(),
-                mode.label()
-            ));
+            .on_hover_text(if channels.is_empty() {
+                format!(
+                    "No frequency is agreed for {} — open this to save the one you are on",
+                    mode.label()
+                )
+            } else {
+                format!(
+                    "The {} frequencies for {} — picking one tunes the dial, and you can save \
+                     your own",
+                    channels.len(),
+                    mode.label()
+                )
+            });
 
         // Grouped by band, the dial's own band first: everything else is a
         // band change, and the entries next to where the operator already is
@@ -748,6 +791,11 @@ impl SdroxideApp {
         let flagged = channels.iter().any(|c| c.outside_data_segment(mode));
 
         let mut pick = None;
+        // Set inside the popup and acted on after it, because both rewrite the
+        // whole list and neither may borrow it while the rows are being drawn
+        // from it.
+        let mut save = false;
+        let mut forget: Option<f64> = None;
         let resp = egui::Popup::from_toggle_button_response(&btn)
             .frame(crate::chrome::window_frame())
             .close_behavior(egui::PopupCloseBehavior::CloseOnClick)
@@ -755,12 +803,19 @@ impl SdroxideApp {
                 crate::chrome::window_body_bg(ui);
                 ui.set_max_width(300.0);
                 ui.label(
-                    RichText::new(format!("{} · conventional frequencies", mode.label()))
+                    RichText::new(format!("{} · frequencies", mode.label()))
                         .color(crate::theme::CYAN_DIM())
                         .size(9.5)
                         .strong(),
                 );
                 ui.add_space(2.0);
+                if groups.is_empty() {
+                    ui.label(
+                        RichText::new("Nothing agreed for this mode — save your own below.")
+                            .size(10.0)
+                            .weak(),
+                    );
+                }
                 // Scrolled rather than sized to the list: a mode with a
                 // convention on every band has more entries than a popup can
                 // be tall on a laptop screen.
@@ -774,7 +829,11 @@ impl SdroxideApp {
                         );
                         for c in chans {
                             let on = here.map(|h| h.dial_hz) == Some(c.dial_hz);
-                            let mut text = format!("   {:.3} MHz", c.dial_hz / 1e6);
+                            // A star for the operator's own, so a frequency
+                            // this station saved is never mistaken for one the
+                            // rest of the world is listening on.
+                            let mark = if c.mine { " ★" } else { "  " };
+                            let mut text = format!(" {mark} {:.3} MHz", c.dial_hz / 1e6);
                             if !c.note.is_empty() {
                                 text.push_str(&format!("   {}", c.note));
                             }
@@ -782,18 +841,32 @@ impl SdroxideApp {
                             if c.outside_data_segment(mode) {
                                 rich = rich.color(crate::theme::YELLOW());
                             }
-                            let row = ui.selectable_label(on, rich);
-                            if c.outside_data_segment(mode) {
-                                row.clone().on_hover_text(format!(
-                                    "A global convention that the IARU Region {} band plan does \
-                                     not put narrow data on — check your own band plan before \
-                                     transmitting here.",
-                                    sdroxide_types::region().number()
-                                ));
-                            }
-                            if row.clicked() {
-                                pick = Some(c.dial_hz);
-                            }
+                            ui.horizontal(|ui| {
+                                let row = ui.selectable_label(on, rich);
+                                if c.outside_data_segment(mode) {
+                                    row.clone().on_hover_text(format!(
+                                        "A global convention that the IARU Region {} band plan \
+                                         does not put narrow data on — check your own band plan \
+                                         before transmitting here.",
+                                        sdroxide_types::region().number()
+                                    ));
+                                }
+                                if row.clicked() {
+                                    pick = Some(c.dial_hz);
+                                }
+                                // Only this station's own entries can go. A
+                                // published convention is not ours to delete —
+                                // and an operator who removed 14.074 by
+                                // accident would have no way to get it back.
+                                if c.mine
+                                    && ui
+                                        .small_button("✕")
+                                        .on_hover_text("Forget this saved frequency")
+                                        .clicked()
+                                {
+                                    forget = Some(c.dial_hz);
+                                }
+                            });
                         }
                     }
                 });
@@ -808,12 +881,58 @@ impl SdroxideApp {
                         .size(10.0),
                     );
                 }
+                // The dial you are on, saved under this mode. The whole of what
+                // issue #268 asked for beyond the shipped tables: a club net or
+                // a local calling frequency is not in anybody's global list, and
+                // having tuned it once you should not have to find it again.
+                ui.add_space(4.0);
+                ui.separator();
+                let saved = here.is_some_and(|h| h.mine);
+                let can_save = !saved && here.is_none();
+                ui.add_enabled_ui(can_save, |ui| {
+                    if ui
+                        .button(RichText::new(format!("＋ Save {:.3} MHz", dial / 1e6)).size(11.0))
+                        .on_hover_text(if saved {
+                            "This dial is already one of your saved frequencies.".to_string()
+                        } else if !can_save {
+                            "This dial is already in the agreed list for this mode.".to_string()
+                        } else {
+                            format!(
+                                "Remember this dial under {} and offer it here from now on. \
+                                 Saved on the station, so every screen attached to this radio \
+                                 has it.",
+                                mode.label()
+                            )
+                        })
+                        .clicked()
+                    {
+                        save = true;
+                    }
+                });
             });
         if let Some(r) = &resp {
             crate::chrome::paint_popup_cut_border(ui.ctx(), &r.response, 1.0);
         }
         if let Some(hz) = pick {
             cmds.push(Command::SetVfo { vfo: self.state.active_vfo, hz });
+        }
+        // The list is edited whole and latest-wins, exactly as the station's
+        // other configuration is: the engine sorts, de-duplicates, saves it and
+        // announces it back, so a second screen catches up on the next message
+        // rather than holding a list of its own.
+        if save || forget.is_some() {
+            let mut presets = sdroxide_types::digi_presets().to_vec();
+            if let Some(hz) = forget {
+                presets.retain(|p| p.mode != mode || (p.dial_hz - hz).abs() >= 1.0);
+            }
+            if save {
+                presets.push(sdroxide_types::DigiPreset {
+                    mode,
+                    dial_hz: dial,
+                    note: String::new(),
+                });
+            }
+            cmds.push(Command::SetDigiPresets(presets));
         }
     }
 

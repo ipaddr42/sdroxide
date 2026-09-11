@@ -9,9 +9,30 @@
 # The LimeRFE is different: sdroxide opens its serial port directly, and on most
 # distributions a USB serial device is owned by root and the `dialout` group.
 #
-# TAG+="uaccess" hands an ACL to whoever is logged in at the active seat. That
-# is better than adding the user to `dialout`, which needs a group to exist, the
-# user to be added to it, and a full re-login before it takes effect.
+# TAG+="uaccess" hands an ACL to whoever is logged in at the active seat, which
+# needs no group to exist and no re-login. It is the better half of this rule
+# and it is not the whole of it: uaccess grants nothing where there is no seat
+# to be logged in at — WSL2, a headless box reached over ssh, a container, or
+# sdroxide running as a systemd service — and the device stays root-owned and
+# unreachable for reasons nothing on screen explains (issue #350).
+#
+# So GROUP="dialout" comes along as a fallback, taking effect for anyone in that
+# group when the ACL does not. `dialout` rather than `plugdev` because this is a
+# serial port and that is who owns serial ports already — the rule agrees with
+# the distribution's own instead of taking the node away from it. To use it:
+#
+#   sudo usermod -aG dialout $USER
+#
+# then log out and back in (`newgrp dialout` for the current shell).
+#
+# That fallback is why the permissions below are applied on their own lines at
+# the end rather than appended to each id. udev resolves GROUP at parse time,
+# and a group that does not exist on this machine — `dialout` is absent on Arch, which uses `uucp` — discards THE WHOLE RULE
+# LINE, not just the GROUP token. Written the obvious way, as one line per id
+# carrying MODE, GROUP and TAG together, a missing dialout takes uaccess down with
+# it and the device stays root-owned on exactly the distros that never had the
+# group (issue #350 again, from the other side). Keeping GROUP alone on its own
+# line means only that line is dropped and the ACL still lands.
 #
 # Install:
 #   sudo cp 60-sdroxide-limerfe.rules /usr/lib/udev/rules.d/
@@ -25,7 +46,12 @@
 # other end of it. The consequence is that this rule also loosens permissions on
 # any other FTDI serial adapter on the machine, which is the same trade every
 # distribution's own FTDI rules already make.
-SUBSYSTEM=="tty", ATTRS{idVendor}=="0403", ATTRS{idProduct}=="6001", MODE="0660", TAG+="uaccess"
+SUBSYSTEM=="tty", ATTRS{idVendor}=="0403", ATTRS{idProduct}=="6001", ENV{SDROXIDE_LIMERFE}="1"
 
 # Some LimeRFE units carry the FT230X's own id instead.
-SUBSYSTEM=="tty", ATTRS{idVendor}=="0403", ATTRS{idProduct}=="6015", MODE="0660", TAG+="uaccess"
+SUBSYSTEM=="tty", ATTRS{idVendor}=="0403", ATTRS{idProduct}=="6015", ENV{SDROXIDE_LIMERFE}="1"
+
+# Permissions, applied on their own lines — see the note at the top of this
+# file for why GROUP must not share a line with TAG+="uaccess".
+ENV{SDROXIDE_LIMERFE}=="1", MODE="0660", TAG+="uaccess"
+ENV{SDROXIDE_LIMERFE}=="1", GROUP="dialout"

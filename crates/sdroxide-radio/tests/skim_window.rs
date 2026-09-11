@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 
 use sdroxide_radio::{AudioParams, Complex32, EngineConfig, IqSource, Result, rtrb, start_engine};
 use sdroxide_types::{
-    Command, CwSkimmerDecoder, DeviceCaps, RadioEvent, SkimmerKind, SkimmerSettings, Vfo,
+    Command, CwEngine, DeviceCaps, RadioEvent, SkimmerKind, SkimmerSettings, Vfo,
 };
 
 /// Wide enough that the window is a slice of the span rather than all of it —
@@ -141,7 +141,7 @@ fn caps() -> DeviceCaps {
 fn cw_only() -> SkimmerSettings {
     let mut s = SkimmerSettings { enabled: [false; 3], ..SkimmerSettings::default() };
     s.enabled[SkimmerKind::Cw.index()] = true;
-    s.cw_decoder = CwSkimmerDecoder::Timing;
+    s.cw_decoder = CwEngine::Timing;
     s
 }
 

@@ -264,6 +264,11 @@ pub struct WefaxRx {
     /// Samples spent phasing, so a transmission whose phasing signal was missed
     /// still produces a (misaligned) chart rather than nothing.
     phase_samples: u64,
+    /// Consecutive completed lines that looked like a phasing signal *while a
+    /// picture was being built*, and where the last one's pulse sat. See
+    /// [`WefaxRx::note_phasing_line`].
+    rephase_lines: u32,
+    rephase_skew: f64,
 
     start_det: ToneDetect,
     stop_det: ToneDetect,
@@ -287,6 +292,16 @@ const TONE_TOL: f64 = 0.18;
 const PHASE_TIMEOUT_S: f64 = 35.0;
 /// Phasing lines to average the skew over before locking.
 const PHASE_LINES: u32 = 5;
+/// Phasing-looking lines in a row, in the middle of a picture, that mean the
+/// next transmission has begun on top of it. Four is about eight seconds at
+/// 30 LPM and two at 120 — short enough to lose almost none of the new chart's
+/// thirty-second phasing signal, long enough that no picture can fake it.
+const REPHASE_LINES: u32 = 4;
+/// How far two phasing lines' pulses may sit apart, as a fraction of a line,
+/// and still be read as the same phasing signal. The line clock drifts by parts
+/// per million between lines; a picture that happened to look like phasing twice
+/// running would not put its white patch in the same place twice.
+const REPHASE_TOL: f64 = 0.02;
 
 impl WefaxRx {
     pub fn new(rate: f64) -> Self {
@@ -314,6 +329,8 @@ impl WefaxRx {
             phase_lines: 0,
             phase_skew: 0.0,
             phase_samples: 0,
+            rephase_lines: 0,
+            rephase_skew: 0.0,
             start_det: ToneDetect::default(),
             stop_det: ToneDetect::default(),
             start_run: 0,
@@ -427,6 +444,9 @@ impl WefaxRx {
         self.phase_lines = 0;
         self.phase_skew = 0.0;
         self.phase_samples = 0;
+        self.rephase_lines = 0;
+        self.start_det.reset();
+        self.start_run = 0;
         self.stop_det.reset();
         self.stop_run = 0;
         out.push(WefaxEvent::Start { ioc, lpm: self.lpm, auto });
@@ -439,6 +459,7 @@ impl WefaxRx {
         let lines = self.line_no;
         self.phase = Phase::Idle;
         self.line_buf.clear();
+        self.rephase_lines = 0;
         self.start_det.reset();
         self.stop_det.reset();
         self.start_run = 0;
@@ -490,8 +511,20 @@ impl WefaxRx {
         if !self.auto_start {
             return;
         }
+        if let Some(ioc) = self.start_tone(level) {
+            self.begin(ioc, true, out);
+        }
+    }
+
+    /// Feed the start-signal detector one sample; `Some(ioc)` once a whole
+    /// start signal has been heard.
+    ///
+    /// Run while receiving as well as while idle: the next transmission's start
+    /// signal is the second way to learn that this picture is over, and the
+    /// stop tone — the first way — is also the first thing a fade takes.
+    fn start_tone(&mut self, level: f32) -> Option<Ioc> {
         let window = (self.rate * TONE_WINDOW_S) as u32;
-        let Some(rate) = self.start_det.push(level, window) else { return };
+        let rate = self.start_det.push(level, window)?;
         // Crossings per window → crossings per second → the alternation rate,
         // which is half the crossing rate.
         let alt_hz = rate / TONE_WINDOW_S / 2.0;
@@ -504,7 +537,7 @@ impl WefaxRx {
                 self.start_run += 1;
                 if self.start_run >= TONE_RUN {
                     self.start_run = 0;
-                    self.begin(ioc, true, out);
+                    return Some(ioc);
                 }
             }
             Some(ioc) => {
@@ -513,11 +546,51 @@ impl WefaxRx {
             }
             None => self.start_run = 0,
         }
+        None
     }
 
-    /// Receiving: accumulate the line, watch for the stop tone.
+    /// Whether `line` continues a run of phasing lines long enough to mean the
+    /// next transmission has started on top of the picture being built.
+    ///
+    /// The pulses have to line up. One dark line with a bright patch in it is
+    /// something a satellite image or a heavily inked chart can produce; four
+    /// in a row with the patch in the same place, to within the line clock's own
+    /// drift, is a phasing signal.
+    fn note_phasing_line(&mut self, line: &[f32]) -> bool {
+        let Some(skew) = phasing_skew(line) else {
+            self.rephase_lines = 0;
+            return false;
+        };
+        let (skew, n) = (skew as f64, line.len() as f64);
+        // Circular: a pulse sitting on the line boundary reads as ≈0 on one
+        // line and ≈n on the next, and that is the same place.
+        let d = (skew - self.rephase_skew).abs();
+        let moved = d.min(n - d) > n * REPHASE_TOL;
+        self.rephase_lines =
+            if self.rephase_lines > 0 && moved { 1 } else { self.rephase_lines + 1 };
+        self.rephase_skew = skew;
+        self.rephase_lines >= REPHASE_LINES
+    }
+
+    /// Receiving: accumulate the line, watch for the stop tone — and for the
+    /// next transmission arriving on top of this one.
     fn step_receiving(&mut self, level: f32, out: &mut Vec<WefaxEvent>) {
         self.line_buf.push(level);
+
+        // The next chart's start signal, heard while this one is still being
+        // drawn. A stop tone is how a transmission normally ends, and a
+        // receiver that misses one — a fade takes five seconds of tone whole,
+        // and not every station sends the same one — used to go on appending
+        // the *next* chart to the old page on the old line phase, which is a
+        // picture that can never come out straight (issue #276). Finish the
+        // page here instead and phase the new one properly.
+        if self.auto_start {
+            if let Some(ioc) = self.start_tone(level) {
+                self.finish(false, out);
+                self.begin(ioc, true, out);
+                return;
+            }
+        }
 
         if self.auto_stop {
             let window = (self.rate * TONE_WINDOW_S) as u32;
@@ -574,6 +647,16 @@ impl WefaxRx {
                 }
             }
             Phase::Image => {
+                // The other half of the same rule: the start signal is five
+                // seconds long and a fade can swallow it whole, while the
+                // phasing signal that follows it runs for thirty. A run of
+                // phasing lines in the middle of a picture is the next
+                // transmission, whether its start tone arrived or not.
+                if self.auto_start && self.note_phasing_line(&line) {
+                    self.finish(false, out);
+                    self.begin(self.ioc, true, out);
+                    return;
+                }
                 let gray = resample_line(&line, self.ioc.width() as usize);
                 out.push(WefaxEvent::Line { y: self.line_no, gray });
                 self.line_no = self.line_no.saturating_add(1);
@@ -853,6 +936,98 @@ mod tests {
             .max()
             .unwrap_or(0);
         assert!(biggest_step < 60, "the row wraps: biggest step {biggest_step}");
+    }
+
+    /// Issue #276: the next chart begins and the stop tone never arrives.
+    ///
+    /// A receiver that just keeps appending draws the new transmission onto the
+    /// old page, on the old line phase — the picture is shifted and no amount
+    /// of waiting straightens it. The phasing signal at the head of the new
+    /// transmission is thirty seconds long and unmistakable, so it is enough on
+    /// its own: the page ends there and the next one is phased properly.
+    #[test]
+    fn a_new_transmission_ends_the_page_and_re_phases_without_a_stop_tone() {
+        let lpm = Lpm::L120;
+        let mut rx = WefaxRx::new(RATE);
+        rx.set_lpm(lpm);
+        // Auto-stop on, and no stop tone anywhere in what follows: this is the
+        // fade that takes the tone, not an operator who switched it off.
+        let mut out = Vec::new();
+        rx.start_manual(&mut out);
+        let mut audio = phasing(lpm, 8);
+        audio.extend(ramp_picture(lpm, 6));
+        // The next transmission, arriving with nothing but its phasing signal.
+        audio.extend(phasing(lpm, 10));
+        audio.extend(ramp_picture(lpm, 6));
+        let ev = drain(&mut rx, &audio);
+
+        let complete = ev.iter().filter(|e| matches!(e, WefaxEvent::Complete { .. })).count();
+        assert_eq!(complete, 1, "the first page should have been finished: {ev:?}");
+        let starts = ev.iter().filter(|e| matches!(e, WefaxEvent::Start { .. })).count();
+        assert_eq!(starts, 1, "and a second page started (the manual one is not an event)");
+        let phased = ev.iter().filter(|e| matches!(e, WefaxEvent::Phased { .. })).count();
+        assert_eq!(phased, 2, "both pages have to be phased: {ev:?}");
+
+        // The second page's rows are numbered from the top again, and its ramp
+        // comes out unwrapped — which is the whole complaint.
+        let after: Vec<&Vec<u8>> = ev
+            .iter()
+            .skip_while(|e| !matches!(e, WefaxEvent::Complete { .. }))
+            .filter_map(|e| match e {
+                WefaxEvent::Line { gray, .. } => Some(gray),
+                _ => None,
+            })
+            .collect();
+        assert!(after.len() >= 3, "only {} lines on the second page", after.len());
+        let row = after[after.len() - 2];
+        let w = row.len();
+        let (a, b) = (row[w / 4] as i32, row[3 * w / 4] as i32);
+        assert!(b - a > 80, "the second page is not a ramp: {a} → {b}");
+        let biggest_step = row[w / 8..7 * w / 8]
+            .windows(2)
+            .map(|p| (p[1] as i32 - p[0] as i32).abs())
+            .max()
+            .unwrap_or(0);
+        assert!(biggest_step < 60, "the second page wraps: biggest step {biggest_step}");
+    }
+
+    /// The same, the ordinary way round: the new transmission's *start* signal
+    /// arrives while the old page is still being drawn.
+    #[test]
+    fn a_start_tone_during_a_picture_starts_the_next_one() {
+        let lpm = Lpm::L120;
+        let mut rx = WefaxRx::new(RATE);
+        rx.set_lpm(lpm);
+        let mut out = Vec::new();
+        rx.start_manual(&mut out);
+        let mut audio = phasing(lpm, 8);
+        audio.extend(ramp_picture(lpm, 6));
+        audio.extend(tone(Ioc::I576.start_tone_hz(), 5.0));
+        let ev = drain(&mut rx, &audio);
+        assert!(
+            ev.iter().any(|e| matches!(e, WefaxEvent::Complete { by_tone: false, .. })),
+            "the page should have ended on the next start signal: {ev:?}"
+        );
+        assert!(rx.receiving() && rx.phasing(), "and the next one should be phasing");
+    }
+
+    /// ...but only when the operator asked for automatic starts. Someone
+    /// capturing a continuous transmission with AUTO START off gets one page,
+    /// however many charts go by.
+    #[test]
+    fn a_manual_capture_is_never_cut_in_two() {
+        let lpm = Lpm::L120;
+        let mut rx = WefaxRx::new(RATE);
+        rx.set_lpm(lpm);
+        rx.set_auto_start(false);
+        let mut out = Vec::new();
+        rx.start_manual(&mut out);
+        let mut audio = phasing(lpm, 8);
+        audio.extend(ramp_picture(lpm, 4));
+        audio.extend(phasing(lpm, 10));
+        let ev = drain(&mut rx, &audio);
+        assert!(!ev.iter().any(|e| matches!(e, WefaxEvent::Complete { .. })), "{ev:?}");
+        assert!(rx.receiving());
     }
 
     /// A line has to come out at the width the index of cooperation demands,

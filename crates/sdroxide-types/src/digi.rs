@@ -981,6 +981,10 @@ pub struct QsoRecord {
     /// beside its `*_sent` siblings because this record rides the postcard
     /// wire, which reads it positionally.
     pub hamqth_sent: bool,
+    /// Uploaded to the World Radio League logbook (issue #337). Appended for
+    /// the reason [`Self::hamqth_sent`] gives.
+    #[serde(default)]
+    pub wrl_sent: bool,
 }
 
 impl QsoRecord {
@@ -1156,6 +1160,51 @@ impl HellVariant {
     }
 }
 
+/// One of the operator's CW message buttons — what the chip says, and what it
+/// sends (issue #374).
+///
+/// The label is kept apart from the text because a chip has to be readable at a
+/// glance and the text it sends is a sentence: a button showing
+/// `TNX FER CALL OM UR RST 599 599 HR` would be a row two panels wide. An empty
+/// label falls back to the first few characters of the text, so a row typed in
+/// a hurry still draws something.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct CwMacro {
+    pub label: String,
+    pub text: String,
+}
+
+impl CwMacro {
+    /// The most buttons the panel will draw. Ten is what a rig's memory bank
+    /// and every contest logger offer, and it is as many chips as the row can
+    /// hold without wrapping into the text box.
+    pub const MAX: usize = 10;
+
+    /// What the chip says: the operator's label, or the head of the text where
+    /// they gave none.
+    pub fn chip_label(&self) -> String {
+        let label = self.label.trim();
+        if !label.is_empty() {
+            return label.to_string();
+        }
+        let text = self.text.trim();
+        if text.chars().count() <= 10 {
+            return text.to_string();
+        }
+        format!("{}…", text.chars().take(9).collect::<String>())
+    }
+
+    /// The text to send, with the station's own details filled in.
+    ///
+    /// The same placeholders the FT8 templates above take, so an operator who
+    /// has written one already knows this. `{DX}` is deliberately not among
+    /// them: CW here is a free-text keyboard mode with no sequencer holding the
+    /// other station's callsign, so there is nothing true to substitute.
+    pub fn expand(&self, my_call: &str, my_grid: &str) -> String {
+        self.text.replace("{MYCALL}", my_call).replace("{MYGRID}", my_grid)
+    }
+}
+
 /// echoed to clients in [`DigiStatus`]. `#[serde(default)]` so an older
 /// `digi.json` without the newer fields still loads.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1213,6 +1262,36 @@ pub struct DigiConfig {
     /// (−) the image time-scale to null out slant against a receiver whose sound-
     /// card clock differs from this station's. 0 = no correction.
     pub sstv_tx_ppm: f32,
+    /// Send the station's callsign in tones after every picture — the FSK ID
+    /// that every SSTV program and unattended repeater reads (issue #287).
+    ///
+    /// A banner printed into the picture identifies the station to a *person*;
+    /// this identifies it to a *machine*, which is what a repeater needs before
+    /// it can log or announce who sent the frame. It costs about two and a half
+    /// seconds after a transmission that has already taken a minute or two.
+    ///
+    /// Nothing is sent when there is no callsign in
+    /// [`my_call`](Self::my_call), so a station that has not set one transmits
+    /// exactly what it always did.
+    #[serde(default = "yes")]
+    pub sstv_fsk_id: bool,
+    /// Silence sent after keying the transmitter and before the picture's own
+    /// calibration header, in milliseconds (issue #351).
+    ///
+    /// An SSTV frame opens with about a second of leader and VIS code that
+    /// says which mode it is, and a decoder that misses any of it does not
+    /// show a late picture — it shows nothing, because it never learned there
+    /// was a picture coming. So the header is exactly the part of the
+    /// transmission that must not go out before the transmitter is really on
+    /// the air, and on a CAT rig that moment is not the one PTT was asked for:
+    /// the engine alone spends 165–240 ms getting there (measured, see
+    /// `crates/sdroxide-radio/tests/tx_turnaround.rs`) and the rig's own T/R
+    /// relay, PLL and PA settling are on top of that. Half a second by
+    /// default, which is nothing against a transmission of a minute or two and
+    /// covers every rig measured; an IQ SDR that keys in 7 ms can take it down
+    /// to zero.
+    #[serde(default = "default_sstv_txdelay_ms")]
+    pub sstv_txdelay_ms: u16,
 
     // ── The banner across the top of every transmitted picture ──
     //
@@ -1358,6 +1437,23 @@ pub struct DigiConfig {
     /// the decoder, since every speed is a different waveform.
     #[serde(default)]
     pub js8_speed: crate::Js8Speed,
+    /// JS8: decode **every** speed each cycle, not only the one being
+    /// transmitted at (issue #358).
+    ///
+    /// The four speeds are four different waveforms on four different slot
+    /// clocks — 30, 15, 10 and 6 seconds — sharing the same sub-band, so a
+    /// receiver listening for one is deaf to the other three. That is fine
+    /// while everyone on the band is on Normal and useless the moment they are
+    /// not: a Turbo station answering a Normal one is a QSO neither side can
+    /// hear, and there is no way to notice it happening from a screen that only
+    /// shows what one speed decoded.
+    ///
+    /// Off by default because it is not free: each speed is a separate decode
+    /// of a separate slot, so the receiver does roughly four times the work.
+    /// [`js8_speed`](Self::js8_speed) still decides what goes *out* — this is
+    /// about hearing, not transmitting.
+    #[serde(default)]
+    pub js8_multi_decode: bool,
     /// JS8: answer SNR? / GRID? / HEARING? / STATUS? addressed to us or to
     /// @ALLCALL. What makes a station worth leaving switched on.
     #[serde(default = "yes")]
@@ -1468,11 +1564,36 @@ pub struct DigiConfig {
     /// 0, or anything at or above `cw_wpm`, means ordinary timing.
     #[serde(default)]
     pub cw_farnsworth_wpm: f32,
+    /// CW: the operator's own message buttons, in the order they are drawn.
+    ///
+    /// A rig's CW memories, in software: the exchanges an operator sends over
+    /// and over — a contest report, a name-and-QTH reply, `TNX 73 GL` — typed
+    /// once instead of every contact (issue #374). Empty by default; a station
+    /// that has never opened the editor carries no rows.
+    ///
+    /// Here rather than in the client's own settings because this is the
+    /// operator's, not the screen's: it belongs with the callsign and the FT8
+    /// message templates above, it reaches a remote client with the rest of the
+    /// configuration, and it is in the directory Settings → General exports.
+    #[serde(default)]
+    pub cw_macros: Vec<CwMacro>,
     /// CW: pin the decoder's speed search to `cw_wpm` instead of reading the
     /// speed off the signal. Worth having for a signal too weak for the search
     /// to settle when you already know how fast the other station sends.
     #[serde(default)]
     pub cw_speed_lock: bool,
+    /// CW: which of the two decoders copies the panel's receive window.
+    ///
+    /// The neural one is better at the job it was trained for and is the
+    /// default. What it cannot do is produce a character its output layer has
+    /// no class for, and its 41 classes are the plain alphabet, the digits and
+    /// four marks — so `Ä`, `Ö`, `Å` and the rest of ITU-R M.1677-1's accented
+    /// letters come out as nothing at all, however cleanly they were sent. The
+    /// timing decoder reads the element string and looks it up, so it copies
+    /// them; an operator working a band where they turn up can say so here
+    /// (issue #382). See [`crate::CwEngine`].
+    #[serde(default)]
+    pub cw_engine: crate::CwEngine,
     /// Keyboard modes and CW: hold what is typed until Return, then send the
     /// line in one piece, instead of putting each character on the air as it is
     /// typed.
@@ -1756,11 +1877,15 @@ fn wspr_default_hop_bands() -> u16 {
     // 80/40/30/20/17/15/12/10 — the bands with a WSPR dial and enough traffic
     // to be worth a slot. 160 m is left out of the default cycle because it is
     // dead by day, and adding it costs a whole slot every time round.
+    //
+    // Bit positions are `Band::wire_index`, the declaration order, because this
+    // is a *saved* mask: the band bar's order moves when a band is added in the
+    // middle of it, and a stored mask read back against the new order would
+    // select bands the operator never chose (issue #396).
     use crate::Band;
     [Band::M80, Band::M40, Band::M30, Band::M20, Band::M17, Band::M15, Band::M12, Band::M10]
         .iter()
-        .filter_map(|b| Band::ALL.iter().position(|x| x == b))
-        .fold(0u16, |m, i| m | (1 << i))
+        .fold(0u16, |m, b| m | (1 << b.wire_index()))
 }
 
 /// Default for [`DigiConfig::sstv_banner_left`] — the operator's own callsign,
@@ -1825,11 +1950,15 @@ impl Default for DigiConfig {
             cw_pitch_hz: cw_default_pitch(),
             cw_wpm: cw_default_wpm(),
             cw_farnsworth_wpm: 0.0,
+            cw_macros: Vec::new(),
             cw_speed_lock: false,
+            cw_engine: crate::CwEngine::default(),
             send_on_enter: false,
             tx_watchdog_min: 6,
             max_tx_repeats: 10,
             sstv_tx_ppm: 0.0,
+            sstv_fsk_id: true,
+            sstv_txdelay_ms: default_sstv_txdelay_ms(),
             sstv_banner: true,
             sstv_banner_left: sstv_default_banner_left(),
             sstv_banner_right: sstv_default_banner_right(),
@@ -1846,6 +1975,7 @@ impl Default for DigiConfig {
             fox_slots: 3,
             rade_mute_analog: false,
             js8_speed: crate::Js8Speed::Normal,
+            js8_multi_decode: false,
             js8_auto_reply: true,
             js8_heartbeat_min: 0,
             js8_hb_ack: false,
@@ -2042,8 +2172,8 @@ pub fn fmt_report(db: i16) -> String {
 /// widest region that has it, so a frequency inside any region's allocation
 /// lands on the right name.
 ///
-/// Above 6 cm the answer is the empty string: sdroxide has no 3 cm band or
-/// anything beyond, and naming a 10 GHz contact `6cm` would put a false
+/// Above 3 cm the answer is the empty string: sdroxide has no 1.2 cm band or
+/// anything beyond, and naming a 24 GHz contact `3cm` would put a false
 /// statement in a log file. An empty band field is one the importer derives from
 /// the frequency, which is the truthful outcome.
 pub fn adif_band(freq_hz: f64) -> &'static str {
@@ -2058,6 +2188,12 @@ pub fn adif_band(freq_hz: f64) -> &'static str {
         m if m < 18.2 => "17m",
         m if m < 21.5 => "15m",
         m if m < 25.0 => "12m",
+        // 11 m is the citizens' band and ADIF has no enumeration for it: the
+        // spec's list runs 12m, 10m, 8m with nothing between 24.99 and 28.0.
+        // An empty BAND is what a log for a contact there honestly holds —
+        // better than filing it under 10m, which is what the coarse `< 29.8`
+        // below used to do to every frequency in this gap (issue #396).
+        m if m < 27.5 => "",
         m if m < 29.8 => "10m",
         m if m < 54.1 => "6m",
         m if m < 70.6 => "4m",
@@ -2069,6 +2205,7 @@ pub fn adif_band(freq_hz: f64) -> &'static str {
         m if m < 2450.1 => "13cm",
         m if m < 3500.1 => "9cm",
         m if m < 5925.1 => "6cm",
+        m if m < 10500.1 => "3cm",
         _ => "",
     }
 }
@@ -2127,88 +2264,105 @@ pub fn qso_log_to_adif(records: &[QsoRecord]) -> String {
         "ADIF export from sdroxide\r\n<ADIF_VER:5>3.1.4\r\n<PROGRAMID:8>sdroxide\r\n<EOH>\r\n",
     );
     for r in records {
-        let (date, time) = adif_date_time(r.start_utc);
-        let (_, time_off) = adif_date_time(r.end_utc);
-        out.push_str(&adif_field("CALL", &r.call));
-        out.push_str(&adif_field("QSO_DATE", &date));
-        out.push_str(&adif_field("TIME_ON", &time));
-        out.push_str(&adif_field("TIME_OFF", &time_off));
-        out.push_str(&adif_field("BAND", &r.band));
-        out.push_str(&adif_field("MODE", &r.mode));
-        out.push_str(&adif_field("FREQ", &format!("{:.6}", r.freq_hz / 1e6)));
-        if let Some(g) = &r.grid {
-            out.push_str(&adif_field("GRIDSQUARE", g));
-        }
-        if let Some(s) = r.rst_sent {
-            out.push_str(&adif_field("RST_SENT", &s.to_string()));
-        }
-        if let Some(s) = r.rst_rcvd {
-            out.push_str(&adif_field("RST_RCVD", &s.to_string()));
-        }
-        // Extended fields — written only when populated.
-        let opt_str = |out: &mut String, name: &str, v: &str| {
-            if !v.trim().is_empty() {
-                out.push_str(&adif_field(name, v.trim()));
-            }
-        };
-        opt_str(&mut out, "NAME", &r.name);
-        opt_str(&mut out, "QTH", &r.qth);
-        opt_str(&mut out, "STATE", &r.state);
-        opt_str(&mut out, "CNTY", &r.county);
-        opt_str(&mut out, "COUNTRY", &r.country);
-        if let Some(v) = r.dxcc {
-            out.push_str(&adif_field("DXCC", &v.to_string()));
-        }
-        if let Some(v) = r.cq_zone {
-            out.push_str(&adif_field("CQZ", &v.to_string()));
-        }
-        if let Some(v) = r.itu_zone {
-            out.push_str(&adif_field("ITUZ", &v.to_string()));
-        }
-        opt_str(&mut out, "CONT", &r.continent);
-        opt_str(&mut out, "IOTA", &r.iota);
-        opt_str(&mut out, "SIG", &r.sig);
-        opt_str(&mut out, "SIG_INFO", &r.sig_info);
-        if let Some(v) = r.tx_pwr {
-            out.push_str(&adif_field("TX_PWR", &format!("{v}")));
-        }
-        opt_str(&mut out, "OPERATOR", &r.operator);
-        opt_str(&mut out, "CONTEST_ID", &r.contest_id);
-        if let Some(v) = r.srx {
-            out.push_str(&adif_field("SRX", &v.to_string()));
-        }
-        if let Some(v) = r.stx {
-            out.push_str(&adif_field("STX", &v.to_string()));
-        }
-        opt_str(&mut out, "SRX_STRING", &r.srx_string);
-        opt_str(&mut out, "STX_STRING", &r.stx_string);
-        opt_str(&mut out, "MY_STATE", &r.my_state);
-        opt_str(&mut out, "MY_COUNTRY", &r.my_country);
-        if let Some(v) = r.my_dxcc {
-            out.push_str(&adif_field("MY_DXCC", &v.to_string()));
-        }
-        if let Some(v) = r.my_cq_zone {
-            out.push_str(&adif_field("MY_CQ_ZONE", &v.to_string()));
-        }
-        if let Some(v) = r.my_itu_zone {
-            out.push_str(&adif_field("MY_ITU_ZONE", &v.to_string()));
-        }
-        opt_str(&mut out, "QSL_VIA", &r.qsl_via);
-        let yn = |out: &mut String, name: &str, v: bool| {
-            if v {
-                out.push_str(&adif_field(name, "Y"));
-            }
-        };
-        yn(&mut out, "LOTW_QSL_SENT", r.lotw_sent);
-        yn(&mut out, "LOTW_QSL_RCVD", r.lotw_rcvd);
-        yn(&mut out, "EQSL_QSL_SENT", r.eqsl_sent);
-        yn(&mut out, "EQSL_QSL_RCVD", r.eqsl_rcvd);
-        yn(&mut out, "QSL_SENT", r.qsl_sent);
-        yn(&mut out, "QSL_RCVD", r.qsl_rcvd);
-        out.push_str(&adif_field("STATION_CALLSIGN", &r.my_call));
-        out.push_str(&adif_field("MY_GRIDSQUARE", &r.my_grid));
-        out.push_str("<EOR>\r\n");
+        out.push_str(&qso_to_adif_record(r));
+        out.push_str("\r\n");
     }
+    out
+}
+
+/// One contact as a bare ADIF record, ending in `<EOR>` and nothing after it.
+///
+/// The record on its own, with no `<EOH>` header and no free text in front of
+/// it, because that is what a *record* is — and what the WSJT-X UDP protocol's
+/// ADIF message carries. A whole file export sent down that socket begins with
+/// a line of prose before the first tag, and a logger reading the datagram as
+/// the single record its protocol promises can make nothing of it (issue #341).
+///
+/// [`qso_log_to_adif`] is this with a file header in front and one record per
+/// contact, which is what a file wants and a datagram does not.
+pub fn qso_to_adif_record(r: &QsoRecord) -> String {
+    let mut out = String::new();
+    let (date, time) = adif_date_time(r.start_utc);
+    let (_, time_off) = adif_date_time(r.end_utc);
+    out.push_str(&adif_field("CALL", &r.call));
+    out.push_str(&adif_field("QSO_DATE", &date));
+    out.push_str(&adif_field("TIME_ON", &time));
+    out.push_str(&adif_field("TIME_OFF", &time_off));
+    out.push_str(&adif_field("BAND", &r.band));
+    out.push_str(&adif_field("MODE", &r.mode));
+    out.push_str(&adif_field("FREQ", &format!("{:.6}", r.freq_hz / 1e6)));
+    if let Some(g) = &r.grid {
+        out.push_str(&adif_field("GRIDSQUARE", g));
+    }
+    if let Some(s) = r.rst_sent {
+        out.push_str(&adif_field("RST_SENT", &s.to_string()));
+    }
+    if let Some(s) = r.rst_rcvd {
+        out.push_str(&adif_field("RST_RCVD", &s.to_string()));
+    }
+    // Extended fields — written only when populated.
+    let opt_str = |out: &mut String, name: &str, v: &str| {
+        if !v.trim().is_empty() {
+            out.push_str(&adif_field(name, v.trim()));
+        }
+    };
+    opt_str(&mut out, "NAME", &r.name);
+    opt_str(&mut out, "QTH", &r.qth);
+    opt_str(&mut out, "STATE", &r.state);
+    opt_str(&mut out, "CNTY", &r.county);
+    opt_str(&mut out, "COUNTRY", &r.country);
+    if let Some(v) = r.dxcc {
+        out.push_str(&adif_field("DXCC", &v.to_string()));
+    }
+    if let Some(v) = r.cq_zone {
+        out.push_str(&adif_field("CQZ", &v.to_string()));
+    }
+    if let Some(v) = r.itu_zone {
+        out.push_str(&adif_field("ITUZ", &v.to_string()));
+    }
+    opt_str(&mut out, "CONT", &r.continent);
+    opt_str(&mut out, "IOTA", &r.iota);
+    opt_str(&mut out, "SIG", &r.sig);
+    opt_str(&mut out, "SIG_INFO", &r.sig_info);
+    if let Some(v) = r.tx_pwr {
+        out.push_str(&adif_field("TX_PWR", &format!("{v}")));
+    }
+    opt_str(&mut out, "OPERATOR", &r.operator);
+    opt_str(&mut out, "CONTEST_ID", &r.contest_id);
+    if let Some(v) = r.srx {
+        out.push_str(&adif_field("SRX", &v.to_string()));
+    }
+    if let Some(v) = r.stx {
+        out.push_str(&adif_field("STX", &v.to_string()));
+    }
+    opt_str(&mut out, "SRX_STRING", &r.srx_string);
+    opt_str(&mut out, "STX_STRING", &r.stx_string);
+    opt_str(&mut out, "MY_STATE", &r.my_state);
+    opt_str(&mut out, "MY_COUNTRY", &r.my_country);
+    if let Some(v) = r.my_dxcc {
+        out.push_str(&adif_field("MY_DXCC", &v.to_string()));
+    }
+    if let Some(v) = r.my_cq_zone {
+        out.push_str(&adif_field("MY_CQ_ZONE", &v.to_string()));
+    }
+    if let Some(v) = r.my_itu_zone {
+        out.push_str(&adif_field("MY_ITU_ZONE", &v.to_string()));
+    }
+    opt_str(&mut out, "QSL_VIA", &r.qsl_via);
+    let yn = |out: &mut String, name: &str, v: bool| {
+        if v {
+            out.push_str(&adif_field(name, "Y"));
+        }
+    };
+    yn(&mut out, "LOTW_QSL_SENT", r.lotw_sent);
+    yn(&mut out, "LOTW_QSL_RCVD", r.lotw_rcvd);
+    yn(&mut out, "EQSL_QSL_SENT", r.eqsl_sent);
+    yn(&mut out, "EQSL_QSL_RCVD", r.eqsl_rcvd);
+    yn(&mut out, "QSL_SENT", r.qsl_sent);
+    yn(&mut out, "QSL_RCVD", r.qsl_rcvd);
+    out.push_str(&adif_field("STATION_CALLSIGN", &r.my_call));
+    out.push_str(&adif_field("MY_GRIDSQUARE", &r.my_grid));
+    out.push_str("<EOR>");
     out
 }
 
@@ -2756,12 +2910,15 @@ mod tests {
             // ADIF has no "5cm": the band the Americas call 5 cm logs as 6 cm,
             // which is the name the enumeration defines.
             (5_900_000_000.0, "6cm"),
+            // 3 cm, which an IC-905 reaches with Icom's own transverter inside
+            // it (issue #326).
+            (10_368_100_000.0, "3cm"),
         ] {
             assert_eq!(adif_band(hz), band, "{hz} Hz");
         }
         // Above every band sdroxide knows, the honest answer is none at all
-        // rather than the nearest name.
-        assert_eq!(adif_band(10_368_100_000.0), "");
+        // rather than the nearest name — 1.2 cm and up have no band here.
+        assert_eq!(adif_band(24_048_000_000.0), "");
         // And a contact anywhere inside a band gets one name for the whole of
         // it, in every region — the widest allocation included, so a US 40 m
         // contact at 7.290 and a Region 2 5 cm one at 5.9 GHz are not filed
@@ -2773,9 +2930,47 @@ mod tests {
                 let Some((lo, hi)) = b.edges_in(region) else { continue };
                 let (inside_lo, inside_hi) = (adif_band(lo + 1000.0), adif_band(hi - 1000.0));
                 assert_eq!(inside_lo, inside_hi, "{b:?} in {region:?} straddles two ADIF bands");
+                // Every *amateur* band has an ADIF name. 11 m has none and
+                // must not borrow one: ADIF's enumeration runs 12m, 10m, 8m
+                // with nothing in between, because the citizens' band is not
+                // an amateur allocation and no amateur log has a column for it
+                // (issue #396). An empty BAND is the honest record.
+                if !b.is_amateur() {
+                    assert!(inside_lo.is_empty(), "{b:?} in {region:?} borrowed an ADIF name");
+                    continue;
+                }
                 assert!(!inside_lo.is_empty(), "{b:?} in {region:?} has no ADIF name");
             }
         }
+    }
+
+    /// Issue #341: the WSJT-X ADIF datagram carries a *record*. A file export
+    /// down that socket starts with a line of prose and an `<EOH>`, which is a
+    /// perfectly good file and not what the message is defined to hold.
+    #[test]
+    fn one_contact_becomes_a_bare_adif_record() {
+        let rec = QsoRecord {
+            call: "W9XYZ".into(),
+            band: "20m".into(),
+            mode: "SSB".into(),
+            freq_hz: 14_250_000.0,
+            my_call: "W1AW".into(),
+            my_grid: "FN31".into(),
+            ..QsoRecord::default()
+        };
+        let one = qso_to_adif_record(&rec);
+        assert!(one.starts_with("<CALL:5>W9XYZ"), "{one}");
+        assert!(one.ends_with("<EOR>"), "{one}");
+        assert!(!one.contains("<EOH>"), "a record carries no file header: {one}");
+        assert!(!one.contains("ADIF export"), "{one}");
+
+        // The file form is that record with a header in front of it, so the two
+        // cannot drift apart.
+        let file = qso_log_to_adif(std::slice::from_ref(&rec));
+        assert!(file.starts_with("ADIF export from sdroxide\r\n"), "{file}");
+        assert!(file.contains("<EOH>\r\n"), "{file}");
+        assert!(file.contains(&one), "the file must contain the record verbatim");
+        assert!(file.ends_with("<EOR>\r\n"), "{file}");
     }
 
     #[test]
@@ -2936,6 +3131,12 @@ fn default_packet_maxframe() -> u8 {
 fn default_packet_txdelay_ms() -> u16 {
     500
 }
+/// Default for [`DigiConfig::sstv_txdelay_ms`] — half a second of dead air
+/// before the calibration header, which is enough for every rig measured and
+/// invisible against a transmission that runs for minutes.
+fn default_sstv_txdelay_ms() -> u16 {
+    500
+}
 fn default_packet_txtail_ms() -> u16 {
     50
 }
@@ -2962,4 +3163,38 @@ fn default_aprs_path() -> String {
 }
 fn default_aprs_ttl() -> u32 {
     60
+}
+
+#[cfg(test)]
+mod cw_macro_tests {
+    use super::CwMacro;
+
+    /// A row typed in a hurry — text but no label — still draws a chip, and a
+    /// long one is cut rather than allowed to stretch the row (issue #374).
+    #[test]
+    fn a_button_with_no_label_names_itself_from_its_text() {
+        let m = CwMacro { label: String::new(), text: "5NN 5NN".into() };
+        assert_eq!(m.chip_label(), "5NN 5NN");
+
+        let long =
+            CwMacro { label: String::new(), text: "TNX FER CALL OM UR RST 599 599 HR".into() };
+        assert_eq!(long.chip_label(), "TNX FER C…");
+
+        // A label the operator did give always wins, trimmed.
+        let named = CwMacro { label: "  RPT ".into(), text: "5NN 5NN".into() };
+        assert_eq!(named.chip_label(), "RPT");
+    }
+
+    /// The station's own details are filled in as the message goes out, so one
+    /// row serves a callsign that changes with the licence being used.
+    #[test]
+    fn the_station_fills_in_its_own_details() {
+        let m = CwMacro { label: "CQ".into(), text: "CQ CQ DE {MYCALL} {MYCALL} K".into() };
+        assert_eq!(m.expand("OE1XYZ", "JN88"), "CQ CQ DE OE1XYZ OE1XYZ K");
+
+        // Text with no placeholder in it is sent exactly as typed — no
+        // trimming, no case folding, nothing.
+        let plain = CwMacro { label: String::new(), text: "  TNX 73 GL  ".into() };
+        assert_eq!(plain.expand("OE1XYZ", "JN88"), "  TNX 73 GL  ");
+    }
 }

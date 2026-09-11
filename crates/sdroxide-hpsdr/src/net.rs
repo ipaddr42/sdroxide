@@ -4,7 +4,7 @@
 
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, UdpSocket};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -14,7 +14,7 @@ use rtrb::{Consumer, Producer, RingBuffer};
 
 use crate::discovery;
 use crate::{protocol1, protocol2};
-use sdroxide_types::{HpsdrFilterBoard, HpsdrIoRxInput};
+use sdroxide_types::{HpsdrIoRxInput, HpsdrOcPlan};
 
 /// Host→radio TX I/Q rate. **Both** protocols transmit at 48 kHz: Protocol 2
 /// feeds the DUC directly, and Protocol 1's EP2 stream (speaker audio + TX I/Q)
@@ -393,6 +393,12 @@ pub(crate) enum Ctrl {
         ddc: u8,
         hz: f64,
     },
+    /// Where the *dial* is, when a transverter has left the radio somewhere
+    /// else. Only the accessory board's band code reads it: a decoder driving
+    /// filters and antenna relays has to follow the band on the air, not the
+    /// I.F. the radio is tuned to (issue #278). `None` puts it back on the
+    /// hardware frequency, which is the ordinary case.
+    BandDial(Option<f64>),
     /// Front-end LNA gain in dB (Hermes-Lite 2 only; ignored elsewhere).
     RxGain(f64),
     /// Where the radio *would* transmit, sent while receiving so an accessory
@@ -411,6 +417,152 @@ pub(crate) enum Ctrl {
 /// a radio that has gone away.
 pub(crate) type RxClock = Arc<AtomicU64>;
 
+/// Automatic overload protection: back the front-end gain off while the board
+/// reports its converter overflowing, and let it back up once it stops.
+///
+/// A direct-sampling front end has no mixer and no preselector in front of the
+/// converter — a Hermes-Lite 2 puts the whole of 0–38 MHz onto a 12-bit ADC at
+/// once — so a broadcast transmitter a band away can drive it into overflow
+/// while the band the operator is looking at shows nothing wrong at all. What
+/// it looks like from the operating position is a noise floor that climbed and
+/// signals that stopped decoding, which is not a fault anybody diagnoses
+/// quickly. The board itself knows: the flag is in the status bytes it sends
+/// with every frame.
+///
+/// **Fast attack, slow decay.** The gain comes down every `attack` while the
+/// flag is set and goes back up every `decay` once it has been clear for that
+/// long, with `decay` two orders of magnitude the longer of the two. That
+/// asymmetry is the design rather than a tuning choice, and it is what
+/// PowerSDR's "Auto S-Att" and N1GP's HermesIntf have both used: retreat
+/// immediately, because every millisecond of overflow is a receiver full of
+/// intermodulation; return slowly, because whatever caused it — a neighbour
+/// keying, a broadcaster coming up at dusk — has usually not gone away, and a
+/// loop that recovered as fast as it retreated would spend the evening
+/// oscillating across the threshold.
+///
+/// **Nothing happens while transmitting.** A board's own transmitter leaks into
+/// its receiver, and reading that as a receive overload would wind the gain
+/// down through every over and hand the operator a deaf receiver on unkey.
+///
+/// See `HpsdrConfig::auto_gain` for the operator's side of it (issue #362).
+#[derive(Debug, Clone, Copy)]
+pub struct AutoGain {
+    pub enabled: bool,
+    pub step_db: f64,
+    pub attack: Duration,
+    pub decay: Duration,
+    /// Bounds the loop may move between, already the right way round.
+    pub min_db: f64,
+    pub max_db: f64,
+    /// When the gain was last moved by the loop.
+    last_step: Option<Instant>,
+    /// When the board last reported the converter overflowing, transmit
+    /// excluded. `None` means it never has on this connection.
+    last_overload: Option<Instant>,
+    /// Overflow reports since the connection opened, whether or not the loop is
+    /// switched on — the counter an operator diagnosing a marginal antenna or
+    /// preamplifier wants (issue #362, item 7).
+    pub events: u64,
+}
+
+/// What one look at the loop decided.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum AutoGainStep {
+    /// Nothing to do this time round.
+    Hold,
+    /// Move the front-end gain to this many dB.
+    Set(f64),
+}
+
+impl AutoGain {
+    pub fn new(
+        enabled: bool,
+        step_db: f64,
+        attack_ms: u32,
+        decay_ms: u32,
+        min_db: f64,
+        max_db: f64,
+    ) -> Self {
+        AutoGain {
+            enabled,
+            // A step of zero would spin the loop against a gain that never
+            // moves; a step wider than the whole range is one jump to a rail.
+            step_db: step_db.clamp(0.5, 12.0),
+            // Floors rather than the raw figures: an attack shorter than the
+            // register rotation takes to reach the board would queue writes
+            // faster than they can be sent.
+            attack: Duration::from_millis(u64::from(attack_ms).max(20)),
+            decay: Duration::from_millis(u64::from(decay_ms).max(100)),
+            min_db: min_db.min(max_db),
+            max_db: min_db.max(max_db),
+            last_step: None,
+            last_overload: None,
+            events: 0,
+        }
+    }
+
+    /// Record what the board said in one status frame. Counted even with the
+    /// loop switched off, because the count is worth having on its own.
+    pub fn observe(&mut self, overload: bool, transmitting: bool, now: Instant) {
+        if !overload || transmitting {
+            return;
+        }
+        self.events += 1;
+        self.last_overload = Some(now);
+    }
+
+    /// True while the board has reported an overflow recently enough to still
+    /// be describing the present — what the indicator lights on. One frame's
+    /// flag is a moment long, and a light that followed it exactly would be
+    /// invisible.
+    pub fn overloading(&self, now: Instant) -> bool {
+        self.last_overload.is_some_and(|t| now.duration_since(t) < OVERLOAD_HOLD)
+    }
+
+    /// Where the gain should be now, given where it is.
+    pub fn step(&mut self, gain_db: f64, transmitting: bool, now: Instant) -> AutoGainStep {
+        if !self.enabled || transmitting {
+            return AutoGainStep::Hold;
+        }
+        let since_step = self.last_step.map(|t| now.duration_since(t));
+        // Down: the flag is set now, or was within the last attack interval —
+        // the status frame carrying it need not be the one this look landed on.
+        let overloading = self.last_overload.is_some_and(|t| now.duration_since(t) < self.attack);
+        if overloading {
+            if since_step.is_some_and(|d| d < self.attack) || gain_db <= self.min_db {
+                return AutoGainStep::Hold;
+            }
+            self.last_step = Some(now);
+            return AutoGainStep::Set((gain_db - self.step_db).max(self.min_db));
+        }
+        // Up: only once the band has been quiet for a whole decay interval, and
+        // only one step per interval. Both tests, not either: the first is the
+        // hysteresis that stops a marginal signal walking the gain up and down
+        // across the threshold, the second is the rate limit.
+        if gain_db >= self.max_db {
+            return AutoGainStep::Hold;
+        }
+        let quiet = self.last_overload.is_none_or(|t| now.duration_since(t) >= self.decay);
+        if !quiet || since_step.is_some_and(|d| d < self.decay) {
+            return AutoGainStep::Hold;
+        }
+        // Nothing to recover from: a connection that has never overloaded must
+        // not walk the operator's gain up to the ceiling on its own.
+        if self.last_overload.is_none() {
+            return AutoGainStep::Hold;
+        }
+        self.last_step = Some(now);
+        AutoGainStep::Set((gain_db + self.step_db).min(self.max_db))
+    }
+}
+
+/// How long after the board's last overflow report the indicator stays lit.
+///
+/// Long enough to be seen — a flag that is set for one frame in a stream
+/// arriving hundreds of times a second is invisible otherwise — and short
+/// enough that a light still on means the front end is still in trouble.
+pub const OVERLOAD_HOLD: Duration = Duration::from_millis(1500);
+
 /// Everything a protocol thread needs: the socket, the radio address, the
 /// rates, the TX ring and the control channel. The RX rings arrive per DDC
 /// with [`Ctrl::Attach`] — streams come and go while the connection runs.
@@ -427,8 +579,9 @@ pub(crate) struct ThreadCtx {
     pub rate_hz: f64,
     /// Initial front-end LNA gain (dB) for boards that have one.
     pub lna_gain_db: f64,
-    /// Accessory board on J16, deciding how the open-collector outputs are driven.
-    pub filter_board: HpsdrFilterBoard,
+    /// How the seven open-collector outputs are driven: a preset's convention
+    /// or the operator's own per-band table (see `HpsdrConfig::oc_plan`).
+    pub oc: HpsdrOcPlan,
     /// Conjugate I/Q in both directions (see `HpsdrConfig::invert_spectrum`).
     pub invert_spectrum: bool,
     /// Switch on the Hermes-Lite's onboard PA (see `HpsdrConfig::pa_enable`).
@@ -437,11 +590,36 @@ pub(crate) struct ThreadCtx {
     /// Where an HL2IOBoard on the accessory bus takes its receive signal from
     /// (see `HpsdrConfig::io_rx_input`). Ignored when no such board answers.
     pub io_rx_input: HpsdrIoRxInput,
+    /// The automatic overload-protection loop's settings — see [`AutoGain`].
+    pub auto_gain: AutoGain,
+    /// The front-end gain actually in force, in hundredths of a dB, so the
+    /// automatic loop's moves reach [`HpsdrRx::lna_gain_db`] and the operator's
+    /// gain rail follows them. Centi-dB for the reason
+    /// [`ThreadCtx::temp_centi_c`] is: it is shared with the network thread
+    /// through an atomic.
+    pub lna_gain_centi_db: Arc<AtomicI32>,
+    /// Set while the board is reporting its converter overflowing, held lit for
+    /// [`OVERLOAD_HOLD`] after the last report — published for
+    /// [`HpsdrRx::adc_overload`].
+    pub adc_overload: Arc<AtomicBool>,
     /// The radio's own PTT line, published for [`HpsdrRx::radio_ptt`].
     pub radio_ptt: Arc<AtomicBool>,
+    /// The board's temperature in hundredths of a degree Celsius, published for
+    /// [`HpsdrRx::pa_temp_c`]. [`TEMP_UNKNOWN`] until the board reports one —
+    /// which most of them never do.
+    pub temp_centi_c: Arc<AtomicI32>,
     pub tx: Consumer<f32>,
     pub ctrl: Receiver<Ctrl>,
 }
+
+/// What [`ThreadCtx::temp_centi_c`] holds before a board has reported a
+/// temperature, and forever on the boards that have no sensor.
+///
+/// A sentinel rather than an `Option` because the value is shared with the
+/// network thread through an atomic, and a temperature that is genuinely absent
+/// has to be told apart from one that is genuinely 0 °C — a Hermes-Lite in a
+/// cold shack in February reads exactly that.
+pub const TEMP_UNKNOWN: i32 = i32::MIN;
 
 /// What every stream of one connection shares. Dropping the last handle stops
 /// the stream and shuts the network thread down.
@@ -461,7 +639,13 @@ struct DevInner {
     tx_rate_hz: f64,
     /// Front-end LNA gain in dB currently commanded (Hermes-Lite 2 only).
     /// Interior-mutable: it is set through shared stream handles.
-    lna_gain_db: Mutex<f64>,
+    /// The front-end gain in force, in hundredths of a dB. Shared with the
+    /// network thread, which is the other thing that moves it — the automatic
+    /// overload loop.
+    lna_gain_centi_db: Arc<AtomicI32>,
+    /// The board's own converter-overflow flag, held lit briefly after each
+    /// report. Shared with the network thread, which is what sets it.
+    adc_overload: Arc<AtomicBool>,
     /// Epoch for every stream's liveness clock (see [`HpsdrRx::silent_for`]).
     opened_at: Instant,
     /// Set while keyed. A half-duplex board can legitimately stop sending I/Q
@@ -473,6 +657,9 @@ struct DevInner {
     /// last saw it reported. A *level*, so a poll can never miss an edge by
     /// arriving late.
     radio_ptt: Arc<AtomicBool>,
+    /// The board's own temperature, hundredths of a degree — see
+    /// [`TEMP_UNKNOWN`].
+    temp_centi_c: Arc<AtomicI32>,
     /// The TX ring's feed end, claimable exactly once — by DDC 0's stream.
     tx_endpoint: Mutex<Option<Producer<f32>>>,
     /// Which DDCs have a live [`HpsdrRx`], so one cannot be vended twice: two
@@ -509,10 +696,11 @@ impl HpsdrBoard {
         ip: Ipv4Addr,
         sample_rate_hz: f64,
         lna_gain_db: f64,
-        filter_board: HpsdrFilterBoard,
+        oc: HpsdrOcPlan,
         invert_spectrum: bool,
         pa_enable: bool,
         io_rx_input: HpsdrIoRxInput,
+        auto_gain: AutoGain,
     ) -> Result<HpsdrBoard, HpsdrError> {
         tracing::info!("HPSDR: opening {ip}, requested RX rate {sample_rate_hz:.0} Hz");
         let (board, protocol) = match discovery::probe(ip, Duration::from_millis(800)) {
@@ -579,11 +767,11 @@ impl HpsdrBoard {
             if invert_spectrum { "INVERTED" } else { "normal" },
             if invert_spectrum { "" } else { "not " },
         );
-        if filter_board != HpsdrFilterBoard::None {
+        if oc.drives_anything() {
             tracing::info!(
-                "HPSDR: driving the J16 open-collector outputs for a {} — check nothing else \
+                "HPSDR: driving the open-collector outputs from {} — check nothing else \
                  (amplifier PTT, antenna relays) is wired to those pins",
-                filter_board.label()
+                oc.describe()
             );
         }
         // The setting that decides whether a keyed Hermes-Lite makes any power
@@ -621,6 +809,20 @@ impl HpsdrBoard {
         // drops it a moment from now it will leave the stream alone.
         let conn_id = claim_connection(IpAddr::V4(ip));
         let radio_ptt = Arc::new(AtomicBool::new(false));
+        let temp_centi_c = Arc::new(AtomicI32::new(TEMP_UNKNOWN));
+        let lna_gain_centi_db = Arc::new(AtomicI32::new((lna_gain_db * 100.0) as i32));
+        let adc_overload = Arc::new(AtomicBool::new(false));
+        if auto_gain.enabled && board_has_lna_gain(&board) {
+            tracing::info!(
+                "HPSDR: automatic overload protection ON — {:+.0}…{:+.0} dB, {:.1} dB down every \
+                 {} ms while the converter overflows and back up every {} ms once it stops",
+                auto_gain.min_db,
+                auto_gain.max_db,
+                auto_gain.step_db,
+                auto_gain.attack.as_millis(),
+                auto_gain.decay.as_millis(),
+            );
+        }
         let ctx = ThreadCtx {
             socket,
             radio: IpAddr::V4(ip),
@@ -629,11 +831,15 @@ impl HpsdrBoard {
             board: board.clone(),
             rate_hz: rate,
             lna_gain_db,
-            filter_board,
+            oc,
             invert_spectrum,
             pa_enable,
             io_rx_input,
+            auto_gain,
+            lna_gain_centi_db: Arc::clone(&lna_gain_centi_db),
+            adc_overload: Arc::clone(&adc_overload),
             radio_ptt: Arc::clone(&radio_ptt),
+            temp_centi_c: Arc::clone(&temp_centi_c),
             tx: tx_cons,
             ctrl: ctrl_rx,
         };
@@ -663,10 +869,12 @@ impl HpsdrBoard {
                 protocol,
                 sample_rate_hz: rate,
                 tx_rate_hz: tx_rate,
-                lna_gain_db: Mutex::new(lna_gain_db),
+                lna_gain_centi_db,
+                adc_overload,
                 opened_at,
                 transmitting: Arc::new(AtomicBool::new(false)),
                 radio_ptt,
+                temp_centi_c,
                 tx_endpoint: Mutex::new(Some(tx_prod)),
                 attached: Mutex::new(std::collections::HashSet::new()),
             }),
@@ -683,6 +891,19 @@ impl HpsdrBoard {
     /// Board name reported by discovery (or "HPSDR" if it did not answer).
     pub fn board(&self) -> &str {
         &self.inner.board
+    }
+
+    /// The board's own temperature in degrees Celsius, where it reports one.
+    ///
+    /// A Hermes-Lite 2 does, on the analogue input its status frames carry;
+    /// nothing else in the HPSDR family that this driver has met reports a
+    /// temperature at all, so `None` is the ordinary answer. See
+    /// `protocol1::hl2_temperature_c` for what the sensor actually measures.
+    pub fn pa_temp_c(&self) -> Option<f32> {
+        match self.inner.temp_centi_c.load(Ordering::Relaxed) {
+            TEMP_UNKNOWN => None,
+            centi => Some(centi as f32 / 100.0),
+        }
     }
 
     /// OpenHPSDR protocol in use (1 or 2).
@@ -830,6 +1051,15 @@ impl HpsdrRx {
         let _ = self.dev.ctrl.send(Ctrl::RxFreq { ddc: self.ddc, hz });
     }
 
+    /// Tell the accessory board's band decoder where the dial is, which is not
+    /// where the radio is tuned when a transverter is in front of it. Only
+    /// DDC 0 — the accessory board is the *board's*, not a stream's.
+    pub fn set_band_dial(&self, hz: Option<f64>) {
+        if self.ddc == 0 {
+            let _ = self.dev.ctrl.send(Ctrl::BandDial(hz));
+        }
+    }
+
     /// Whether this board has a front-end gain this crate can command.
     pub fn has_lna_gain(&self) -> bool {
         board_has_lna_gain(&self.dev.board)
@@ -837,7 +1067,19 @@ impl HpsdrRx {
 
     /// The front-end LNA gain currently commanded, in dB.
     pub fn lna_gain_db(&self) -> f64 {
-        *self.dev.lna_gain_db.lock().expect("lna lock")
+        f64::from(self.dev.lna_gain_centi_db.load(Ordering::Relaxed)) / 100.0
+    }
+
+    /// Whether the board is reporting its converter overflowing right now.
+    ///
+    /// The board's own flag, not a measurement of the samples that reach us:
+    /// what overflows is the wideband converter, and a DDC delivering 48 kHz
+    /// out of the 38 MHz in front of it can hand over a stream with nothing
+    /// clipped in it at all while the ADC is being hammered by a broadcaster
+    /// three bands away. Held lit for [`OVERLOAD_HOLD`] after the last report
+    /// so it can be seen. `None` on a board with no such flag.
+    pub fn adc_overload(&self) -> Option<bool> {
+        board_has_lna_gain(&self.dev.board).then(|| self.dev.adc_overload.load(Ordering::Relaxed))
     }
 
     /// Set the front-end LNA gain in dB. No-op on boards without one. The gain
@@ -848,7 +1090,7 @@ impl HpsdrRx {
             return;
         }
         let db = db.clamp(LNA_GAIN_MIN_DB, LNA_GAIN_MAX_DB);
-        *self.dev.lna_gain_db.lock().expect("lna lock") = db;
+        self.dev.lna_gain_centi_db.store((db * 100.0) as i32, Ordering::Relaxed);
         tracing::debug!("HPSDR: set {LNA_GAIN_ELEMENT} gain {db:+.0} dB");
         let _ = self.dev.ctrl.send(Ctrl::RxGain(db));
     }
@@ -895,6 +1137,19 @@ impl HpsdrRx {
     /// for it yet, so a P2 board always answers `false`.
     pub fn radio_ptt(&self) -> bool {
         self.tx.is_some() && self.dev.radio_ptt.load(Ordering::Relaxed)
+    }
+
+    /// The board's own temperature, where it reports one — see
+    /// [`HpsdrBoard::pa_temp_c`].
+    ///
+    /// Answered on every stream, not only the one that owns the transmitter:
+    /// the board has one temperature and every tab looking at it is looking at
+    /// the same hardware getting hot.
+    pub fn pa_temp_c(&self) -> Option<f32> {
+        match self.dev.temp_centi_c.load(Ordering::Relaxed) {
+            crate::net::TEMP_UNKNOWN => None,
+            centi => Some(centi as f32 / 100.0),
+        }
     }
 
     /// Stop transmitting.
@@ -1007,6 +1262,87 @@ fn clamp_rate(hz: f64, protocol: u8) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Fast attack, slow decay, and neither of them free-running. Issue #362.
+    #[test]
+    fn the_overload_loop_retreats_fast_and_returns_slowly() {
+        let t0 = Instant::now();
+        let mut a = AutoGain::new(true, 1.0, 100, 10_000, -12.0, 48.0);
+        // Nothing has overloaded, so nothing moves — least of all upward: the
+        // operator's gain is not the loop's to raise on its own.
+        assert_eq!(a.step(20.0, false, t0), AutoGainStep::Hold);
+        assert_eq!(a.step(20.0, false, t0 + Duration::from_secs(60)), AutoGainStep::Hold);
+
+        // The board reports an overflow: down one step, immediately.
+        a.observe(true, false, t0);
+        assert_eq!(a.step(20.0, false, t0), AutoGainStep::Set(19.0));
+        // ...and not again inside the attack interval, however many frames
+        // carry the flag.
+        a.observe(true, false, t0 + Duration::from_millis(10));
+        assert_eq!(a.step(19.0, false, t0 + Duration::from_millis(10)), AutoGainStep::Hold);
+        a.observe(true, false, t0 + Duration::from_millis(120));
+        assert_eq!(a.step(19.0, false, t0 + Duration::from_millis(120)), AutoGainStep::Set(18.0));
+
+        // The overflow stops. Nothing comes back for a whole decay interval —
+        // that is the hysteresis, and it is what stops a marginal signal
+        // walking the gain up and down across the threshold all evening.
+        let clear = t0 + Duration::from_millis(120);
+        assert_eq!(a.step(18.0, false, clear + Duration::from_secs(5)), AutoGainStep::Hold);
+        assert_eq!(a.step(18.0, false, clear + Duration::from_secs(11)), AutoGainStep::Set(19.0));
+        // One step per decay interval, not one per look.
+        assert_eq!(a.step(19.0, false, clear + Duration::from_secs(12)), AutoGainStep::Hold);
+        assert_eq!(a.step(19.0, false, clear + Duration::from_secs(22)), AutoGainStep::Set(20.0));
+    }
+
+    /// A board's own transmitter leaks into its receiver. Reading that as a
+    /// receive overload would wind the gain down through every over and hand
+    /// the operator a deaf receiver on unkey.
+    #[test]
+    fn transmitting_is_not_an_overload() {
+        let t0 = Instant::now();
+        let mut a = AutoGain::new(true, 1.0, 100, 10_000, -12.0, 48.0);
+        a.observe(true, true, t0);
+        assert_eq!(a.events, 0, "not even counted");
+        assert_eq!(a.step(20.0, true, t0), AutoGainStep::Hold);
+        assert_eq!(a.step(20.0, false, t0), AutoGainStep::Hold, "and nothing was recorded");
+    }
+
+    /// The loop stays inside the bounds it was given, and does nothing at all
+    /// when it is switched off.
+    #[test]
+    fn the_loop_keeps_to_its_bounds_and_its_switch() {
+        let t0 = Instant::now();
+        let mut a = AutoGain::new(true, 6.0, 100, 10_000, 0.0, 24.0);
+        a.observe(true, false, t0);
+        // Clamped at the floor rather than stepping past it.
+        assert_eq!(a.step(3.0, false, t0), AutoGainStep::Set(0.0));
+        assert_eq!(a.step(0.0, false, t0 + Duration::from_secs(1)), AutoGainStep::Hold);
+        // And at the ceiling on the way back.
+        assert_eq!(a.step(20.0, false, t0 + Duration::from_secs(60)), AutoGainStep::Set(24.0));
+        assert_eq!(a.step(24.0, false, t0 + Duration::from_secs(120)), AutoGainStep::Hold);
+
+        // Bounds given the wrong way round are still bounds.
+        let b = AutoGain::new(true, 1.0, 100, 10_000, 30.0, 6.0);
+        assert_eq!((b.min_db, b.max_db), (6.0, 30.0));
+
+        let mut off = AutoGain::new(false, 1.0, 100, 10_000, -12.0, 48.0);
+        off.observe(true, false, t0);
+        assert_eq!(off.events, 1, "the count is kept whether or not the loop acts on it");
+        assert_eq!(off.step(20.0, false, t0), AutoGainStep::Hold);
+    }
+
+    /// The indicator has to outlast the frame that set it, or it is invisible
+    /// in a stream arriving hundreds of times a second.
+    #[test]
+    fn the_overload_light_is_held_long_enough_to_see() {
+        let t0 = Instant::now();
+        let mut a = AutoGain::new(false, 1.0, 100, 10_000, -12.0, 48.0);
+        assert!(!a.overloading(t0));
+        a.observe(true, false, t0);
+        assert!(a.overloading(t0 + Duration::from_millis(1)));
+        assert!(a.overloading(t0 + OVERLOAD_HOLD - Duration::from_millis(1)));
+        assert!(!a.overloading(t0 + OVERLOAD_HOLD));
+    }
 
     #[test]
     fn lna_gain_wire_codes() {

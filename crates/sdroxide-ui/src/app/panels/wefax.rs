@@ -137,7 +137,9 @@ impl SdroxideApp {
             let auto_start = self.digi_cfg_edit.wefax_auto_start;
             if crate::chrome::chip(ui, auto_start, "AUTO START")
                 .on_hover_text(
-                    "Begin a chart when the 300 Hz (IOC 576) or 675 Hz start tone is heard",
+                    "Begin a chart when the 300 Hz (IOC 576) or 675 Hz start tone is heard \
+                     — and end the one in progress and phase the new one when the next \
+                     transmission arrives, whether or not a stop tone came first.",
                 )
                 .clicked()
             {

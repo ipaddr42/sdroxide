@@ -457,6 +457,30 @@ pub struct UiSettings {
     pub spectrum_3d_speed: Speed,
     /// Waterfall colour palette, as an index into the client's palette list.
     pub waterfall_palette: usize,
+    /// A row of finger-sized tuning buttons under the strip on a phone or
+    /// tablet: step down, the step itself, step up.
+    ///
+    /// On by default, and never drawn on a desktop, which has the dial, the
+    /// wheel and the panadapter. A touched client has none of those working
+    /// well: the readout's per-digit scroll needs a wheel, and dragging the
+    /// panadapter to a station 3 kHz away is a gesture nobody lands (issue
+    /// #380). Costs one chip-height of waterfall, which is why it can be
+    /// turned off.
+    pub tune_step_buttons: bool,
+    /// What one press of those buttons moves the dial, in hertz. Remembered
+    /// between sessions: an operator working one band works one channel
+    /// spacing.
+    pub tune_step_hz: f64,
+    /// Whether the waterfall's history is drawn through a smoothing filter.
+    ///
+    /// On — the default, and what it has always done — each screen pixel is
+    /// interpolated between the bins and rows around it, which is what makes a
+    /// signal look continuous when the display is wider than the transform. Off
+    /// draws every bin and every row as the block it is, which is what a
+    /// listener reading a signal's *signature* off the waterfall wants: an
+    /// interpolated picture cannot be told apart from a genuinely wider signal
+    /// (issue #375).
+    pub waterfall_smooth: bool,
     /// How many columns the panadapter and its waterfall are drawn with.
     ///
     /// This screen's preference, like the frame rate above it and for the same
@@ -538,6 +562,41 @@ pub struct UiSettings {
     /// Decode-list filter: only stations that would put something new in the
     /// log (new entity, new band-slot, new grid, or a callsign never worked).
     pub decode_new_only: bool,
+    /// In CW, read the frequency of the *signal* rather than of the dial —
+    /// the QRG, in the Q-code an operator would use to ask for it.
+    ///
+    /// A CW dial sits a sidetone pitch below what is being copied, so the
+    /// number in the readout is not the number either operator would quote —
+    /// it is that number minus the pitch, and the arithmetic is left to the
+    /// person. With this on, the main readout shows what
+    /// [`crate::Mode::on_air_hz`] answers, and the tuning line on the
+    /// panadapter moves to sit on the signal, where the passband is already
+    /// centred (the engine keeps the filter on the pitch).
+    ///
+    /// A display preference, not a change of tuning: the dial is still the
+    /// dial, and everything that tunes, stores or checks a band edge goes on
+    /// using it. Off by default, which is what every other radio does.
+    ///
+    /// CW only for now. RTTY and WEFAX sit off their dials too
+    /// ([`crate::Mode::tunes_off_dial`]) and could join it, but each wants
+    /// checking against real signals first.
+    pub cw_qrg: bool,
+    /// Draw the world's cities on the flat maps — the dot per place and the
+    /// name beside it.
+    ///
+    /// On by default: on a map of the whole world the cities are most of what
+    /// says *where* a dot is, and a coastline alone is a poor substitute. But
+    /// they are also the busiest thing on that map, and the panel maps are
+    /// small — an operator watching where their FT8 contacts are coming from is
+    /// reading a handful of coloured dots against a field of grey ones with
+    /// names attached to them, which is the complaint this answers (issue
+    /// #312).
+    ///
+    /// This screen's preference, like the theme and the spot tints: the
+    /// decodes are the station's, what the map they are drawn on carries is the
+    /// operator's. The 3D globe is untouched — its cities are night-side lights
+    /// rather than markers, and nothing is written across a contact there.
+    pub map_cities: bool,
 }
 
 /// Default for [`UiSettings::spot_colors`] — every kind on its stock tint.
@@ -596,11 +655,20 @@ where
 impl Default for UiSettings {
     fn default() -> Self {
         UiSettings {
+            // Off: the dial is what every other radio shows, and an operator
+            // who has not asked for the change should not find their readout
+            // reading differently from the rig beside it.
+            cw_qrg: false,
             frame_rate_fps: 60,
             waterfall_speed: Speed::Medium,
             spectrum_speed: Speed::Medium,
             spectrum_3d_speed: Speed::Medium,
             waterfall_palette: 0,
+            waterfall_smooth: true,
+            tune_step_buttons: true,
+            // 1 kHz: the round step the operators who asked for this tune in,
+            // on a band where the stations sit 3 kHz apart.
+            tune_step_hz: 1_000.0,
             spectrum_detail: SpectrumDetail::Auto,
             spectrum_gradient: true,
             gradient_top: [64, 0, 0],   // dark red
@@ -625,11 +693,41 @@ impl Default for UiSettings {
             decode_single_list: false,
             decode_cq_only: false,
             decode_new_only: false,
+            map_cities: true,
         }
     }
 }
 
 impl UiSettings {
+    /// The steps the tuning buttons cycle through, in hertz — from the 10 Hz
+    /// that trims a carrier onto zero-beat up to the 25 kHz of an FM channel,
+    /// by way of the AM broadcast spacings (9 kHz in Regions 1 and 3, 10 kHz in
+    /// Region 2) and the 5 kHz most shortwave broadcasters sit on.
+    pub const TUNE_STEPS_HZ: [f64; 9] =
+        [10.0, 100.0, 500.0, 1_000.0, 2_500.0, 5_000.0, 9_000.0, 10_000.0, 25_000.0];
+
+    /// The step after the current one, wrapping. A tap on the step button.
+    pub fn next_tune_step(&self) -> f64 {
+        let steps = Self::TUNE_STEPS_HZ;
+        let at = steps.iter().position(|s| (s - self.tune_step_hz).abs() < 0.5);
+        steps[at.map_or(0, |i| (i + 1) % steps.len())]
+    }
+
+    /// The current step written the way a radio's own display would: "100 Hz",
+    /// "1 kHz", "12.5 kHz".
+    pub fn tune_step_label(&self) -> String {
+        let hz = self.tune_step_hz;
+        if hz < 1_000.0 {
+            return format!("{hz:.0} Hz");
+        }
+        let khz = hz / 1_000.0;
+        if (khz - khz.round()).abs() < 1e-6 {
+            format!("{khz:.0} kHz")
+        } else {
+            format!("{khz:.1} kHz")
+        }
+    }
+
     /// Selectable frame rates for the UI combo.
     ///
     /// The rates below 30 are for machines that cannot keep up — a Raspberry Pi
@@ -706,6 +804,53 @@ impl UiSettings {
             Speed::Fast | Speed::Faster | Speed::Fastest => 0.0,
             Speed::Medium => 0.1,
             Speed::Slow => 0.2,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tune_step_tests {
+    use super::UiSettings;
+
+    /// The step button walks the ladder and comes back round, from wherever a
+    /// stored setting left it — including a value that is not on the ladder at
+    /// all, which is what a hand-edited `config.toml` can hold (issue #380).
+    #[test]
+    fn the_step_button_walks_the_ladder_and_wraps() {
+        let mut ui = UiSettings::default();
+        assert_eq!(ui.tune_step_hz, 1_000.0, "the shipped default is a round kilohertz");
+
+        let mut seen = vec![ui.tune_step_hz];
+        for _ in 1..UiSettings::TUNE_STEPS_HZ.len() {
+            ui.tune_step_hz = ui.next_tune_step();
+            seen.push(ui.tune_step_hz);
+        }
+        let mut sorted = seen.clone();
+        sorted.sort_by(f64::total_cmp);
+        assert_eq!(sorted, UiSettings::TUNE_STEPS_HZ, "every step is reachable, exactly once");
+        ui.tune_step_hz = ui.next_tune_step();
+        assert_eq!(ui.tune_step_hz, seen[0], "and the ladder wraps back to where it started");
+
+        // A figure that is on no rung starts again at the bottom rather than
+        // sticking, which is the only behaviour that cannot strand an operator.
+        ui.tune_step_hz = 3_333.0;
+        assert_eq!(ui.next_tune_step(), UiSettings::TUNE_STEPS_HZ[0]);
+    }
+
+    /// Written the way a radio's own display writes it.
+    #[test]
+    fn the_step_reads_as_a_radio_would_write_it() {
+        let mut ui = UiSettings::default();
+        for (hz, want) in [
+            (10.0, "10 Hz"),
+            (500.0, "500 Hz"),
+            (1_000.0, "1 kHz"),
+            (2_500.0, "2.5 kHz"),
+            (9_000.0, "9 kHz"),
+            (25_000.0, "25 kHz"),
+        ] {
+            ui.tune_step_hz = hz;
+            assert_eq!(ui.tune_step_label(), want);
         }
     }
 }

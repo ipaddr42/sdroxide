@@ -49,6 +49,7 @@
 //! per-mode override.
 
 use std::collections::VecDeque;
+use std::time::Instant;
 
 use sdroxide_radio::{Complex32, ControlUpdate, IqSource, Result};
 use sdroxide_types::{DeviceCaps, Mode, PanadapterAudio, PanadapterConfig};
@@ -101,9 +102,19 @@ pub struct PanadapterSource {
     ctrl_buf: Vec<Complex32>,
     /// Transceiver audio waiting to be played, when it is what is being heard.
     audio_q: VecDeque<f32>,
+    /// Wall-clock time [`Self::rx_audio`] last drew from `audio_q`, so what it
+    /// takes tracks how much audio could plausibly have arrived since — rather
+    /// than a guess at how often it is being called. `None` before the first
+    /// draw. See [`Self::rx_audio`] for what the guess cost (issue #354).
+    last_audio_pull: Option<Instant>,
     /// True while the transmitter is keyed, so the receive side knows to stop
     /// handing over what it hears of our own signal.
     keyed: bool,
+    /// The sidetone pitch the operator is copying CW at, which is how far above
+    /// our dial the transceiver's own VFO has to sit — see
+    /// [`Self::cw_offset_hz`]. Kept up to date by the engine
+    /// ([`IqSource::set_cw_pitch_hz`]); the default stands in until it says.
+    cw_pitch_hz: f32,
     label: String,
 }
 
@@ -134,7 +145,12 @@ impl PanadapterSource {
             dial_known: false,
             ctrl_buf: vec![Complex32::new(0.0, 0.0); 4096],
             audio_q: VecDeque::new(),
+            last_audio_pull: None,
             keyed: false,
+            // `DigiConfig::cw_pitch_hz`'s own default, so a pairing that is
+            // never told stands where the station most likely is rather than at
+            // zero, which would read as "this rig makes no CW carrier".
+            cw_pitch_hz: 700.0,
             label,
         }
     }
@@ -232,6 +248,10 @@ impl PanadapterSource {
             // on the radio being *listened to*, and switching the receiver
             // painting the picture off would leave nothing to draw with.
             commands_rig_power: ctrl.commands_rig_power,
+            // The transceiver's as well, and for the same reason: the receiving
+            // antenna on offer is the one on the radio being listened to. A
+            // borrowed receiver has its own aerial and no say in this.
+            has_rx_antenna: ctrl.has_rx_antenna,
         }
     }
 
@@ -242,7 +262,16 @@ impl PanadapterSource {
         if self.mode == Some(mode) {
             return;
         }
+        // The dial we were last asked for, before the *outgoing* mode's CW
+        // offset went on it.
+        let dial = self.dial_known.then(|| self.dial_hz - self.cw_offset_hz());
         self.mode = Some(mode);
+        // Entering or leaving CW moves where a self-keying transceiver belongs
+        // ([`Self::cw_offset_hz`]) without the operator having touched the
+        // dial, so the rig is put back there rather than left a sidetone out.
+        if let Some(dial) = dial {
+            self.set_dial(dial);
+        }
         let off = self.cfg.offset_for(mode);
         if (off - self.off).abs() < 0.5 {
             return;
@@ -256,11 +285,45 @@ impl PanadapterSource {
         }
     }
 
+    /// How far above our dial the transceiver's own VFO has to sit, in Hz.
+    ///
+    /// Zero everywhere but CW, and there it is the sidetone pitch. sdroxide's
+    /// CW dial is a zero-beat: the note being copied sits a pitch above it,
+    /// which is what [`Mode::on_air_hz`] answers and where the receiver's
+    /// passband is centred. A transceiver put in CW makes its own carrier on
+    /// its own VFO — whether the key is a paddle in its socket or text handed
+    /// to its keyer — so a VFO left on our dial transmits a whole sidetone
+    /// below the station being answered.
+    ///
+    /// That is [`Engine::rig_cw_offset_hz`]'s job on a rig handing over its own
+    /// I/Q (issue #170), and it cannot reach here: a pairing answers
+    /// `center_is_dial` false on purpose, because the span belongs to the
+    /// *receiver*. So the same arithmetic is done on this side, where the two
+    /// radios are actually told apart — the receiver stays on our dial and only
+    /// the transceiver moves. That is issue #364, reported with a QMX keying
+    /// and an Airspy HF+ listening: a station worked at 14.1007 was called at
+    /// 14.100 and never came back.
+    ///
+    /// Not for MCW, where the rig is deliberately held on a sideband
+    /// ([`IqSource::cw_audio_keyed`]) and the keyed sidetone lands a pitch above
+    /// its VFO exactly as it does on an SDR.
+    fn cw_offset_hz(&self) -> f64 {
+        if self.mode != Some(Mode::Cw) || self.ctrl.cw_audio_keyed() {
+            return 0.0;
+        }
+        f64::from(self.cw_pitch_hz)
+    }
+
     /// Command the transceiver's dial, skipping a write that would change
     /// nothing. The CAT layer debounces as well, but a rig reached over a slow
     /// shared port should not be handed the same frequency on every engine
     /// block to begin with.
+    ///
+    /// `hz` is on the *dial's* scale, as everything the engine says is; what
+    /// the rig is given is that plus [`Self::cw_offset_hz`], and `dial_hz`
+    /// records the rig's number so the dedup below compares like with like.
     fn set_dial(&mut self, hz: f64) {
+        let hz = hz + self.cw_offset_hz();
         if self.dial_known && (hz - self.dial_hz).abs() < 0.5 {
             return;
         }
@@ -422,11 +485,35 @@ impl IqSource for PanadapterSource {
         if self.cfg.audio != PanadapterAudio::Transceiver {
             return None;
         }
-        // A block's worth, paced by whatever has arrived; silence rather than
-        // nothing when the rig is momentarily behind, so the speaker path keeps
-        // its cadence instead of stalling and letting the sub receiver's ear
-        // run away from it.
-        let want = (self.ctrl.sample_rate() * AUDIO_QUEUE_MS / 1000.0 / 4.0).max(1.0) as usize;
+        // How much to take is how much wall-clock time has passed since the
+        // last call, not a guess at how often this is called. It runs once per
+        // block the *attached receiver* hands back, and a fixed quarter of
+        // `AUDIO_QUEUE_MS` assumed that landed close to forty times a second.
+        // On a fast SDR it does not: an RSP1B at 2 Msps hands back a few
+        // thousand samples at a time, a few milliseconds apart, so every call
+        // over-drew a queue that could not possibly have filled 25 ms since the
+        // one before it and most of every block came back silence-padded —
+        // continuous stutter rather than the occasional glitch clock drift
+        // alone would cause (issue #354). The reverse mismatch is no better: a
+        // receiver with a coarser block interval than the guess would hit the
+        // queue cap every call and trim the oldest samples instead.
+        //
+        // Silence still pads what is short, so the speaker path keeps its
+        // cadence when the rig is momentarily behind instead of stalling and
+        // letting the sub receiver's ear run away from it.
+        //
+        // Clamped to the queue's own span: a pause longer than
+        // `AUDIO_QUEUE_MS` — the first call, a stall, an over and back — cannot
+        // have left more than that much genuinely waiting, and asking for more
+        // only pads the excess with silence a fresh block should not carry.
+        let now = Instant::now();
+        let elapsed = self
+            .last_audio_pull
+            .map(|t| now.duration_since(t).as_secs_f64())
+            .unwrap_or(AUDIO_QUEUE_MS / 1000.0)
+            .min(AUDIO_QUEUE_MS / 1000.0);
+        self.last_audio_pull = Some(now);
+        let want = ((self.ctrl.sample_rate() * elapsed) as usize).max(1);
         let take = self.audio_q.len().min(want);
         out.extend(self.audio_q.drain(..take));
         out.resize(want, 0.0);
@@ -473,16 +560,26 @@ impl IqSource for PanadapterSource {
     fn poll_control(&mut self) -> Vec<ControlUpdate> {
         let mut out = Vec::new();
         for u in self.ctrl.poll_control() {
-            if let ControlUpdate::Freq(hz) = u {
-                // The rig's own knob. Recorded as already commanded so the
-                // engine's answering `set_if_offset` doesn't write it straight
-                // back down the serial port.
-                self.dial_known = true;
-                self.dial_hz = hz;
-            }
-            if let ControlUpdate::Mode(m) = u {
-                self.set_mode(m);
-            }
+            let u = match u {
+                ControlUpdate::Freq(hz) => {
+                    // The rig's own knob. Recorded as already commanded so the
+                    // engine's answering `set_if_offset` doesn't write it
+                    // straight back down the serial port — on the rig's scale,
+                    // which is what `set_dial` compares against.
+                    self.dial_known = true;
+                    self.dial_hz = hz;
+                    // What the engine is told is a dial, and in CW the rig's
+                    // VFO is a sidetone above one ([`Self::cw_offset_hz`]).
+                    // Taking the offset back out is what stops the readout
+                    // climbing by one pitch per poll.
+                    ControlUpdate::Freq(hz - self.cw_offset_hz())
+                }
+                ControlUpdate::Mode(m) => {
+                    self.set_mode(m);
+                    u
+                }
+                _ => u,
+            };
             out.push(u);
         }
         // The receiver has no dial of its own here — its frequency is ours to
@@ -520,10 +617,19 @@ impl IqSource for PanadapterSource {
         self.ctrl.rx_signal_dbm()
     }
 
+    /// The *receiver's*, not the transceiver's: what overflows is the converter
+    /// the spectrum is coming out of, and the transceiver in this arrangement
+    /// is not in that path at all.
+    fn adc_overload(&mut self) -> Option<bool> {
+        self.rx.adc_overload()
+    }
+
     // ── Transmit: the transceiver ───────────────────────────────────────────
 
+    /// `center_hz` arrives on the dial's scale; the transmitter goes where the
+    /// contact is, a sidetone above it in CW ([`Self::cw_offset_hz`]).
     fn tx_begin(&mut self, center_hz: f64, rate: f64) -> Result<f64> {
-        let r = self.ctrl.tx_begin(center_hz, rate)?;
+        let r = self.ctrl.tx_begin(center_hz + self.cw_offset_hz(), rate)?;
         self.keyed = true;
         // Whatever the rig's capture ring holds from before the over is stale
         // by the time it ends, and what it holds during one is our own
@@ -587,9 +693,26 @@ impl IqSource for PanadapterSource {
     }
 
     /// The transmit frequency, for whatever the transceiver switches bands on.
-    /// Not the receiver's business: it is not in the transmit path.
+    /// Not the receiver's business: it is not in the transmit path. On the
+    /// rig's scale, like everything else it is handed.
     fn set_tx_freq_hz(&mut self, hz: f64) {
-        self.ctrl.set_tx_freq_hz(hz);
+        self.ctrl.set_tx_freq_hz(hz + self.cw_offset_hz());
+    }
+
+    /// The pitch the operator is copying CW at, which is the whole of
+    /// [`Self::cw_offset_hz`]. Moving it moves where a self-keying transceiver
+    /// belongs, so the rig is put back there rather than left where the old
+    /// pitch had it.
+    fn set_cw_pitch_hz(&mut self, hz: f32) {
+        if (self.cw_pitch_hz - hz).abs() < 0.5 {
+            return;
+        }
+        // The dial we were last asked for, before the old offset went on it.
+        let dial = self.dial_known.then(|| self.dial_hz - self.cw_offset_hz());
+        self.cw_pitch_hz = hz;
+        if let Some(dial) = dial {
+            self.set_dial(dial);
+        }
     }
 
     fn cw_text_keying(&self) -> Option<usize> {
@@ -617,6 +740,20 @@ impl IqSource for PanadapterSource {
 
     fn commands_rig_power(&self) -> bool {
         self.ctrl.commands_rig_power()
+    }
+
+    /// The transceiver's receiving antenna, for the reason its power switch is
+    /// the transceiver's: it is the radio being listened to.
+    fn rx_antenna(&self) -> Option<bool> {
+        self.ctrl.rx_antenna()
+    }
+
+    fn set_rx_antenna(&mut self, on: bool) -> Result<()> {
+        self.ctrl.set_rx_antenna(on)
+    }
+
+    fn reread_rx_antenna(&mut self) {
+        self.ctrl.reread_rx_antenna();
     }
 
     /// Gated on the same test, so the two answers cannot disagree: a level that
@@ -858,6 +995,83 @@ mod tests {
         );
     }
 
+    /// Issue #364: in CW the transceiver has to sit on the contact, a sidetone
+    /// above our zero-beat dial, while the receiver stays on the dial.
+    ///
+    /// Reported with a QMX keying and an Airspy HF+ listening: the station
+    /// being copied at 700 Hz was on 14.1007 and every call went out on
+    /// 14.100, so nobody ever came back.
+    #[test]
+    fn cw_puts_the_transceiver_on_the_contact_and_leaves_the_receiver_on_the_dial() {
+        let (mut src, rx_log, ctrl_log) = pair(cfg());
+        src.set_control_mode(Mode::Cw).unwrap();
+        src.set_cw_pitch_hz(700.0);
+        // Engine: centre 14.100, VFO on it.
+        src.set_if_offset(0.0);
+        assert_eq!(
+            ctrl_log.lock().unwrap().centers.last().copied(),
+            Some(14_100_700.0),
+            "the rig keys its own carrier and belongs a sidetone up"
+        );
+        assert!(rx_log.lock().unwrap().centers.is_empty(), "the receiver stays on the dial");
+
+        // Transmit goes to the same place, not to the zero-beat.
+        src.tx_begin(14_100_000.0, 48_000.0).unwrap();
+        assert_eq!(ctrl_log.lock().unwrap().tx_begins, vec![14_100_700.0]);
+
+        // What the rig reports comes back on the dial's scale, so the readout
+        // does not climb by one pitch per poll.
+        ctrl_log.lock().unwrap().updates = vec![ControlUpdate::Freq(14_100_700.0)];
+        assert_eq!(src.poll_control(), vec![ControlUpdate::Freq(14_100_000.0)]);
+
+        // Moving the pitch moves the contact, and the rig follows it.
+        src.set_cw_pitch_hz(500.0);
+        assert_eq!(ctrl_log.lock().unwrap().centers.last().copied(), Some(14_100_500.0));
+
+        // Leaving CW puts it back on the dial, with nobody having tuned.
+        src.set_control_mode(Mode::Usb).unwrap();
+        assert_eq!(ctrl_log.lock().unwrap().centers.last().copied(), Some(14_100_000.0));
+    }
+
+    /// MCW is the exception: there the rig is deliberately held on a sideband
+    /// and the keyed sidetone lands a pitch above its VFO on its own, exactly
+    /// as it does on an SDR. Offsetting the dial as well would double it.
+    #[test]
+    fn mcw_leaves_the_dial_alone() {
+        struct Mcw(Fake);
+        impl IqSource for Mcw {
+            fn sample_rate(&self) -> f64 {
+                self.0.sample_rate()
+            }
+            fn center_hz(&self) -> f64 {
+                self.0.center_hz()
+            }
+            fn set_center_hz(&mut self, hz: f64) -> Result<()> {
+                self.0.set_center_hz(hz)
+            }
+            fn read(&mut self, buf: &mut [Complex32]) -> Result<usize> {
+                self.0.read(buf)
+            }
+            fn describe(&self) -> String {
+                self.0.describe()
+            }
+            fn tx_begin(&mut self, center_hz: f64, rate: f64) -> Result<f64> {
+                self.0.tx_begin(center_hz, rate)
+            }
+            fn cw_audio_keyed(&self) -> bool {
+                true
+            }
+        }
+        let (rx, _) = Fake::new("rx", 2_000_000.0, 14_100_000.0);
+        let (ctrl, ctrl_log) = Fake::new("rig", 48_000.0, 14_100_000.0);
+        let mut src =
+            PanadapterSource::new(Box::new(rx), Box::new(Mcw(ctrl)), cfg(), Some(Mode::Usb));
+        src.set_control_mode(Mode::Cw).unwrap();
+        src.set_cw_pitch_hz(700.0);
+        src.set_if_offset(0.0);
+        assert_eq!(ctrl_log.lock().unwrap().centers.last().copied(), Some(14_100_000.0));
+    }
+
     /// Each half of the radio gets the calls that belong to it.
     #[test]
     fn control_goes_to_the_rig_and_the_front_end_to_the_receiver() {
@@ -1003,12 +1217,28 @@ mod tests {
         assert_eq!(rate, 48_000.0);
         assert!(!out.is_empty());
         assert!(out.iter().take(600).all(|&s| s == 0.5), "the rig's samples, not the receiver's");
-        // A block always comes out the same length, padded with silence, so the
-        // speaker path keeps its cadence when the rig falls behind.
-        let mut later = Vec::new();
-        src.rx_audio(&mut later).unwrap();
-        assert_eq!(later.len(), out.len());
-        assert!(later.iter().all(|&s| s == 0.0));
+        // A tight loop of further calls — the shape a fast SDR's block rate puts
+        // this under, once per block it hands back — must not stretch the rig's
+        // 600 samples into more than there were. Each call's length tracks the
+        // wall-clock time that has actually passed rather than a fixed guess at
+        // how often it is called, so an empty queue with no time behind it comes
+        // back with almost nothing in it instead of a whole block of padding
+        // (issue #354).
+        let mut nonzero = 0usize;
+        let mut padded = 0usize;
+        for _ in 0..50 {
+            let mut chunk = Vec::new();
+            src.rx_audio(&mut chunk).unwrap();
+            nonzero += chunk.iter().filter(|&&s| s != 0.0).count();
+            padded += chunk.len();
+        }
+        assert_eq!(nonzero, 0, "nothing further arrived, so nothing further plays");
+        assert!(
+            padded < out.len(),
+            "fifty calls in no time at all asked for {padded} samples, more than the \
+             {} one call used to demand on its own",
+            out.len()
+        );
     }
 
     /// Listening to the receiver: nothing is offered as external audio, but the

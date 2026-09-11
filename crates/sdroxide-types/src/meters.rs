@@ -71,6 +71,15 @@ pub struct Meters {
     /// the last meter window, in dBFS. `f32::NEG_INFINITY` before anything has
     /// been measured.
     pub adc_peak_dbfs: f32,
+    /// The radio's own temperature in degrees Celsius, where it measures one.
+    ///
+    /// The board's sensor, not a figure derived on this side, and reported in
+    /// receive as well as transmit: what a small PA does is heat up over an
+    /// afternoon and cool slowly afterwards, and both halves of that are what
+    /// the operator is watching (issue #333). `None` on the great majority of
+    /// radios, which have no such sensor — see `IqSource::pa_temp_c`.
+    #[serde(default)]
+    pub pa_temp_c: Option<f32>,
     /// Fraction of converter samples at full scale over the same window,
     /// `0.0..=1.0`. Above [`OVERLOAD_FRACTION`] — ask [`Meters::adc_overloaded`] —
     /// the front end is
@@ -84,6 +93,22 @@ pub struct Meters {
     /// constant-envelope signal passes √2 of full scale. Together they say both
     /// *whether* and roughly *how far*.
     pub adc_clip: f32,
+    /// The *radio's own* converter-overflow flag, where it reports one.
+    ///
+    /// A different claim from `adc_clip` beside it, and neither replaces the
+    /// other. `adc_clip` is measured here, from the samples that arrived; this
+    /// is the front end reporting on the converter those samples came out of.
+    /// On a direct-sampling radio the two can disagree completely and the
+    /// radio's is the one that is right: a Hermes-Lite 2 puts the whole of
+    /// 0–38 MHz onto one 12-bit ADC and then hands over 48 kHz of it, so a
+    /// broadcaster three bands away can drive the converter into its rails
+    /// while every sample that reaches us sits at a tenth of full scale
+    /// (issue #362).
+    ///
+    /// `None` on the great majority of radios, which have no such flag —
+    /// see `IqSource::adc_overload`.
+    #[serde(default)]
+    pub adc_overload: Option<bool>,
     /// Present while transmitting.
     pub tx: Option<TxMeters>,
     /// A WFM stereo pilot is locked on the main receiver. Drives the `ST`
@@ -93,13 +118,35 @@ pub struct Meters {
     /// the sub-audible readout; always `None` outside NFM, and `None` in NFM
     /// until a tone has been present long enough to be sure of.
     pub tone: Option<crate::SubTone>,
+    /// The level in the receive passband in **dBFS**, uncalibrated and
+    /// ungained — exactly the figure the software squelch compares its
+    /// threshold against.
+    ///
+    /// Not the same number as `s_dbm` beside it, and that is the point.
+    /// `s_dbm` is what the *operator* is shown: the front end's own gain
+    /// subtracted, `cal_offset_db` added, and on a rig that reports its own
+    /// meter it is the rig's reading rather than a measurement made here at
+    /// all. None of that scale reaches the squelch, so on such a radio there
+    /// was nothing on screen to set the threshold against and the rail had to
+    /// be hunted across blind (issue #394).
+    ///
+    /// `f32::NEG_INFINITY` where there is no chain to measure — a demod-audio
+    /// front end, which has no software squelch either.
+    #[serde(default = "minus_infinity")]
+    pub passband_dbfs: f32,
+}
+
+fn minus_infinity() -> f32 {
+    f32::NEG_INFINITY
 }
 
 impl Meters {
     /// The front end is running into its rails, so nothing downstream — this
     /// struct's own `s_dbm` included — is reading an undistorted signal.
     pub fn adc_overloaded(&self) -> bool {
-        self.adc_clip > OVERLOAD_FRACTION
+        // The radio's own flag wins where there is one: it is watching the
+        // converter, and this side is only watching what came out of it.
+        self.adc_overload.unwrap_or(false) || self.adc_clip > OVERLOAD_FRACTION
     }
 
     /// S-units for display: S9 = -73 dBm, 6 dB per unit below, dB-over-9 above.

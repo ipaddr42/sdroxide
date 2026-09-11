@@ -231,6 +231,7 @@ mod tests {
             frames: 1,
             complete: true,
             to_me,
+            speed: sdroxide_types::Js8Speed::Normal,
         }
     }
 

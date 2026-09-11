@@ -80,6 +80,29 @@ pub trait DigiEngine: Send {
     fn tx_burst_active(&self) -> bool;
     fn fill_tx_block(&mut self, out: &mut [f32]) -> bool;
 
+    /// The rate [`fill_tx_block`](Self::fill_tx_block) hands samples back at.
+    ///
+    /// Not the receive tap's rate, and not always 48 kHz. Nearly every modem
+    /// here synthesises its transmit audio at a fixed 48 kHz whatever it is
+    /// listening at — the burst synthesisers resample their own 12 kHz work up
+    /// to it, and the keyboard modes their 8 kHz — so 48 kHz is the default and
+    /// the two AX.25 controllers, whose modem is built at the tap rate, are the
+    /// only ones that override it.
+    ///
+    /// The engine rate-matches this to whatever the radio actually plays, so a
+    /// wrong answer here is a burst that goes out at the wrong speed rather
+    /// than one that sounds wrong: an Icom on its 12 kHz IF receives at 24 kHz
+    /// and takes transmit audio back at 48, and taking the tap for the answer
+    /// stretched every FT8/FT4 over to twice its length ([issue #359]) — the
+    /// mirror of the packet burst that went out at twice its baud rate when
+    /// there was no rate matching at all ([issue #150]).
+    ///
+    /// [issue #150]: https://github.com/dividebysandwich/sdroxide/issues/150
+    /// [issue #359]: https://github.com/dividebysandwich/sdroxide/issues/359
+    fn tx_rate(&self) -> f64 {
+        48_000.0
+    }
+
     /// The peak amplitude [`fill_tx_block`](Self::fill_tx_block) reaches, as a
     /// fraction of full scale.
     ///
@@ -163,6 +186,8 @@ pub trait DigiEngine: Send {
     fn set_sstv_mode(&mut self, _mode: Option<SstvMode>) {}
     /// SSTV: queue a composed image (interleaved RGB) and start transmitting.
     fn set_sstv_image(&mut self, _mode: SstvMode, _rgb: Vec<u8>, _w: u16, _h: u16) {}
+    /// SSTV: throw away the picture being received and hunt for a header again.
+    fn sstv_restart_rx(&mut self) {}
 
     /// Weather fax: begin a picture now rather than waiting for a start tone.
     /// The usual way to catch a chart already under way, which on a

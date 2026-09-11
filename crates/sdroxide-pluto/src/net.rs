@@ -61,6 +61,20 @@ const ENSM_TX: &str = "tx";
 /// How often a stream thread emits a throughput line (`RUST_LOG=…=debug`).
 pub(crate) const STATS_INTERVAL: Duration = Duration::from_secs(2);
 
+/// How long to wait before replacing the control socket, so a board that
+/// refuses every connection cannot become a tight loop of TCP handshakes.
+const CTRL_REDIAL_BACKOFF: Duration = Duration::from_millis(100);
+
+/// How many times the control socket may be replaced without a single command
+/// completing in between before the connection is given up on.
+///
+/// The same reasoning as `stream::MAX_BLIND_REDIALS`: a redial is cheap and
+/// nearly always works, but a link that fails again on the fresh socket is not
+/// one this layer can fix by trying harder, and the engine's reopen — which
+/// backs off, re-reads the device and puts the reason on screen — is the right
+/// thing to fall back to.
+const MAX_BLIND_CTRL_REDIALS: u32 = 5;
+
 /// How much airtime one transmit buffer should cover.
 ///
 /// `WRITEBUF` is synchronous — command, status line, payload, status line — so
@@ -147,6 +161,9 @@ pub(crate) struct Shared {
     /// socket that is already closed leaves the *new* read blocked until its
     /// own deadline — a shutdown that no longer shuts anything down.
     pub rx_shutdown: Mutex<Option<std::net::TcpStream>>,
+    /// The *live* control socket, kept here for the same reason and replaced
+    /// the same way — see [`crate::net::redial_ctrl`].
+    pub ctrl_shutdown: Mutex<Option<std::net::TcpStream>>,
     /// Receive buffer should be open. Cleared for the length of an over.
     pub rx_enabled: AtomicBool,
     /// Receive buffer *is* open — the acknowledgement the control thread waits
@@ -230,9 +247,12 @@ impl Shared {
     /// shutting down a socket nobody is on any more while the *live* one, by
     /// then a different socket entirely, goes untouched.
     pub(crate) fn drop_rx_socket(&self) {
-        if let Some(sock) = self.rx_shutdown.lock().unwrap_or_else(|e| e.into_inner()).take() {
-            let _ = sock.shutdown(std::net::Shutdown::Both);
-        }
+        drop_socket(&self.rx_shutdown);
+    }
+
+    /// The same for the control socket, which is replaced under us too.
+    pub(crate) fn drop_ctrl_socket(&self) {
+        drop_socket(&self.ctrl_shutdown);
     }
 
     /// Adopt `conn`'s socket as the one [`RigInner::release`] should break.
@@ -243,12 +263,32 @@ impl Shared {
     /// handle installed in time is shut down, and one that missed the window is
     /// rejected here rather than left blocking a read nobody can reach.
     pub(crate) fn adopt_rx_socket(&self, conn: &Connection) -> Result<()> {
-        let mut slot = self.rx_shutdown.lock().unwrap_or_else(|e| e.into_inner());
+        self.adopt_socket(&self.rx_shutdown, conn)
+    }
+
+    /// The same for the control socket.
+    pub(crate) fn adopt_ctrl_socket(&self, conn: &Connection) -> Result<()> {
+        self.adopt_socket(&self.ctrl_shutdown, conn)
+    }
+
+    fn adopt_socket(
+        &self,
+        slot: &Mutex<Option<std::net::TcpStream>>,
+        conn: &Connection,
+    ) -> Result<()> {
+        let mut slot = slot.lock().unwrap_or_else(|e| e.into_inner());
         if !self.alive.load(Ordering::Relaxed) {
             return Err(Error::Msg("this connection is closing".into()));
         }
         *slot = conn.shutdown_handle();
         Ok(())
+    }
+}
+
+/// Shut down and forget whichever socket a slot is holding.
+fn drop_socket(slot: &Mutex<Option<std::net::TcpStream>>) {
+    if let Some(sock) = slot.lock().unwrap_or_else(|e| e.into_inner()).take() {
+        let _ = sock.shutdown(std::net::Shutdown::Both);
     }
 }
 
@@ -313,9 +353,10 @@ impl RigInner {
         for sock in &self.shutdowns {
             let _ = sock.shutdown(std::net::Shutdown::Both);
         }
-        // After `alive` was cleared, so a receive thread racing to install a
+        // After `alive` was cleared, so a thread racing to install a
         // replacement socket is refused rather than leaving one behind us.
         self.shared.drop_rx_socket();
+        self.shared.drop_ctrl_socket();
         for j in self.joins.lock().unwrap_or_else(|e| e.into_inner()).drain(..) {
             let _ = j.join();
         }
@@ -418,6 +459,30 @@ impl PlutoRig {
         let bandwidth = phy.set_bandwidth(&mut control, want_bw)?;
         phy.set_agc_mode(&mut control, 0, cfg.agc.iio_name())?;
         phy.set_rx_gain(&mut control, 0, cfg.agc.iio_name(), cfg.rx_gain_db)?;
+        // The second chain, on a firmware that has control registers for one.
+        //
+        // Not housekeeping: the AD9361 keeps a gain-control mode *per chain*,
+        // and chain 1's boots wherever the driver's device tree left it —
+        // an attack mode on the boards this was reported from. The control
+        // thread tracks a mode per chain and seeds both from this config, so
+        // unless the hardware is actually put there, the second receiver's
+        // first gain write goes out believing it is in manual and the driver
+        // answers `-EOPNOTSUPP`: the slider moves and nothing happens
+        // (issue #311).
+        //
+        // Refusals are not fatal here the way chain 0's are. A board that
+        // streams two chains but will not take these has a working first
+        // receiver, and saying so beats declining to open at all.
+        if phy.rx2_control {
+            for step in [
+                phy.set_agc_mode(&mut control, 1, cfg.agc.iio_name()),
+                phy.set_rx_gain(&mut control, 1, cfg.agc.iio_name(), cfg.rx_gain_db),
+            ] {
+                if let Err(e) = step {
+                    tracing::warn!("PlutoSDR: configuring the second receive chain: {e}");
+                }
+            }
+        }
         if !cfg.rx_port.trim().is_empty() {
             phy.set_rx_port(&mut control, 0, cfg.rx_port.trim())?;
         }
@@ -556,6 +621,7 @@ impl PlutoRig {
             phy: phy.clone(),
             addr,
             rx_shutdown: Mutex::new(None),
+            ctrl_shutdown: Mutex::new(None),
             rx_enabled: AtomicBool::new(true),
             rx_paused: AtomicBool::new(false),
             rx_active: AtomicBool::new(false),
@@ -606,12 +672,13 @@ impl PlutoRig {
         // Taken before the connections are handed to their threads: after that
         // the only way to reach a socket is through the thread that is blocked
         // on it, which is precisely the situation these exist to break. The
-        // receive socket is not among them — it is the one that gets replaced
-        // under us, so it lives in `Shared::rx_shutdown` where the receive
-        // thread can keep it current.
+        // receive and control sockets are not among them — both get replaced
+        // under us, so each lives in a `Shared` slot its own thread keeps
+        // current.
         let shutdowns: Vec<std::net::TcpStream> =
-            [&control, &tx_conn].iter().filter_map(|c| c.shutdown_handle()).collect();
+            [&tx_conn].iter().filter_map(|c| c.shutdown_handle()).collect();
         shared.adopt_rx_socket(&rx_conn)?;
+        shared.adopt_ctrl_socket(&control)?;
 
         let (ctrl_tx, ctrl_rx) = crossbeam_channel::unbounded();
         let rx_shared = Arc::clone(&shared);
@@ -947,10 +1014,12 @@ impl PlutoRx {
     /// Select the receive port, if it is not the one already selected.
     ///
     /// The no-op guard is not an optimisation. `rf_port_select` is refused
-    /// (`-EINVAL`) while the receive buffer is running, and the engine re-asserts
-    /// the antenna on every retune — so a radio with exactly one wired port
-    /// logged a rejected write each time the operator touched the dial, for a
-    /// change that was never a change.
+    /// (`-EINVAL`) while the receive buffer is running, so the write is
+    /// bracketed by a stand-down (`with_rx_stood_down`) that costs a gap in the
+    /// audio — and the engine re-asserts the antenna on every retune. Without
+    /// the guard, a radio with exactly one wired port would break its own
+    /// receiver each time the operator touched the dial, for a change that was
+    /// never a change.
     pub fn set_rx_port(&mut self, port: &str) {
         if self.rx_port == port {
             return;
@@ -1264,67 +1333,101 @@ fn control_thread(
     // `open` parked it, and `None` if it would not park. See [`key_up`] for why
     // an over that does not have to move it is so much quicker off the mark.
     let mut tx_lo = tx_lo;
-    while shared.alive.load(Ordering::Relaxed) {
+    // Control sockets replaced with no command completing in between — see
+    // [`MAX_BLIND_CTRL_REDIALS`].
+    let mut blind_redials = 0u32;
+    'ctrl: while shared.alive.load(Ordering::Relaxed) {
         let msg = match ctrl.recv_timeout(Duration::from_millis(200)) {
             Ok(m) => m,
             Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
             Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
         };
-        let outcome = match msg {
-            Ctrl::RxFreq { hz, origin } => {
-                // An echo of where the LO already is moves nothing and tells
-                // nobody — the dedup that keeps two engines sharing this LO
-                // from chasing each other.
-                if (hz - rx_hz).abs() < 0.5 {
-                    Ok(())
-                } else {
-                    match phy.set_rx_lo(&mut conn, PlutoConfig::apply_ppm(hz, ppm)) {
-                        Ok(()) => {
-                            rx_hz = hz;
-                            notify_lo_moved(&shared, hz, origin);
-                            Ok(())
+        // A command that dies on the transport is given one more go on a fresh
+        // socket before the radio is declared gone — see [`redial_ctrl`].
+        let mut redialled = false;
+        let outcome = loop {
+            let outcome = match &msg {
+                Ctrl::RxFreq { hz, origin } => {
+                    let (hz, origin) = (*hz, *origin);
+                    // An echo of where the LO already is moves nothing and tells
+                    // nobody — the dedup that keeps two engines sharing this LO
+                    // from chasing each other.
+                    if (hz - rx_hz).abs() < 0.5 {
+                        Ok(())
+                    } else {
+                        match phy.set_rx_lo(&mut conn, PlutoConfig::apply_ppm(hz, ppm)) {
+                            Ok(()) => {
+                                rx_hz = hz;
+                                notify_lo_moved(&shared, hz, origin);
+                                Ok(())
+                            }
+                            Err(e) => Err(e),
                         }
-                        Err(e) => Err(e),
                     }
                 }
-            }
-            Ctrl::RxGain { chain, db } => {
-                // Remembered whatever the mode is, so a slider moved while an
-                // attack mode is running still takes effect on the way back
-                // into manual rather than being thrown away.
-                rx_gain_db[chain as usize & 1] = db;
-                phy.set_rx_gain(&mut conn, chain, &agc_mode[chain as usize & 1], db)
-            }
-            Ctrl::AgcMode { chain, mode } => {
-                phy.set_agc_mode(&mut conn, chain, &mode).and_then(|()| {
-                    let c = chain as usize & 1;
-                    agc_mode[c] = mode;
-                    // The gain register is the AD9361's while an attack mode
-                    // runs, so the value the operator last chose has to be
-                    // replayed on the way back into manual — otherwise the
-                    // radio resumes at whatever level the AGC happened to
-                    // leave behind.
-                    phy.set_rx_gain(&mut conn, chain, &agc_mode[c], rx_gain_db[c])
-                })
-            }
-            Ctrl::RxPort { chain, port } => phy.set_rx_port(&mut conn, chain, &port),
-            Ctrl::TxPort(p) => phy.set_tx_port(&mut conn, &p),
-            Ctrl::TxGain(db) => phy.set_tx_gain(&mut conn, db),
-            Ctrl::Ppm(v) => {
-                ppm = v;
-                // Take effect now rather than at the next retune: an operator
-                // trimming ppm is watching a carrier while they drag. The
-                // engine-domain frequency is unchanged, so the siblings are
-                // not told — their dials did not move.
-                if rx_hz > 0.0 {
-                    phy.set_rx_lo(&mut conn, PlutoConfig::apply_ppm(rx_hz, ppm))
-                } else {
-                    Ok(())
+                Ctrl::RxGain { chain, db } => {
+                    let (chain, db) = (*chain, *db);
+                    // Remembered whatever the mode is, so a slider moved while an
+                    // attack mode is running still takes effect on the way back
+                    // into manual rather than being thrown away.
+                    rx_gain_db[chain as usize & 1] = db;
+                    phy.set_rx_gain(&mut conn, chain, &agc_mode[chain as usize & 1], db)
+                }
+                Ctrl::AgcMode { chain, mode } => {
+                    let chain = *chain;
+                    phy.set_agc_mode(&mut conn, chain, mode).and_then(|()| {
+                        let c = chain as usize & 1;
+                        agc_mode[c] = mode.clone();
+                        // The gain register is the AD9361's while an attack mode
+                        // runs, so the value the operator last chose has to be
+                        // replayed on the way back into manual — otherwise the
+                        // radio resumes at whatever level the AGC happened to
+                        // leave behind.
+                        phy.set_rx_gain(&mut conn, chain, &agc_mode[c], rx_gain_db[c])
+                    })
+                }
+                // Both port writes go through the receive stand-down: the AD9361
+                // refuses `rf_port_select` outright while a buffer is running.
+                Ctrl::RxPort { chain, port } => {
+                    let chain = *chain;
+                    with_rx_stood_down(&shared, |c| phy.set_rx_port(c, chain, port), &mut conn)
+                }
+                Ctrl::TxPort(p) => {
+                    with_rx_stood_down(&shared, |c| phy.set_tx_port(c, p), &mut conn)
+                }
+                Ctrl::TxGain(db) => phy.set_tx_gain(&mut conn, *db),
+                Ctrl::Ppm(v) => {
+                    ppm = *v;
+                    // Take effect now rather than at the next retune: an operator
+                    // trimming ppm is watching a carrier while they drag. The
+                    // engine-domain frequency is unchanged, so the siblings are
+                    // not told — their dials did not move.
+                    if rx_hz > 0.0 {
+                        phy.set_rx_lo(&mut conn, PlutoConfig::apply_ppm(rx_hz, ppm))
+                    } else {
+                        Ok(())
+                    }
+                }
+                Ctrl::TxOn(hz) => key_up(&mut conn, &shared, *hz, ppm, &mut tx_lo),
+                Ctrl::TxOff => key_down(&mut conn, &shared, rx_hz, ppm),
+                Ctrl::Shutdown => break 'ctrl,
+            };
+            // A refusal means the board answered — the link is fine and the
+            // argument is with the value, so there is nothing to redial.
+            match &outcome {
+                Ok(()) | Err(Error::Remote { .. }) | Err(Error::Unsupported(_)) => {
+                    blind_redials = 0;
+                    break outcome;
+                }
+                Err(_) if redialled || blind_redials >= MAX_BLIND_CTRL_REDIALS => break outcome,
+                Err(e) => {
+                    if !redial_ctrl(&shared, e, &mut conn) {
+                        break outcome;
+                    }
+                    redialled = true;
+                    blind_redials += 1;
                 }
             }
-            Ctrl::TxOn(hz) => key_up(&mut conn, &shared, hz, ppm, &mut tx_lo),
-            Ctrl::TxOff => key_down(&mut conn, &shared, rx_hz, ppm),
-            Ctrl::Shutdown => break,
         };
         if let Err(e) = outcome {
             // A rejected attribute write is not fatal on its own — a value out
@@ -1359,6 +1462,91 @@ fn control_thread(
     }
     conn.exit();
     tracing::debug!("PlutoSDR: control thread finished");
+}
+
+/// Replace the control socket after a transport failure, without taking the
+/// radio down with it. Returns whether `conn` now holds a working replacement.
+///
+/// The receive stream has done this since it was written (`stream::redial_rx`),
+/// on exactly the evidence that applies here: a socket wedged mid-message is
+/// not a board that has gone, and `iiod` on the same board answers a *fresh*
+/// connection in single-digit milliseconds. The control connection was the one
+/// left without it, so a read timeout on a retune — the very moment the link is
+/// busiest — cleared `alive` for the whole rig and handed the radio to the
+/// engine's reopen: read the context XML again, set the whole front end again,
+/// swap the source. One operator measured that at 44 seconds over five attempts
+/// where a redial would have cost a few milliseconds (issue #377).
+///
+/// Nothing has to be re-asserted afterwards. Every front-end setting lives on
+/// the device, not on the connection; the one thing that does belong to the
+/// connection — the server-side device timeout — is set by
+/// [`Connection::connect`].
+fn redial_ctrl(shared: &Shared, cause: &Error, conn: &mut Connection) -> bool {
+    tracing::warn!("PlutoSDR: the control socket failed ({cause}) — replacing it");
+    shared.trace.note(format!("~~ control socket failed ({cause}); redialling"));
+    // Shut the old one down at both ends before dialling, so `iiod` starts
+    // reaping this client rather than keeping a wedged thread on it, and so a
+    // `release` racing us cannot be left holding a socket nobody is on.
+    shared.drop_ctrl_socket();
+    std::thread::sleep(CTRL_REDIAL_BACKOFF);
+    if !shared.alive.load(Ordering::Relaxed) {
+        return false;
+    }
+    let fresh = match Connection::connect(shared.addr, CONNECT_TIMEOUT, shared.trace.clone()) {
+        Ok(c) => c,
+        Err(e) => {
+            // Not merely stalled but unreachable, which is the engine's
+            // problem to solve.
+            shared.trace.note(format!("!! the control socket could not be replaced: {e}"));
+            return false;
+        }
+    };
+    if let Err(e) = shared.adopt_ctrl_socket(&fresh) {
+        tracing::debug!("PlutoSDR: control socket replaced during shutdown ({e})");
+        return false;
+    }
+    // The old socket is wedged by definition, so it is dropped rather than
+    // sent an `EXIT` that would sit on the write timeout waiting for a server
+    // that is not reading.
+    *conn = fresh;
+    tracing::info!("PlutoSDR: control socket replaced");
+    true
+}
+
+/// Run `f` with the receive buffer closed, then put receive back as it was.
+///
+/// `rf_port_select` is the one front-end write the AD9361 will not take while a
+/// buffer is open on it: the driver answers `-EINVAL`, and the port stays where
+/// it was. So an operator clicking ANT on a working receiver used to get a
+/// rejected write per click and a socket that never moved (issue #314). Closing
+/// the buffer for the length of the write is what makes the switch happen.
+///
+/// The previous state is restored rather than assumed, because there are two
+/// reasons receive may already be down — an over in progress, or a link that
+/// carries one direction at a time — and re-enabling it out from under either
+/// would put the receiver back on the air mid-transmission. On a link that
+/// never stood receive down (full duplex) this still closes the buffer, because
+/// the chip's objection is to the buffer and not to the link.
+///
+/// The gap costs a buffer's worth of audio, which is the price of the switch
+/// actually taking effect; the wait is bounded for the same reason `key_up`'s
+/// is, so a receive thread that has died cannot wedge the control thread.
+fn with_rx_stood_down(
+    shared: &Shared,
+    f: impl FnOnce(&mut Connection) -> Result<()>,
+    conn: &mut Connection,
+) -> Result<()> {
+    let was = shared.rx_enabled.load(Ordering::Relaxed);
+    if was {
+        shared.rx_enabled.store(false, Ordering::Relaxed);
+        let deadline = Instant::now() + Duration::from_millis(500);
+        while shared.rx_active.load(Ordering::Relaxed) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+    let out = f(conn);
+    shared.rx_enabled.store(was, Ordering::Relaxed);
+    out
 }
 
 /// Tell every attached stream but `origin` that the shared LO moved to `hz`

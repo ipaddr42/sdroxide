@@ -73,6 +73,7 @@ impl Partial {
             frames: self.frames,
             complete,
             to_me,
+            speed: self.speed,
         }
     }
 }

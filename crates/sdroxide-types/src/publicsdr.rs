@@ -26,7 +26,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::radio::{Backend, RadioConfig, SpyServerConfig};
+use crate::radio::{Backend, RadioConfig, RxSite, SpyServerConfig};
 
 /// Which directory an entry came from, which is also which protocol it speaks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -156,7 +156,35 @@ impl PublicSdrEntry {
         }
         // Nothing here transmits: these are other people's antennas.
         cfg.freq_ranges_tx.clear();
+        // ...and being other people's antennas, they are not where the operator
+        // is. Whatever is heard through this receiver is reported from *its*
+        // square, not from the station's — issue #284, where a receiver in
+        // Australia taken in a European station's tab turned every 2 m decode
+        // into an intercontinental opening. `set_backend` above has just put
+        // the site back to the station, so this states it second and wins.
+        //
+        // An entry that published no position at all still says "somewhere
+        // else", with an empty locator: that is the honest answer, and it stops
+        // the reports rather than posting them from the wrong continent.
+        cfg.rx_site = RxSite::Elsewhere(self.locator());
         cfg
+    }
+
+    /// The receiver's Maidenhead locator, from whichever of the two forms its
+    /// directory publishes, or empty when it published neither.
+    ///
+    /// KiwiSDR states a locator and a GPS position; a SpyServer states only an
+    /// antenna position, and both networks leave either blank often enough that
+    /// this has to cope with having nothing.
+    pub fn locator(&self) -> String {
+        let stated = self.grid.trim();
+        if !stated.is_empty() {
+            return stated.to_string();
+        }
+        match (self.lat, self.lon) {
+            (Some(lat), Some(lon)) => crate::latlon_to_grid(lat as f64, lon as f64),
+            _ => String::new(),
+        }
     }
 
     /// Why this receiver cannot be used right now, or `None` when it can.
@@ -751,6 +779,39 @@ var kiwisdr_com =
             narrow.spyserver, base.spyserver,
             "the low-bandwidth pick must not also write the wideband block"
         );
+    }
+
+    /// Issue #284: whatever is heard through somebody else's antenna is
+    /// reported from *its* square. Both the receiver that states a locator and
+    /// the one that states only a position, and — the case that made the bug
+    /// worth a variant of its own — the one that states neither.
+    #[test]
+    fn a_public_receiver_reports_from_its_own_square() {
+        let base = RadioConfig::default();
+        let kiwis = parse_kiwisdr_directory(KIWI_SAMPLE).expect("parses");
+        // Stated outright by the operator.
+        let cfg = kiwis[0].radio_config(&base, false);
+        assert_eq!(cfg.rx_site, RxSite::Elsewhere("DO30db".into()));
+        assert_eq!(cfg.report_grid("JN88ec"), Some("DO30db"), "not the operator's own");
+
+        // A SpyServer publishes a position and no locator, so one is derived.
+        let spy = parse_spyserver_directory(SPYSERVER_SAMPLE).expect("parses");
+        let ottawa = spy.iter().find(|e| e.lat == Some(45.42)).expect("the discone");
+        let cfg = ottawa.radio_config(&base, false);
+        assert_eq!(cfg.rx_site, RxSite::Elsewhere("FN25dk".into()));
+
+        // And one that published neither is somewhere else all the same —
+        // which stops the reports rather than posting them from the shack.
+        let anon = spy.iter().find(|e| e.lat.is_none()).expect("a 0,0 antenna location");
+        let cfg = anon.radio_config(&base, false);
+        assert_eq!(cfg.rx_site, RxSite::Elsewhere(String::new()));
+        assert_eq!(cfg.report_grid("JN88ec"), None, "nothing honest to report");
+
+        // Back to a radio in the shack, and the station's own square returns.
+        let mut back = cfg.clone();
+        back.set_backend(Backend::IcomNet);
+        assert_eq!(back.rx_site, RxSite::Station);
+        assert_eq!(back.report_grid("JN88ec"), Some("JN88ec"));
     }
 
     /// Issue #254. Taking a public receiver in the tab a transceiver was in

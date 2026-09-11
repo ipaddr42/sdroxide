@@ -665,11 +665,15 @@ impl IqSource for EladSource {
                 // The meters arrive on their own telemetry channels, not here;
                 // and the ELAD dialect has no squelch command, so that read is
                 // never asked for either.
+                //
+                // Nor has an FDM-DUO a separate receiving antenna: its two
+                // sockets are a choice between them, which is `Antenna` above.
                 sdroxide_cat::CatUpdate::Swr(_)
                 | sdroxide_cat::CatUpdate::Alc(_)
                 | sdroxide_cat::CatUpdate::Po(_)
                 | sdroxide_cat::CatUpdate::FwdW(_)
                 | sdroxide_cat::CatUpdate::Squelch(_)
+                | sdroxide_cat::CatUpdate::RxAntenna(_)
                 | sdroxide_cat::CatUpdate::Signal(_) => {}
             }
         }
@@ -683,6 +687,14 @@ impl IqSource for EladSource {
             Control::None => {}
         }
         Ok(())
+    }
+
+    /// Only over the CAT link, which puts the mode through `digi_mode` and the
+    /// dial (see `commanded_mode`). The gateway writes a mode frame straight to
+    /// the radio from a table with no frequency in it, so there SSTV and RADE
+    /// still have to arrive already translated to the sideband they ride.
+    fn resolves_band_sideband(&self) -> bool {
+        matches!(self.control, Control::Serial(_))
     }
 
     /// The rig's own receive filter.

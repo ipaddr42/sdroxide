@@ -216,8 +216,9 @@ fn mode_digit(m: Mode) -> char {
         | Mode::SstvFm
         | Mode::RttyFm
         | Mode::Adsb
-        | Mode::Vdl2 => '4',
-        Mode::Am | Mode::Sam | Mode::Dsb | Mode::Drm => '5',
+        | Mode::Vdl2
+        | Mode::Ais => '4',
+        Mode::Am | Mode::Sam | Mode::Dsb | Mode::Isb | Mode::Drm => '5',
         Mode::Digl => '9',
         Mode::Digu
         | Mode::Ft8

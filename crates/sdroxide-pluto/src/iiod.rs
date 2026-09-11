@@ -92,7 +92,50 @@ const IO_DEADLINE: Duration = Duration::from_secs(8);
 /// while the daemon on the same board answers a fresh connection in six
 /// milliseconds. Every second spent waiting on that socket is a second of dead
 /// audio, and [`crate::stream::rx_thread`] can now redial in ~50 ms.
+///
+/// A starting point rather than a fixed rule: a link carrying nearly as many
+/// bytes per second as it can hold stalls for longer than this and still
+/// recovers, so [`Connection::set_payload_deadline`] lets the receive thread
+/// raise it when the evidence says the stalls are the transport rather than a
+/// wedge. See [`MAX_PAYLOAD_DEADLINE`].
 const PAYLOAD_DEADLINE: Duration = Duration::from_secs(2);
+
+/// The most [`Connection::set_payload_deadline`] may stretch a payload read
+/// to.
+///
+/// Stops just short of [`IO_DEADLINE`]: past that a stalled payload would
+/// outlast the wait for a reply that has not started yet, and the two
+/// deadlines would no longer say different things about where the fault is.
+const MAX_PAYLOAD_DEADLINE: Duration = Duration::from_secs(6);
+
+/// How long a chunk that has *started* arriving may take in total before the
+/// connection is called dead anyway — one more deadline on top of the first.
+///
+/// [`PAYLOAD_DEADLINE`] is how long a single silence may last; this is how long
+/// the whole chunk may take across however many of them, and
+/// [`Connection::read_exact_into`] is where the difference between the two
+/// faults is made.
+///
+/// The number is the reconciliation of two field reports that pull opposite
+/// ways. A socket wedged mid-payload (issue #377) delivered nothing for eight
+/// seconds while the daemon on the same board answered a fresh connection in
+/// six milliseconds — waiting on that is dead air for a fault a redial clears
+/// in fifty. A board that pauses under its own load (issue #288) goes quiet for
+/// a second or two *with the bytes still coming*, and redialling around that
+/// costs a socket and a buffer reopen for a transfer that was going to finish.
+///
+/// What separates them is whether anything is arriving at all, and then how
+/// long. A chunk with nothing to show for itself is the wedge and dies at the
+/// first deadline, unchanged. One that is arriving in fits and starts gets a
+/// second deadline to finish in — enough for the pause, and still well short of
+/// the wedge, which is twice this again.
+///
+/// Held inside [`IO_DEADLINE`] whatever [`Connection::set_payload_deadline`]
+/// has been stretched to, because that is what keeps the engine's own silence
+/// watchdog outside this one.
+fn payload_total(deadline: Duration) -> Duration {
+    (deadline * 2).min(IO_DEADLINE)
+}
 
 /// How long a write may block. Commands are tiny, so this only ever fires when
 /// the link itself has gone.
@@ -172,6 +215,10 @@ pub struct Connection {
     /// Whether the head of a buffer response has been traced yet. Only the
     /// first one is worth keeping; after that it is 8 MB/s of noise.
     traced_head: bool,
+    /// How long a read that is part-way through an announced payload may stall
+    /// before this connection is called dead — see [`PAYLOAD_DEADLINE`], which
+    /// is where it starts.
+    payload_deadline: Duration,
 }
 
 impl Connection {
@@ -199,6 +246,7 @@ impl Connection {
             writer,
             trace,
             traced_head: false,
+            payload_deadline: PAYLOAD_DEADLINE,
         };
         // Tell the server how long it may wait on the device. Old firmwares
         // that don't know the command answer -EINVAL, which is not fatal.
@@ -206,6 +254,23 @@ impl Connection {
             conn.trace.note(format!("TIMEOUT not accepted ({e}); continuing with the default"));
         }
         Ok(conn)
+    }
+
+    /// Give a part-way-through payload read longer — or shorter — before this
+    /// connection is called dead. Clamped to [`MAX_PAYLOAD_DEADLINE`].
+    ///
+    /// For the receive thread to raise when a socket it replaced for stalling
+    /// mid-payload had been delivering samples perfectly well beforehand: that
+    /// is the signature of a link running close to its capacity, not of the
+    /// wedge [`PAYLOAD_DEADLINE`] was chosen for, and replacing the socket
+    /// every time costs more than waiting the stall out would have.
+    pub fn set_payload_deadline(&mut self, deadline: Duration) {
+        self.payload_deadline = deadline.min(MAX_PAYLOAD_DEADLINE);
+    }
+
+    /// How long this connection currently allows a stalled payload read.
+    pub fn payload_deadline(&self) -> Duration {
+        self.payload_deadline
     }
 
     // ---- commands -------------------------------------------------------
@@ -516,20 +581,82 @@ impl Connection {
     /// announced, under the shorter [`PAYLOAD_DEADLINE`] — see there for why
     /// this wait is held to a different standard than the one for a reply that
     /// has not started yet.
+    ///
+    /// # Why the loop is written out rather than left to `read_exact`
+    ///
+    /// `read_exact` does not say how many bytes it had already taken, so a
+    /// stall part-way through one left no way of knowing where in the payload
+    /// the gap fell — and the only safe answer to that was to abandon the
+    /// connection, redial and reopen the buffer. Issue #288 is what that costs:
+    /// a Pluto whose own processor is busy enough to pause the transfer for a
+    /// couple of seconds had every such pause turned into a teardown, on a link
+    /// with no errors, no packet loss and the samples still on their way.
+    ///
+    /// Counting the bytes in here is what makes the gap survivable: the payload
+    /// stays exactly where it was, so a silence that ends is simply waited out
+    /// and the chunk completes. The bytes that had arrived are kept rather than
+    /// thrown away with the socket, and the buffer on the far side is never
+    /// reopened.
+    ///
+    /// It does not make this layer infinitely patient, which would hide the
+    /// fault [`PAYLOAD_DEADLINE`] exists for. A socket that has produced
+    /// **nothing at all** for this chunk is the wedge that constant was
+    /// measured against and still dies at the first deadline; only one that has
+    /// handed over bytes gets a second one, and no more than that — see
+    /// [`payload_total`].
     fn read_exact_into(&mut self, cmd: &str, buf: &mut [u8]) -> Result<()> {
-        self.reader.get_mut().deadline = PAYLOAD_DEADLINE;
-        let outcome = self.reader.read_exact(buf);
+        let want = buf.len();
+        let total = payload_total(self.payload_deadline);
+        let started = Instant::now();
+        let mut filled = 0usize;
+        let outcome = loop {
+            // Each wait is the shorter of this connection's patience for one
+            // silence and what is left of the whole chunk's budget, so however
+            // many stalls are ridden out the call cannot outlast
+            // [`payload_total`] by more than a poll. That is what keeps the
+            // engine's own silence watchdog outside this one, which is the
+            // arrangement [`IO_DEADLINE`] describes.
+            let left = total.saturating_sub(started.elapsed());
+            self.reader.get_mut().deadline = self.payload_deadline.min(left.max(IO_POLL));
+            match self.reader.read(&mut buf[filled..]) {
+                Ok(0) => {
+                    break Err(Error::Protocol {
+                        cmd: cmd.to_string(),
+                        what: format!(
+                            "the server closed the connection with {} bytes still due",
+                            want - filled
+                        ),
+                    });
+                }
+                Ok(n) => {
+                    filled += n;
+                    if filled >= want {
+                        break Ok(());
+                    }
+                }
+                // `Patient` has already waited the payload deadline out for a
+                // single byte and got none. Fatal only if this chunk has
+                // nothing to show for itself, or has been at it long enough
+                // that "slow" is no longer the description.
+                Err(ref e) if is_transient(e) && filled > 0 && started.elapsed() < total => {
+                    // One line per stall ridden out, on the same principle as
+                    // `Patient`'s: this is the record of an intermittent fault
+                    // whose cause is not yet known, and how far in it fell is
+                    // half of the evidence.
+                    let waited = started.elapsed().as_secs_f64();
+                    self.trace.note(format!(
+                        "~~ payload stalled {waited:.1}s at {filled}/{want} bytes; waiting \
+                         rather than replacing the socket"
+                    ));
+                    tracing::debug!(
+                        "PlutoSDR: payload stalled {waited:.1}s at {filled}/{want} bytes; waiting"
+                    );
+                }
+                Err(e) => break Err(Error::io("read payload", e)),
+            }
+        };
         self.reader.get_mut().deadline = IO_DEADLINE;
-        outcome.map_err(|e| match e.kind() {
-            std::io::ErrorKind::UnexpectedEof => Error::Protocol {
-                cmd: cmd.to_string(),
-                what: format!(
-                    "the server closed the connection with {} bytes still due",
-                    buf.len()
-                ),
-            },
-            _ => Error::io("read payload", e),
-        })
+        outcome
     }
 
     /// Swallow the `\n` (or `\r\n`) that follows a length-counted payload.
@@ -703,6 +830,77 @@ mod tests {
         let text = err.to_string();
         assert!(text.contains("OPEN cf-ad9361-lpc"), "{text}");
         assert!(text.contains("device busy"), "{text}");
+    }
+
+    /// Issue #288: a chunk that arrives in two halves with a silence between
+    /// them completes, on the same socket, with the bytes in the right order.
+    ///
+    /// A Pluto whose own processor is busy pauses mid-transfer for a second or
+    /// two on a link with no errors and nothing dropped. Every one of those
+    /// used to end the connection — `read_exact` could not say how far into the
+    /// payload the gap had fallen, so the only safe answer was to redial and
+    /// reopen the buffer. Counting the bytes here is what makes it survivable:
+    /// what arrived is kept and the read simply carries on.
+    #[test]
+    fn a_payload_that_stalls_and_resumes_is_not_a_dead_connection() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let stall = PAYLOAD_DEADLINE + Duration::from_millis(400);
+        std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().expect("accept");
+            sock.write_all(b"0\r\n").expect("timeout reply");
+            // The chunk header, the mask, and the first four of its six bytes.
+            sock.write_all(b"6\n00000003\n").expect("head");
+            sock.write_all(&[1, 2, 3, 4]).expect("first half");
+            sock.flush().ok();
+            // ...then the board goes quiet for longer than one payload
+            // deadline before finishing the chunk and the response.
+            std::thread::sleep(stall);
+            sock.write_all(&[5, 6]).expect("second half");
+            sock.write_all(b"0\n").expect("terminator");
+            sock.flush().ok();
+            let mut sink = [0u8; 256];
+            while matches!(sock.read(&mut sink), Ok(n) if n > 0) {}
+        });
+
+        let mut conn =
+            Connection::connect(addr, Duration::from_secs(2), Trace::new()).expect("connect");
+        let mut out = [0u8; 6];
+        let n = conn.read_buf("cf-ad9361-lpc", 2, &mut out).expect("the stall was ridden out");
+        assert_eq!(n, 6);
+        assert_eq!(out, [1, 2, 3, 4, 5, 6], "the halves were spliced wrong");
+    }
+
+    /// ...and the fault the payload deadline was measured for is untouched: a
+    /// socket that announces a chunk and then delivers *none* of it is the
+    /// wedge, and still dies at the first deadline rather than being waited out
+    /// for as long as one that is making progress.
+    #[test]
+    fn a_payload_that_never_starts_is_still_a_dead_connection() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let (done_tx, done_rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().expect("accept");
+            sock.write_all(b"0\r\n").expect("timeout reply");
+            sock.write_all(b"6\n00000003\n").expect("head");
+            sock.flush().ok();
+            // Not one byte of the payload, ever.
+            let _ = done_rx.recv_timeout(Duration::from_secs(30));
+        });
+
+        let mut conn =
+            Connection::connect(addr, Duration::from_secs(2), Trace::new()).expect("connect");
+        let mut out = [0u8; 6];
+        let started = Instant::now();
+        let err = conn.read_buf("cf-ad9361-lpc", 2, &mut out).expect_err("a wedge is a wedge");
+        let took = started.elapsed();
+        assert!(err.is_payload_stall(), "{err}");
+        assert!(
+            took < PAYLOAD_DEADLINE + Duration::from_secs(2),
+            "a wedged socket took {took:?} to be called one"
+        );
+        let _ = done_tx.send(());
     }
 
     /// The framing this client is most likely to have wrong: a `READBUF`

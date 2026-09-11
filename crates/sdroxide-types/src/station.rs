@@ -78,4 +78,14 @@ pub struct StationConfig {
     ///
     /// Appended last, for the usual reason.
     pub relay: RelayConfig,
+    /// The frequencies the operator has added to the digital modes' own tables
+    /// — `digi_presets.json` on the engine's machine (issue #268).
+    ///
+    /// Travels for the same reason the band plan does: a remote client draws
+    /// the same **⇵** picker as the console, and a list held on the operator's
+    /// laptop would be one the station never offers and one a second screen
+    /// could silently write over.
+    ///
+    /// Appended last, for the usual reason.
+    pub digi_presets: Vec<crate::DigiPreset>,
 }

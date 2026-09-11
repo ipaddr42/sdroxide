@@ -29,6 +29,12 @@ const ENTERPRISE: u32 = 30351;
 /// Our template IDs. Any value ≥ 256 works; these match what other clients use.
 const TEMPLATE_SENDER: u16 = 0x5001;
 const TEMPLATE_RECEIVER: u16 = 0x5002;
+/// The same reception report with the frequency field widened to five bytes.
+const TEMPLATE_SENDER_WIDE: u16 = 0x5003;
+/// The highest frequency the default 4-byte field can carry.
+const NARROW_FREQ_MAX: u64 = u32::MAX as u64;
+/// The highest frequency the 5-byte field can carry — a little over 1 THz.
+pub const MAX_REPORT_HZ: u64 = (1u64 << 40) - 1;
 /// Keep packets inside the smallest MTU we might cross.
 const MAX_PACKET: usize = 1400;
 /// Never batch more than this many reports, however long the interval.
@@ -42,7 +48,11 @@ pub struct Report {
     pub call: String,
     pub grid: String,
     /// The signal's own frequency (dial + audio offset), in Hz.
-    pub freq_hz: u32,
+    ///
+    /// Wider than the collector's default 4-byte field on purpose: that field
+    /// stops at 4.295 GHz, and a QO-100 station heard on 10489.540 MHz is well
+    /// past it (issue #378). Such a report goes out under the wide template.
+    pub freq_hz: u64,
     pub snr_db: i8,
     /// "FT8", "FT4", …
     pub mode: String,
@@ -67,6 +77,12 @@ fn push_u16(out: &mut Vec<u8>, v: u16) {
 
 fn push_u32(out: &mut Vec<u8>, v: u32) {
     out.extend_from_slice(&v.to_be_bytes());
+}
+
+/// A 5-byte big-endian integer: the widened frequency field PSK Reporter
+/// documents for anything above 4 GHz.
+fn push_u40(out: &mut Vec<u8>, v: u64) {
+    out.extend_from_slice(&v.min(MAX_REPORT_HZ).to_be_bytes()[3..]);
 }
 
 /// An IPFIX variable-length string: one length byte, then the bytes. Anything
@@ -96,14 +112,19 @@ fn pad4(out: &mut Vec<u8>, set_start: usize) {
 }
 
 /// The template describing a reception report (what we heard).
-fn sender_template(out: &mut Vec<u8>) {
+///
+/// `freq_len` is the width of the frequency field: 4 bytes is the default
+/// template every client sends, 5 bytes the widening PSK Reporter documents for
+/// frequencies above 4 GHz. The wide one is only ever sent when a report needs
+/// it, so an HF-only station's datagrams are byte for byte what they were.
+fn sender_template(out: &mut Vec<u8>, freq_len: u16) {
     let start = out.len();
     push_u16(out, 2); // set id 2 = template set
     push_u16(out, 0); // length, patched below
-    push_u16(out, TEMPLATE_SENDER);
+    push_u16(out, if freq_len == 4 { TEMPLATE_SENDER } else { TEMPLATE_SENDER_WIDE });
     push_u16(out, 7); // field count
     push_field(out, 1, 0xFFFF, true); // senderCallsign
-    push_field(out, 5, 4, true); // frequency
+    push_field(out, 5, freq_len, true); // frequency
     push_field(out, 6, 1, true); // sNR
     push_field(out, 10, 0xFFFF, true); // mode
     push_field(out, 3, 0xFFFF, true); // senderLocator
@@ -154,8 +175,12 @@ pub fn encode_packet(
 
     // Both templates travel in every packet: they cost ~100 bytes and mean a
     // datagram is never orphaned by an earlier one going missing.
-    sender_template(&mut out);
+    sender_template(&mut out, 4);
     receiver_template(&mut out);
+    // The third template — the same report with a 5-byte frequency — is built
+    // here but only spliced in below if a report actually needs it.
+    let mut wide_template = Vec::new();
+    sender_template(&mut wide_template, 5);
 
     // Receiver record.
     let start = out.len();
@@ -169,29 +194,54 @@ pub fn encode_packet(
     let len = (out.len() - start) as u16;
     out[start + 2..start + 4].copy_from_slice(&len.to_be_bytes());
 
-    // Reception reports, up to the packet budget.
-    let start = out.len();
-    push_u16(&mut out, TEMPLATE_SENDER);
-    push_u16(&mut out, 0);
+    // Reception reports, up to the packet budget. Each goes into the set whose
+    // frequency field can hold it, still in the order they were given so a
+    // packet always consumes a prefix of the batch.
+    let mut narrow = Vec::new();
+    let mut wide = Vec::new();
+    // What the sets themselves cost on top of the records: two set headers and
+    // their padding, plus the wide template. Counted whether or not the wide
+    // set is used, which at worst leaves one report for the next datagram.
+    let overhead = out.len() + wide_template.len() + 2 * (4 + 3);
     let mut used = 0;
     for r in reports {
-        let before = out.len();
-        push_str(&mut out, &r.call);
-        push_u32(&mut out, r.freq_hz);
-        out.push(r.snr_db as u8);
-        push_str(&mut out, &r.mode);
-        push_str(&mut out, &r.grid);
-        out.push(1); // informationSource: 1 = automatically decoded
-        push_u32(&mut out, r.when_utc);
-        if out.len() + 3 > MAX_PACKET {
-            out.truncate(before); // doesn't fit — leave it for the next packet
+        let is_wide = r.freq_hz > NARROW_FREQ_MAX;
+        let other = if is_wide { narrow.len() } else { wide.len() };
+        let buf = if is_wide { &mut wide } else { &mut narrow };
+        let before = buf.len();
+        push_str(buf, &r.call);
+        if is_wide {
+            push_u40(buf, r.freq_hz);
+        } else {
+            push_u32(buf, r.freq_hz as u32);
+        }
+        buf.push(r.snr_db as u8);
+        push_str(buf, &r.mode);
+        push_str(buf, &r.grid);
+        buf.push(1); // informationSource: 1 = automatically decoded
+        push_u32(buf, r.when_utc);
+        if overhead + other + buf.len() > MAX_PACKET {
+            buf.truncate(before); // doesn't fit — leave it for the next packet
             break;
         }
         used += 1;
     }
-    pad4(&mut out, start);
-    let len = (out.len() - start) as u16;
-    out[start + 2..start + 4].copy_from_slice(&len.to_be_bytes());
+    // A widened report needs its template, and only then.
+    if !wide.is_empty() {
+        out.extend_from_slice(&wide_template);
+    }
+    for (id, records) in [(TEMPLATE_SENDER, &narrow), (TEMPLATE_SENDER_WIDE, &wide)] {
+        if records.is_empty() {
+            continue;
+        }
+        let start = out.len();
+        push_u16(&mut out, id);
+        push_u16(&mut out, 0);
+        out.extend_from_slice(records);
+        pad4(&mut out, start);
+        let len = (out.len() - start) as u16;
+        out[start + 2..start + 4].copy_from_slice(&len.to_be_bytes());
+    }
 
     let total = out.len() as u16;
     out[2..4].copy_from_slice(&total.to_be_bytes());
@@ -407,6 +457,60 @@ mod tests {
         let call = pkt.windows(6).any(|w| w == b"\x05AB1CD");
         assert!(call, "receiver callsign is not length-prefixed in the packet");
         assert!(pkt.windows(6).any(|w| w == b"\x05W9XYZ"), "sender callsign missing");
+    }
+
+    /// Walk the sets of a packet, returning `(set id, body)` for each.
+    fn sets(pkt: &[u8]) -> Vec<(u16, Vec<u8>)> {
+        let mut at = 16;
+        let mut out = Vec::new();
+        while at < pkt.len() {
+            let (id, len) = (be16(pkt, at), be16(pkt, at + 2) as usize);
+            assert!(len >= 4 && at + len <= pkt.len(), "set {id:#x} length {len} at {at}");
+            out.push((id, pkt[at + 4..at + len].to_vec()));
+            at += len;
+        }
+        assert_eq!(at, pkt.len(), "sets exactly fill the packet");
+        out
+    }
+
+    /// A QO-100 station is heard on 10489.540 MHz, which the collector's
+    /// default 4-byte frequency field cannot hold — the report has to go out
+    /// under the widened template instead of being clipped to 4.295 GHz
+    /// (issue #378).
+    #[test]
+    fn a_microwave_report_uses_the_five_byte_frequency() {
+        let mut r = report("W9XYZ", -12);
+        r.freq_hz = 10_489_540_000;
+        let (pkt, used) = encode_packet(&rx(), &[r], 1_700_000_100, 0, 1);
+        assert_eq!(used, 1);
+        let sets = sets(&pkt);
+        let ids: Vec<u16> = sets.iter().map(|(id, _)| *id).collect();
+        assert_eq!(ids, vec![2, 3, TEMPLATE_RECEIVER, 2, TEMPLATE_SENDER_WIDE]);
+
+        // The widened template says five bytes for field 30351.5.
+        let tpl = &sets[3].1;
+        assert_eq!(be16(tpl, 0), TEMPLATE_SENDER_WIDE);
+        assert_eq!(be16(tpl, 12), 0x8005, "field after senderCallsign is the frequency");
+        assert_eq!(be16(tpl, 14), 5, "frequency field width");
+
+        // And the record carries the real frequency, big-endian, in five bytes.
+        let rec = &sets[4].1;
+        assert_eq!(&rec[..6], b"\x05W9XYZ");
+        assert_eq!(&rec[6..11], &10_489_540_000u64.to_be_bytes()[3..]);
+    }
+
+    /// HF and microwave reports in one batch each land in the set that can
+    /// carry them, and both still go out.
+    #[test]
+    fn a_mixed_batch_splits_into_two_sets() {
+        let mut sat = report("W9XYZ", -12);
+        sat.freq_hz = 10_489_540_000;
+        let (pkt, used) = encode_packet(&rx(), &[report("K1ABC", -8), sat], 0, 0, 1);
+        assert_eq!(used, 2);
+        let ids: Vec<u16> = sets(&pkt).iter().map(|(id, _)| *id).collect();
+        assert_eq!(ids, vec![2, 3, TEMPLATE_RECEIVER, 2, TEMPLATE_SENDER, TEMPLATE_SENDER_WIDE]);
+        assert!(pkt.windows(6).any(|w| w == b"\x05K1ABC"));
+        assert!(pkt.windows(6).any(|w| w == b"\x05W9XYZ"));
     }
 
     #[test]

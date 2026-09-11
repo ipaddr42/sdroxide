@@ -1,9 +1,17 @@
 //! AVLC — the link layer VDL Mode 2 carries everything in.
 //!
-//! One frame per burst. The transmission header's length field says exactly how
-//! long it is, so unlike every other HDLC descendant there are no `0x7E` flags
-//! to hunt for and no bit stuffing to undo: what the Reed-Solomon layer hands
-//! over *is* the frame.
+//! One frame per burst, inside an ordinary HDLC wrapper: an opening `0x7E`
+//! flag, the frame with a zero stuffed after every five ones, and a closing
+//! flag. [`crate::hdlc`] takes that off; what is left is what this module
+//! parses.
+//!
+//! The transmission header's length field says how long the *wrapper* is, in
+//! bits — which is why it is in bits, since a stuffed frame is not a whole
+//! number of octets. This module was written believing the field was the frame
+//! itself and that the length made the flags unnecessary. It is not, and they
+//! are there: every transmission in the issue #265 recording carries them, and
+//! reading the field as a bare frame put every octet one out and failed every
+//! check sequence.
 //!
 //! ```text
 //!   4 octets     4 octets     1 octet    0..n octets   2 octets

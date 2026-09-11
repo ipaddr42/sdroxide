@@ -127,6 +127,52 @@ pub(in crate::app) fn remote_access_settings(ui: &mut egui::Ui, access: &mut Rem
     );
 }
 
+/// The fixed trim on this radio's receive audio.
+///
+/// Lives beside the sound-card pickers because that is what it is for: the AF
+/// rail on the strip tops out at unity, which can turn a radio down and never
+/// up, and a transceiver whose USB codec puts out a quiet signal is then quiet
+/// at full volume in sdroxide *and* in the operating system (issue #315). It is
+/// per radio, because what it corrects is that radio's interface rather than
+/// how loudly anyone wants to listen.
+///
+/// Edited straight into `radio_edit`, which the settings window sends and saves
+/// on any change — so it takes effect while the operator is listening, with no
+/// Apply and no reopen.
+pub(in crate::app) fn settings_rx_audio_gain(
+    ui: &mut egui::Ui,
+    cfg: &mut sdroxide_types::RadioConfig,
+) {
+    ui.add_space(8.0);
+    ui.horizontal(|ui| {
+        ui.label(RichText::new("Receive audio gain").strong());
+        ui.add(
+            egui::DragValue::new(&mut cfg.rx_audio_gain_db)
+                .speed(0.5)
+                .range(-20.0..=30.0)
+                .fixed_decimals(1)
+                .suffix(" dB"),
+        );
+        if cfg.rx_audio_gain_db != 0.0 && ui.button("0 dB").clicked() {
+            cfg.rx_audio_gain_db = 0.0;
+        }
+    });
+    ui.add_space(4.0);
+    ui.label(
+        RichText::new(
+            "Extra gain on everything this radio sends to the speakers, on top of the volume \
+             control. Leave it at 0 dB unless the radio is quiet at full volume: the volume \
+             rail's top is the audio as it arrives, so it can turn a radio down but never up, \
+             and some transceivers' USB sound output sits well below full scale.\n\n\
+             Go up 6 dB at a time. Too much clips — the audio is limited at full scale rather \
+             than allowed to wrap round, so overdoing it sounds harsh rather than loud. \
+             Recordings are taken ahead of this and are not affected.",
+        )
+        .size(10.5)
+        .color(crate::theme::gray(140)),
+    );
+}
+
 impl SdroxideApp {
     /// The band-plan file: where it is, whether the station is on it, and the
     /// button that re-reads it.
@@ -192,6 +238,144 @@ impl SdroxideApp {
             .color(crate::theme::gray(140)),
         );
     }
+
+    /// Take this station's settings away as one file, and put one back.
+    ///
+    /// The answer to "how do I copy all this to my other machine" being
+    /// "screenshots" (issue #356). Native only, and only where the settings are
+    /// on *this* machine: a browser client has no filesystem, and a remote one
+    /// would be exporting its own laptop's configuration rather than the
+    /// station's, which is the opposite of what was asked for.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(in crate::app) fn settings_transfer(
+        &self,
+        ui: &mut egui::Ui,
+        export: &mut bool,
+        import: &mut bool,
+    ) {
+        ui.label(RichText::new("Settings file").strong());
+        if self.ctrl.engine_is_remote() {
+            ui.label(
+                RichText::new(
+                    "The settings are on the machine the radio is attached to. Export them \
+                     there.",
+                )
+                .size(10.5)
+                .color(crate::theme::gray(140)),
+            );
+            return;
+        }
+        ui.horizontal_wrapped(|ui| {
+            if crate::chrome::chip(ui, false, RichText::new("EXPORT…").size(10.5))
+                .on_hover_text(
+                    "Write every setting at this station — the radios, the modes, the servers, \
+                     the memories, the band plan — to one file you can carry to another \
+                     installation. Your logbook and any saved server password stay here.",
+                )
+                .clicked()
+            {
+                *export = true;
+            }
+            if crate::chrome::chip(ui, false, RichText::new("IMPORT…").size(10.5))
+                .on_hover_text(
+                    "Replace this station's settings with the ones in a file exported from \
+                     another installation. Restart sdroxide afterwards.",
+                )
+                .clicked()
+            {
+                *import = true;
+            }
+        });
+        if let Some(note) = &self.settings_transfer_note {
+            ui.add_space(4.0);
+            ui.add(
+                egui::Label::new(RichText::new(note).size(10.5).color(Color32::LIGHT_GREEN)).wrap(),
+            );
+        }
+        ui.add_space(4.0);
+        ui.add(
+            egui::Label::new(
+                RichText::new(
+                    "An import overwrites what is here, file for file, and takes effect the \
+                     next time sdroxide starts — the settings already in memory would \
+                     otherwise be written straight back over it. Anything the file does not \
+                     mention is left as it is, so a bundle from a one-radio station does not \
+                     remove a second radio here. Your logbook is never in the file: export it \
+                     as ADIF from the LOG window if you want to move that too.",
+                )
+                .size(10.5)
+                .color(crate::theme::gray(140)),
+            )
+            .wrap(),
+        );
+    }
+
+    /// The browser client has no filesystem, and the settings it would export
+    /// are on the engine's machine in any case.
+    #[cfg(target_arch = "wasm32")]
+    pub(in crate::app) fn settings_transfer(
+        &self,
+        _ui: &mut egui::Ui,
+        _export: &mut bool,
+        _import: &mut bool,
+    ) {
+    }
+
+    /// Carry out what [`Self::settings_transfer`]'s buttons asked for, after
+    /// the window closure has given `&mut self` back — see [`SettingsIo`].
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(in crate::app) fn run_settings_transfer(&mut self, export: bool, import: bool) {
+        if export {
+            self.settings_transfer_note = Some(match sdroxide_config::transfer::export_json() {
+                Ok(json) => {
+                    let note = sdroxide_config::transfer::export()
+                        .map(|b| b.summary())
+                        .unwrap_or_else(|_| "settings".into());
+                    crate::download::save("sdroxide-settings.json", json.as_bytes());
+                    format!("Exported {note} — choose where to save it.")
+                }
+                Err(e) => format!("Export failed: {e}"),
+            });
+        }
+        if import {
+            self.settings_transfer_note = None;
+            crate::download::load_text(
+                "sdroxide settings",
+                "json",
+                self.settings_import_inbox.clone(),
+            );
+        }
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    pub(in crate::app) fn run_settings_transfer(&mut self, _export: bool, _import: bool) {}
+
+    /// Apply a settings bundle the operator picked, once the picker thread has
+    /// delivered it. Drained every frame beside the ADIF import.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(in crate::app) fn poll_settings_import(&mut self) {
+        let loaded = self.settings_import_inbox.lock().ok().and_then(|mut g| g.take());
+        let Some(loaded) = loaded else { return };
+        // Said on screen rather than on stderr: the operator who pressed the
+        // button is looking at the window, and on Windows there is no console
+        // behind it to print to.
+        self.settings_transfer_note = Some(match loaded {
+            Err(e) => format!("Import failed: {e}"),
+            Ok(loaded) => match sdroxide_config::transfer::import(&loaded.text) {
+                Err(e) => format!("Import failed: {e}"),
+                Ok(report) => {
+                    let mut msg = format!("{} — restart sdroxide to use them.", report.summary());
+                    for (path, why) in report.skipped.iter().take(4) {
+                        msg.push_str(&format!("\nSkipped {path}: {why}"));
+                    }
+                    msg
+                }
+            },
+        });
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    pub(in crate::app) fn poll_settings_import(&mut self) {}
 
     /// The SWR guard: arm it, and set the ratio it stops transmitting at.
     ///

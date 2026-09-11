@@ -50,10 +50,39 @@ pub enum Band {
     /// RSGB, the WIA and the NRRL, and 5 cm in the Americas; see
     /// [`Band::label_in`], which says whichever the station's own region does.
     Cm6,
+    /// 3 cm — 10.0–10.5 GHz, the same allocation in all three regions.
+    ///
+    /// Appended for the reason [`Band::M70`] gives, and reached by a
+    /// transverter in every station but one: the IC-905 carries Icom's own
+    /// 10 GHz unit *inside* it, so its 3 cm is the radio's own band and not an
+    /// entry in the transverter table (issue #326).
+    Cm3,
+    /// 11 m — the citizens' band, 26.965–27.405, and **not an amateur
+    /// allocation** (issue #396).
+    ///
+    /// The one band here that is not ours. It is on the bar because it is a
+    /// band people work: a busy one in Europe, with its own digimode
+    /// conventions on the ordinary 40-channel grid — FT8 on channel 26, JS8 on
+    /// 25, SSTV on 23 and 37, packet on 24 and 36 — and a receiver that could
+    /// not be pointed at it by name was simply worse at its job.
+    ///
+    /// What does *not* follow is a transmit permission. Every other band in
+    /// this list is one an amateur licence grants; this one is a separate
+    /// service with its own rules and its own type-approved equipment, and a
+    /// transceiver keyed there under an amateur callsign is out of band in
+    /// every administration. So [`Band::is_amateur`] says no, and with the
+    /// station's `tx_ham_only` set — the default — the transmit lockout holds
+    /// here exactly as it does in general coverage. An operator entitled to
+    /// transmit here turns that off, as they would to work any other allocation
+    /// sdroxide cannot check their licence for.
+    ///
+    /// Appended for the reason [`Band::M70`] gives; [`Band::ALL`] puts it
+    /// between 12 m and 10 m, where the frequencies are.
+    M11,
 }
 
 impl Band {
-    pub const ALL: [Band; 21] = [
+    pub const ALL: [Band; 23] = [
         Band::M160,
         Band::M80,
         Band::M60,
@@ -63,6 +92,7 @@ impl Band {
         Band::M17,
         Band::M15,
         Band::M12,
+        Band::M11,
         Band::M10,
         Band::M6,
         Band::M4,
@@ -74,8 +104,69 @@ impl Band {
         Band::Cm13,
         Band::Cm9,
         Band::Cm6,
+        Band::Cm3,
         Band::Gen,
     ];
+
+    /// This band's place in [`Band::ALL`] — the order the bands are shown in,
+    /// and an index for a table with one entry per band that is built and used
+    /// within one run.
+    ///
+    /// Not the declaration order, which is the postcard wire order and has 70
+    /// cm, 4 m and 1.25 m appended out of place; [`Band::ALL`] is the order an
+    /// operator reads.
+    ///
+    /// ⚠️ Stable within a build and **not** across them: a band added between
+    /// two others moves every band after it. Anything *stored* has to use
+    /// [`Band::wire_index`] instead.
+    pub fn index(self) -> usize {
+        Band::ALL.iter().position(|b| *b == self).unwrap_or(Band::ALL.len() - 1)
+    }
+
+    /// Every band in *declaration* order — which is the order postcard numbers
+    /// the variants in, and the order [`Band::wire_index`] counts.
+    ///
+    /// Append-only, forever. A new band goes on the end here and wherever it
+    /// belongs in [`Band::ALL`]; the two lists are deliberately different.
+    const DECLARED: [Band; 23] = [
+        Band::M160,
+        Band::M80,
+        Band::M60,
+        Band::M40,
+        Band::M30,
+        Band::M20,
+        Band::M17,
+        Band::M15,
+        Band::M12,
+        Band::M10,
+        Band::M6,
+        Band::M2,
+        Band::Gen,
+        Band::M70,
+        Band::M4,
+        Band::M125,
+        Band::Cm33,
+        Band::Cm23,
+        Band::Cm13,
+        Band::Cm9,
+        Band::Cm6,
+        Band::Cm3,
+        Band::M11,
+    ];
+
+    /// This band's position in the *declaration* order, which is append-only
+    /// and therefore means the same thing in every release.
+    ///
+    /// The index anything **saved** has to be keyed on. [`Band::index`] is the
+    /// order the band bar is read in, and a band added in the middle of it —
+    /// 11 m, between 12 m and 10 m — moves every band above it by one. That is
+    /// free for a table built at startup and wrong for a bitmask in a file: the
+    /// WSPR hop set is one, and keyed on the bar's order it would come back
+    /// after an upgrade selecting a different set of bands than the operator
+    /// chose (issue #396).
+    pub fn wire_index(self) -> usize {
+        Band::DECLARED.iter().position(|b| *b == self).unwrap_or(0)
+    }
 
     /// The band's name, as the station's configured region writes it.
     pub fn label(self) -> &'static str {
@@ -104,6 +195,7 @@ impl Band {
             Band::M17 => "17M",
             Band::M15 => "15M",
             Band::M12 => "12M",
+            Band::M11 => "11M",
             Band::M10 => "10M",
             Band::M6 => "6M",
             Band::M4 => "4M",
@@ -118,8 +210,21 @@ impl Band {
                 Region::R1 => "6CM",
                 Region::R2 | Region::R3 => "5CM",
             },
+            Band::Cm3 => "3CM",
             Band::Gen => "GEN",
         }
+    }
+
+    /// Whether this band is an *amateur* allocation.
+    ///
+    /// True for every band on the bar but two: [`Band::Gen`], which is the
+    /// absence of a band, and [`Band::M11`], which is the citizens' band — a
+    /// separate radio service that an amateur licence does not grant. The
+    /// transmit lockout asks this rather than comparing against `Gen`, so
+    /// putting a band on the bar so it can be *listened* to does not quietly
+    /// hand out permission to key up on it (issue #396).
+    pub fn is_amateur(self) -> bool {
+        !matches!(self, Band::Gen | Band::M11)
     }
 
     /// Band edges in Hz for the station's configured region (see
@@ -202,6 +307,17 @@ impl Band {
             Band::M17 => Some((18_068_000.0, 18_168_000.0)),
             Band::M15 => Some((21_000_000.0, 21_450_000.0)),
             Band::M12 => Some((24_890_000.0, 24_990_000.0)),
+            // 11 m: the 40-channel citizens' band, 26.965–27.405. Not an IARU
+            // allocation at all — see [`Band::M11`] — but the same 40 channels
+            // in all three regions, because CEPT, the FCC and the ACMA all
+            // grant that grid.
+            //
+            // The wider claims are deliberately absent. Above 27.405 is the
+            // "freeband", which no administration grants to anybody; the UK's
+            // second block at 27.60125–27.99125 is a national arrangement and
+            // belongs in that operator's own `bandplan.json`, which is what
+            // the file is for.
+            Band::M11 => Some((26_965_000.0, 27_405_000.0)),
             Band::M10 => Some((28_000_000.0, 29_700_000.0)),
             Band::M6 => by_region(
                 (50_000_000.0, 52_000_000.0),
@@ -255,6 +371,11 @@ impl Band {
                 (5_650_000_000.0, 5_925_000_000.0),
                 (5_650_000_000.0, 5_925_000_000.0),
             ),
+            // 3 cm. The one microwave band the three regions agree on exactly,
+            // 10.0 to 10.5 GHz throughout — though several national licences
+            // stop at 10.45 or carve the middle out, which is what a
+            // hand-edited `bandplan.json` is for.
+            Band::Cm3 => Some((10_000_000_000.0, 10_500_000_000.0)),
             Band::Gen => None,
         }
     }
@@ -289,6 +410,9 @@ impl Band {
             Band::M17 => (18_120_000.0, Mode::Usb),
             Band::M15 => (21_250_000.0, Mode::Usb),
             Band::M12 => (24_940_000.0, Mode::Usb),
+            // Channel 25, the agreed 11 m digital calling channel — and the
+            // one part of the band a program like this one is any use on.
+            Band::M11 => (27_245_000.0, Mode::Usb),
             Band::M10 => (28_400_000.0, Mode::Usb),
             Band::M6 => (50_150_000.0, Mode::Usb),
             // 70.200 is the 4 m SSB/CW calling frequency, in the narrow-band
@@ -318,6 +442,9 @@ impl Band {
             Band::Cm13 => (2_320_200_000.0, Mode::Usb),
             Band::Cm9 => (3_400_100_000.0, Mode::Usb),
             Band::Cm6 => (5_760_100_000.0, Mode::Usb),
+            // The 3 cm narrow-band calling frequency, and the same one
+            // everywhere: 10368.100 is where a 3 cm contact starts.
+            Band::Cm3 => (10_368_100_000.0, Mode::Usb),
             Band::Gen => (7_200_000.0, Mode::Am),
         }
     }
@@ -326,6 +453,98 @@ impl Band {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Issue #326: an IC-905 carries Icom's 10 GHz transverter inside the
+    /// radio, so 3 cm is a band it *has* rather than one reached through the
+    /// transverter table — and it has to be on the band bar like any other.
+    #[test]
+    fn three_centimetres_is_a_band_in_every_region() {
+        for r in Region::ALL {
+            assert_eq!(
+                Band::Cm3.edges_in(r),
+                Some((10_000_000_000.0, 10_500_000_000.0)),
+                "3 cm in {r:?}"
+            );
+            assert_eq!(Band::Cm3.label_in(r), "3CM");
+        }
+        // The narrow-band calling frequency, which is where a 3 cm contact
+        // starts wherever you are.
+        assert_eq!(Band::Cm3.default_entry(), (10_368_100_000.0, crate::Mode::Usb));
+        // On the bar between 6 cm and general coverage, and nowhere else.
+        assert_eq!(Band::ALL.iter().filter(|b| **b == Band::Cm3).count(), 1);
+        assert!(Band::Cm3.index() > Band::Cm6.index());
+        assert!(Band::Cm3.index() < Band::Gen.index());
+    }
+
+    /// Issue #396: 11 m is on the bar so it can be tuned and listened to, and
+    /// it is not an amateur band — which is a different claim, and the one the
+    /// transmit lockout reads.
+    #[test]
+    fn eleven_metres_is_a_band_but_not_an_amateur_one() {
+        for r in Region::ALL {
+            assert_eq!(
+                Band::M11.edges_in(r),
+                Some((26_965_000.0, 27_405_000.0)),
+                "11 m in {r:?} is not the 40-channel allocation"
+            );
+            assert_eq!(Band::M11.label_in(r), "11M");
+        }
+        assert!(!Band::M11.is_amateur());
+        assert!(!Band::Gen.is_amateur());
+        // ...and it is the only band on the bar that is not, so nothing else
+        // has quietly lost its transmit permission.
+        for b in Band::ALL {
+            assert_eq!(
+                b.is_amateur(),
+                !matches!(b, Band::M11 | Band::Gen),
+                "{b:?} is on the wrong side of is_amateur"
+            );
+        }
+        // Between 12 m and 10 m on the bar, where its frequencies are.
+        assert!(Band::M11.index() > Band::M12.index());
+        assert!(Band::M11.index() < Band::M10.index());
+        // Channel 25, the digital calling channel, and inside the band.
+        assert_eq!(Band::M11.default_entry(), (27_245_000.0, crate::Mode::Usb));
+    }
+
+    /// The stored index is the declaration order, which is append-only: the
+    /// nine bands a WSPR hop mask can name have to keep the bit positions they
+    /// have had since the setting existed, or an upgrade silently rearranges
+    /// somebody's hop cycle (issue #396).
+    #[test]
+    fn the_wire_index_is_the_declaration_order_and_never_moves() {
+        // A bijection onto 0..N, so no two bands share a bit and none is
+        // unreachable.
+        let mut seen = vec![false; Band::ALL.len()];
+        for b in Band::ALL {
+            let i = b.wire_index();
+            assert!(!seen[i], "{b:?} shares index {i}");
+            seen[i] = true;
+        }
+        assert!(seen.iter().all(|s| *s));
+        // And the positions that are actually in a saved file are the ones the
+        // first release had, in that order.
+        for (i, b) in [
+            Band::M160,
+            Band::M80,
+            Band::M60,
+            Band::M40,
+            Band::M30,
+            Band::M20,
+            Band::M17,
+            Band::M15,
+            Band::M12,
+            Band::M10,
+            Band::M6,
+            Band::M2,
+            Band::Gen,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            assert_eq!(b.wire_index(), i, "{b:?} moved");
+        }
+    }
 
     /// Region 1 is the default, and it must still be exactly the band table
     /// sdroxide shipped before regions existed — an installation that never

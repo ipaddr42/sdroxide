@@ -37,7 +37,7 @@ use std::time::SystemTime;
 
 use sdroxide_deepcw::{Tuner, Worker};
 use sdroxide_dsp::{CwRx, CwTx, MonoResampler};
-use sdroxide_types::{CwStatus, DigiConfig, DigiStatus, Mode, QsoStep, TranscriptLine};
+use sdroxide_types::{CwEngine, CwStatus, DigiConfig, DigiStatus, Mode, QsoStep, TranscriptLine};
 
 use crate::DigiEngine;
 use crate::controller::DigiAction;
@@ -209,9 +209,16 @@ pub struct CwController {
     /// and replaced wholesale each time, so the last word or two visibly firms
     /// up instead of appearing late.
     rx_pending: String,
-    /// `None` only if the model would not load, in which case the classic
-    /// decoder's text is used instead of leaving the panel blank.
+    /// The neural decoder, when it is the engine in force and the model
+    /// loaded. `None` means the classic decoder's text is what the panel shows
+    /// — either because the operator asked for it ([`DigiConfig::cw_engine`],
+    /// the only way to copy the accented letters) or because the model would
+    /// not load, in which case falling back beats leaving the panel blank.
     deep: Option<Worker>,
+    /// The model would not load, so the neural engine is unavailable however it
+    /// is configured. Remembered so the failure is logged once rather than on
+    /// every pass through [`CwController::set_config`].
+    deep_failed: bool,
     tuner: Tuner,
     deep_scratch: Vec<f32>,
 
@@ -254,19 +261,27 @@ impl CwController {
         let pitch = cfg.cw_pitch_hz;
         let mut rx = CwRx::new(CW_RATE, pitch);
         rx.set_speed_lock(cfg.cw_speed_lock.then_some(cfg.cw_wpm));
-        let deep = match Worker::new() {
-            Ok(w) => Some(w),
-            Err(e) => {
-                tracing::error!("DeepCW unavailable, falling back to the timing decoder: {e}");
-                None
-            }
-        };
+        // Built only when it is the engine the operator asked for: it is a
+        // neural model to load and hold, and a station set to the timing
+        // decoder should not be paying for one it will never run.
+        let mut deep_failed = false;
+        let deep = (cfg.cw_engine == CwEngine::Neural)
+            .then(|| match Worker::new() {
+                Ok(w) => Some(w),
+                Err(e) => {
+                    tracing::error!("DeepCW unavailable, falling back to the timing decoder: {e}");
+                    deep_failed = true;
+                    None
+                }
+            })
+            .flatten();
         CwController {
             rx,
             rx_rs: MonoResampler::new(tap_rate, CW_RATE),
             rx_text: String::new(),
             rx_pending: String::new(),
             deep,
+            deep_failed,
             tuner: Tuner::new(tap_rate, pitch as f64),
             deep_scratch: Vec::new(),
             tx: CwTx::new(CW_RATE, pitch as f64, cfg.cw_wpm),
@@ -312,6 +327,29 @@ impl CwController {
             self.rx_text.drain(..cut);
         }
         self.status_dirty = true;
+    }
+
+    /// Put the decoder the configuration now asks for in circuit.
+    ///
+    /// Switching to the timing decoder drops the model: it is the expensive
+    /// half of this controller and nothing is going to read its output.
+    /// Switching back builds one — the first attempt may be the only one that
+    /// says anything, because a model that will not load will not load twice.
+    /// Either way the tail the old decoder had not settled on is dropped: it
+    /// belongs to a decoder that is no longer running.
+    fn set_engine(&mut self) {
+        match self.cfg.cw_engine {
+            CwEngine::Timing => self.deep = None,
+            CwEngine::Neural if self.deep.is_none() && !self.deep_failed => match Worker::new() {
+                Ok(w) => self.deep = Some(w),
+                Err(e) => {
+                    tracing::error!("DeepCW unavailable, falling back to the timing decoder: {e}");
+                    self.deep_failed = true;
+                }
+            },
+            CwEngine::Neural => {}
+        }
+        self.rx_pending.clear();
     }
 
     /// Collect whatever the model finished since the last poll.
@@ -666,7 +704,11 @@ impl DigiEngine for CwController {
         }
         self.rx.set_speed_lock(cfg.cw_speed_lock.then_some(cfg.cw_wpm));
         self.tx.set_params(cfg.cw_pitch_hz as f64, cfg.cw_wpm, cfg.cw_farnsworth_wpm);
+        let engine_moved = cfg.cw_engine != self.cfg.cw_engine;
         self.cfg = cfg;
+        if engine_moved {
+            self.set_engine();
+        }
         self.status_dirty = true;
     }
 
@@ -790,20 +832,34 @@ mod tests {
 
     /// Settle the receive window: the model decodes on its own thread, so the
     /// text a test wants has to be waited for rather than read straight back.
+    ///
+    /// Waited for on the decoder's own account rather than by watching the text
+    /// stop changing. "The display has not moved for a second" is not the same
+    /// claim as "the decoder has finished", and on a machine running the rest
+    /// of this suite beside it they come apart: a decode is tens of
+    /// milliseconds of arithmetic but nothing bounds how long that thread waits
+    /// to be scheduled, so a pause between two committed words outlasted the
+    /// window and this returned half a transmission. `Worker::queued` answers
+    /// the question that was actually being asked.
     fn settle(c: &mut CwController) -> String {
         if let Some(deep) = c.deep.as_ref() {
             deep.flush();
+            // Everything pushed — the whole transmission, and the flush behind
+            // it — is through the model by the time this reaches zero, and
+            // whatever it produced is already on the update channel.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+            while deep.queued() > 0 && std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
         }
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
-        let mut idle = 0;
-        while std::time::Instant::now() < deadline && idle < 100 {
+        // Now drain it into the display. Nothing further is coming, so this
+        // converges immediately; the loop is here because `poll` moves one
+        // update at a time.
+        for _ in 0..100 {
             let before = c.rx_display();
             c.poll(SystemTime::now(), 14_030_000.0);
             if c.rx_display() == before {
-                idle += 1;
-                std::thread::sleep(std::time::Duration::from_millis(10));
-            } else {
-                idle = 0;
+                break;
             }
         }
         c.rx_display().trim().to_string()

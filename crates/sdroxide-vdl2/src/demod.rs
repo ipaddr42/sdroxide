@@ -135,9 +135,11 @@ pub const CUTOFF_SYMS: f64 = 1.2;
 /// # It is also the channel filter
 ///
 /// The downconverter's own decimating low-pass is designed against its output
-/// rate, not against a 50 kHz channel raster, so a neighbouring VDL2 channel is
-/// not necessarily outside it. This is what puts it outside: a neighbour sits
-/// four and three quarter symbol rates away, far into this filter's stopband.
+/// rate, which is ten times a channel wide, so a neighbouring VDL2 channel is
+/// well inside it. This is what puts it outside: the plan is the whole 25 kHz
+/// raster, a neighbour sits two and a third symbol rates away — its own
+/// shoulder a symbol and a half away — and both are far into this filter's
+/// stopband.
 ///
 /// The cutoff is wider than the signal on purpose. A receiver whose clock is a
 /// few tens of parts per million out — which an uncalibrated one is — slides the
@@ -295,8 +297,18 @@ impl<'a> SymbolReader<'a> {
         }
     }
 
-    /// The next symbol's three bits, least significant first, or `None` past
-    /// the end of what the buffer can be filtered over.
+    /// The next symbol's three bits, **most significant first**, or `None`
+    /// past the end of what the buffer can be filtered over.
+    ///
+    /// Which end of the symbol goes first is not a detail: it decides every bit
+    /// of the header and every octet of the frame, and reading it backwards
+    /// produces a bit stream that is perfectly self-consistent and means
+    /// nothing. It was backwards until issue #265 — the transmitter in
+    /// `crate::tx` packed symbols the same way round, so the two agreed with
+    /// each other and with nothing on the air. Measured against a recording:
+    /// most-significant-first makes the header's parity check out with **no
+    /// correction** on every burst in it, and least-significant-first needs a
+    /// repair on every one and yields lengths that are nonsense.
     pub fn next_symbol(&mut self) -> Option<[u8; 3]> {
         self.pos += self.sps;
         if self.pos.floor() as usize + self.rrc.half() + 1 >= self.iq.len() {
@@ -323,7 +335,7 @@ impl<'a> SymbolReader<'a> {
 
         let k = (kr as i32 & 7) as usize;
         let v = GRAY[k];
-        Some([v & 1, (v >> 1) & 1, (v >> 2) & 1])
+        Some([(v >> 2) & 1, (v >> 1) & 1, v & 1])
     }
 
     /// Read `n` symbols' worth of bits, stopping early at the end of the burst.
@@ -399,7 +411,7 @@ mod tests {
     }
 
     /// The receive filter passes the whole signal and stops a neighbouring VDL2
-    /// channel, which sits four and three quarter symbol rates away.
+    /// channel, which sits two and a third symbol rates away.
     ///
     /// Measured rather than assumed: the cutoff, the tap count and the taper are
     /// numbers that have to earn their place, and this is where they do it.
@@ -430,12 +442,15 @@ mod tests {
         // ...and past the cutoff it goes, so a mistuned receiver still has the
         // signal inside the passband but the noise does not come with it.
         assert!(db(CUTOFF_SYMS + 0.6) < -20.0, "the stopband is only {} dB", db(1.8));
-        // A VDL2 neighbour is 50 kHz away, which is nearly five symbol rates:
-        // this is what keeps a strong station on the next channel out of the
-        // decision, since the downconverter ahead of it is designed against its
-        // own output rate rather than against a 50 kHz raster.
-        let neighbour = 50_000.0 / SYMBOL_RATE;
+        // A VDL2 neighbour is 25 kHz away, and the part of it that comes
+        // nearest is its own shoulder, (1 + alpha)/2 symbol rates below its
+        // centre. This is what keeps a strong station on the next channel out
+        // of the decision, since the downconverter ahead of it is designed
+        // against its own output rate rather than against the channel raster.
+        let neighbour = 25_000.0 / SYMBOL_RATE;
         assert!(db(neighbour) < -60.0, "the neighbour is only {} dB down", db(neighbour));
+        let shoulder = neighbour - 0.5 * (1.0 + ALPHA);
+        assert!(db(shoulder) < -40.0, "the neighbour's shoulder is only {} dB down", db(shoulder));
     }
 
     /// The filter's phases really are sub-sample positions of one prototype:

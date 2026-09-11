@@ -1,0 +1,39 @@
+[package]
+name = "sdroxide-ais"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# Native-only: the AIS decoder — the ship-reporting system on two 25 kHz
+# channels either side of 162.000 MHz. Not linked by the wasm client; it runs
+# server-side in the engine, off the raw I/Q, like the ADS-B and VDL2 decoders.
+# The types the panel draws live in `sdroxide-types`.
+#
+# No third-party AIS crate is used. The ones on crates.io decode the *NMEA*
+# layer — an `!AIVDM` sentence that some other receiver already produced — and
+# none of them carries a demodulator, which is the half that actually needed
+# writing. So, like every other decoder in this tree, the whole stack is written
+# from the published standard: ITU-R M.1371-5 (the AIS technical
+# characteristics) for the physical layer, the packet structure and every
+# message layout, IEC 61162-1 for the six-bit armouring convention its field
+# tables are stated in, and IALA Guideline 1082 for the aid-to-navigation type
+# list. Sources are cited per module.
+#
+# Cross-checked against the observable behaviour of `gnuais` and `rtl-ais`, but
+# no code came from either: both are GPL-2.0 and a port would have been a
+# licence event needing a PROVENANCE.md.
+#
+# `sdroxide-ax25` is a dependency for one function. The AIS frame check sequence
+# is CRC-16/X.25 — reflected 0x8408, initialised 0xFFFF, residue 0xF0B8 — which
+# is bit for bit what that crate already implements and tests against catalogue
+# values and a captured frame. Nothing else carries over: AIS has its own
+# framing constants, its own slot structure and a payload that shares nothing
+# with an AX.25 address field.
+
+[dependencies]
+sdroxide-types.workspace = true
+sdroxide-dsp.workspace = true
+sdroxide-ax25.workspace = true
+num-complex.workspace = true
+crossbeam-channel.workspace = true
+tracing.workspace = true

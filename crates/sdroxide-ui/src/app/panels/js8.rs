@@ -78,10 +78,23 @@ fn js8_station_decode(
     }
 }
 
-/// A heard station's last transmission on one line: the command, then the text.
+/// A heard station's last transmission on one line: who it was for, then the
+/// command, then the text.
+///
+/// The recipient comes first because without it a directed message is
+/// ambiguous — on a busy channel half a dozen stations answer the same
+/// heartbeat within a minute, and `HEARTBEAT SNR -02` alone says nothing about
+/// which of them was being answered. This is the order JS8Call prints too.
 fn js8_msg_summary(m: &sdroxide_types::Js8Msg) -> String {
     let mut s = String::new();
+    let to = m.to.trim();
+    if !to.is_empty() {
+        s.push_str(to);
+    }
     if let Some(c) = &m.cmd {
+        if !s.is_empty() {
+            s.push(' ');
+        }
         s.push_str(c);
     }
     let text = m.text.trim();
@@ -163,14 +176,65 @@ impl SdroxideApp {
         // ── Header: speed, tuning, queue depth ──────────────────────────────
         ui.horizontal_wrapped(|ui| {
             ui.label(RichText::new("JS8").size(11.0).strong().color(crate::theme::CYAN()));
-            for speed in Js8Speed::ALL {
-                if crate::chrome::chip(ui, js8.speed == speed, speed.label()).clicked()
-                    && js8.speed != speed
+            let multi = self.digi_cfg_edit.js8_multi_decode;
+            // Slowest first: these are one dial from 30-second slots 25 Hz wide
+            // to 6-second slots 160 Hz wide, and the declaration order runs
+            // NORMAL FAST TURBO SLOW, which is the order JS8Call happened to
+            // ship the submodes in and a scale of nothing (issue #389).
+            for speed in Js8Speed::UI_ORDER {
+                // A lit chip is a speed being *decoded*, which with MULTI on is
+                // all four of them — the row is the honest answer to "what am I
+                // hearing", and a single lit chip while four waveforms were
+                // being read said otherwise. Which one goes out is then the
+                // marked one: it is still one speed, and the mark has to
+                // survive the whole row being lit.
+                let tx = js8.speed == speed;
+                let face = if multi && tx {
+                    format!("▸{}", speed.label())
+                } else {
+                    speed.label().to_string()
+                };
+                if crate::chrome::chip(ui, multi || tx, face)
+                    .on_hover_text(if multi && tx {
+                        format!(
+                            "Every speed is being decoded; ▸ marks {}, the one you transmit at",
+                            speed.label()
+                        )
+                    } else if multi {
+                        format!(
+                            "Every speed is being decoded. Click to transmit at {} instead",
+                            speed.label()
+                        )
+                    } else {
+                        format!("Transmit and decode at {}", speed.label())
+                    })
+                    .clicked()
+                    && !tx
                 {
                     self.digi_cfg_edit.js8_speed = speed;
                     cmds.push(Command::SetDigiConfig(self.digi_cfg_edit.clone()));
                 }
             }
+            // Decoding all four rather than the one being worked (issue #358).
+            // Beside the speed chips because that is the setting it qualifies:
+            // without it a station on another speed is simply not there, and
+            // nothing on this screen would say so — but set apart from them,
+            // because it is not a fifth speed and a row of five identical chips
+            // reads as one (issue #389).
+            ui.add_space(10.0);
+            if crate::chrome::chip(ui, multi, "MULTI")
+                .on_hover_text(
+                    "Decode every JS8 speed, not only the one you transmit at. The four \
+                     speeds share the sub-band and are four different waveforms, so without \
+                     this a station on another speed is invisible — and an exchange between \
+                     two speeds cannot happen at all. Costs about four times the receive CPU.",
+                )
+                .clicked()
+            {
+                self.digi_cfg_edit.js8_multi_decode = !multi;
+                cmds.push(Command::SetDigiConfig(self.digi_cfg_edit.clone()));
+            }
+            ui.add_space(6.0);
             ui.label(RichText::new(format!("{audio_hz:.0} Hz")).monospace());
             if crate::chrome::chip(ui, false, "−").clicked() {
                 cmds.push(Command::SetDigiAudioFreq((audio_hz - 10.0).clamp(200.0, 3500.0)));
@@ -783,6 +847,7 @@ impl SdroxideApp {
     /// turns into the reply it expects.
     fn js8_conversation(&mut self, ui: &mut egui::Ui, js8: &sdroxide_types::Js8Status) {
         let me = self.js8_me(js8);
+        let multi = self.digi_cfg_edit.js8_multi_decode;
         let mut pick: Option<(String, Option<String>)> = None;
         egui::ScrollArea::vertical()
             .id_salt("js8-convo")
@@ -808,6 +873,23 @@ impl SdroxideApp {
                                 ui.label(
                                     RichText::new(format!("{h:02}:{mi:02}")).monospace().weak(),
                                 );
+                                // Which of the four waveforms carried this.
+                                // Only where it is a question: with one speed
+                                // running every row is that speed and a column
+                                // saying so is noise, but with MULTI on the
+                                // list was the one place that did not say
+                                // (issue #389). A row decoded before the
+                                // setting was turned off keeps its tag, so
+                                // nothing already on screen quietly loses the
+                                // answer it was showing.
+                                if multi || m.speed != js8.speed {
+                                    ui.label(
+                                        RichText::new(m.speed.tag())
+                                            .monospace()
+                                            .color(crate::theme::PINK()),
+                                    )
+                                    .on_hover_text(format!("Decoded at {}", m.speed.label()));
+                                }
                                 if to_me {
                                     ui.label(RichText::new("★").color(crate::theme::YELLOW()));
                                 }
@@ -821,6 +903,22 @@ impl SdroxideApp {
                                         },
                                     ),
                                 );
+                                // Who it was addressed to. Without this a
+                                // directed message reads as if it were meant
+                                // for everyone: on a busy channel several
+                                // stations answer the same heartbeat inside a
+                                // minute and every one of them says
+                                // "HEARTBEAT SNR ..".
+                                let to = m.to.trim();
+                                if !to.is_empty() {
+                                    ui.label(RichText::new(to).monospace().strong().color(
+                                        if to_me {
+                                            crate::theme::YELLOW()
+                                        } else {
+                                            crate::theme::GREEN()
+                                        },
+                                    ));
+                                }
                                 if let Some(c) = &m.cmd {
                                     ui.label(
                                         RichText::new(c).monospace().color(crate::theme::PINK()),
@@ -1093,6 +1191,7 @@ mod js8_panel_tests {
             frames: 1,
             complete: true,
             to_me: true,
+            speed: sdroxide_types::Js8Speed::Normal,
         }
     }
 
@@ -1179,11 +1278,25 @@ mod js8_panel_tests {
     fn a_stations_last_word_reads_as_one_line() {
         let mut m = msg(Some("HB"), "@ALLCALL");
         m.text = "EM73".into();
-        assert_eq!(js8_msg_summary(&m), "HB EM73");
+        assert_eq!(js8_msg_summary(&m), "@ALLCALL HB EM73");
         m.cmd = None;
-        assert_eq!(js8_msg_summary(&m), "EM73");
+        assert_eq!(js8_msg_summary(&m), "@ALLCALL EM73");
         // Still arriving, and the row has to say so.
         m.complete = false;
-        assert_eq!(js8_msg_summary(&m), "EM73…");
+        assert_eq!(js8_msg_summary(&m), "@ALLCALL EM73…");
+    }
+
+    #[test]
+    fn a_reply_names_the_station_it_answers() {
+        // The point of issue #372: on a busy channel a dozen stations answer
+        // the same heartbeat, and "HEARTBEAT SNR -02" on its own does not say
+        // which of them was being answered.
+        let mut m = msg(Some("HEARTBEAT SNR"), "OH8STN");
+        m.text = "-02".into();
+        assert_eq!(js8_msg_summary(&m), "OH8STN HEARTBEAT SNR -02");
+        // An undirected transmission has no recipient to name.
+        let mut free = msg(None, "");
+        free.text = "GOOD MORNING FROM VIENNA".into();
+        assert_eq!(js8_msg_summary(&free), "GOOD MORNING FROM VIENNA");
     }
 }

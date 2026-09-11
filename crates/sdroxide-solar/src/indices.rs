@@ -246,11 +246,17 @@ fn band_group(band: sdroxide_types::Band) -> Option<&'static str> {
         // solar-flux verdict knows anything about.
         Band::M160
         | Band::M60
+        // 11 m is inside the range the "12m-10m" verdict covers, but it is not
+        // one of the bands that verdict is published *about* — it is not an
+        // amateur band at all — and quoting an amateur forecast at it would be
+        // claiming an authority the source does not have.
+        | Band::M11
         | Band::M6
         | Band::M4
         | Band::M2
         | Band::M125
         | Band::M70
+        | Band::Cm3
         | Band::Cm33
         | Band::Cm23
         | Band::Cm13

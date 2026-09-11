@@ -78,6 +78,9 @@ pub struct SmartSdrSource {
     trace: sdroxide_smartsdr::Trace,
     /// Warning captured while opening, surfaced in the UI.
     warning: Option<String>,
+    /// Conjugate what the radio sends, mirroring the spectrum — see
+    /// [`sdroxide_types::SmartSdrConfig::swap_iq`].
+    swap_iq: bool,
 }
 
 impl SmartSdrSource {
@@ -155,6 +158,7 @@ impl SmartSdrSource {
             last_telem: None,
             trace,
             warning,
+            swap_iq: cfg.swap_iq,
         })
     }
 
@@ -229,8 +233,12 @@ impl IqSource for SmartSdrSource {
             std::thread::sleep(Duration::from_millis(2));
             return Ok(0);
         }
+        // Negating Q mirrors the spectrum about the panadapter centre. Receive
+        // only: transmit is audio the radio modulates itself, so there is no
+        // second direction here to keep in step (issue #368).
+        let q = if self.swap_iq { -1.0 } else { 1.0 };
         for p in 0..pairs {
-            buf[p] = Complex32::new(self.scratch[2 * p], self.scratch[2 * p + 1]);
+            buf[p] = Complex32::new(self.scratch[2 * p], q * self.scratch[2 * p + 1]);
         }
         Ok(pairs)
     }

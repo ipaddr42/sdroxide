@@ -79,10 +79,29 @@ const SPAN_SYMS: f64 = 8.0;
 
 /// The bit stream a burst carries: the header, then the interleaved and
 /// Reed-Solomon-coded data field, scrambled as one run.
+///
+/// The frame goes into the field the way it goes out on the air — inside two
+/// `0x7E` flags, bit-stuffed, and padded to a whole octet with zeros (see
+/// [`crate::hdlc`]). The length the header states is the length of *that*, in
+/// bits, before the padding. Until issue #265 this wrapped nothing and stated
+/// the bare frame's length, which made a generator that agreed with this
+/// decoder and with no transmitter in the sky.
 pub fn burst_bits(frame: &[u8], order: InterleaveOrder) -> Vec<u8> {
-    let field = block::encode(frame, order);
+    let framed = crate::hdlc::frame_bits(frame);
+    let mut field_bits = framed.clone();
+    // The Reed-Solomon layer works in octets, so the last one is filled out.
+    // With zeros: measured off the air on every frame in the issue #265
+    // recording that carried any padding at all.
+    while !field_bits.len().is_multiple_of(8) {
+        field_bits.push(0);
+    }
+    let data: Vec<u8> = field_bits
+        .chunks_exact(8)
+        .map(|c| c.iter().enumerate().fold(0u8, |o, (k, &b)| o | ((b & 1) << k)))
+        .collect();
+    let field = block::encode(&data, order);
     let mut bits = Vec::with_capacity(header::HEADER_BITS + field.len() * 8);
-    bits.extend_from_slice(&header::encode((frame.len() * 8) as u32, 0));
+    bits.extend_from_slice(&header::encode(framed.len() as u32, 0));
     for &o in &field {
         for k in 0..8 {
             bits.push((o >> k) & 1);
@@ -103,8 +122,11 @@ pub fn burst_increments(frame: &[u8], ramp_syms: usize, order: InterleaveOrder) 
     let bits = burst_bits(frame, order);
     let mut inc = vec![0u8; ramp_syms];
     inc.extend_from_slice(&UW_INCREMENTS);
+    // Most significant bit of the symbol first — see
+    // `SymbolReader::next_symbol`, which is the half of this that has to agree
+    // with a real transmitter rather than with this one.
     for c in bits.chunks_exact(3) {
-        let v = c[0] | (c[1] << 1) | (c[2] << 2);
+        let v = (c[0] << 2) | (c[1] << 1) | c[2];
         inc.push(UNGRAY[v as usize]);
     }
     inc
@@ -116,6 +138,23 @@ pub fn burst_increments(frame: &[u8], ramp_syms: usize, order: InterleaveOrder) 
 /// on one channel is written the way it happens.
 pub fn modulate_at(frame: &[u8], p: &TxParams, at: f64, out: &mut Vec<Complex32>) {
     let inc = burst_increments(frame, p.ramp_syms, InterleaveOrder::RoundRobin);
+    modulate_increments_at(&inc, p, at, out);
+}
+
+/// [`modulate_at`] from phase increments that are already in hand, rather than
+/// from a frame this module encoded.
+///
+/// What that is for: a burst *captured off the air* can be replayed through the
+/// whole receiver by carrying its symbols rather than its samples — a hundred
+/// and fifty bytes instead of a hundred kilobytes — and everything from the
+/// symbol decision inwards is then tested against a real transmitter instead of
+/// against this one. That distinction is the whole of issue #265: the encoder
+/// above and the decoder agreed with each other about the bit order inside a
+/// symbol and about there being no HDLC wrapper, and were both wrong.
+///
+/// `inc` includes the ramp-up and the synchronisation word; `p.ramp_syms` says
+/// how many of the leading symbols the envelope ramps over.
+pub fn modulate_increments_at(inc: &[u8], p: &TxParams, at: f64, out: &mut Vec<Complex32>) {
     let sps = p.sample_rate / SYMBOL_RATE * (1.0 + p.clock_ppm * 1e-6);
     let span = (SPAN_SYMS * sps).ceil() as isize;
 
@@ -239,21 +278,25 @@ mod tests {
     }
 
     /// The bit stream is the header, then the coded field, and it is exactly as
-    /// long as the header's own length field implies.
+    /// long as the header's own length field implies — where that length is the
+    /// *flagged and stuffed* field's, not the bare frame's (issue #265).
     #[test]
     fn the_bit_stream_is_the_length_the_header_claims() {
         for n in [11usize, 40, 100, 250] {
             let frame: Vec<u8> = (0..n).map(|i| i as u8).collect();
             let bits = burst_bits(&frame, InterleaveOrder::RoundRobin);
-            let l = block::layout(n);
+            let framed = crate::hdlc::frame_bits(&frame);
+            let l = block::layout(framed.len().div_ceil(8));
             let want = header::HEADER_BITS + l.total_octets * 8;
             assert_eq!(bits.len(), want.next_multiple_of(3), "{n} octets");
 
-            // And the header at the front really says the frame's length.
+            // And the header at the front really says how long the field is.
             let mut head = bits[..header::HEADER_BITS].to_vec();
             Lfsr::new().apply(&mut head);
             let h = header::decode(&head).expect("clean header");
-            assert_eq!(h.trlen_bits as usize, n * 8);
+            assert_eq!(h.trlen_bits as usize, framed.len());
+            // Which is the frame, both flags, and whatever was stuffed.
+            assert!(h.trlen_bits as usize >= n * 8 + 16);
         }
     }
 

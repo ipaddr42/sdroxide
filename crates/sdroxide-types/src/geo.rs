@@ -33,6 +33,40 @@ pub fn grid_to_latlon(grid: &str) -> Option<(f64, f64)> {
     Some((lat, lon))
 }
 
+/// The 6-character Maidenhead locator a position falls in.
+///
+/// The inverse of [`grid_to_latlon`], and the reason it exists: the public
+/// receiver directories publish a position two different ways — a KiwiSDR
+/// states a locator, a SpyServer states latitude and longitude — and a station
+/// reporting what it heard through somebody else's antenna has to name where
+/// that antenna is in the one form PSK Reporter and WSPRnet accept.
+///
+/// Six characters rather than four because that is what the sources carry and
+/// what both networks take; a caller wanting four can truncate. Positions
+/// outside the sphere are folded into it rather than refused: a latitude of
+/// exactly +90 belongs in the last square, not in the one after it.
+pub fn latlon_to_grid(lat: f64, lon: f64) -> String {
+    // Shifted into the 0..360 / 0..180 corner the locator system counts from,
+    // then clamped a hair inside so that the poles and the antimeridian land in
+    // the last square instead of one past its end.
+    let lon = (lon + 180.0).clamp(0.0, 360.0 - 1e-9);
+    let lat = (lat + 90.0).clamp(0.0, 180.0 - 1e-9);
+    let field_lon = (lon / 20.0) as usize;
+    let field_lat = (lat / 10.0) as usize;
+    let sq_lon = ((lon % 20.0) / 2.0) as usize;
+    let sq_lat = (lat % 10.0) as usize;
+    let sub_lon = ((lon % 2.0) / (2.0 / 24.0)) as usize;
+    let sub_lat = ((lat % 1.0) / (1.0 / 24.0)) as usize;
+    let mut s = String::with_capacity(6);
+    s.push((b'A' + field_lon as u8) as char);
+    s.push((b'A' + field_lat as u8) as char);
+    s.push((b'0' + sq_lon as u8) as char);
+    s.push((b'0' + sq_lat as u8) as char);
+    s.push((b'a' + sub_lon.min(23) as u8) as char);
+    s.push((b'a' + sub_lat.min(23) as u8) as char);
+    s
+}
+
 const EARTH_R_KM: f64 = 6371.0;
 
 /// Great-circle distance in km between two grids.
@@ -113,6 +147,22 @@ mod tests {
         assert!((lat - 53.5).abs() < 0.6);
         assert!((lon - 11.0).abs() < 1.1, "{lon}");
         assert!(grid_to_latlon("XX").is_none());
+    }
+
+    /// The inverse has to land back in the square it started from, and the
+    /// edges of the world are where an off-by-one shows: +90/+180 belong in the
+    /// last square, not one past its end.
+    #[test]
+    fn grid_from_latlon_round_trips() {
+        for g in ["FN42ma", "JO53gk", "JN88ec", "DO30db", "AA00aa", "RR99xx"] {
+            let (lat, lon) = grid_to_latlon(g).unwrap();
+            assert_eq!(latlon_to_grid(lat, lon), g.to_string(), "{g}");
+        }
+        // The corners of the sphere, folded in rather than refused.
+        assert_eq!(latlon_to_grid(-90.0, -180.0), "AA00aa");
+        assert_eq!(latlon_to_grid(90.0, 180.0), "RR99xx");
+        // And a plain position: Vienna is JN88.
+        assert!(latlon_to_grid(48.2, 16.37).starts_with("JN88"), "{}", latlon_to_grid(48.2, 16.37));
     }
 
     #[test]

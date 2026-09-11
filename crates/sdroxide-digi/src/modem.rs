@@ -11,7 +11,18 @@ use sdroxide_types::{Decode, Mode};
 use crate::params::{AUDIO_MAX_HZ, AUDIO_MIN_HZ};
 
 const SYNC_MIN: f32 = 1.5;
-const MAX_CAND: usize = 120;
+/// How many sync candidates a slot's decode is allowed to try.
+///
+/// The list is sorted by sync power and cut here, so on a quiet band this is
+/// never reached and on a busy one it decides which of the weak signals are
+/// never looked at — which is exactly the shape of issue #307, where the gap
+/// against WSJT-X grew with the number of stations on the band.
+///
+/// Measured on a synthetic forty-signal slot: 120 candidates found thirteen
+/// messages, 300 found fourteen and 600 found fifteen, for 9.6, 10.2 and
+/// 11.8 milliseconds of decode. A slot is fifteen seconds long, so the whole
+/// range is free and the only question is how many are looked at.
+const MAX_CAND: usize = 600;
 
 /// Which of the 77-bit message layouts a decode came from, read straight from
 /// the `i3`/`n3` type bits. Guessing this from the text can't work — free text
@@ -340,9 +351,10 @@ impl Ft8Modem {
 ///
 /// The ladder is: the DXpedition (Fox) layout when the text is written as one,
 /// then the EU VHF contest exchange, then a directed CQ, then the standard
-/// exchange, then the non-standard-callsign layout (which can only carry
-/// `RRR` / `RR73` / `73`, so a grid or report is dropped), then 13 characters
-/// of free text.
+/// exchange, then that same exchange with a non-standard callsign carried as
+/// its hash ([`pack77_hashed`]), then the non-standard-callsign layout (which
+/// spells the callsign out but can only carry `RRR` / `RR73` / `73` beside
+/// it), then 13 characters of free text.
 fn pack_message(text: &str) -> Option<([u8; 77], String)> {
     let text = text.trim().to_ascii_uppercase();
     let toks: Vec<&str> = text.split_whitespace().collect();
@@ -396,6 +408,14 @@ fn pack_message(text: &str) -> Option<([u8; 77], String)> {
         }
     }
 
+    // 3b. One compound / non-standard callsign addressed with a grid or a
+    //     signal report — neither of which the layout below has anywhere to
+    //     put. The standard layout does, so long as that callsign travels as
+    //     its hash instead of spelled out (issue #348).
+    if let Some((m, sent)) = pack77_hashed(c1, c2, payload) {
+        return Some((m, sent));
+    }
+
     // 4. One compound / non-standard callsign, the other one hashed. Only a
     //    bare RRR / RR73 / 73 fits alongside it — a grid or report is lost, so
     //    the returned text says so.
@@ -431,6 +451,82 @@ fn pack_message(text: &str) -> Option<([u8; 77], String)> {
     let free: String = text.chars().take(13).collect();
     let m = wsjt77::pack77_free_text(free.trim_end())?;
     Some((m, free.trim_end().to_string()))
+}
+
+/// Where `unpack28` stops reading a 28-bit callsign field as one of the fixed
+/// tokens (`DE`, `QRZ`, `CQ`, `CQ NNN`, `CQ XXXX`) and starts reading it as a
+/// callsign. The 4194304 values above it are 22-bit hashes; spelled-out
+/// callsigns begin above those. WSJT-X's `packjt77.f90` calls it `NTOKENS`;
+/// mfsk-core knows the same number but does not export it, and only ever
+/// *reads* the hash range — `pack28` has no arm that writes one.
+const NTOKENS: u32 = 2_063_592;
+
+/// The everyday layout with one callsign carried as its 22-bit hash rather
+/// than spelled out, which is the only way FT8 can send a report or a grid to
+/// a station whose callsign the 28-bit field cannot hold (issue #348).
+///
+/// The non-standard layout (`i3 = 4`, [`wsjt77::pack77_type4`]) spells such a
+/// callsign out in full, but it spends 58 of its 77 bits doing so and has room
+/// left for nothing but a bare `RRR` / `RR73` / `73`. So a reply to
+/// `R7KJG/QRP` that should have carried `R-12` went out as an acknowledgement
+/// with no report in it at all, and the contact stalled there. The way through
+/// is the one WSJT-X takes, and the reason the hash range exists: send
+/// `<R7KJG/QRP> F4CYH R-12` as an ordinary `i3 = 1` message whose first
+/// callsign field holds `NTOKENS + hash22`. Both ends resolve it — the far end
+/// because the hash is of its own callsign, and this one because the contact
+/// opened with a message that spelled the callsign out.
+///
+/// `None` for anything that layout should not carry, leaving the ladder in
+/// [`pack_message`] to go on to the next rung:
+///
+/// * A bare `RRR` / `RR73` / `73`, and an empty payload. Those fit the
+///   non-standard layout whole, and spelling the callsign out is worth more
+///   than the hash saves — it is what lets a third station resolve the hashes
+///   in everything around it.
+/// * Both callsigns non-standard, or neither. Hashing both would leave a
+///   message that only a station which had already heard *both* spell
+///   themselves out could read, and the everyday packer already handles
+///   neither.
+fn pack77_hashed(c1: &str, c2: &str, payload: &str) -> Option<([u8; 77], String)> {
+    if payload.is_empty() || matches!(payload, "RRR" | "RR73" | "73") {
+        return None;
+    }
+    // A callsign the operator wrote in brackets is one they are asking to have
+    // hashed; one that will not fit the 28-bit field has to be, brackets or no.
+    let (b1, b2) = (eu_vhf::bare(c1), eu_vhf::bare(c2));
+    let wants_hash = |tok: &str, bare: &str| {
+        !bare.is_empty()
+            && bare != "CQ"
+            && (tok.starts_with('<') || !wsjt77::is_standard_callsign(bare))
+    };
+    let (h1, h2) = (wants_hash(c1, b1), wants_hash(c2, b2));
+    if h1 == h2 {
+        return None;
+    }
+    let (hashed, spelled) = if h1 { (b1, b2) } else { (b2, b1) };
+    if !wsjt77::is_valid_callsign(hashed) || !wsjt77::is_standard_callsign(spelled) {
+        return None;
+    }
+    // Packed with a stand-in where the hash goes and then overwritten, rather
+    // than assembled here: the report field alone has five shapes, and the
+    // difference between a grid, a report and an R-report is mfsk-core's to
+    // know. Only the one field it cannot write is written by hand.
+    const STAND_IN: &str = "K1ABC";
+    let mut msg =
+        wsjt77::pack77(if h1 { STAND_IN } else { b1 }, if h2 { STAND_IN } else { b2 }, payload)?;
+    // WSJT-X hashes the callsign whole, `/QRP` and all (`save_hash_call`), so
+    // the hash is taken here rather than through mfsk-core's table, which
+    // strips a `/P` or `/R` suffix first — the same divergence [`eu_vhf`]
+    // keeps its own table for.
+    let n28 = NTOKENS + mfsk_core::msg::hash_table::ihashcall(hashed, 22);
+    let start = if h1 { 0 } else { 29 };
+    for i in 0..28 {
+        msg[start + i] = ((n28 >> (27 - i)) & 1) as u8;
+    }
+    let bracket = |call: &str, hash: bool| {
+        if hash { format!("<{call}>") } else { call.to_string() }
+    };
+    Some((msg, join3(&bracket(b1, h1), &bracket(b2, h2), payload)))
 }
 
 /// Pack the DXpedition (Fox) layout — `i3=0, n3=1`:
@@ -1365,6 +1461,67 @@ mod tests {
             .expect("decoded");
         assert_eq!(d.from.as_deref(), Some("AB1CD"));
         assert_eq!(d.message, "DL/W1AW <AB1CD> RR73");
+    }
+
+    /// Answering a non-standard callsign has to carry the report, which the
+    /// non-standard layout has no room for. It goes out as an ordinary message
+    /// with that callsign hashed instead, the way WSJT-X sends it — issue #348
+    /// is a reply to R7KJG/QRP whose "R-12" never left the building.
+    #[test]
+    fn a_report_to_a_compound_call_is_carried_by_hashing_it() {
+        let mut modem = Ft8Modem::new(Mode::Ft8);
+        // Both ends of a real contact know the callsign: the far end because
+        // it is its own, this end because the CQ that opened it spelled it out.
+        modem.seed_hashes(&["R7KJG/QRP".to_string()]);
+        let (burst, sent) = modem.encode_burst_12k("R7KJG/QRP F4CYH R-12", 1500.0, 0.5).unwrap();
+        assert_eq!(sent, "<R7KJG/QRP> F4CYH R-12");
+
+        let mut slot = vec![0.0f32; 6_000];
+        slot.extend_from_slice(&burst);
+        slot.resize(15 * 12_000, 0.0);
+        let buf: Vec<i16> = slot.iter().map(|&s| (s * 20_000.0) as i16).collect();
+        let d = modem
+            .decode_slot(&buf, 0, &ApHints::default(), 1500.0)
+            .into_iter()
+            .find(|d| d.message.contains("F4CYH"))
+            .expect("decoded");
+        assert_eq!(d.message, "<R7KJG/QRP> F4CYH R-12");
+        assert_eq!(d.to.as_deref(), Some("R7KJG/QRP"), "the compound call is the addressee");
+        assert_eq!(d.from.as_deref(), Some("F4CYH"));
+    }
+
+    /// The same both ways round: a non-standard station reporting to a
+    /// standard one hashes its own callsign, in the second field.
+    #[test]
+    fn a_report_from_a_compound_call_hashes_the_senders_own() {
+        let (bits, sent) = pack_message("F4CYH R7KJG/QRP -12").expect("packs");
+        assert_eq!(sent, "F4CYH <R7KJG/QRP> -12");
+        assert_eq!(msg_kind(&bits), MsgKind::Standard);
+        let mut ht = CallsignHashTable::new();
+        ht.insert("R7KJG/QRP");
+        assert_eq!(
+            wsjt77::unpack77_with_hash(&bits, &ht).as_deref(),
+            Some("F4CYH <R7KJG/QRP> -12")
+        );
+    }
+
+    /// ...and a grid, which the non-standard layout drops just as silently.
+    #[test]
+    fn a_grid_to_a_compound_call_survives_too() {
+        let (_, sent) = pack_message("R7KJG/QRP F4CYH JN18").expect("packs");
+        assert_eq!(sent, "<R7KJG/QRP> F4CYH JN18");
+    }
+
+    /// The bare acknowledgements stay on the non-standard layout, which
+    /// carries them whole *and* spells the callsign out — worth more than the
+    /// hash saves, and what everything else on the band resolves from.
+    #[test]
+    fn an_acknowledgement_to_a_compound_call_still_spells_it_out() {
+        for rpt in ["RRR", "RR73", "73"] {
+            let (bits, sent) = pack_message(&format!("R7KJG/QRP F4CYH {rpt}")).expect("packs");
+            assert_eq!(sent, format!("R7KJG/QRP <F4CYH> {rpt}"));
+            assert_eq!(msg_kind(&bits), MsgKind::NonStandard);
+        }
     }
 
     #[test]

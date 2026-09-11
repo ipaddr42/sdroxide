@@ -19,6 +19,12 @@
 //! frequency list for the whole world. Only where a mode really does operate in
 //! two places, like PSK31 and RTTY on 40 m, is a dial tagged with the regions
 //! it belongs to.
+//!
+//! 11 m has dial entries ([`CB11_DIALS`]) and deliberately no segments. It is
+//! not an amateur band and there is no band plan to transcribe: forty numbered
+//! channels, and a sub-band split invented here would be putting words in an
+//! administration's mouth. The waterfall strip already draws the allocation as
+//! CB (`widgets::bandplan`), which is what it is.
 
 use serde::{Deserialize, Serialize};
 
@@ -719,6 +725,14 @@ pub struct DigiChannel {
     /// "secondary", "DX calling". Empty for the plain calling frequency, which
     /// is the first entry in a band.
     pub note: &'static str,
+    /// True for one of the operator's own [`DigiPreset`]s rather than a
+    /// published convention.
+    ///
+    /// The distinction is not decoration. Only the operator's own entries can
+    /// be deleted, and only a published convention is a frequency the rest of
+    /// the world is listening on — so a rule that moves the dial by itself is
+    /// entitled to pick one of those and not one of these.
+    pub mine: bool,
 }
 
 impl DigiChannel {
@@ -770,29 +784,134 @@ fn wideband_by_design(mode: crate::Mode) -> bool {
     )
 }
 
+/// The 11 m (citizens' band) digital channels, by the mode each carries.
+///
+/// Not a band plan any administration publishes — CB has forty numbered
+/// channels and no modes attached to them. This is what the operators there
+/// agreed among themselves, and it is a real agreement: a JS8 station calls on
+/// channel 25 and an FT8 station on channel 26 the way a 20 m station calls on
+/// 14.078 and 14.074, and one tuned anywhere else is talking to nobody
+/// (issue #396). The channel number is carried as the note, because that is
+/// what a CB operator is actually reading off their radio.
+///
+/// **Only the channels inside the 40-channel allocation.** The lists that
+/// circulate also name 27.500 (CW/PSK31/RTTY), 27.585 (FAX), 27.635 and
+/// 27.700–27.710 (SSTV), and every one of those is above 27.405 — the
+/// "freeband", which no administration grants. sdroxide is not going to point
+/// a transmitter at them by name. They tune by hand like anything else, and a
+/// licence that does cover them (the UK's second block starts at 27.60125) is
+/// what a hand-edited `bandplan.json` and the operator's own presets are for.
+///
+/// WSPR is absent for a different reason: 27.255 is quoted for it, and
+/// nobody appears to use it.
+///
+/// Tagged as every region's. The channel grid is the same 40 channels under
+/// CEPT, the FCC and the ACMA, and the mode agreement travels with the
+/// channel numbers — but it is a European band above all, and the note says
+/// which channel rather than claiming a worldwide convention.
+const CB11_DIALS: &[(crate::Mode, f64, &str)] = &[
+    (crate::Mode::Packet, 27_235_000.0, "ch 24, FM 1200 baud"),
+    (crate::Mode::Js8, 27_245_000.0, "ch 25, calling"),
+    (crate::Mode::Sstv, 27_255_000.0, "ch 23"),
+    (crate::Mode::Ft8, 27_265_000.0, "ch 26"),
+    (crate::Mode::Packet, 27_365_000.0, "ch 36, 1200 baud"),
+    (crate::Mode::Sstv, 27_375_000.0, "ch 37"),
+];
+
 /// The conventional dial frequencies for `mode` in the station's configured
 /// region, ascending.
 pub fn digi_channels(mode: crate::Mode) -> Vec<DigiChannel> {
     digi_channels_for(mode, crate::region())
 }
 
+/// One frequency the operator added to a mode's list themselves.
+///
+/// The shipped tables are what the mode's community settled on globally; this
+/// is the local net that meets on 3.585 every Tuesday, the club's own SSTV
+/// frequency, the corner of 30 m a group actually uses. sdroxide cannot know
+/// those and should not pretend to — but having tuned one once, an operator
+/// should not have to remember the number again (issue #268).
+///
+/// Kept beside the built-in tables rather than replacing them: both appear in
+/// the same picker, and the operator's own entries are marked so it is always
+/// clear which is which.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DigiPreset {
+    /// The mode it belongs to. A frequency is only ever offered for the mode it
+    /// was saved under — 14.100 means something quite different in CW and in
+    /// PSK31.
+    pub mode: crate::Mode,
+    /// Dial frequency in Hz, on the same terms as [`DigiChannel::dial_hz`].
+    pub dial_hz: f64,
+    /// What the operator called it. Shown beside the frequency in the picker,
+    /// which is the whole reason to save one rather than type it again.
+    #[serde(default)]
+    pub note: String,
+}
+
+/// The operator's own presets, once they have been installed; empty until then.
+static INSTALLED_PRESETS: std::sync::RwLock<Option<&'static [DigiPreset]>> =
+    std::sync::RwLock::new(None);
+
+/// The frequencies the operator has added to the mode tables themselves.
+///
+/// Leaked on install for the same reason the band plan is: the lookups hand out
+/// `&'static` data, installs happen at startup and when the list is edited, and
+/// neither is in a loop.
+#[must_use]
+pub fn digi_presets() -> &'static [DigiPreset] {
+    match INSTALLED_PRESETS.read() {
+        Ok(g) => g.unwrap_or(&[]),
+        // A poisoned lock means a writer panicked mid-install. No presets is a
+        // safe answer, and far better than joining the panic from a draw loop.
+        Err(_) => &[],
+    }
+}
+
+/// Adopt `presets` as the operator's own frequency list.
+///
+/// Called by the engine at startup and whenever the list is edited, and by a
+/// remote client when the station announces its own — the presets belong to the
+/// station, like the band plan, so every screen attached to a radio offers the
+/// same ones.
+pub fn set_digi_presets(presets: Vec<DigiPreset>) {
+    let leaked: &'static [DigiPreset] = Box::leak(presets.into_boxed_slice());
+    if let Ok(mut g) = INSTALLED_PRESETS.write() {
+        *g = Some(leaked);
+    }
+}
+
 /// The conventional dial frequencies for `mode` in `region`, ascending.
 ///
 /// Empty for a mode with no convention of its own — CW, SSB, and the modes
 /// whose operating frequency is a property of what they are pointed at rather
-/// than of the mode (RF Paint, RADE).
+/// than of the mode (RF Paint, RADE) — unless the operator has saved one of
+/// their own, which is exactly how a mode with no global convention gets a
+/// list.
 pub fn digi_channels_for(mode: crate::Mode, region: Region) -> Vec<DigiChannel> {
     use crate::Mode;
     let plain = |v: &[f64]| -> Vec<DigiChannel> {
-        v.iter().map(|&dial_hz| DigiChannel { dial_hz, note: "" }).collect()
+        v.iter().map(|&dial_hz| DigiChannel { dial_hz, note: "", mine: false }).collect()
     };
     // The region-tagged tables: an entry only appears where its convention
     // actually holds, so a Region 1 operator is never offered 7.070 for PSK31.
     let tagged = |v: &[(f64, &'static str, u8)]| -> Vec<DigiChannel> {
         v.iter()
             .filter(|&&(_, _, m)| region.in_mask(m))
-            .map(|&(dial_hz, note, _)| DigiChannel { dial_hz, note })
+            .map(|&(dial_hz, note, _)| DigiChannel { dial_hz, note, mine: false })
             .collect()
+    };
+
+    // The 11 m channels, appended to whatever the mode's own table holds.
+    // Here rather than inside each table because they are one agreement about
+    // one band, and splitting them across six tables would lose that.
+    let cb11 = |v: &mut Vec<DigiChannel>| {
+        v.extend(
+            CB11_DIALS
+                .iter()
+                .filter(|&&(m, _, _)| m == mode)
+                .map(|&(_, dial_hz, note)| DigiChannel { dial_hz, note, mine: false }),
+        );
     };
 
     let mut v = match mode {
@@ -800,11 +919,11 @@ pub fn digi_channels_for(mode: crate::Mode, region: Region) -> Vec<DigiChannel> 
         Mode::Wspr => plain(WSPR_DIALS),
         Mode::Ft8 => {
             let mut v = plain(FT8_DIALS);
-            v.extend(
-                FT8_DXPED_DIALS
-                    .iter()
-                    .map(|&dial_hz| DigiChannel { dial_hz, note: "DXpedition (Fox/Hound)" }),
-            );
+            v.extend(FT8_DXPED_DIALS.iter().map(|&dial_hz| DigiChannel {
+                dial_hz,
+                note: "DXpedition (Fox/Hound)",
+                mine: false,
+            }));
             v.extend(tagged(FT8_VHF_DIALS));
             v
         }
@@ -817,8 +936,21 @@ pub fn digi_channels_for(mode: crate::Mode, region: Region) -> Vec<DigiChannel> 
         Mode::SstvFm => tagged(SSTV_FM_DIALS),
         Mode::Rifp => plain(RIFP_CALLING),
         Mode::Aprs => tagged(APRS_DIALS),
+        // Packet has no HF/VHF table of its own — its VHF channel is the APRS
+        // one and its HF use is not channelised — but 11 m does give it two.
         _ => Vec::new(),
     };
+    cb11(&mut v);
+    // The operator's own, in every region: these are their frequencies, not a
+    // continent's convention, and a station that travels takes them along.
+    // A preset on a frequency the tables already carry is dropped rather than
+    // listed twice — the built-in entry says the same thing and says what it is.
+    for p in digi_presets().iter().filter(|p| p.mode == mode) {
+        if v.iter().any(|c| (c.dial_hz - p.dial_hz).abs() < 1.0) {
+            continue;
+        }
+        v.push(DigiChannel { dial_hz: p.dial_hz, note: p.note.as_str(), mine: true });
+    }
     v.sort_by(|a, b| a.dial_hz.total_cmp(&b.dial_hz));
     v
 }
@@ -868,6 +1000,57 @@ pub fn is_rtty_segment_in(hz: f64, region: Region) -> bool {
 mod tests {
     use super::*;
     use crate::Band;
+
+    /// Issue #268: a frequency the operator saved appears in the mode's list,
+    /// marked as theirs, and is offered whatever region the station is in — it
+    /// is their net, not a continent's convention.
+    ///
+    /// The install is process-wide, so this test owns the list for its whole
+    /// length and puts it back; nothing else in this module reads it.
+    #[test]
+    fn a_saved_frequency_joins_the_modes_own_list() {
+        set_digi_presets(vec![
+            DigiPreset {
+                mode: crate::Mode::Psk,
+                dial_hz: 3_585_000.0,
+                note: "Tuesday net".to_string(),
+            },
+            // A duplicate of a published entry is dropped rather than listed
+            // twice: 14.070 is already PSK31's calling frequency.
+            DigiPreset { mode: crate::Mode::Psk, dial_hz: 14_070_000.0, note: String::new() },
+            // A mode the shipped tables have nothing at all for still gets a
+            // list, which is the only way an operator can ever save one.
+            DigiPreset { mode: crate::Mode::Olivia, dial_hz: 14_106_500.0, note: String::new() },
+        ]);
+
+        let psk = digi_channels_for(crate::Mode::Psk, Region::R1);
+        let mine: Vec<_> = psk.iter().filter(|c| c.mine).collect();
+        assert_eq!(mine.len(), 1, "the duplicate of a published entry should have been dropped");
+        assert_eq!(mine[0].dial_hz, 3_585_000.0);
+        assert_eq!(mine[0].note, "Tuesday net");
+        assert_eq!(
+            psk.iter().filter(|c| (c.dial_hz - 14_070_000.0).abs() < 1.0).count(),
+            1,
+            "14.070 must appear once, as the published convention"
+        );
+        // Ascending, presets included — the picker groups by band and relies on it.
+        assert!(psk.windows(2).all(|w| w[0].dial_hz <= w[1].dial_hz));
+        // Their frequencies, not a region's: the same entry in every region.
+        for r in [Region::R1, Region::R2, Region::R3] {
+            assert!(
+                digi_channels_for(crate::Mode::Psk, r).iter().any(|c| c.mine),
+                "{r:?} should still offer the operator's own"
+            );
+        }
+        let olivia = digi_channels_for(crate::Mode::Olivia, Region::R1);
+        assert_eq!(olivia.len(), 1);
+        assert!(olivia[0].mine);
+        assert_eq!(digi_channels_in(crate::Mode::Olivia, Band::M20).len(), 1);
+
+        set_digi_presets(Vec::new());
+        assert!(digi_channels_for(crate::Mode::Olivia, Region::R1).is_empty());
+        assert!(!digi_channels_for(crate::Mode::Psk, Region::R1).iter().any(|c| c.mine));
+    }
 
     /// The one mode with no worldwide frequency: selecting APRS tunes to the
     /// region's own channel, and getting that wrong means a receiver that
@@ -1111,7 +1294,7 @@ mod tests {
         }
         // ...and the ordinary FT8 calling frequencies never are either.
         for &f in FT8_DIALS {
-            let c = DigiChannel { dial_hz: f, note: "" };
+            let c = DigiChannel { dial_hz: f, note: "", mine: false };
             assert!(!c.outside_data_segment_in(Mode::Ft8, Region::R1));
         }
     }
@@ -1123,7 +1306,7 @@ mod tests {
     fn what_region_1_flags_is_mostly_in_plan_elsewhere() {
         use crate::Mode;
         let flagged = |hz: f64, mode, region| {
-            DigiChannel { dial_hz: hz, note: "" }.outside_data_segment_in(mode, region)
+            DigiChannel { dial_hz: hz, note: "", mine: false }.outside_data_segment_in(mode, region)
         };
         // FT8's 160 m DXpedition frequency, FSQCall's 40 m and 20 m, and FT2's
         // 160 m dial all land in Region 1 phone segments and in Region 2 and 3
@@ -1313,8 +1496,26 @@ mod js8_tests {
     #[test]
     fn js8_has_conventional_channels() {
         let ch = digi_channels_for(crate::Mode::Js8, Region::R1);
-        assert_eq!(ch.len(), JS8_DIALS.len());
+        let cb = CB11_DIALS.iter().filter(|(m, _, _)| *m == crate::Mode::Js8).count();
+        assert_eq!(ch.len(), JS8_DIALS.len() + cb);
         assert!(ch.iter().any(|c| c.dial_hz == 14_078_000.0), "20 m JS8 missing");
+    }
+
+    /// Issue #396: the 11 m channels are the ones inside the 40-channel
+    /// allocation and nowhere else. The lists that circulate also name
+    /// frequencies above 27.405 — the freeband, which nobody is licensed for —
+    /// and sdroxide does not point a transmitter at those by name.
+    #[test]
+    fn the_eleven_metre_channels_are_inside_the_allocation() {
+        let (lo, hi) =
+            crate::Band::M11.iaru_default_edges_in(Region::R1).expect("11 m is in every region");
+        for &(mode, dial, note) in CB11_DIALS {
+            assert!((lo..=hi).contains(&dial), "{note} ({dial} Hz) is outside {lo}..{hi}");
+            // And each one is offered for the mode it belongs to, in the band
+            // it belongs to.
+            let ch = digi_channels_in_region(mode, crate::Band::M11, Region::R1);
+            assert!(ch.iter().any(|c| c.dial_hz == dial), "{note} is not offered for {mode:?}");
+        }
     }
 
     #[test]

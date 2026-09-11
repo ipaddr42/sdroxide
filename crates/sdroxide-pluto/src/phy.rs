@@ -48,6 +48,14 @@ const RX2_CHAN: (bool, &str) = (false, "voltage1");
 const TX_CHAN: (bool, &str) = (true, "voltage0");
 
 /// The control channel for receive chain `chain` (0 or 1).
+/// `-EOPNOTSUPP`, which is what the AD9361 driver answers to a write of a
+/// register the part currently owns — the receive gain of a chain that is not
+/// in manual gain control.
+const EOPNOTSUPP: i64 = -95;
+/// `-EINVAL`, which is what the same driver answers to a carrier frequency
+/// outside the range the part it bound as is allowed — see [`reaches`].
+const EINVAL: i64 = -22;
+
 fn rx_chan(chain: u8) -> (bool, &'static str) {
     if chain == 0 { RX_CHAN } else { RX2_CHAN }
 }
@@ -268,6 +276,37 @@ impl Phy {
         if !modes.is_empty() {
             limits.agc_modes = modes;
         }
+        // The tuning range is the one limit a board can be *modified* to
+        // change, so it is settled by asking the synthesiser rather than by
+        // reading a claim about it — see [`measure_lo_range`].
+        match measure_lo_range(conn, &phy_id, limits.rx_lo_hz) {
+            Ok(Some(measured)) => {
+                if measured != limits.rx_lo_hz {
+                    tracing::info!(
+                        "PlutoSDR: the synthesiser tunes {:.3}–{:.3} MHz, not the \
+                         {:.3}–{:.3} MHz this firmware advertises",
+                        measured.0 / 1e6,
+                        measured.1 / 1e6,
+                        limits.rx_lo_hz.0 / 1e6,
+                        limits.rx_lo_hz.1 / 1e6,
+                    );
+                }
+                // The two synthesisers are halves of one part, and the
+                // modification that moves one moves the other.
+                limits.rx_lo_hz = measured;
+                limits.tx_lo_hz = measured;
+                // Measured, so no longer a guess whatever the firmware
+                // published.
+                missing.retain(|m| *m != "a tuning range");
+            }
+            Ok(None) => {}
+            Err(e) => {
+                // Not fatal: the advertised range still works, it is just not
+                // confirmed. A board that cannot be talked to at all will fail
+                // on the next attribute anyway.
+                tracing::debug!("PlutoSDR: the tuning range could not be measured ({e})");
+            }
+        }
         limits.assumed = missing.into_iter().map(str::to_string).collect();
 
         tracing::info!(
@@ -474,6 +513,14 @@ impl Phy {
     ///
     /// Skipping is not the same as losing the value: the caller keeps it and
     /// replays it on the way back into manual (see `control_thread`).
+    ///
+    /// `mode` is what the *caller* believes the chain is in, and belief can be
+    /// wrong: the AD9361 keeps a mode per chain, another program can move one,
+    /// and a 2R2T firmware boots the second chain wherever its device tree left
+    /// it rather than where the first one was put. So a write the driver
+    /// refuses with `-EOPNOTSUPP` is answered by asserting the mode and trying
+    /// once more, instead of leaving the operator with a slider that logs an
+    /// errno and does nothing (issue #311).
     pub fn set_rx_gain(&self, conn: &mut Connection, chain: u8, mode: &str, db: f64) -> Result<()> {
         if mode != Phy::MANUAL_AGC {
             tracing::debug!(
@@ -487,6 +534,20 @@ impl Phy {
             return Ok(());
         }
         let db = db.clamp(self.limits.rx_gain_db.0, self.limits.rx_gain_db.1);
+        match self.write_rx_gain(conn, chain, db) {
+            Err(e) if e.remote_code() == Some(EOPNOTSUPP) => {
+                tracing::debug!(
+                    "PlutoSDR: receive chain {chain} would not take a gain, so it is not in \
+                     {mode} after all — putting it there and trying again"
+                );
+                self.set_agc_mode(conn, chain, mode)?;
+                self.write_rx_gain(conn, chain, db)
+            }
+            other => other,
+        }
+    }
+
+    fn write_rx_gain(&self, conn: &mut Connection, chain: u8, db: f64) -> Result<()> {
         conn.write_attr(&self.phy_id, Some(rx_chan(chain)), "hardwaregain", &format!("{db:.6}"))
     }
 
@@ -875,6 +936,104 @@ fn read_f64(conn: &mut Connection, dev: &str, chan: (bool, &str), attr: &str) ->
     let head = text.split_whitespace().next().unwrap_or("");
     head.parse()
         .map_err(|_| Error::Msg(format!("{dev} {} {attr} answered {text:?}, not a number", chan.1)))
+}
+
+/// How close a synthesiser has to land to a frequency for the write to count as
+/// accepted.
+///
+/// The RF PLL quantises, and a driver that dislikes a frequency may clamp it to
+/// the nearest one it likes rather than refusing outright — so "did it move
+/// there?" is the question, not "did the write return success?". One part in a
+/// thousand is far wider than the PLL's own step and far narrower than the gap
+/// between the two candidate limits.
+const LO_TOLERANCE: f64 = 1e-3;
+
+/// Settle what this board's synthesiser actually tunes, by asking it to go to
+/// each end of the AD9364's range and seeing whether it arrives.
+///
+/// A stock Pluto carries an AD9363 held to 325 MHz–3.8 GHz, and the popular
+/// "frequency expansion" modification does not touch the hardware at all: it
+/// rewrites a u-boot variable so the kernel binds the part as an AD9364 and
+/// lifts the check. The board's EEPROM still says AD9363A afterwards, and on a
+/// good many firmwares so does `frequency_available` — so every claim this
+/// backend could read is the *unmodified* answer, and an operator who paid for
+/// 70 MHz–6 GHz gets 325 MHz–3.8 GHz with no explanation.
+///
+/// Trying it settles the question in two writes. The synthesiser is put back
+/// where it was on the way out, and this runs before the buffers are opened, so
+/// nothing is listening to the excursion.
+///
+/// Returns `None` when the current frequency could not be read — without it
+/// there is nothing to restore, and moving an operator's LO without being able
+/// to put it back is worse than not knowing. `Err` is reserved for the link
+/// itself failing.
+fn measure_lo_range(
+    conn: &mut Connection,
+    phy_id: &str,
+    advertised: (f64, f64),
+) -> Result<Option<(f64, f64)>> {
+    // A firmware claiming to reach past the wider of the two parts knows
+    // about something this table does not. Believe it, and leave its
+    // synthesiser where it is.
+    if advertised.0 < AD9364_LO_HZ.0 || advertised.1 > AD9364_LO_HZ.1 {
+        return Ok(None);
+    }
+    let Ok(was) = read_f64(conn, phy_id, RX_LO, "frequency") else {
+        return Ok(None);
+    };
+    let low = reaches(conn, phy_id, AD9364_LO_HZ.0)?;
+    let high = reaches(conn, phy_id, AD9364_LO_HZ.1)?;
+    // Put it back. Best-effort on purpose: the caller sets the dial as its
+    // next act, so a synthesiser left on 6 GHz for a few milliseconds costs
+    // nothing — and where it *cannot* go back (a board booted with its LO
+    // outside the range just measured) that says nothing about the
+    // measurement, which is already in hand.
+    let restore = format!("{}", was.round() as i64);
+    if let Err(e) = conn.write_attr(phy_id, Some(RX_LO), "frequency", &restore) {
+        tracing::debug!("PlutoSDR: the receive LO could not be put back on {restore} Hz ({e})");
+    }
+    // Either end that could not be settled leaves that end as it was found.
+    match (low, high) {
+        (None, None) => Ok(None),
+        (low, high) => Ok(Some((
+            match low {
+                Some(true) => AD9364_LO_HZ.0,
+                Some(false) => AD9363_LO_HZ.0,
+                None => advertised.0,
+            },
+            match high {
+                Some(true) => AD9364_LO_HZ.1,
+                Some(false) => AD9363_LO_HZ.1,
+                None => advertised.1,
+            },
+        ))),
+    }
+}
+
+/// Whether the receive synthesiser can be put on `hz`: `Some(true)` it went
+/// there, `Some(false)` it would not, `None` the board said something that does
+/// not answer the question.
+///
+/// The write is allowed to fail — a refusal *is* the answer — but only where
+/// the refusal is about the frequency. `-EINVAL` is what the AD9361 driver
+/// answers to a carrier outside the part's range and `-EOPNOTSUPP` what a
+/// driver that does not take the write at all answers; anything else is a
+/// synthesiser that is busy or wedged, and narrowing an operator's tuning range
+/// on that evidence would be worse than admitting we do not know.
+///
+/// A driver may also clamp rather than refuse, so the frequency is read back:
+/// "did it arrive?" is the question, never "did the write return success?".
+fn reaches(conn: &mut Connection, phy_id: &str, hz: f64) -> Result<Option<bool>> {
+    let value = format!("{}", hz.round() as i64);
+    if let Err(e) = conn.write_attr(phy_id, Some(RX_LO), "frequency", &value) {
+        return match e.remote_code() {
+            Some(EINVAL) | Some(EOPNOTSUPP) => Ok(Some(false)),
+            Some(_) => Ok(None),
+            None => Err(e),
+        };
+    }
+    let got = read_f64(conn, phy_id, RX_LO, "frequency")?;
+    Ok(Some((got - hz).abs() <= hz * LO_TOLERANCE))
 }
 
 /// Read an IIO `[min step max]` range, or `None` when the device does not

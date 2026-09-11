@@ -77,6 +77,14 @@ pub enum ControlUpdate {
     /// putting a session file's port back on top of the one the operator left
     /// the radio on.
     Antenna(&'static str),
+    /// Whether the radio's separate *receiving* antenna is switched into the
+    /// receive path — an IC-7300MK2's RX ANT IN/OUT, an IC-7610's RX ANT.
+    ///
+    /// The radio's own setting arriving, and *only* ever arriving: the rig
+    /// recalls it per band (an IC-7610 keeps antenna memories at
+    /// `1A 05 0276~0287`), so it is read and adopted rather than asserted, and
+    /// sdroxide writes it exactly when the operator clicks.
+    RxAntenna(bool),
     /// The state of the radio's own PTT line — a foot switch, a mic button, or
     /// whatever is wired to the board's PTT input. `true` is keyed.
     ///
@@ -206,6 +214,26 @@ pub trait IqSource: Send {
     fn learned_antennas(&self) -> Option<&'static [&'static str]> {
         None
     }
+    /// The RX gain stages the front end has **right now**, when their ranges
+    /// are not a fact about the hardware alone. `None` — the default — leaves
+    /// `DeviceCaps::gains` exactly as it was built.
+    ///
+    /// Receive stages only, and the whole of them: what comes back replaces
+    /// every `Direction::Rx` element in the capabilities, in this order, and
+    /// leaves the transmit ones where they are.
+    ///
+    /// One backend needs this. An RSP's RF gain is a step into a table whose
+    /// length is a property of the *band*: an RSPdx has 28 states at 250–420
+    /// MHz and 19 below 12 MHz, so a range published once at open is wrong for
+    /// most of the spectrum, and a slider built from it spends its top third
+    /// moving nothing and snapping back as the driver clamps.
+    ///
+    /// Asked only where the answer can have changed — after a retune, a port
+    /// change or a gain command — rather than on every pass of the engine
+    /// loop, because building it allocates.
+    fn learned_rx_gains(&self) -> Option<Vec<sdroxide_types::GainElement>> {
+        None
+    }
     /// Switch the *radio* off, or back on again, over its control link.
     ///
     /// The radio's own power switch, not sdroxide's: an Icom answers `18 00` /
@@ -222,6 +250,37 @@ pub trait IqSource: Send {
     fn commands_rig_power(&self) -> bool {
         false
     }
+    /// Whether this radio has a separate *receiving* antenna connector, and
+    /// whether it is switched into the receive path.
+    ///
+    /// `None` — the default — where it has none, or has not said yet, which is
+    /// every SDR: a board's ports are a choice between sockets, not an extra
+    /// input switched in alongside the one the transmitter uses. `Some`
+    /// becomes `DeviceCaps::has_rx_antenna` (that there is one) and
+    /// `RadioState::rx_antenna` (which way it is set).
+    ///
+    /// Asked on every pass of the engine loop, like [`Self::learned_antennas`],
+    /// so it must not allocate or take a lock that anything else holds for
+    /// long.
+    fn rx_antenna(&self) -> Option<bool> {
+        None
+    }
+    /// Switch that connector into the receive path, or out of it.
+    ///
+    /// Only ever from an operator's click. The radio recalls the setting per
+    /// band on its own, so everywhere else it is read and adopted — see
+    /// [`Self::reread_rx_antenna`].
+    fn set_rx_antenna(&mut self, _on: bool) -> Result<()> {
+        Ok(())
+    }
+    /// Ask the radio again what its antennas are set to, because something it
+    /// recalls per band has just happened — a band change, or a socket
+    /// command whose answer belongs to the socket being selected rather than
+    /// to the one being left.
+    ///
+    /// Not an assertion: what comes back is adopted. Free on a front end with
+    /// nothing to ask.
+    fn reread_rx_antenna(&mut self) {}
     /// Whether the receive port is the source's own to decide, so a remembered
     /// one must not be restored over the top of it.
     ///
@@ -303,6 +362,26 @@ pub trait IqSource: Send {
     /// the transmitted samples. No-op for IQ sources (they apply drive in the
     /// modulator chain instead).
     fn set_tx_drive(&mut self, _frac: f64) {}
+    /// A ceiling on transmit drive that the *station* imposes rather than the
+    /// operator, as a `0..1` fraction, or `None` where there is none.
+    ///
+    /// What imposes one is a transverter: its I.F. input takes milliwatts, and
+    /// the drive that is right for the radio's own bands destroys it. The
+    /// engine holds the operator's setting under this rather than moving the
+    /// slider, so the number they set for HF comes back untouched when the dial
+    /// leaves the transverter's band (issue #278).
+    fn tx_drive_ceiling(&self) -> Option<f32> {
+        None
+    }
+    /// Tell the source where the *dial* is, when that is not where the hardware
+    /// is tuned.
+    ///
+    /// Only a converted source ever calls this, and only an accessory board
+    /// cares: a band decoder switching filters and antennas has to follow the
+    /// frequency on the air, not the intermediate frequency a transverter left
+    /// the radio on. Everything else about a source is stated in hardware
+    /// frequencies and stays that way.
+    fn set_dial_hz(&mut self, _hz: f64) {}
     /// Set the TUNE drive as a `0..1` fraction (see [`Self::set_tx_drive`]).
     fn set_tune_drive(&mut self, _frac: f64) {}
     /// Whether [`Self::set_tx_drive`] actually commands the rig's output power
@@ -339,6 +418,36 @@ pub trait IqSource: Send {
     fn tx_telemetry(&mut self) -> Option<sdroxide_types::TxTelemetry> {
         None
     }
+    /// The radio's own temperature in degrees Celsius, where it measures one.
+    ///
+    /// Polled on the meter tick in receive as well as transmit, because the
+    /// number an operator watches is the one *after* the over: what a small PA
+    /// does over an afternoon of FT8 is heat up and stay hot, and a reading
+    /// that vanished at unkey would hide exactly the part worth seeing
+    /// (issue #333).
+    ///
+    /// Almost nothing reports one — this is the board's own sensor, not a
+    /// figure derived from anything on this side — so `None` is the ordinary
+    /// answer and the meter simply says nothing. Default: none.
+    fn pa_temp_c(&mut self) -> Option<f32> {
+        None
+    }
+    /// The front end's own converter-overflow flag, where the radio reports one.
+    ///
+    /// Not the same claim as `Meters::adc_clip`, which is measured on this side
+    /// from the samples that arrive. A direct-sampling radio converts a whole
+    /// band at once and then hands over a narrow DDC out of it, so the stream
+    /// can be perfectly clean while the converter behind it is being driven
+    /// into its rails by a broadcaster three bands away — everything
+    /// intermodulates, the noise floor climbs, and nothing in the samples says
+    /// why. Only the board knows, and a Hermes-Lite 2 says so in the status
+    /// bytes it sends with every frame (issue #362).
+    ///
+    /// `None` on the great majority of radios, which have no such flag.
+    /// Default: none.
+    fn adc_overload(&mut self) -> Option<bool> {
+        None
+    }
     /// The rig's own S-meter in dBm, polled by the engine while receiving.
     ///
     /// For a source that hands us already-demodulated audio (a CAT rig on a
@@ -348,6 +457,29 @@ pub trait IqSource: Send {
     /// us IQ need none of this — the engine measures the passband itself.
     /// Default: none.
     fn rx_signal_dbm(&mut self) -> Option<f32> {
+        None
+    }
+    /// Absolute gain, in dB, between the antenna socket and the converter that
+    /// produced these samples. `None` when the front end cannot say.
+    ///
+    /// The engine measures the passband in dBFS, which is a level *at the
+    /// converter*; the level at the antenna is that minus whatever the front
+    /// end put in front of it. Where a source knows that number the engine
+    /// takes it off, and what is left is a reading that stays put when the
+    /// gain moves — which is the whole point, because on a front end with an
+    /// AGC the gain moves continuously and an S-meter that follows it is
+    /// measuring the loop rather than the band.
+    ///
+    /// Default: `None`, which leaves the reading on the old footing — dBFS
+    /// plus the operator's fixed calibration offset. That is the right answer
+    /// for a front end whose gain nothing reports, and for one whose gain
+    /// never moves.
+    ///
+    /// Must describe the samples being delivered *now*, not a gain that has
+    /// been commanded and not yet taken effect: a front end that answers with
+    /// the new value while the old samples are still in flight puts a step in
+    /// the meter that the antenna never saw.
+    fn rx_gain_db(&self) -> Option<f32> {
         None
     }
     /// Offset (Hz) of the operator's VFO from the IQ centre, so a rig that keeps
@@ -646,6 +778,20 @@ pub trait IqSource: Send {
     fn cw_audio_keyed(&self) -> bool {
         false
     }
+    /// True when this radio's control layer works out for itself which sideband
+    /// a mode whose sideband follows the band rides — analog SSTV and RADE, LSB
+    /// on 160/80/40 m and USB above (`Mode::sideband_follows_band`).
+    ///
+    /// The engine translates those into plain LSB before handing them over (see
+    /// `Engine::control_mode`), because a family's mode map is a table with no
+    /// dial in it. A CAT rig is the exception: there the mode goes through
+    /// `digi_mode`, the operator's choice between the plain sideband and the
+    /// rig's DATA position, and that choice has to survive on both sidebands —
+    /// a translation to plain LSB spends it (issue #313). Such a radio answers
+    /// true and is sent [`Mode::Sstv`] or [`Mode::Rade`] itself, dial and all.
+    fn resolves_band_sideband(&self) -> bool {
+        false
+    }
     /// Hand `text` to the radio's own keyer, at most `cw_text_keying()` worth,
     /// and not again until the last lot has been sent.
     ///
@@ -658,6 +804,19 @@ pub trait IqSource: Send {
     /// Tell the radio's keyer what speed to send at. It keys at its own speed,
     /// so until this arrives the panel's WPM is not what goes on the air.
     fn set_cw_wpm(&mut self, _wpm: f32) {}
+    /// Tell the front end the sidetone pitch the operator is copying CW at.
+    ///
+    /// sdroxide's CW dial is a zero-beat and the note sits a pitch above it, so
+    /// on any arrangement where a *transceiver* makes its own CW carrier the
+    /// rig's VFO belongs a pitch above our dial rather than on it. Where the
+    /// rig is also the front end the engine does that arithmetic itself
+    /// (`Engine::rig_cw_offset_hz`); where the rig and the receiver are two
+    /// different radios only the source can tell them apart, which is what this
+    /// is for (issue #364).
+    ///
+    /// Default: ignored — an SDR keys the sidetone through its own transmit
+    /// chain and the dial is already the zero-beat.
+    fn set_cw_pitch_hz(&mut self, _hz: f32) {}
 
     /// Block until queued TX audio has been played out, so PTT can be released
     /// without cutting off the tail of a burst. Default: nothing is buffered.
@@ -753,30 +912,167 @@ pub trait IqSource: Send {
 /// 2.4 GHz uplink leaves the radio direct, and only the receive side is offset.
 pub struct ConvertedSource {
     inner: Box<dyn IqSource>,
-    /// Hardware frequency minus operator frequency. Positive for an upconverter.
-    offset_hz: f64,
-    /// The same, for the transmit path; `None` when transmit is withdrawn.
-    tx_offset_hz: Option<f64>,
+    plan: ConverterPlan,
+    /// The step the dial has selected. Held rather than looked up per call
+    /// because [`Self::down`] has only a *hardware* frequency to work from, and
+    /// which step took it there is not recoverable from that number — two
+    /// transverters on one I.F. hand back the same 28 MHz.
+    step: ConverterStep,
 }
 
 impl ConvertedSource {
+    /// One converter in front of the whole receiver: an upconverter, an LNB.
     pub fn new(inner: Box<dyn IqSource>, offset_hz: f64, tx_offset_hz: Option<f64>) -> Self {
-        ConvertedSource { inner, offset_hz, tx_offset_hz }
+        ConvertedSource::with_plan(
+            inner,
+            ConverterPlan::single(ConverterStep {
+                band: None,
+                rx_offset_hz: offset_hz,
+                tx_offset_hz,
+                tx_drive: None,
+            }),
+        )
     }
 
-    /// Operator frequency → hardware frequency.
-    fn up(&self, hz: f64) -> f64 {
-        hz + self.offset_hz
+    /// A station with more than one box in front of it — see [`ConverterPlan`].
+    pub fn with_plan(inner: Box<dyn IqSource>, plan: ConverterPlan) -> Self {
+        // Seeded by working *backwards* from where the front end already is.
+        // Nothing has told us a dial yet, and the first thing the engine does
+        // is read `center_hz()` — so a source that started on a transverter's
+        // I.F. has to say so, or the radio comes up on 28 MHz having been
+        // opened for 144.
+        let step = plan.step_from_hardware(inner.center_hz());
+        ConvertedSource { inner, plan, step }
     }
 
-    /// Hardware frequency → operator frequency.
+    /// The plan this source is following, for the caller that has to publish
+    /// the same tuning ranges — see [`plan_caps`].
+    pub fn plan(&self) -> &ConverterPlan {
+        &self.plan
+    }
+
+    /// Hardware frequency → operator frequency, through the selected step.
     fn down(&self, hz: f64) -> f64 {
-        hz - self.offset_hz
+        hz - self.step.rx_offset_hz
     }
 
     /// Operator frequency → hardware frequency, on the transmit path.
+    ///
+    /// The step is chosen by the *transmit* frequency, which split and XIT
+    /// make a different question from where the receiver is listening.
     fn up_tx(&self, hz: f64) -> Option<f64> {
-        self.tx_offset_hz.map(|t| hz + t)
+        self.plan.step_for(hz).tx_offset_hz.map(|t| hz + t)
+    }
+}
+
+/// One band of a converter plan: what the hardware does while the dial is in it.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct ConverterStep {
+    /// The dial range this step covers, in Hz, or `None` for every frequency —
+    /// which is what a converter in front of the whole receiver is.
+    pub band: Option<(f64, f64)>,
+    /// `hardware = dial + rx_offset_hz`.
+    pub rx_offset_hz: f64,
+    /// The same for transmit; `None` withdraws transmit on this band.
+    pub tx_offset_hz: Option<f64>,
+    /// A ceiling on transmit drive while this step is selected, 0.0–1.0.
+    /// `None` is no ceiling — the radio's own bands.
+    pub tx_drive: Option<f32>,
+}
+
+impl ConverterStep {
+    /// Whether this step does anything at all: a zero offset that neither
+    /// withdraws transmit nor limits drive is the bare radio.
+    fn is_identity(&self) -> bool {
+        self.rx_offset_hz == 0.0
+            && self.tx_offset_hz == Some(0.0)
+            && self.tx_drive.is_none()
+            && self.band.is_none()
+    }
+
+    fn covers(&self, dial_hz: f64) -> bool {
+        match self.band {
+            None => true,
+            Some((lo, hi)) => (lo..=hi).contains(&dial_hz),
+        }
+    }
+}
+
+/// What is in front of the radio, band by band.
+///
+/// One entry is the ordinary case and the one sdroxide shipped first: an
+/// upconverter or an LNB that converts every frequency. A station with
+/// transverters has several, each covering the band it works, and the dial
+/// decides which applies — a 2 m and a 6 m transverter sharing a 28 MHz I.F.
+/// are two steps with different offsets and the same hardware behind them
+/// (issue #278).
+///
+/// Steps are tried in order and the first that covers the dial wins, so a
+/// band-limited step must come before the catch-all one. [`Self::from_steps`]
+/// does that sorting; nothing else needs to think about it.
+///
+/// A dial no step covers is *not* converted and *may* transmit: it is the radio
+/// on its own bands, which is exactly what a station with a 2 m transverter
+/// still has on HF.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct ConverterPlan {
+    steps: Vec<ConverterStep>,
+}
+
+impl ConverterPlan {
+    /// The bare radio: nothing in front of it.
+    pub fn none() -> ConverterPlan {
+        ConverterPlan { steps: Vec::new() }
+    }
+
+    /// One converter over the whole dial.
+    pub fn single(step: ConverterStep) -> ConverterPlan {
+        ConverterPlan { steps: vec![step] }
+    }
+
+    /// Build a plan, putting the band-limited steps ahead of any catch-all.
+    pub fn from_steps(steps: impl IntoIterator<Item = ConverterStep>) -> ConverterPlan {
+        let mut steps: Vec<ConverterStep> = steps.into_iter().collect();
+        steps.sort_by_key(|s| u8::from(s.band.is_none()));
+        ConverterPlan { steps }
+    }
+
+    pub fn steps(&self) -> &[ConverterStep] {
+        &self.steps
+    }
+
+    /// Whether this plan leaves the radio exactly as it is.
+    pub fn is_transparent(&self) -> bool {
+        self.steps.iter().all(ConverterStep::is_identity)
+    }
+
+    /// The step for a dial frequency — the bare radio where none covers it.
+    pub fn step_for(&self, dial_hz: f64) -> ConverterStep {
+        self.steps
+            .iter()
+            .find(|s| s.covers(dial_hz))
+            .copied()
+            .unwrap_or(ConverterStep { tx_offset_hz: Some(0.0), ..ConverterStep::default() })
+    }
+
+    /// `hardware = dial + this`, for a dial.
+    pub fn offset_for(&self, dial_hz: f64) -> f64 {
+        self.step_for(dial_hz).rx_offset_hz
+    }
+
+    /// The step for a *hardware* frequency: the one whose offset puts it back
+    /// inside its own band.
+    ///
+    /// The inverse is not unique — two transverters on one I.F. hand back the
+    /// same 28 MHz — so this is only ever used to seed a source from where the
+    /// front end was found, before any dial has been commanded. The first
+    /// match wins, which is the order the plan lists them in.
+    pub fn step_from_hardware(&self, hw_hz: f64) -> ConverterStep {
+        self.steps
+            .iter()
+            .find(|s| s.covers(hw_hz - s.rx_offset_hz))
+            .copied()
+            .unwrap_or(ConverterStep { tx_offset_hz: Some(0.0), ..ConverterStep::default() })
     }
 }
 
@@ -816,6 +1112,89 @@ pub fn shift_caps(
         }
     }
     caps
+}
+
+/// The tuning ranges a front end behind a converter publishes, from the two
+/// answers that exist about them.
+///
+/// The order is the whole of issue #279. What the *device* says is in the
+/// hardware's own domain, so [`shift_caps`] moves it onto the dial; what the
+/// *operator* typed is already on the dial, because a transverter owner who
+/// writes 144-148 means the band they tune and not the 28-32 MHz I.F. their
+/// radio is really sitting on. So the shift goes on first and the stated ranges
+/// replace the result — applying the offset to a typed range put the limit a
+/// whole offset away from the band it named, and a 2 m transverter came up
+/// refusing everything outside 260-264 MHz.
+///
+/// A stated transmit range cannot put back a transmitter the operator withdrew:
+/// with `tx_offset_hz` of `None`, [`shift_caps`] has taken transmit away and it
+/// stays away.
+pub fn converted_caps(
+    caps: sdroxide_types::DeviceCaps,
+    offset_hz: f64,
+    tx_offset_hz: Option<f64>,
+    stated_rx: &[(f64, f64)],
+    stated_tx: &[(f64, f64)],
+) -> sdroxide_types::DeviceCaps {
+    let shifted = shift_caps(caps, offset_hz, tx_offset_hz);
+    let mut caps = override_caps_ranges(shifted, stated_rx, stated_tx);
+    if tx_offset_hz.is_none() {
+        caps.freq_ranges_tx.clear();
+    }
+    caps
+}
+
+/// The tuning ranges a front end behind a whole [`ConverterPlan`] publishes.
+///
+/// The union of what each step can reach, clipped to the band that step covers,
+/// plus — where no step covers everything — the radio's own ranges for the
+/// bands nothing is in front of. That last part is what keeps HF on a station
+/// whose only converter is a 2 m transverter.
+///
+/// The stated ranges go on top of the lot, on the dial, for the reason
+/// [`converted_caps`] gives.
+pub fn plan_caps(
+    caps: sdroxide_types::DeviceCaps,
+    plan: &ConverterPlan,
+    stated_rx: &[(f64, f64)],
+    stated_tx: &[(f64, f64)],
+) -> sdroxide_types::DeviceCaps {
+    /// One step's view of a set of hardware ranges, on the dial.
+    fn through(ranges: &[(f64, f64)], offset_hz: f64, band: Option<(f64, f64)>) -> Vec<(f64, f64)> {
+        ranges
+            .iter()
+            .filter_map(|&(lo, hi)| {
+                let (mut lo, mut hi) = ((lo - offset_hz).max(0.0), hi - offset_hz);
+                if let Some((blo, bhi)) = band {
+                    lo = lo.max(blo);
+                    hi = hi.min(bhi);
+                }
+                (hi > lo).then_some((lo, hi))
+            })
+            .collect()
+    }
+
+    let mut out = caps.clone();
+    let covers_all = plan.steps().iter().any(|s| s.band.is_none());
+    let mut rx: Vec<(f64, f64)> = if covers_all { Vec::new() } else { caps.freq_ranges_rx.clone() };
+    let mut tx: Vec<(f64, f64)> = if covers_all { Vec::new() } else { caps.freq_ranges_tx.clone() };
+    for step in plan.steps() {
+        rx.extend(through(&caps.freq_ranges_rx, step.rx_offset_hz, step.band));
+        if let Some(t) = step.tx_offset_hz {
+            tx.extend(through(&caps.freq_ranges_tx, t, step.band));
+        }
+    }
+    out.freq_ranges_rx = rx;
+    out.freq_ranges_tx = tx;
+    // Transmit is withdrawn outright only when *nothing* may transmit: a
+    // station that keys on HF and not through its transverter still has a
+    // transmitter, and the ranges above are what hold it to the right bands.
+    if out.freq_ranges_tx.is_empty() && !caps.freq_ranges_tx.is_empty() {
+        out.antennas_tx.clear();
+        out.tx_channels = 0;
+    }
+    let stated_tx: &[(f64, f64)] = if out.tx_channels == 0 { &[] } else { stated_tx };
+    override_caps_ranges(out, stated_rx, stated_tx)
 }
 
 /// Which hardware frequency to open a converted front end on, for the dial the
@@ -894,7 +1273,11 @@ impl IqSource for ConvertedSource {
     }
 
     fn set_center_hz(&mut self, hz: f64) -> Result<()> {
-        let hw = self.up(hz);
+        // Chosen but not committed: a refused tune must leave the source on the
+        // step it was already using, or the *next* `down()` would relabel the
+        // frequency the receiver is still sitting on.
+        let step = self.plan.step_for(hz);
+        let hw = hz + step.rx_offset_hz;
         // Refused here rather than passed down, because several back ends
         // (RTL-SDR, RX-888, HPSDR) answer `Ok` to any frequency and then clamp
         // inside their DDC. That would leave the engine believing the tune
@@ -904,14 +1287,28 @@ impl IqSource for ConvertedSource {
             return Err(crate::RadioError::Msg(format!(
                 "{:.6} MHz is below DC once the {:.6} MHz converter offset is applied",
                 hz / 1e6,
-                self.offset_hz / 1e6
+                step.rx_offset_hz / 1e6
             )));
         }
-        self.inner.set_center_hz(hw)
+        self.inner.set_center_hz(hw)?;
+        // The band decoder wants the frequency on the *air*, not the I.F. an
+        // accessory board would otherwise switch its filters for.
+        self.inner.set_dial_hz(hz);
+        self.step = step;
+        Ok(())
+    }
+
+    /// The ceiling the selected transverter puts on transmit drive.
+    fn tx_drive_ceiling(&self) -> Option<f32> {
+        self.step.tx_drive
     }
 
     fn describe(&self) -> String {
-        format!("{} (+{:.6} MHz converter)", self.inner.describe(), self.offset_hz / 1e6)
+        let boxes = self.plan.steps().len();
+        if boxes > 1 {
+            return format!("{} ({boxes} converters)", self.inner.describe());
+        }
+        format!("{} (+{:.6} MHz converter)", self.inner.describe(), self.step.rx_offset_hz / 1e6)
     }
 
     fn wide_spectrum_db(&mut self, out: &mut Vec<f32>) -> Option<(f64, f64)> {
@@ -992,11 +1389,26 @@ impl IqSource for ConvertedSource {
     fn learned_antennas(&self) -> Option<&'static [&'static str]> {
         self.inner.learned_antennas()
     }
+    /// The front end's own stages. A converter shifts the frequency the *radio*
+    /// shows, but the tuner behind it is still on the converted one, so its
+    /// band-dependent ranges are the inner source's to report.
+    fn learned_rx_gains(&self) -> Option<Vec<sdroxide_types::GainElement>> {
+        self.inner.learned_rx_gains()
+    }
     fn set_rig_power(&mut self, on: bool) -> Result<()> {
         self.inner.set_rig_power(on)
     }
     fn commands_rig_power(&self) -> bool {
         self.inner.commands_rig_power()
+    }
+    fn rx_antenna(&self) -> Option<bool> {
+        self.inner.rx_antenna()
+    }
+    fn set_rx_antenna(&mut self, on: bool) -> Result<()> {
+        self.inner.set_rx_antenna(on)
+    }
+    fn reread_rx_antenna(&mut self) {
+        self.inner.reread_rx_antenna();
     }
 
     fn owns_rx_antenna(&self) -> bool {
@@ -1084,8 +1496,23 @@ impl IqSource for ConvertedSource {
         self.inner.tx_telemetry()
     }
 
+    fn pa_temp_c(&mut self) -> Option<f32> {
+        self.inner.pa_temp_c()
+    }
+    fn adc_overload(&mut self) -> Option<bool> {
+        self.inner.adc_overload()
+    }
+
     fn rx_signal_dbm(&mut self) -> Option<f32> {
         self.inner.rx_signal_dbm()
+    }
+
+    /// The front end's own gain, which is what it was: a converter ahead of it
+    /// shifts the frequency and not the level. Its conversion gain or loss is
+    /// the operator's to put in the calibration offset, being a property of
+    /// their box rather than anything the radio can read.
+    fn rx_gain_db(&self) -> Option<f32> {
+        self.inner.rx_gain_db()
     }
 
     /// Relative (VFO minus IQ centre), so untouched.
@@ -1142,6 +1569,12 @@ impl IqSource for ConvertedSource {
         self.inner.commands_rx_mode()
     }
 
+    /// A question about the radio's control layer, which a frequency
+    /// translation in front of it does not change.
+    fn resolves_band_sideband(&self) -> bool {
+        self.inner.resolves_band_sideband()
+    }
+
     fn mutes_rx_audio_on_tx(&self) -> bool {
         self.inner.mutes_rx_audio_on_tx()
     }
@@ -1169,6 +1602,9 @@ impl IqSource for ConvertedSource {
     }
     fn set_cw_wpm(&mut self, wpm: f32) {
         self.inner.set_cw_wpm(wpm);
+    }
+    fn set_cw_pitch_hz(&mut self, hz: f32) {
+        self.inner.set_cw_pitch_hz(hz);
     }
 
     fn tx_drain(&mut self) {

@@ -557,6 +557,9 @@ fn candidates(m: Mode) -> &'static [&'static str] {
         Mode::Cw => &["CW"],
         Mode::Am | Mode::Sam | Mode::Drm => &["AM"],
         Mode::Dsb => &["DSB"],
+        // No rig has an ISB position; DSB is the same filter and AM is the
+        // fallback every rig does have.
+        Mode::Isb => &["DSB", "AM"],
         Mode::Nfm => &["FM", "FM-N", "NFM"],
         // No plain-FM fallback here, unlike the data lists below: a rig with
         // no WFM position would report `FM` back, which reads as NFM and would
@@ -565,7 +568,7 @@ fn candidates(m: Mode) -> &'static [&'static str] {
         // No rig has an ADS-B mode and none ever will: the dial is at
         // 1090 MHz. Grouped with FM so nothing downstream has to special-case
         // a mode a radio can neither be put into nor report back.
-        Mode::Wfm | Mode::Adsb | Mode::Vdl2 => &["WFM", "FM-W"],
+        Mode::Wfm | Mode::Adsb | Mode::Vdl2 | Mode::Ais => &["WFM", "FM-W"],
         // Data over FM rather than over a sideband: the carrier is the
         // signal's centre, not one edge of it.
         Mode::Rifp | Mode::Packet | Mode::Aprs | Mode::SstvFm | Mode::RttyFm => {

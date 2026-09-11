@@ -35,6 +35,7 @@ sdroxide-skimmer = { path = "../sdroxide-skimmer" }
 sdroxide-ism = { path = "../sdroxide-ism" }
 sdroxide-adsb = { path = "../sdroxide-adsb" }
 sdroxide-vdl2 = { path = "../sdroxide-vdl2" }
+sdroxide-ais = { path = "../sdroxide-ais" }
 sdroxide-qo100 = { path = "../sdroxide-qo100" }
 sdroxide-net = { path = "../sdroxide-net" }
 sdroxide-winlink = { path = "../sdroxide-winlink" }

@@ -276,11 +276,11 @@ fn mode_digit(m: Mode) -> char {
         // No rig has an ADS-B mode and none ever will: the dial is at
         // 1090 MHz. Grouped with FM so nothing downstream has to special-case
         // a mode a radio can neither be put into nor report back.
-        Mode::Nfm | Mode::Wfm | Mode::Adsb | Mode::Vdl2 => '4',
+        Mode::Nfm | Mode::Wfm | Mode::Adsb | Mode::Vdl2 | Mode::Ais => '4',
         // RIFP keys the carrier itself and VHF packet frequency-modulates it:
         // data over FM (DATA-FM), not over a sideband.
         Mode::Rifp | Mode::Packet | Mode::Aprs | Mode::SstvFm | Mode::RttyFm => 'A',
-        Mode::Am | Mode::Sam | Mode::Dsb | Mode::Drm => '5',
+        Mode::Am | Mode::Sam | Mode::Dsb | Mode::Isb | Mode::Drm => '5',
         Mode::Digl => '8',
         Mode::Digu
         | Mode::Ft8
