@@ -184,6 +184,8 @@ impl eframe::App for SdroxideApp {
             self.applied_ui_font = self.ui_settings.menu_font_size;
             crate::theme::apply_zoom(&ctx);
             ctx.request_repaint();
+        } else {
+            self.remember_ui_zoom(&ctx);
         }
         self.drain_events(&ctx, now);
         self.poll_adif_import();
@@ -692,6 +694,8 @@ impl eframe::App for SdroxideApp {
                             crate::chrome::angled_frame(ui, crate::theme::PINK(), |ui| {
                                 if mode.is_rade() {
                                     self.rade_panel(ui, &mut cmds, panel_h);
+                                } else if mode.is_atchat() {
+                                    self.atchat_panel(ui, &mut cmds, panel_h);
                                 } else if mode.is_wefax() {
                                     self.wefax_panel(ui, &mut cmds, panel_h);
                                 } else if mode == Mode::Navtex {
@@ -1378,8 +1382,18 @@ impl SdroxideApp {
                     self.skimmer_active_at.retain(|id, _| live.contains(id));
                     self.skimmer_spots = s;
                 }
-                RadioEvent::Spots(s) => self.spots = s,
-                RadioEvent::NetStatus(s) => self.net_status = s,
+                // A tab that shares the station radio's feeds drops back to
+                // them on the next frame if its own engine says anything.
+                RadioEvent::Spots(s) => {
+                    self.spots = s;
+                    self.spots_gen += 1;
+                    self.adopted_spots_gen = None;
+                }
+                RadioEvent::NetStatus(s) => {
+                    self.net_status = s;
+                    self.spots_gen += 1;
+                    self.adopted_spots_gen = None;
+                }
                 RadioEvent::TciServerStatus { running, addr, clients, error } => {
                     self.tci_srv_status = Some(TciServerStatus { running, addr, clients, error });
                 }

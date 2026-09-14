@@ -17,7 +17,8 @@ or connects to a remote sdroxide server.
 1. [Feature overview](#1-feature-overview)
 2. [Basic operation](#2-basic-operation)
     - [2.21 QO-100 beacon plugin](#221-qo-100-beacon-plugin)
-3. [Digital modes (FT8, FT4, FT2, PSK31, RTTY, Olivia, THOR, FSQ, Hellschreiber, SSTV, RIFP, weather fax, JS8, RF Paint, WSPR, packet, APRS, ADS-B, NAVTEX, VDL2, AIS)](#3-digital-modes)
+3. [Digital modes (FT8, FT4, FT2, PSK31, RTTY, Olivia, THOR, FSQ, Hellschreiber, SSTV, RIFP, weather fax, JS8, RF Paint, WSPR, packet, APRS, ADS-B, NAVTEX, VDL2, AIS, AtCHAT NET)](#3-digital-modes)
+    - [3.17 AtCHAT NET](#317-atchat-net)
 4. [Skimmers (CW, PSK, RTTY)](#4-skimmers)
 5. [ISM band decoder (315 / 345 / 433 / 868 / 915 MHz devices)](#5-ism-band-decoder)
 6. [Settings](#6-settings)
@@ -56,7 +57,10 @@ or connects to a remote sdroxide server.
   a radar display — see [§3.13](#313-ads-b-aircraft-on-1090-mhz) — and **AIS**
   does the same for the ships on 162 MHz, onto a marine chart with the vessels
   drawn as hulls pointed the way they are heading
-  ([§3.16](#316-ais-ships-on-162-mhz)).
+  ([§3.16](#316-ais-ships-on-162-mhz)). **AtCHAT NET** is a multi-station
+  keyboard and file mode with dynamic master election, a shared roster, and
+  block-CRC-ARQ file/image transfer alongside the chat
+  ([§3.17](#317-atchat-net)).
 - **Receive controls:** AGC (Off/Slow/Med/Fast), volume, mute, squelch, an
   impulse noise blanker, an adaptive auto-notch (constant-tone canceller),
   noise reduction (four engines, three strengths each), front-end decimation
@@ -334,19 +338,31 @@ The **VFO** module has:
 - **SPLIT** — transmit on one VFO and receive on the other.
 - **SUB** — enable a second receiver, routed to the right ear.
 
-**Each VFO keeps its own mode**, and its own filter width with it. A VFO is a
-whole listening position rather than just a number — CW on A while B sits on an
-SSB net is what the pair is for — so switching between them puts the receiver
-into the mode that VFO was left in, exactly as the A/B button on a transceiver
-does. Swap and Copy A to B move the mode along with the frequency: after a swap
-each VFO holds what the other one had, and after a copy B is A in every respect.
+**Each VFO keeps its own mode**, its own filter width, and its own antenna. A
+VFO is a whole listening position rather than just a number — CW on A while B
+sits on an SSB net is what the pair is for — so switching between them puts the
+receiver into the mode that VFO was left in and back on the socket it was heard
+on, exactly as the A/B button on a transceiver does. Swap and Copy A to B move
+all of it along with the frequency: after a swap each VFO holds what the other
+one had, and after a copy B is A in every respect.
 
-Both VFOs, the mode each was left in, and which of the two was selected are
-remembered per radio in `session.json`, so a station left listening on B — or set
-up for split, with the other VFO on the DX's transmit frequency — comes back the
-same way at the next start rather than with B collapsed onto A. `--freq` and
-`--mode` still override the dial and the mode for a run, and they apply to
-whichever VFO was active.
+The antenna is remembered per band as well
+([6.2](#62-radio-choosing-and-configuring-the-rig)), and the two memories divide
+the work by what you have just done. **An A/B press that stays inside one band
+keeps each VFO's socket** — Antenna A on a broadcast station and Antenna B on
+the amateur allocation below it is one band and two sockets, which the band
+memory alone cannot express. **Crossing a band edge recalls the band's socket
+instead**, whether you got there by the dial or by pressing A/B onto a VFO
+parked on another band: which aerial hears 2 m is a fact about the station
+rather than about a VFO. Choosing a socket by hand is what writes the band's
+entry, so the band always holds your last explicit choice on it.
+
+Both VFOs, the mode and socket each was left in, and which of the two was
+selected are remembered per radio in `session.json`, so a station left listening
+on B — or set up for split, with the other VFO on the DX's transmit frequency —
+comes back the same way at the next start rather than with B collapsed onto A.
+`--freq` and `--mode` still override the dial and the mode for a run, and they
+apply to whichever VFO was active.
 
 The sub-receiver tunes **independently of A/B**: swapping VFOs or turning the
 dial leaves it where you parked it. Switching it on reveals a **SUB module** in
@@ -472,7 +488,11 @@ mode. What is in the box never changes; only where the two rows are cut does.
   into. The panadapter's grips are the quick way to place a passband by eye
   against what is on the band; this is where an exact figure — 2200, 2700,
   3000 — is entered, which a drag can only creep up on (issue #371). See
-  [2.7](#27-receiver-controls) for what the numbers mean in each mode.
+  [2.7](#27-receiver-controls) for what the numbers mean in each mode. In
+  **WFM** it sets the channel filter in front of the FM detector — narrow it to
+  keep a strong station 100 kHz away out of a weak one, at the cost of stereo
+  and RDS first and audio distortion after; it will not go below 20 kHz
+  (issue #414).
 - **MUTE** — mute the receiver (keyboard shortcut **M**).
 - **REC** — record what you hear and what you send, or the raw spectrum
   to an MP3 file, and choose whether it is written in two channels or one. See
@@ -508,7 +528,10 @@ mode. What is in the box never changes; only where the two rows are cut does.
   elements** — heterodynes, carriers, and tuner-uppers — while leaving voice and
   noise. Toggle it on when a steady whistle is spoiling a voice signal. (Like NR,
   it affects only what you hear, not the digital decoders; leave it off for CW
-  and data modes, whose signals *are* tones.)
+  and data modes, whose signals *are* tones.) It is not offered in **AM**,
+  **SAM**, **WFM** or **DRM**: on broadcast audio the sustained notes of the
+  programme are exactly what it cancels, so it took the station away with the
+  whistle (issue #434).
 - **NR** — noise reduction on the audio, with four selectable engines. The button
   always reads just `NR` and lights when noise reduction is in circuit — that is
   all it tells you, and it never changes width under the buttons beside it. Click
@@ -905,9 +928,10 @@ reaching for the other aerial do not mean opening a dialog.
   ceiling in the FFT popup are yours to keep only while FIT is off).
 - **CTR** — keep the tuned frequency in the **middle** of the panadapter. Lit,
   the window slides under the dial every time you tune, so the marker stays put
-  and the band scrolls past it. With it off — the way it has always worked — the
-  window holds still and the marker travels across it until the dial leaves the
-  span, at which point the picture jumps a whole window at once.
+  and the band scrolls past it. It is **on** for a new station, and a radio keeps
+  whichever way you leave it. With it off the window holds still and the marker
+  travels across it until the dial leaves the span, at which point the picture
+  jumps a whole window at once.
 
   Zoomed in this costs nothing: the window is a viewport onto a wider captured
   span, and the receiver is never disturbed. Zoomed all the way out there is
@@ -2195,7 +2219,8 @@ Reporter, FreeDV Reporter), WSPRnet, TLE refresh and the antenna rotator all
 run on it, because a station has one of each of those no matter how many
 radios it has. Its configuration also lives where a single-radio installation
 keeps it, so adding and removing other radios never touches it. It is the one
-tab that cannot be closed.
+tab that cannot be closed. The spots it collects are shown on **every** radio's
+waterfall and SPOTS list, not only its own (issue #410).
 
 **One transmitter on the air at a time.** The radios share a station-wide
 transmit interlock. Keying any radio — PTT, TUNE, a digital-mode sequence,
@@ -2672,6 +2697,11 @@ anywhere the beacon is still inside the captured span.
 > **Note:** like the skimmers and the ISM decoder, this is a wideband feature.
 > It needs a true IQ source and is unavailable when a CAT radio is feeding
 > demodulated audio.
+
+For a task-oriented walkthrough of getting a Pluto + LNB station onto QO-100
+from scratch, see the [QO-100 quick-start guide](qo100-quickstart.en.md)
+([Türkçe](qo100-quickstart.tr.md)); this section is the reference detail behind
+its beacon-sync step.
 
 #### How it works: ON and AUTO
 
@@ -5217,7 +5247,10 @@ ETA, and the position with its accuracy.
 the form every other AIS program in the world reads, and it is there on purpose:
 this decoder was written from ITU-R M.1371 rather than from a recording, so if
 you want to know whether sdroxide is reading a message correctly, copy that line
-into any other AIS decoder and compare.
+into any other AIS decoder and compare. (Up to 1.6.6 every received byte was
+read the wrong way round, which put ships all over the world map or left it
+empty; the decoder is now checked against a published sentence decoded by
+gpsd — issues #345 and #408.)
 
 #### Data fields
 
@@ -5259,6 +5292,86 @@ built independently from the same standard, including on a receiver four
 kilohertz off frequency and with two ships in adjacent slots. What that cannot
 prove is that the standard was read correctly: a field offset wrong in the same
 way at both ends agrees with itself.
+
+### 3.17 AtCHAT NET
+
+Choose **ATCHAT** from the DIGITAL row. AtCHAT NET is a multi-station keyboard
+and file mode built out of nostalgia for the old packet-radio net: several
+stations share one channel, chat both openly and directly, and pass files and
+pictures around, all while the net itself works out who is in charge without
+anyone touching a setting. Underneath is a 2.7 kHz COFDM waveform (BPSK/QPSK),
+the same width as a DIGU/DIGL window; there is no tone offset to set — the
+carriers are fixed by the waveform — and like PSK31, RTTY and the other
+keyboard modes it leaves the dial exactly where you put it rather than jumping
+to a convention ([3.1](#31-general-considerations)). Selecting the mode puts
+the station on the air using the callsign on the General tab
+([6.1](#61-general-station-audio-and-remote-access)), the same one every other
+mode reports with.
+
+#### The net: master election and the roster
+
+There is no separate "server" station — whichever station has been on the net
+longest becomes **MASTER**, the others fall in as backups, and if the master
+disappears one of them takes over without an operator doing anything. The
+panel header shows your own role (**MASTER** in green, **BACKUP** in yellow)
+and, once known, who the current master is. The **ROSTER** strip lists every
+station heard, green while active and grey once it has aged out of the net;
+clicking a callsign there opens a direct-message tab to it, the same tab row
+the panel carries below.
+
+Before a station transmits it listens: **● CARRIER** lights in the header
+whenever something else is already on the channel, and a send waits behind it
+rather than colliding. On the real radio that test is not a fixed threshold —
+a receiver's own AGC settles well above any fixed level once it is on the air,
+so the gate instead tracks the ambient noise floor and calls a hop a carrier
+only when it rises well clear of it, learned in about half a second after the
+station joins.
+
+#### Joining, leaving, and the virtual channel
+
+The join badge in the header doubles as the leave/rejoin control: **ON NET**
+(green) while joined, **REJOIN** once off. Clicking it drops the link — the
+roster and conversation are kept — or rejoins if you have dropped it or the
+station could not start. **● TX** lights while your own frame is actually
+going out.
+
+**VIRTUAL CHANNEL**, below the header, swaps the radio for a
+`channel_server`-compatible TCP loopback — useful for trying the net, or
+developing against it, without keying a transmitter. Off (the default) puts
+the station on the air; on, it dials the address beside the toggle
+(`127.0.0.1:6000` unless changed) instead. Because nothing keys a transmitter
+over the loopback, **SEND** and **SEND FILE** are available there even on a
+station with no TX-capable radio configured.
+
+#### The panel
+
+**⚙ SETUP** opens the callsign and virtual-channel-address fields just
+described. Below the header, the panel splits into a CHAT side and a FILES
+side (stacked instead of side by side on a narrow window).
+
+CHAT carries a tab row above the transcript: a permanent **CHAT** tab for the
+common channel (messages to everyone), a closable tab per station you have
+opened a direct message with — from the roster or by replying to one — and a
+permanent **LOG** tab last, which is read-only and shows the station's own
+on-air activity: master election, roster ageing, ARQ retries. An unread direct
+message marks its tab with a dot. Typing in the box at the bottom and pressing
+Enter (or **SEND**) sends to wherever the active tab points — everyone from
+CHAT, that one station from a direct-message tab.
+
+#### Files and images
+
+FILES lists transfers in progress — an arrow for direction, the filename, the
+peer, and a progress bar — followed by an **IMAGES** viewer with ◀ ▶ between
+the pictures that have arrived, each labelled with who sent it and when.
+**SEND FILE** opens a native file picker (there is no filesystem to pick from
+in the browser client) and sends to whichever chat tab is active, the same way
+a typed line does. Every transfer is block-CRC-ARQ: missing blocks are
+requested back and resent until the file checks out, so a transfer that
+survives fades and drop-outs rather than one that has to be started over.
+
+A received file is written under a `received/` folder — created next to
+wherever sdroxide was started from — named `<transfer-id>_<filename>`, so two
+stations sending a file with the same name never collide.
 
 ## 4. Skimmers
 
@@ -6391,7 +6504,9 @@ which turns the onboard amplifier off and leaves transmit at the low-power RF1
 output, which is how an external amplifier or a transverter is driven. And it
 does not choose the receive port: that is remembered **per band** already, so
 selecting the transverter's antenna once on the band leaves it there
-([6.2](#62-radio-choosing-and-configuring-the-rig)).
+([6.2](#62-radio-choosing-and-configuring-the-rig)). On a Hermes-Lite 2 with an
+HL2IOBoard that means its **IO board RX input** — offered on the ANT control
+once the setting is moved off *Radio's own input* ([6.2.3](#623-hpsdr-network-radios)).
 
 **RX range** and **TX range**, below the offset, are where you tell sdroxide
 which frequencies this radio actually covers. They are **in megahertz**, written
@@ -6521,7 +6636,10 @@ exposes, and nothing it does not:
 > channel is where you change your mind about which one that should be
 > ([2.12](#212-memory-channels)). A band you have never chosen a socket on is
 > left exactly where the radio already is, so nothing moves a relay for you
-> until you have said what belongs on that band.
+> until you have said what belongs on that band. **Each VFO remembers its socket
+> too**, which is what lets you keep A and B on different sockets at the same
+> end of one band; a change of band hands the choice back to the band
+> ([2.5](#25-vfos-split-and-the-sub-receiver)).
 - **Stream** — **Sample rate** and **Baseband filter**, listing the values this
   device says it accepts. Both default to leaving things as they were: the rate
   falls back to the app-wide `sample_rate`, and the filter to whatever the
@@ -7704,7 +7822,11 @@ going out.
   you have wired the IO board's own SMA jacks: J9 can replace the radio's receive
   input, and J10 is a PureSignal (transmit sample) input. Selecting **IO board
   J9** with nothing connected to it leaves the receiver deaf. Takes effect on
-  *Apply / reconnect*.
+  *Apply / reconnect*. Once it is set to one of the J9 choices, the three inputs
+  also appear on the receiver's **ANT** control and are remembered **per band**
+  like any other receiving antenna — so a transverter band can listen on J9
+  while HF stays on the radio's own jack. Left at *Radio's own input*, no ANT
+  control is shown, because an HL2 that has never used J9 has nothing there.
 
 > **Help wanted — the HPSDR backend is not fully tested yet.** 
 > If you own an HPSDR board, you can help by running with diagnostic logging 
@@ -8134,7 +8256,13 @@ configured in exactly the same way as one on your desk.
   Apply.
 - **RX / TX port** — the AD9361's `rf_port_select`. A stock Pluto wires one of
   each (`A_BALANCED` and `A`), so leave these empty unless you have a board that
-  does not.
+  does not. The **ANT** control only offers the ports the board will actually
+  switch to: each is tried once as the radio connects, and a Pluto whose device
+  tree locks the port — every stock one — offers just the port it is on. The
+  transmit-monitor loopbacks are never offered (issue #314). While the AGC is in
+  one of its attack modes the main window's **Gain** slider is greyed out, since
+  the AD9361 ignores a gain written then; set the AGC to *Manual* to use it
+  (issue #417).
 
 **AD9363 or AD9364.** A stock Pluto is an AD9363 and covers **325 MHz–3.8 GHz**;
 a great many have had the well-known firmware change applied, which turns them
@@ -10736,6 +10864,10 @@ back to receive rather than transmitting your office.
   default zoom and tune. Swapping them is a single dropdown if you would rather
   scroll to tune.
 - **Tune step** — the Hz per wheel detent, and the grid wheel tuning lands on.
+  A dial left between two grid points — by a click on the waterfall, say — goes
+  to the next point in the direction you turn on the first detent: from
+  14.262.500 one 1 kHz step up is 14.263.000, and one down is 14.262.000. The
+  keyboard's tuning keys work the same way (issue #431).
 - **Zoom rate** — scales how far one detent zooms.
 - **Click-tune rounding** — the step click-to-tune snaps to.
 - **Invert wheel direction** — flips both wheel actions.
@@ -13912,6 +14044,9 @@ Check **CW keying** on the Radio tab — see
 [6.2.2](#622-cat-radios-serial-control--usb-audio). A rig in CW
 ignores audio sent to its sound card, so it can only be keyed from text: with
 **Rig keyer (CAT)**, on Yaesu check that CW memory 1 is free to be overwritten;
+on a Yaesu FTX-1, sdroxide plays that memory with `KY01`, the form its CAT
+manual gives; through **Hamlib rigctld**, the text goes to Hamlib's `send_morse`,
+so it is Hamlib's backend for your rig that keys it (issue #412);
 on Kenwood, that break-in is on (sdroxide only asserts it when the rig has
 reported CW, because the same command is the VOX switch in every other mode);
 on Icom, that the radio takes `16 47` — sdroxide turns semi break-in on with
@@ -13922,8 +14057,8 @@ or VFO REV, where it answers `?;` and does nothing; on any rig, that
 the radio is actually in CW (**Mode control** = `CAT`) and that the **Drive**
 slider — which *is* the rig's output power on a CAT rig, in CW as in every other
 mode — is not down at the bottom. On a radio whose keyer sdroxide cannot drive
-at all — a Xiegu G90 keys up with no power out, and rigctld and the ELAD have
-no text keying — choose **Sound card (MCW)** instead: the keyed tone goes out
+at all — a Xiegu G90 keys up with no power out, and the ELAD has no text
+keying — choose **Sound card (MCW)** instead: the keyed tone goes out
 as audio and the rig is kept on the **Digimode mode** sideband rather than
 switched to CW (on the G90, `Radio controlled` with the rig parked in U-D, as
 for FT8).
@@ -14077,6 +14212,9 @@ the full detail.
   the G90's other modes take transmit audio from the microphone rather than
   the interface — commanded into plain USB it keys up and transmits the room,
   or nothing.
+- **Transmit meter:** SWR and ALC only. The G90 answers the power-output meter
+  read with a number that is not on Icom's scale — full power at 10 % drive —
+  so sdroxide does not ask for it (issue #430).
 - **CW:** set **CW keying** to `Sound card (MCW)`. The `Rig keyer (CAT)` route
   keys the G90 with **no power out** — sdroxide cannot drive its keyer. With
   MCW, sdroxide keeps the rig on the Digimode-mode sideband (with the recipe
@@ -14894,6 +15032,7 @@ using. Bind them under **Speech** on the Controls tab:
 | ADS-B | Aircraft surveillance on 1090 MHz: a target list and a radar picture with history dots, speed vectors and data blocks. Receive only, and needs a receiver streaming at least 2 Msps. See [3.13](#313-ads-b-aircraft-on-1090-mhz). |
 | VDL2 | The VHF datalink aircraft exchange ACARS over, on fourteen channels between 136.650 and 136.975 MHz at once: a message log and the stations sending them. Receive only. See [3.15](#315-vdl2-what-the-aircraft-are-saying). |
 | AIS | Ship reporting on the two channels either side of 162.000 MHz at once: a vessel list and a marine chart with hulls drawn to their heading, time-based trails and speed vectors. Receive only. See [3.16](#316-ais-ships-on-162-mhz). |
+| ATCHAT | AtCHAT NET — a 2.7 kHz COFDM multi-station keyboard and file mode: dynamic master election, a shared roster, common and directed chat, and block-CRC-ARQ file/image transfer. See [3.17](#317-atchat-net). |
 
 ### Bands
 

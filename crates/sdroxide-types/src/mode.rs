@@ -245,6 +245,11 @@ pub enum Mode {
     /// listened to while it runs. Appended for the same reason as
     /// [`Mode::Hell`].
     Ais,
+    /// AtChat NET — a 2.7 kHz COFDM multi-station keyboard/file mode (dynamic
+    /// master election, roster, chat, ARQ file/image transfer). USB underneath,
+    /// decoded/encoded by `sdroxide-atchat`. Appended for the same reason as
+    /// [`Mode::Hell`].
+    AtChat,
 }
 
 /// The bands on which a mode that keeps phone practice rides the lower
@@ -265,7 +270,7 @@ const PHONE_LSB_BANDS: [(f64, f64); 3] =
 impl Mode {
     /// Every mode, in the order they cycle and appear in the picker — which is
     /// deliberately *not* the enum's declaration order (see [`Mode::Hell`]).
-    pub const ALL: [Mode; 38] = [
+    pub const ALL: [Mode; 39] = [
         Mode::Lsb,
         Mode::Usb,
         Mode::Cw,
@@ -301,6 +306,7 @@ impl Mode {
         Mode::Olivia,
         Mode::Thor,
         Mode::Fsq,
+        Mode::AtChat,
         Mode::Hell,
         Mode::RfPaint,
         Mode::Rade,
@@ -310,7 +316,7 @@ impl Mode {
     /// slotted FT8/FT4 modes, the continuous keyboard modes, Hell, SSTV, RIFP,
     /// packet, RF Paint). All are USB underneath except RIFP, VHF packet and
     /// VHF SSTV, which frequency-modulate the carrier.
-    pub const DIGITAL: [Mode; 22] = [
+    pub const DIGITAL: [Mode; 23] = [
         Mode::Ft8,
         Mode::Ft4,
         Mode::Ft2,
@@ -322,6 +328,7 @@ impl Mode {
         Mode::Olivia,
         Mode::Thor,
         Mode::Fsq,
+        Mode::AtChat,
         Mode::Hell,
         Mode::Sstv,
         Mode::SstvFm,
@@ -353,6 +360,7 @@ impl Mode {
                 | Mode::Olivia
                 | Mode::Thor
                 | Mode::Fsq
+                | Mode::AtChat
                 | Mode::Hell
                 | Mode::RfPaint
                 | Mode::Rade
@@ -494,6 +502,12 @@ impl Mode {
             self,
             Mode::Psk | Mode::Rtty | Mode::RttyFm | Mode::Olivia | Mode::Thor | Mode::Fsq
         )
+    }
+
+    /// True for the AtChat NET mode. Its own decode/encode engine and panel,
+    /// like the packet and APRS controllers.
+    pub fn is_atchat(self) -> bool {
+        self == Mode::AtChat
     }
 
     /// True for the slotted FT8/FT4 modes, as opposed to the continuous
@@ -692,6 +706,7 @@ impl Mode {
             Mode::Vdl2 => "VDL2",
             Mode::Isb => "ISB",
             Mode::Ais => "AIS",
+            Mode::AtChat => "ATCHAT",
         }
     }
 
@@ -700,7 +715,8 @@ impl Mode {
     pub fn default_filter(self) -> (f32, f32) {
         match self {
             Mode::Lsb => (-2850.0, -150.0),
-            Mode::Usb => (150.0, 2850.0),
+            // AtChat COFDM occupies ~312-2688 Hz — the same 2.7 kHz USB window.
+            Mode::Usb | Mode::AtChat => (150.0, 2850.0),
             // CW passband is centered on the sidetone pitch (default 700 Hz).
             Mode::Cw => (450.0, 950.0),
             Mode::Am | Mode::Sam => (-5000.0, 5000.0),
@@ -930,7 +946,7 @@ impl Mode {
         use crate::IfModeClass as C;
         match self {
             Mode::Lsb => C::Lsb,
-            Mode::Usb | Mode::Spec => C::Usb,
+            Mode::Usb | Mode::Spec | Mode::AtChat => C::Usb,
             Mode::Cw => C::Cw,
             // DRM sits on the dial like AM does, and a receiver with an
             // I.F. output offers no separate DRM setting to differ from.
@@ -1018,6 +1034,18 @@ impl Mode {
         matches!(self, Mode::Cw | Mode::Lsb | Mode::Usb)
     }
 
+    /// Whether the audio auto-notch (ANC) is offered and run in this mode.
+    ///
+    /// Not on broadcast audio. The notch is an adaptive line-canceller: it
+    /// removes whatever is predictable across a fraction of a millisecond,
+    /// which on a heterodyne is the whistle and on AM or FM programme — music,
+    /// sustained and full of low notes — is the programme itself. On AM it
+    /// took the audio away with the whistle (issue #434), and DRM's decoded
+    /// audio is the same material.
+    pub fn auto_notch_applies(self) -> bool {
+        !matches!(self, Mode::Am | Mode::Sam | Mode::Wfm | Mode::Drm)
+    }
+
     /// Furthest a filter edge may be dragged from the carrier — bounded by
     /// the mode's DSP channel bandwidth.
     pub fn max_filter_hz(self) -> f32 {
@@ -1081,7 +1109,7 @@ impl Mode {
     /// Filter width presets: (label, lo, hi) relative to the carrier.
     pub fn filter_presets(self) -> &'static [(&'static str, f32, f32)] {
         match self {
-            Mode::Usb | Mode::Digu => &[
+            Mode::Usb | Mode::Digu | Mode::AtChat => &[
                 ("1.8k", 200.0, 2000.0),
                 ("2.4k", 200.0, 2600.0),
                 ("2.7k", 150.0, 2850.0),
@@ -1694,7 +1722,7 @@ mod tests {
         // dropped and nothing listed twice.
         // The last variant *by discriminant*, which is the one appended most
         // recently — not the one that reads last in the picker.
-        let last = Mode::Ais as u8;
+        let last = Mode::AtChat as u8;
         for i in 0..=last {
             let present = Mode::ALL.iter().filter(|m| **m as u8 == i).count();
             assert_eq!(present, 1, "discriminant {i} appears {present} times in Mode::ALL");
@@ -1902,5 +1930,23 @@ mod tests {
         }
         assert!(Mode::Sstv.sideband_follows_band() && Mode::Rade.sideband_follows_band());
         assert!(!Mode::SstvFm.sideband_follows_band());
+    }
+}
+
+#[cfg(test)]
+mod auto_notch_tests {
+    use super::Mode;
+
+    /// Issue #434: no auto-notch on broadcast audio, where the "tone" it
+    /// cancels is the programme; still there for the voice and CW modes it was
+    /// made for.
+    #[test]
+    fn the_auto_notch_is_not_offered_on_broadcast_audio() {
+        for m in [Mode::Am, Mode::Sam, Mode::Wfm, Mode::Drm] {
+            assert!(!m.auto_notch_applies(), "{m:?}");
+        }
+        for m in [Mode::Usb, Mode::Lsb, Mode::Cw, Mode::Nfm, Mode::Dsb] {
+            assert!(m.auto_notch_applies(), "{m:?}");
+        }
     }
 }

@@ -543,6 +543,33 @@ pub struct SdroxideApp {
     /// Packet: how far back through [`Self::packet_history`] the operator has
     /// walked. `None` means they are typing something new.
     packet_history_at: Option<usize>,
+    /// AtCHAT: what is typed on the chat line but not yet sent. The active
+    /// chat tab decides where it goes — the common channel, or one callsign.
+    atchat_draft: String,
+    /// AtCHAT: the open direct-message tabs, in the order they appeared. The
+    /// common "CHAT" tab is always present and is not in this list.
+    atchat_dm_tabs: Vec<String>,
+    /// AtCHAT: the selected chat tab. `None` is the common "CHAT" tab (lines go
+    /// to ALL); `Some(call)` is that station's direct-message tab.
+    atchat_chat_tab: Option<String>,
+    /// AtCHAT: the permanent LOG tab is up — the transcript area shows the
+    /// station's on-air activity log instead of a conversation. Takes
+    /// precedence over [`Self::atchat_chat_tab`] while set; any other tab
+    /// click clears it.
+    atchat_show_log: bool,
+    /// AtCHAT: newest incoming direct-message timestamp already turned into a
+    /// tab, per peer — so closing a tab does not make an old message reopen it.
+    atchat_dm_seen: std::collections::HashMap<String, u64>,
+    /// AtCHAT: newest incoming direct-message timestamp the operator has viewed
+    /// for that peer — drives the unread dot on an inactive DM tab.
+    atchat_dm_read: std::collections::HashMap<String, u64>,
+    /// AtCHAT: which received image the viewer is showing — an index into the
+    /// image-only subset of the status file list, oldest first.
+    atchat_img_at: usize,
+    /// AtCHAT: received images decoded from disk once and kept as textures,
+    /// keyed by file path. `None` marks a path that would not decode, so it is
+    /// not retried every frame.
+    atchat_img_cache: std::collections::HashMap<String, Option<egui::TextureHandle>>,
     /// APRS: the station icons, decoded once and kept as textures.
     aprs_icons: crate::aprs_icons::AprsIcons,
     /// APRS: the map's centre, zoom and selected station.
@@ -673,6 +700,13 @@ pub struct SdroxideApp {
     spots: Vec<Spot>,
     /// Latest feed/connection status line (cluster state, feed errors).
     net_status: Option<String>,
+    /// Bumped whenever `spots` or `net_status` changes, so the multi-radio
+    /// shell can hand the station radio's feeds to the other tabs without
+    /// comparing or cloning the list every frame.
+    spots_gen: u64,
+    /// The station radio's `spots_gen` this tab last took its spots from, in a
+    /// multi-radio window — see [`SdroxideApp::adopt_spot_feed`].
+    adopted_spots_gen: Option<u64>,
     /// Spots window open state.
     show_spots: bool,
     /// Show only spots that fall inside the current panadapter view span.
@@ -1103,6 +1137,7 @@ impl SdroxideApp {
         crate::theme::set_spot_colors(&ui_settings.spot_colors);
         crate::theme::set_bandplan_colors(&ui_settings.bandplan_colors);
         crate::theme::set_map_cities(ui_settings.map_cities);
+        crate::theme::set_ui_zoom(ui_settings.ui_zoom);
         crate::theme::apply(egui_ctx);
         // What this renderer will carry. Gathered here because it is the one
         // place that holds the render state and the controller at once, and
@@ -1324,6 +1359,14 @@ impl SdroxideApp {
             packet_draft: String::new(),
             packet_history: Vec::new(),
             packet_history_at: None,
+            atchat_draft: String::new(),
+            atchat_dm_tabs: Vec::new(),
+            atchat_chat_tab: None,
+            atchat_show_log: false,
+            atchat_dm_seen: std::collections::HashMap::new(),
+            atchat_dm_read: std::collections::HashMap::new(),
+            atchat_img_at: 0,
+            atchat_img_cache: std::collections::HashMap::new(),
             aprs_show_traffic: false,
             aprs_filter: String::new(),
             aprs_lat_buf: String::new(),
@@ -1351,6 +1394,8 @@ impl SdroxideApp {
             log_edit: None,
             spots: Vec::new(),
             net_status: None,
+            spots_gen: 0,
+            adopted_spots_gen: None,
             show_spots: false,
             spot_in_view_only: false,
             spot_search: String::new(),
@@ -1493,9 +1538,59 @@ impl SdroxideApp {
         }
     }
 
+    /// Keep the operator's ctrl+plus / ctrl+minus zoom for next time
+    /// (issue #425).
+    ///
+    /// egui owns the zoom factor and changes it on those keys without telling
+    /// anybody, so it is compared with what the settings would put there: a
+    /// difference is the operator zooming, and the part of it that is not the
+    /// menu font size is stored. Another radio tab may already have stored it
+    /// this frame, which is why a tab behind the shared value only catches up
+    /// rather than writing the file again.
+    pub(in crate::app) fn remember_ui_zoom(&mut self, ctx: &egui::Context) {
+        let shared = crate::theme::ui_zoom();
+        let zoom = ctx.zoom_factor() / crate::theme::ui_scale();
+        if (zoom - shared).abs() > 1e-3 {
+            crate::theme::set_ui_zoom(zoom);
+            self.ui_settings.ui_zoom = crate::theme::ui_zoom();
+            crate::app::persist::persist_ui_settings(&self.ui_settings);
+        } else if (self.ui_settings.ui_zoom - shared).abs() > 1e-3 {
+            self.ui_settings.ui_zoom = shared;
+        }
+    }
+
     /// Multi-radio: mark the logbook file as shared with other tabs.
     pub(crate) fn set_shared_log(&mut self, shared: bool) {
         self.shared_log = shared;
+    }
+
+    /// Multi-radio: the network spots and feed status this tab holds, and the
+    /// generation they are at.
+    pub(crate) fn spot_feed(&self) -> (u64, &[Spot], Option<&str>) {
+        (self.spots_gen, &self.spots, self.net_status.as_deref())
+    }
+
+    /// Multi-radio: take the station radio's spots and feed status.
+    ///
+    /// Only the station radio's engine runs the feeds — a DX cluster login, an
+    /// RBN socket and the reporters are things a station has one of — so every
+    /// other tab's engine sends none, and a spot never reached the waterfall or
+    /// the SPOTS list of any radio but the first (issue #410). `generation` is the
+    /// station tab's own counter.
+    pub(crate) fn adopt_spot_feed(
+        &mut self,
+        generation: u64,
+        spots: &[Spot],
+        status: Option<&str>,
+    ) {
+        self.adopted_spots_gen = Some(generation);
+        self.spots = spots.to_vec();
+        self.net_status = status.map(str::to_string);
+    }
+
+    /// Whether this tab is behind the station radio's spot generation `generation`.
+    pub(crate) fn wants_spot_feed(&self, generation: u64) -> bool {
+        self.adopted_spots_gen != Some(generation)
     }
 
     /// Whether this radio is on the air — the tab strip's TX badge.

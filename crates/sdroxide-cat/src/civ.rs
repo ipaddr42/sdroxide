@@ -26,6 +26,14 @@ pub fn encode_freq(hz: f64) -> [u8; 5] {
     out
 }
 
+/// Whether a frequency report's payload has the shape of one: five BCD bytes,
+/// or six from a radio above 10 GHz, and no `FC` (the bus's collision jam) or
+/// stray preamble byte inside it — both of which mean two frames welded
+/// together on the wire rather than a frequency (issue #415).
+pub fn plausible_freq_payload(data: &[u8]) -> bool {
+    matches!(data.len(), 5 | 6) && !data.iter().any(|&b| b == 0xFC || b == PREAMBLE)
+}
+
 /// Decode 5 little-endian BCD bytes back to a frequency in Hz.
 pub fn decode_freq(bytes: &[u8]) -> Option<f64> {
     if bytes.len() < 5 {
@@ -66,7 +74,9 @@ pub fn mode_to_civ(m: Mode) -> u8 {
         | Mode::RfPaint
         | Mode::Rade
         // HF packet is 300 baud AFSK on a sideband, like any keyboard mode.
-        | Mode::PacketHf => 0x01,
+        | Mode::PacketHf
+        // AtChat NET is a 2.7 kHz COFDM keyboard/file mode on a sideband.
+        | Mode::AtChat => 0x01,
         Mode::Am | Mode::Sam | Mode::Dsb | Mode::Isb | Mode::Drm => 0x02,
         Mode::Cw => 0x03,
         // RIFP is FSK on the carrier, and VHF packet frequency-modulates it,
