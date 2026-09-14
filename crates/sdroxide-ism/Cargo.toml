@@ -30,4 +30,4 @@ tracing.workspace = true
 [build-dependencies]
 cmake = "0.1"
 cc = "1"
-bindgen = "0.72"
+bindgen = "0.73"
