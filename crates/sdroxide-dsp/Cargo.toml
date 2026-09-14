@@ -33,5 +33,5 @@ df = { package = "deep_filter", git = "https://github.com/Rikorose/DeepFilterNet
 # For DfTract::process, which takes ndarray views. This MUST track deep_filter's
 # own requirement (`ndarray = "^0.15"`) — a different major is a different crate,
 # and the view types would not interoperate.
-ndarray = "0.15"
+ndarray = "0.17"
 
