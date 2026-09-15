@@ -4244,6 +4244,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "rand_distr"
+version = "0.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4d431c2703ccf129de4d45253c03f49ebb22b97d6ad79ee3ecfc7e3f4862c1d8"
+dependencies = [
+ "num-traits",
+ "rand 0.10.2",
+]
+
+[[package]]
 name = "range-alloc"
 version = "0.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4893,7 +4903,7 @@ dependencies = [
  "hound",
  "num-complex",
  "rand 0.8.8",
- "rand_distr",
+ "rand_distr 0.6.0",
  "rustfft",
  "serde",
  "serde_json",
@@ -6539,7 +6549,7 @@ dependencies = [
  "getrandom 0.2.17",
  "log",
  "rand 0.8.8",
- "rand_distr",
+ "rand_distr 0.4.3",
  "rustfft",
  "tract-nnef",
 ]
