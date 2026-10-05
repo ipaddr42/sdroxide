@@ -436,6 +436,12 @@ impl IqSource for Recorder {
         self.hw_center = hz;
         Ok(())
     }
+    fn select_vfo(&mut self, _vfo: Vfo, hz: f64) {
+        self.calls.note("select_vfo");
+        // A rig selecting a VFO receives on that VFO's frequency, so the
+        // centre it reports is the number it was handed.
+        self.hw_center = hz;
+    }
     fn lo_offset_hz(&self) -> f64 {
         self.calls.note("lo_offset_hz");
         600_000.0
@@ -572,6 +578,15 @@ fn every_call_reaches_the_front_end_underneath() {
     assert!((s.center_hz() - DIAL).abs() < 1.0);
     s.set_center_hz(DIAL + 1000.0).unwrap();
     assert!((s.center_hz() - (DIAL + 1000.0)).abs() < 1.0, "round trip through the wrapper");
+    // The other VFO is on the operator's side of the converter too, and reaches
+    // the rig with the offset added, not taken away.
+    s.select_vfo(Vfo::B, DIAL + 2000.0);
+    assert!(
+        (s.center_hz() - (DIAL + 2000.0)).abs() < 1.0,
+        "select_vfo converts the way set_center_hz does, got {}",
+        s.center_hz()
+    );
+    s.set_center_hz(DIAL + 1000.0).unwrap();
     assert!(s.describe().contains("recorder"), "the inner description survives");
     assert!(s.describe().contains("converter"), "and says a converter is in circuit");
     let mut bins = Vec::new();
@@ -630,6 +645,7 @@ fn every_call_reaches_the_front_end_underneath() {
         "sample_rate",
         "center_hz",
         "set_center_hz",
+        "select_vfo",
         "lo_offset_hz",
         "read",
         "describe",

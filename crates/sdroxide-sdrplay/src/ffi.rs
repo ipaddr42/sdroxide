@@ -103,10 +103,19 @@ pub const BW_UNDEFINED: BwType = 0;
 /// `sdrplay_api_If_kHzT` — the value is the IF in kHz; `-1` is "undefined".
 pub type IfType = i32;
 pub const IF_ZERO: IfType = 0;
-/// The 450 kHz low IF. What the tuner uses where a zero IF is impractical,
-/// and — per SDRuno's HDR documentation — what the RSPdx's HDR path expects.
-/// Nothing here selects it: the driver pins a zero IF, and running the HDR
-/// path at 450 kHz by hand did not make it deliver anything either.
+/// The 450 kHz low IF, for the API's own down-conversion. Nothing here selects
+/// it: the driver pins a zero IF.
+///
+/// It has **nothing to do with the RSPdx's HDR path**, contrary to what this
+/// comment used to say. The API specification (3.15, "Conditions for LIF
+/// down-conversion") enables this IF only at `fsHz == 2000000` with a
+/// bandwidth of 300 kHz or less, or exactly 600 kHz — and the HDR conditions,
+/// printed directly beneath that table on the same page, name no IF at all:
+/// only `rfHz` and `hdrEnable` (see [`UPDATE_RSPDX_HDR_ENABLE`]). The two
+/// tables being adjacent is very likely how they came to be conflated.
+/// Recorded because the mistake cost an afternoon of driving the HDR path at
+/// 450 kHz by hand, which could not have worked — at the rate and bandwidth
+/// in use the API would not have enabled the low IF either.
 pub const IF_0_450: IfType = 450;
 /// The low IF the API's own downconverter works from. Mandatory with both of
 /// an RSPduo's tuners running, where the ADC is fixed at 6 MHz.
@@ -116,9 +125,13 @@ pub const IF_2_048: IfType = 2048;
 /// `sdrplay_api_LoModeT`.
 pub type LoMode = i32;
 pub const LO_AUTO: LoMode = 1;
-/// The fixed LO settings. The API picks one under `LO_AUTO`; the HDR path's
-/// short list of usable centres looks like the product of a particular choice,
-/// so they are nameable here.
+/// The fixed LO settings. The API picks one under `LO_AUTO`, which is what the
+/// driver leaves it on.
+///
+/// Nameable here, but nothing connects them to HDR: the specification gives
+/// that path's usable centres as a plain list of `rfHz` values and never
+/// mentions the LO setting. This comment used to say the list looked like the
+/// product of a particular choice, which was a guess and read as a finding.
 pub const LO_120MHZ: LoMode = 2;
 pub const LO_144MHZ: LoMode = 3;
 pub const LO_168MHZ: LoMode = 4;

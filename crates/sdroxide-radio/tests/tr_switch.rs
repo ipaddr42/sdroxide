@@ -179,6 +179,12 @@ struct Station {
 /// would stop the second radio ever reaching the air — which is the case the
 /// last test is about.
 fn station(n: u32) -> Station {
+    station_with(n, relay_cfg(), caps())
+}
+
+/// [`station`], with the switch's configuration and the radio's capabilities
+/// given rather than the defaults.
+fn station_with(n: u32, cfg: RelayConfig, caps: DeviceCaps) -> Station {
     isolate_config();
     let hub = Arc::new(TrSwitch::new());
     let board = Arc::new(Mutex::new(BoardLog::default()));
@@ -188,7 +194,7 @@ fn station(n: u32) -> Station {
         let log = Arc::new(Mutex::new(RigLog::default()));
         let h = start_engine(
             Box::new(MockTrx { log: Arc::clone(&log) }),
-            caps(),
+            caps.clone(),
             EngineConfig {
                 tx_ham_only: false,
                 instance: i,
@@ -216,7 +222,6 @@ fn station(n: u32) -> Station {
     st.wait(0, "the engine's own T/R switch to settle", |ev| {
         matches!(ev, RadioEvent::RelayStatus(_))
     });
-    let cfg = relay_cfg();
     st.hub.install(
         Some(sdroxide_relay::spawn(
             Box::new(FakeBoard { log: Arc::clone(&st.board), last: None }),
@@ -466,6 +471,131 @@ fn a_switch_that_cannot_be_opened_refuses_the_over() {
     assert!(
         !st.rigs[0].lock().unwrap().keyed.is_empty(),
         "\"transmit anyway, warn\" refused anyway"
+    );
+    st.shutdown();
+}
+
+/// Under a satellite lock the transmitter is on the transponder's uplink, not
+/// on the dial — so the band decoder's TX word has to be the uplink band's.
+/// AO-7's mode B, a real inverting transponder: the dial on the 2 m downlink,
+/// the transmitter on 70 cm. Taken from the dial, the key-down would have put
+/// the 2 m filter in line with a 70 cm transmitter (issue #442).
+#[test]
+fn a_satellite_lock_switches_the_band_decoder_to_the_uplink_band() {
+    use sdroxide_types::{Band, RelayBandRow, SatLockConfig, SatUplink};
+    const TWO_M: ChannelMask = 0b010;
+    const SEVENTY_CM: ChannelMask = 0b100;
+    let filter = |index: u8| RelayChannel {
+        index,
+        role: RelayRole::BandDecoder,
+        label: format!("filter {index}"),
+        active_high: true,
+        lead_ms: LEAD_MS,
+        hold_ms: HOLD_MS,
+    };
+    let mut cfg = relay_cfg();
+    cfg.channels.extend([filter(2), filter(3)]);
+    cfg.band_table = vec![
+        RelayBandRow { band: Band::M2, rx_mask: TWO_M, tx_mask: TWO_M },
+        RelayBandRow { band: Band::M70, rx_mask: SEVENTY_CM, tx_mask: SEVENTY_CM },
+    ];
+    let caps = DeviceCaps { freq_ranges_tx: vec![(144e6, 148e6), (430e6, 440e6)], ..caps() };
+    let st = station_with(1, cfg, caps);
+
+    st.engines[0]
+        .cmd_tx
+        .send(Command::SetSatLock(Some(Box::new(SatLockConfig {
+            norad_id: 7530,
+            name: "OSCAR 7 (AO-7)".into(),
+            tle: Some((
+                "1 07530U 74089B   26205.50898980 -.00000033  00000+0  81693-4 0  9992".into(),
+                "2 07530 101.9909 219.1448 0012602  61.1135  93.5622 12.53698681365193".into(),
+            )),
+            observer: Some((48.2, 16.4)),
+            downlink_hz: 145_950_000.0,
+            uplink: Some(SatUplink {
+                up_lo_hz: 432_125_000.0,
+                up_hi_hz: 432_175_000.0,
+                down_lo_hz: 145_925_000.0,
+                down_hi_hz: 145_975_000.0,
+                inverting: true,
+            }),
+            doppler: false,
+            rotator: false,
+        }))))
+        .unwrap();
+    // Receiving on the downlink: the 2 m filter.
+    st.wait_state(TWO_M);
+    assert_eq!(st.changes().last().map(|(_, m)| *m), Some(TWO_M), "never settled on 2 m");
+
+    st.key(0, true);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while st.rigs[0].lock().unwrap().keyed.is_empty() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    assert!(!st.rigs[0].lock().unwrap().keyed.is_empty(), "the radio never keyed");
+    let on_air = st.changes().last().map(|(_, m)| *m);
+    assert_eq!(
+        on_air,
+        Some(0b001 | SEVENTY_CM),
+        "keyed on the 70 cm uplink with the contacts at {on_air:?}, not the 70 cm filter"
+    );
+    st.key(0, false);
+    st.wait_state(TWO_M);
+    st.shutdown();
+}
+
+/// On a two-radio station the receive word is the primary's band, and the
+/// transmit word the band of whichever radio keyed: the second radio on 40 m
+/// keys while the primary listens on 20 m, and the 40 m filter is what goes
+/// in line — then the 20 m one comes back when the over ends.
+#[test]
+fn the_band_decoder_follows_the_radio_that_keyed() {
+    use sdroxide_types::{Band, RelayBandRow};
+    const TWENTY: ChannelMask = 0b010;
+    const FORTY: ChannelMask = 0b100;
+    let filter = |index: u8| RelayChannel {
+        index,
+        role: RelayRole::BandDecoder,
+        label: format!("filter {index}"),
+        active_high: true,
+        lead_ms: LEAD_MS,
+        hold_ms: HOLD_MS,
+    };
+    let mut cfg = relay_cfg();
+    cfg.channels.extend([filter(2), filter(3)]);
+    cfg.band_table = vec![
+        RelayBandRow { band: Band::M20, rx_mask: TWENTY, tx_mask: TWENTY },
+        RelayBandRow { band: Band::M40, rx_mask: FORTY, tx_mask: FORTY },
+    ];
+    let st = station_with(2, cfg, caps());
+    st.engines[1]
+        .cmd_tx
+        .send(Command::SetVfo { vfo: sdroxide_types::Vfo::A, hz: 7_074_000.0 })
+        .unwrap();
+    // The primary is on 20 m, so that is the receive word.
+    st.wait_state(TWENTY);
+    assert_eq!(st.changes().last().map(|(_, m)| *m), Some(TWENTY), "never settled on 20 m");
+
+    st.key(1, true);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while st.rigs[1].lock().unwrap().keyed.is_empty() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    assert!(!st.rigs[1].lock().unwrap().keyed.is_empty(), "the second radio never keyed");
+    let on_air = st.changes().last().map(|(_, m)| *m);
+    assert_eq!(
+        on_air,
+        Some(0b001 | FORTY),
+        "the 40 m radio keyed with the contacts at {on_air:?}, not the 40 m filter"
+    );
+
+    st.key(1, false);
+    st.wait_state(TWENTY);
+    assert_eq!(
+        st.changes().last().map(|(_, m)| *m),
+        Some(TWENTY),
+        "the primary's 20 m filter did not come back after the over"
     );
     st.shutdown();
 }

@@ -7,3 +7,6 @@
 [submodule "vendor/faad2"]
 	path = vendor/faad2
 	url = https://github.com/knik0/faad2
+[submodule "vendor/xng"]
+	path = vendor/xng
+	url = https://github.com/airframesio/xng.git

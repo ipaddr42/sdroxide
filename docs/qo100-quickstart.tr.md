@@ -4,7 +4,7 @@
 yörüngeli transponderına sdroxide üzerinden çıkarmak için görev odaklı bir
 anlatım. Bir kerelik istasyon ayarlarını, uyduya kilitlenmeyi ve QO-100
 beacon senkronizasyon sekmesini kapsar. Her kontrolün ayrıntısı için
-[`USER_MANUAL.md`](USER_MANUAL.md) §2.21 (QO-100 beacon plugin) ve §6.2.7
+[`USER_MANUAL.md`](USER_MANUAL.md) §2.22 (QO-100 beacon plugin) ve §6.2.7
 (PlutoSDR) bölümlerine bakın.
 
 10 GHz downlink LNB üzerinden iner; 2,4 GHz uplink doğrudan Pluto'dan çıkar.

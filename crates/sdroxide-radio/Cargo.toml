@@ -17,6 +17,9 @@ sdroxide-dsp.workspace = true
 # DRM reception. Links a vendored C++ receiver, so it is native-only — which
 # this crate already is.
 sdroxide-drm.workspace = true
+# HD Radio reception, through the libnrsc5 installed on the machine — found at
+# run time, nothing linked (issue #488).
+sdroxide-nrsc5.workspace = true
 num-complex.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
@@ -37,6 +40,9 @@ sdroxide-adsb = { path = "../sdroxide-adsb" }
 sdroxide-vdl2 = { path = "../sdroxide-vdl2" }
 sdroxide-ais = { path = "../sdroxide-ais" }
 sdroxide-qo100 = { path = "../sdroxide-qo100" }
+# Native-only, like the rest of the `on_rx_iq` lanes: the HFDL decoder runs
+# in the engine off a dedicated downconversion of the raw IQ.
+sdroxide-hfdl = { path = "../sdroxide-hfdl" }
 sdroxide-net = { path = "../sdroxide-net" }
 sdroxide-winlink = { path = "../sdroxide-winlink" }
 # Only for `tlesub`: the engine persists the satellite subscriptions and, being
@@ -60,7 +66,7 @@ sdroxide-wsjtx = { path = "../sdroxide-wsjtx" }
 # JPEG as well as PNG: the transmit-preset store normalises whatever the
 # operator picked, and the file picker offers both.
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
-shine-rs = "0.1.3"
+shine-rs = "0.1.4"
 
 [dev-dependencies]
 # The APRS codec, so the transmit test can read back what the engine sent.

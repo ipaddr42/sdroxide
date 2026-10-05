@@ -267,3 +267,136 @@ fn the_samples_a_lime_transmits_follow_the_bands_calibration() {
         let _ = t.join();
     }
 }
+
+/// The other half of #504, and the half that matters at the antenna: a ceiling
+/// the operator set for the radio holds the *samples* down, on TUNE as well as
+/// on an over, and a band trim cannot lift them back over it.
+///
+/// This is the shape of the reported hazard. An ANAN-7000DLE's drive register
+/// is pinned at full scale by the HPSDR backends and the I/Q amplitude is the
+/// drive, so the top of the Drive control is the transmitter wide open — about
+/// 50 W at 15% and well over 200 W out of 100 W-rated finals a little above
+/// that. The ceiling is what puts the rated power at the top of the control.
+#[test]
+fn a_drive_ceiling_holds_the_transmitted_samples_down() {
+    isolate_config();
+    let peak = Arc::new(Mutex::new(0.0f32));
+    let mut h = start_engine(
+        Box::new(MockIqTx { center: 14_074_000.0, peak: Arc::clone(&peak) }),
+        caps(),
+        EngineConfig { tx_ham_only: false, ..EngineConfig::default() },
+    );
+    let thread = h.thread.take();
+    std::thread::sleep(Duration::from_millis(200));
+
+    let tune_peak = |h: &sdroxide_radio::EngineHandles| -> f32 {
+        *peak.lock().unwrap() = 0.0;
+        h.cmd_tx.send(Command::SetTune(true)).unwrap();
+        std::thread::sleep(Duration::from_millis(400));
+        h.cmd_tx.send(Command::SetTune(false)).unwrap();
+        std::thread::sleep(Duration::from_millis(200));
+        *peak.lock().unwrap()
+    };
+
+    h.cmd_tx.send(Command::SetVfo { vfo: Vfo::A, hz: 14_074_000.0 }).unwrap();
+    h.cmd_tx.send(Command::SetTuneDrive(1.0)).unwrap();
+    std::thread::sleep(Duration::from_millis(250));
+
+    // What the radio does today: full drive is full scale, and nothing is
+    // between the top of the control and the finals.
+    let wide_open = tune_peak(&h);
+    assert!(wide_open > 0.01, "the untrimmed radio should have transmitted, got {wide_open}");
+
+    // A quarter of full drive, set once for this radio. The band is calibrated
+    // *up* at the same time: a calibration may not lift the drive back over a
+    // limit, which is the whole reason the ceiling is applied last.
+    let cfg = RadioConfig {
+        tx_drive_max: Some(0.25),
+        tx_drive_trim: vec![BandDriveTrim { band: Band::M20, db: 6.0 }],
+        ..RadioConfig::default()
+    };
+    h.cmd_tx.send(Command::SetRadioConfig { cfg: Box::new(cfg), reopen: false }).unwrap();
+    std::thread::sleep(Duration::from_millis(250));
+
+    let capped = tune_peak(&h);
+    let ratio = capped / wide_open;
+    assert!(
+        (ratio - 0.25).abs() < 0.02,
+        "a 25% ceiling should hold a held carrier to a quarter of full scale even with the \
+         band trimmed up: got {capped} against {wide_open} (ratio {ratio})"
+    );
+
+    // And the operator's own setting is where they left it. The ceiling is a
+    // limit, not an edit: the Drive control still reads what they set, exactly
+    // as the band calibration leaves it alone.
+    let mut last: Option<RadioState> = None;
+    while let Ok(ev) = h.event_rx.try_recv() {
+        if let RadioEvent::State(s) = ev {
+            last = Some(s);
+        }
+    }
+    if let Some(s) = last {
+        assert!(
+            (s.tx.tune_drive - 1.0).abs() < 1e-6,
+            "the TUNE setting is untouched, got {}",
+            s.tx.tune_drive
+        );
+    }
+
+    // Taking it off gives the radio back.
+    h.cmd_tx
+        .send(Command::SetRadioConfig { cfg: Box::new(RadioConfig::default()), reopen: false })
+        .unwrap();
+    std::thread::sleep(Duration::from_millis(250));
+    let released = tune_peak(&h);
+    assert!(
+        released > capped * 2.0,
+        "removing the ceiling should let the drive back up: got {released} against {capped}"
+    );
+
+    drop(h.cmd_tx);
+    if let Some(t) = thread {
+        let _ = t.join();
+    }
+}
+
+/// The same ceiling on a rig that commands its own power, where it lands on the
+/// commanded fraction rather than on the samples.
+#[test]
+fn a_drive_ceiling_binds_a_rig_that_commands_its_own_power() {
+    isolate_config();
+    let drive = Arc::new(Mutex::new(Vec::new()));
+    let mut h = start_engine(
+        Box::new(MockRig { center: 14_074_000.0, drive: Arc::clone(&drive) }),
+        caps(),
+        EngineConfig::default(),
+    );
+    let thread = h.thread.take();
+    std::thread::sleep(Duration::from_millis(200));
+
+    let cfg = RadioConfig { tx_drive_max: Some(0.4), ..RadioConfig::default() };
+    h.cmd_tx.send(Command::SetRadioConfig { cfg: Box::new(cfg), reopen: false }).unwrap();
+    h.cmd_tx.send(Command::SetVfo { vfo: Vfo::A, hz: 14_074_000.0 }).unwrap();
+    std::thread::sleep(Duration::from_millis(250));
+
+    drive.lock().unwrap().clear();
+    h.cmd_tx.send(Command::SetTxDrive(1.0)).unwrap();
+    std::thread::sleep(Duration::from_millis(200));
+    let commanded = *drive.lock().unwrap().last().expect("the rig should have been given a power");
+    assert!(
+        (commanded - 0.4).abs() < 1e-3,
+        "the rig may not be commanded past the ceiling, got {commanded}"
+    );
+
+    // Below the ceiling the operator still has the whole of their control.
+    drive.lock().unwrap().clear();
+    h.cmd_tx.send(Command::SetTxDrive(0.1)).unwrap();
+    std::thread::sleep(Duration::from_millis(200));
+    let under = *drive.lock().unwrap().last().expect("the rig should have been given a power");
+    assert!((under - 0.1).abs() < 1e-3, "a setting under the ceiling is untouched, got {under}");
+
+    drop(h.cmd_tx);
+    if let Some(t) = thread {
+        let _ = t.join();
+    }
+}

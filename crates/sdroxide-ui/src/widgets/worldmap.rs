@@ -107,7 +107,7 @@ impl MapView {
     /// Zoom by `factor` (below 1 zooms *in*) about a point given as a fraction
     /// of the map rect — (0,0) top-left, (1,1) bottom-right — keeping whatever
     /// is under that point in place.
-    fn zoom_about(&mut self, factor: f64, fx: f64, fy: f64, aspect: f64) {
+    pub(crate) fn zoom_about(&mut self, factor: f64, fx: f64, fy: f64, aspect: f64) {
         // Where the anchor sits relative to the centre, in view fractions, and
         // the place it is currently over.
         let (ax, ay) = (fx - 0.5, 0.5 - fy);
@@ -303,14 +303,26 @@ fn stamp_lines(
         {
             continue;
         }
-        let mut prev = project(f64::from(part.pts[0].0), f64::from(part.pts[0].1));
+        let mut prev_lon = f64::from(part.pts[0].1);
+        let mut prev = project(f64::from(part.pts[0].0), prev_lon);
         for point in &part.pts[1..] {
-            let cur = project(f64::from(point.0), f64::from(point.1));
-            // A segment that leaves the map and comes back the other side is
-            // the date line under the projection's wrap; drawn straight it
-            // would be a scar across the whole map.
+            let lon = f64::from(point.1);
+            let cur = project(f64::from(point.0), lon);
+            // A segment across the view's seam — the far side of the world,
+            // `clon ± 180°`, wherever the map has been panned to, and not the
+            // date line — comes out with its ends on opposite edges, and drawn
+            // straight it is a scar across the whole map.
+            //
+            // Recognised in longitude, where it is exact: the projection has
+            // the segment stepping 360° further than the line itself does.
+            // This used to be measured on screen, as a jump of at least one map
+            // width — but 360° is `360 / lon_span` widths, which is several
+            // zoomed in and only just under one at the whole world, so there
+            // every crossing slipped through and was drawn.
+            let drawn = wrap180(lon - clon) - wrap180(prev_lon - clon);
+            let crosses_seam = (drawn - wrap180(lon - prev_lon)).abs() > 180.0;
             let (dx, dy) = (cur.0 - prev.0, cur.1 - prev.1);
-            if dx.abs() < cols as f64 {
+            if !crosses_seam {
                 // Step along it half a cell at a time — half, so a diagonal
                 // leaves no gaps at the corners.
                 let steps = (dx.abs().max(dy.abs()) * 2.0).ceil().max(1.0);
@@ -325,6 +337,7 @@ fn stamp_lines(
                 }
             }
             prev = cur;
+            prev_lon = lon;
         }
     }
 }
@@ -342,6 +355,25 @@ fn stamp_lines(
 /// Returns the dot radius, which is the scale the callers draw their own
 /// markers against.
 pub(crate) fn draw_base(
+    p: &eframe::egui::Painter,
+    rect: eframe::egui::Rect,
+    clat: f64,
+    clon: f64,
+    lon_span: f64,
+    lat_span: f64,
+    map: &theme::MapPalette,
+) -> f32 {
+    let dot_r = draw_ground(p, rect, clat, clon, lon_span, lat_span, map);
+    if theme::map_cities() {
+        draw_cities(p, rect, clat, clon, lon_span, lat_span, dot_r, map);
+    }
+    dot_r
+}
+
+/// [`draw_base`] without the cities: land, rivers and borders. Apart for the
+/// map that shades the night side, where the ground goes under the grey line
+/// and the cities — marks and names to be read — go over it.
+fn draw_ground(
     p: &eframe::egui::Painter,
     rect: eframe::egui::Rect,
     clat: f64,
@@ -403,9 +435,6 @@ pub(crate) fn draw_base(
             let a = base + spread * (f32::from(rank - 1) / 12.0).min(1.0);
             p.circle_filled(at(i % cols, i / cols), dot_r, alpha(ink, weight * a));
         }
-    }
-    if theme::map_cities() {
-        draw_cities(p, rect, clat, clon, lon_span, lat_span, dot_r, map);
     }
     dot_r
 }
@@ -487,6 +516,47 @@ fn draw_cities(
     }
 }
 
+/// Stamp an equirectangular world texture across the view, repeated sideways so
+/// a view that straddles the antimeridian is still covered. The painter's clip
+/// rectangle trims what falls outside.
+///
+/// The projection is linear in latitude and longitude, so the whole world is an
+/// axis-aligned rectangle here and the texture's own bilinear filtering is what
+/// turns its cells into soft shapes with no visible edges. `tint` multiplies
+/// the texture — [`Color32::WHITE`] paints it as it is.
+#[allow(clippy::too_many_arguments)]
+fn paint_world_texture(
+    p: &eframe::egui::Painter,
+    rect: eframe::egui::Rect,
+    clat: f64,
+    clon: f64,
+    lon_span: f64,
+    lat_span: f64,
+    tex: eframe::egui::TextureId,
+    tint: Color32,
+) {
+    let lon_to_x = |lon: f64| rect.left() + (0.5 + ((lon - clon) / lon_span) as f32) * rect.width();
+    let lat_to_y = |lat: f64| rect.top() + (0.5 - ((lat - clat) / lat_span) as f32) * rect.height();
+    let world = eframe::egui::Rect::from_min_max(
+        pos2(lon_to_x(-180.0), lat_to_y(90.0)),
+        pos2(lon_to_x(180.0), lat_to_y(-90.0)),
+    );
+    let world_w = world.width();
+    if world_w <= 1.0 {
+        return;
+    }
+    // Which copies of the world overlap what is on screen.
+    let first = ((rect.left() - world.right()) / world_w).floor() as i32;
+    let last = ((rect.right() - world.left()) / world_w).ceil() as i32;
+    let uv = eframe::egui::Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0));
+    for k in first..=last {
+        let r = world.translate(vec2(k as f32 * world_w, 0.0));
+        if r.intersects(rect) {
+            p.image(tex, r, uv, tint);
+        }
+    }
+}
+
 /// Draw the map filling the available width (2:1 aspect). `view` carries the
 /// animated centre/zoom across frames. `home`/`dx`/`preview` are (lat, lon) in
 /// degrees. `stations` is every decoded station still on the map — drawn as
@@ -516,6 +586,13 @@ pub fn show(
     // (see `crate::prop_map::PropHeat`). Painted under the continents, so the
     // coastline stays readable on top of it.
     heat: Option<eframe::egui::TextureId>,
+    // The grey line — night and twilight — as an equirectangular RGBA image of
+    // the whole world (see `crate::prop_map::NightShade`). Painted over the
+    // heat and the continents, so a band that is dead because the Sun is down
+    // reads that way and the terminator reads across land as well as sea; the
+    // cities and every station mark go over it. How dark it gets is the map
+    // palette's `night_max`.
+    night: Option<eframe::egui::TextureId>,
     tx_active: bool,
     max_h: f32,
 ) {
@@ -584,30 +661,26 @@ pub fn show(
     // sideways to cover a view that straddles the antimeridian; the painter's
     // clip rectangle trims what falls outside.
     if let Some(tex) = heat {
-        let lon_to_x =
-            |lon: f64| rect.left() + (0.5 + ((lon - clon) / lon_span) as f32) * rect.width();
-        let lat_to_y =
-            |lat: f64| rect.top() + (0.5 - ((lat - clat) / lat_span) as f32) * rect.height();
-        let world = eframe::egui::Rect::from_min_max(
-            pos2(lon_to_x(-180.0), lat_to_y(90.0)),
-            pos2(lon_to_x(180.0), lat_to_y(-90.0)),
-        );
-        let world_w = world.width();
-        if world_w > 1.0 {
-            // Which copies of the world overlap what is on screen.
-            let first = ((rect.left() - world.right()) / world_w).floor() as i32;
-            let last = ((rect.right() - world.left()) / world_w).ceil() as i32;
-            let uv = eframe::egui::Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0));
-            for k in first..=last {
-                let r = world.translate(vec2(k as f32 * world_w, 0.0));
-                if r.intersects(rect) {
-                    p.image(tex, r, uv, Color32::WHITE);
-                }
-            }
-        }
+        paint_world_texture(&p, rect, clat, clon, lon_span, lat_span, tex, Color32::WHITE);
     }
 
-    let dot_r = draw_base(&p, rect, clat, clon, lon_span, lat_span, map);
+    let dot_r = draw_ground(&p, rect, clat, clon, lon_span, lat_span, map);
+
+    // The grey line, over the heat and the continents: both darken on the night
+    // side, so the terminator reads across land as well as sea. The cities and
+    // the station and spot marks are drawn after it and keep their light.
+    //
+    // At the palette's strength rather than the texture's: a light map's marks
+    // are dark ink, and a full-strength night would put them ink on ink. A
+    // premultiplied tint scales colour and alpha together, which is opacity.
+    if let Some(tex) = night {
+        let strength = (map.night_max / sdroxide_solar::NIGHT_MAX_ALPHA).clamp(0.0, 1.0);
+        let tint = Color32::WHITE.gamma_multiply(strength);
+        paint_world_texture(&p, rect, clat, clon, lon_span, lat_span, tex, tint);
+    }
+    if theme::map_cities() {
+        draw_cities(&p, rect, clat, clon, lon_span, lat_span, dot_r, map);
+    }
 
     // Project (lat, lon) to screen using the current view; longitude wraps.
     let project = |lat: f64, lon: f64| -> Pos2 {
@@ -879,6 +952,39 @@ mod tests {
         for row in 0..rows {
             let filled = marks[row * cols..(row + 1) * cols].iter().filter(|m| **m != 0).count();
             assert!(filled * 3 < cols, "row {row} is {filled}/{cols} wide — a wrap scar");
+        }
+    }
+
+    /// The seam is wherever the view puts the far side of the world —
+    /// `clon ± 180°` — not the date line. The border data is already split at
+    /// ±180°, so a map centred on Greenwich hides the problem: pan it and the
+    /// seam lands in Asia, where hundreds of borders and rivers cross it.
+    ///
+    /// The whole world is the case that matters, because it is where the seam
+    /// jump is smallest. A segment across the seam steps 360° of longitude, which
+    /// is `360 / lon_span` map widths: six at a 60° zoom and trivially spotted,
+    /// but only just under one at 360°, where it was being drawn straight across.
+    #[test]
+    fn nothing_is_drawn_across_the_seam_wherever_the_map_is_panned() {
+        let (cols, rows) = (200usize, 100usize);
+        let lines = crate::basemap::lines();
+        for clon in (-180..180).step_by(15) {
+            for (name, layer) in [("borders", &lines.borders), ("rivers", &lines.rivers)] {
+                let mut marks = vec![0u8; cols * rows];
+                let view = (0.0, f64::from(clon), 360.0, 180.0);
+                stamp_lines(layer, view, (cols, rows), &mut marks);
+                for row in 0..rows {
+                    // A scar is one long unbroken run; a real line is short. The
+                    // longest straight border drawn is the 49th parallel, 28° of
+                    // it — about 16 cells here, far under a quarter of the width.
+                    let cells = &marks[row * cols..(row + 1) * cols];
+                    let longest = cells.split(|m| *m == 0).map(<[u8]>::len).max().unwrap_or(0);
+                    assert!(
+                        longest * 4 < cols,
+                        "{name}, centred on {clon}°: row {row} has a run of {longest}/{cols} — a seam scar"
+                    );
+                }
+            }
         }
     }
 

@@ -116,6 +116,13 @@ pub enum DigiAction {
     /// emitted by diff, so decoding the *same* station twice running — the
     /// common case in a QSO — would stop re-reporting it.
     RadeCallsign { call: String, snr_db: f32, freq_hz: f64 },
+    /// RADE: a signal is in sync but has not identified itself yet, so the
+    /// engine should tell the reporting networks we are hearing *something*.
+    ///
+    /// An event rather than a status field because it is a report to send, not
+    /// a value to display, and it must be paced (see the controller) rather
+    /// than emitted on every poll.
+    RadePresence { snr_db: f32 },
     /// CW for the *rig's* keyer to send, rather than sidetone for the engine to
     /// transmit. A transceiver in CW mode keys its own transmitter and ignores
     /// what arrives at its sound card, so on a CAT rig this is the only route
@@ -129,6 +136,11 @@ pub enum DigiAction {
     SendCw { text: String, seconds: f32 },
     /// Stop CW the rig is part way through sending.
     AbortCw,
+    /// PI4: what a completed one-minute cycle's search decoded.
+    ///
+    /// Not `Decodes`, for the same reason [`DigiAction::WsprSpots`] is not: a
+    /// beacon reception is a measurement, not a message addressed to anyone.
+    Pi4Spots(Vec<sdroxide_types::Pi4Spot>),
 }
 
 struct DecodeJob {
@@ -149,6 +161,10 @@ struct DecodeJob {
     ap: ApHints,
     /// Where we are listening, for FT4's targeted a-priori pass.
     audio_hz: f32,
+    /// The FT8 decode depth in force when the slot completed — see
+    /// [`sdroxide_types::Ft8Depth`]. Read off the config here rather than held
+    /// on the worker's modem, which the job is the only thing that updates.
+    ft8_depth: sdroxide_types::Ft8Depth,
 }
 
 pub struct DigiController {
@@ -215,9 +231,10 @@ pub struct DigiController {
     /// are kept: two stations on one frequency is exactly the situation worth
     /// avoiding.
     recent_activity: Vec<(i64, f32)>,
-    // Decode worker.
+    // Decode worker. FT8 sends two result batches per slot — the quick pass,
+    // then the SIC extras — and `final` on the second marks the slot finished.
     job_tx: Sender<DecodeJob>,
-    res_rx: Receiver<(i64, Vec<Decode>)>,
+    res_rx: Receiver<(i64, Vec<Decode>, bool)>,
     _worker: std::thread::JoinHandle<()>,
     // TX burst playback.
     burst: Option<BurstPlayer>,
@@ -290,17 +307,26 @@ impl DigiController {
 
         // Decode worker: owns its own modem, runs LDPC off the RT thread.
         let (job_tx, job_rx) = std::sync::mpsc::channel::<DecodeJob>();
-        let (res_tx, res_rx) = std::sync::mpsc::channel::<(i64, Vec<Decode>)>();
+        let (res_tx, res_rx) = std::sync::mpsc::channel::<(i64, Vec<Decode>, bool)>();
         let worker_mode = params.mode;
         let worker = std::thread::Builder::new()
             .name("sdroxide-ft8-decode".into())
             .spawn(move || {
                 let mut modem = Ft8Modem::new(worker_mode);
                 while let Ok(job) = job_rx.recv() {
+                    modem.set_ft8_depth(job.ft8_depth);
                     modem.seed_hashes(&job.ap.calls());
-                    let decodes =
-                        modem.decode_slot(&job.audio, job.slot_utc, &job.ap, job.audio_hz);
-                    if res_tx.send((job.slot_idx, decodes)).is_err() {
+                    // Two stages for FT8: the quick single-pass result is sent
+                    // as soon as it is ready, so an auto-sequenced reply can be
+                    // decided inside the transmit offset, and the slower SIC
+                    // extras follow as a second batch. `false`/`true` says which
+                    // is which, so the controller knows when the slot is done.
+                    let (quick, extras) =
+                        modem.decode_slot_staged(&job.audio, job.slot_utc, &job.ap, job.audio_hz);
+                    if res_tx.send((job.slot_idx, quick, false)).is_err() {
+                        break;
+                    }
+                    if res_tx.send((job.slot_idx, extras, true)).is_err() {
                         break;
                     }
                 }
@@ -308,13 +334,17 @@ impl DigiController {
             .expect("spawn ft8 decode worker");
 
         let tx_even = cfg.tx_even;
-        let qso = QsoMachine::new(params.mode, cfg);
+        let qso = QsoMachine::new(params.mode, cfg.clone());
 
         DigiController {
             params,
             scheduler: SlotScheduler::for_mode(mode),
             qso,
-            modem: Ft8Modem::new(params.mode),
+            modem: {
+                let mut m = Ft8Modem::new(params.mode);
+                m.set_ft8_depth(cfg.ft8_depth);
+                m
+            },
             resampler,
             slot_buf: Vec::with_capacity(params.slot_samples()),
             tap_scratch: Vec::new(),
@@ -350,6 +380,7 @@ impl DigiController {
         if cfg.dxped_mode == sdroxide_types::DxpedMode::Fox {
             self.tx_even = cfg.tx_even;
         }
+        self.modem.set_ft8_depth(cfg.ft8_depth);
         self.qso.set_config(cfg);
         self.status_dirty = true;
     }
@@ -779,10 +810,14 @@ impl DigiController {
         // 1. Drain finished decodes from the worker.
         loop {
             match self.res_rx.try_recv() {
-                Ok((slot_idx, decodes)) => {
-                    // Answered for, whether or not it found anything: an empty
-                    // slot is a finished slot.
-                    self.decoding = self.decoding.saturating_sub(1);
+                Ok((slot_idx, decodes, final_batch)) => {
+                    // Only the FINAL batch marks the slot done. FT8 arrives in
+                    // two: the quick pass (so a reply can be decided inside the
+                    // transmit offset) and the SIC extras, which can come a
+                    // second or so later.
+                    if final_batch {
+                        self.decoding = self.decoding.saturating_sub(1);
+                    }
                     if !decodes.is_empty() {
                         let slot_utc = self.scheduler.slot_start_unix(slot_idx) as i64;
                         // Remember which slot we heard each station in (reply
@@ -842,7 +877,14 @@ impl DigiController {
                     };
                     if self
                         .job_tx
-                        .send(DecodeJob { audio, slot_idx, slot_utc, ap, audio_hz: self.audio_hz })
+                        .send(DecodeJob {
+                            audio,
+                            slot_idx,
+                            slot_utc,
+                            ap,
+                            audio_hz: self.audio_hz,
+                            ft8_depth: self.modem.ft8_depth(),
+                        })
                         .is_ok()
                     {
                         self.decoding += 1;

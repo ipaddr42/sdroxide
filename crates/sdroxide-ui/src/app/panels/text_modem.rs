@@ -64,6 +64,7 @@ impl SdroxideApp {
                 }
                 self.digi_squelch_slider(ui, cmds);
                 self.clear_rx_chip(ui, cmds);
+                self.save_rx_chip(ui);
             });
         });
         ui.add_space(4.0);
@@ -75,7 +76,17 @@ impl SdroxideApp {
         let input_h = 56.0; // fixed-height, internally-scrolling TX box
         let gap = 5.0;
         let bottom_pad = 12.0; // clear space below the button row
-        let rx_h = (content_bottom - ui.cursor().top() - btn_h - input_h - 2.0 * gap - bottom_pad)
+        // The message-button row under the buttons, as on the CW panel: it is
+        // drawn whether or not any buttons exist, and uncounted it would be laid
+        // out past the bottom of the panel and paint over whatever is below.
+        let macro_h = 4.0 + crate::chrome::chip_height(ui, None);
+        let rx_h = (content_bottom
+            - ui.cursor().top()
+            - btn_h
+            - macro_h
+            - input_h
+            - 2.0 * gap
+            - bottom_pad)
             .max(24.0);
 
         ui.allocate_ui(egui::vec2(ui.available_width(), rx_h), |ui| {
@@ -277,10 +288,55 @@ impl SdroxideApp {
                      instead of streaming each character onto the air as it is typed. \
                      Lets a line be read back and corrected before any of it goes out.",
                 );
+                self.text_msg_edit_chip(ui);
             });
         });
+        super::macros::macro_row(
+            ui,
+            cmds,
+            tx_ok,
+            &my_call,
+            &self.digi_cfg_edit.my_grid,
+            &self.digi_cfg_edit.text_macros,
+            &mut self.text_tx,
+        );
         // Visible padding below the buttons so they aren't flush with the edge.
         ui.add_space(bottom_pad);
+    }
+
+    /// The chip that opens the message editor, beside SEND ON RETURN.
+    fn text_msg_edit_chip(&mut self, ui: &mut egui::Ui) {
+        if crate::chrome::chip(ui, self.text_macro_edit, "MSG")
+            .on_hover_text(
+                "Your own message buttons — working conditions, the weather, a standard \
+                 reply. Each sends its whole text in one go, and F2–F10 press the first \
+                 nine. They travel with the station's configuration, so a remote client \
+                 has them too.",
+            )
+            .clicked()
+        {
+            self.text_macro_edit = !self.text_macro_edit;
+        }
+    }
+
+    /// The message editor window. The control is shared with the CW panel
+    /// ([`super::macros`]); only the list is the keyboard modes'.
+    pub(in crate::app) fn text_macro_window(
+        &mut self,
+        ctx: &egui::Context,
+        cmds: &mut Vec<Command>,
+    ) {
+        if super::macros::macro_window(
+            ctx,
+            "MESSAGES",
+            "TextMacros",
+            "{MYCALL} DE {MYCALL}",
+            &mut self.text_macro_edit,
+            &mut self.digi_cfg_edit.text_macros,
+        ) && self.digi_cfg_seeded
+        {
+            cmds.push(Command::SetDigiConfig(self.digi_cfg_edit.clone()));
+        }
     }
 
     /// Hellschreiber panel: the scrolling receive raster on top, then a

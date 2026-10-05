@@ -56,7 +56,7 @@ fn mode_name(m: Mode) -> &'static str {
         Mode::Lsb => "LSB",
         Mode::Usb | Mode::Spec | Mode::Sstv | Mode::Wefax | Mode::Navtex | Mode::RfPaint => "USB",
         Mode::Cw => "CW",
-        Mode::Am | Mode::Sam | Mode::Drm => "AM",
+        Mode::Am | Mode::Sam | Mode::Drm | Mode::Acars => "AM",
         Mode::Dsb => "DSB",
         // Hamlib has no independent-sideband mode; AM is what a rig asked to
         // pass both sidebands would be put into anyway.
@@ -65,7 +65,7 @@ fn mode_name(m: Mode) -> &'static str {
         // No rig has an ADS-B mode and none ever will: the dial is at
         // 1090 MHz. Grouped with FM so nothing downstream has to special-case
         // a mode a radio can neither be put into nor report back.
-        Mode::Wfm | Mode::Adsb | Mode::Vdl2 | Mode::Ais => "WFM",
+        Mode::Wfm | Mode::Adsb | Mode::Vdl2 | Mode::Ais | Mode::Hfdl | Mode::HdRadio => "WFM",
         // Data over FM rather than over a sideband: the carrier is the signal's
         // centre, not one edge of it.
         Mode::Rifp | Mode::Packet | Mode::Aprs | Mode::SstvFm | Mode::RttyFm => "PKTFM",
@@ -74,6 +74,13 @@ fn mode_name(m: Mode) -> &'static str {
         | Mode::Ft8
         | Mode::Js8
         | Mode::Wspr
+        | Mode::Pi4
+        | Mode::Msk144
+        | Mode::Jt65
+        | Mode::Jt9
+        | Mode::Fst4
+        | Mode::Q65
+        | Mode::Fsk441
         | Mode::Ft4
         | Mode::Ft2
         | Mode::Psk

@@ -210,6 +210,32 @@ pub const RTTY_CENTER_HZ: f32 = 2210.0;
 /// mode's audio offset, there is nothing here for an operator to choose.
 pub const NAVTEX_TONE_HZ: f32 = 1700.0;
 
+/// How hard the FT8 decoder works for weak signals, and what it costs.
+///
+/// FT8's recall comes from signal subtraction, and the most thorough pass —
+/// WSJT-X's checkpointed multi-pass (mfsk-core's `.sic_early()`, a recall
+/// superset of the flat `.sic_rounds(n)`) — is **sequential by construction**,
+/// so it can neither be spread across cores nor made cheap. It was measured at
+/// ~1.2 s on a busy slot against FT8's 0.5 s transmit offset, so an operator who
+/// wants the reply to go out on time should be able to trade a few weak decodes
+/// for it. That trade is this setting.
+///
+/// Measured on mfsk-core's `qso3_busy.wav`, `.osd(true)`, 16 cores:
+/// - [`Fast`](Self::Fast) — one pass, no subtraction: ~30 ms, ~16 stations.
+/// - [`Normal`](Self::Normal) — flat multi-pass SIC: ~0.4 s, ~19–20.
+/// - [`Deep`](Self::Deep) — the checkpointed pass: ~1.2 s, ~22.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum Ft8Depth {
+    /// One pass, no subtraction. Fastest, least sensitive.
+    Fast,
+    /// Flat multi-pass SIC: a little quicker than [`Deep`](Self::Deep), a
+    /// little less thorough.
+    Normal,
+    /// The checkpointed multi-pass. The most decodes.
+    #[default]
+    Deep,
+}
+
 /// A "special operating activity": a contest whose exchange is not the
 /// everyday grid-and-report, so the slotted modes have to send and read
 /// something else (issue #223).
@@ -516,10 +542,27 @@ pub struct DigiStatus {
     /// will take it next. `None` in every other mode, as `cw` and `js8` are.
     #[serde(default)]
     pub wspr: Option<crate::WsprStatus>,
+    /// PI4: where the one-minute beacon cycle is, and whether this slot's
+    /// audio is still being searched. `None` in every other mode.
+    #[serde(default)]
+    pub pi4: Option<crate::Pi4Status>,
     /// The contact in progress, beyond the callsign and grid above. `None`
     /// whenever no station is being worked. See [`QsoLive`].
     #[serde(default)]
     pub qso: Option<QsoLive>,
+    /// ACARS status, when that mode is selected. `None` in every other mode,
+    /// as the rest of these are.
+    ///
+    /// Last in the struct for the usual reason: postcard numbers fields by
+    /// position, and a field added in the middle would shift the tail for every
+    /// peer that matches the protocol version but not this build.
+    #[serde(default)]
+    pub acars: Option<AcarsStatus>,
+    /// Why a key-up was refused or is armed with nothing to send — an empty
+    /// message box, most often. `None` when there is nothing to say. A message
+    /// rather than a flag so each mode can name its own reason.
+    #[serde(default)]
+    pub tx_refused: Option<String>,
 }
 
 /// The running detail of the contact in progress: when it started and what has
@@ -543,7 +586,7 @@ pub struct QsoLive {
 }
 
 /// Live state of the CW decoder.
-#[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct CwStatus {
     /// The decoder is copying: its timing fit is good and holding steady.
     pub locked: bool,
@@ -555,6 +598,22 @@ pub struct CwStatus {
     /// The tone actually being copied, in Hz above the dial — the operator's
     /// pitch plus whatever the decoder's AFC has pulled to stay on the signal.
     pub tone_hz: f32,
+    /// Whether the radio is sending from its own keyer rather than from our
+    /// sidetone.
+    ///
+    /// True over the control port: the text goes to the rig and the rig times
+    /// the elements, so there is nothing between the keyboard and the air for
+    /// a hand to drive, and the straight key cannot engage. The panel needs
+    /// the answer because the operator cannot see it — the KEY button used to
+    /// light up and then key nothing, which is the whole of issue #495. False
+    /// is the ordinary case and the safe default: an SDR, or a rig on the
+    /// sound-card route, keys from the sidetone we generate.
+    pub rig_keys_itself: bool,
+    /// What the straight key decoded of *our own* sending, so the operator can
+    /// see the characters their hand produced. Empty in every other mode and
+    /// whenever the key has not been used.
+    #[serde(default)]
+    pub sent_text: String,
 }
 
 /// Live state of the RADE V1 modem.
@@ -788,6 +847,96 @@ impl NavtexMessage {
     pub fn is_mandatory(&self) -> bool {
         matches!(self.kind, 'A' | 'B' | 'D')
     }
+
+    /// The time-of-day a NAVTEX body states, as `(hour, minute)` UTC, if it
+    /// names one.
+    ///
+    /// Time is not a message class: a NAVTEX station's time broadcasts and the
+    /// `AT 1200 UTC` in a gale warning are ordinary text that happens to carry
+    /// a clock reading, so this reads the body rather than the header. It is a
+    /// convenience for the reader — a warning is nearly always read against
+    /// when it was issued, and picking the figure out of a column of positions
+    /// by eye is the tedious part — not a synchronisation source: sdroxide
+    /// never sets the system clock from it (issue #212).
+    ///
+    /// Only a four-digit time that is *marked* as a time counts — followed by
+    /// `UTC`, or run into a `Z` — so a bare four-digit number in a position or
+    /// a serial is not mistaken for one. `HH:MM` is accepted too, since
+    /// stations send it. The first such reading in the body wins; a message
+    /// that states several is a forecast table, and the first is its header
+    /// time.
+    #[must_use]
+    pub fn body_time_utc(&self) -> Option<(u8, u8)> {
+        parse_navtex_time(&self.text)
+    }
+}
+
+/// Pull the first marked UTC time-of-day out of a NAVTEX body.
+///
+/// Free function rather than a method's private detail so the tests can reach
+/// it with raw text, including the shapes a real station sends.
+pub(crate) fn parse_navtex_time(text: &str) -> Option<(u8, u8)> {
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    while i + 3 < bytes.len() {
+        // A four-digit run, optionally written `HH:MM`.
+        let whole_word = i == 0 || !bytes[i - 1].is_ascii_digit();
+        let digits = if whole_word
+            && bytes[i].is_ascii_digit()
+            && bytes[i + 1].is_ascii_digit()
+            && bytes.get(i + 2) == Some(&b':')
+            && bytes.get(i + 3).is_some_and(u8::is_ascii_digit)
+            && bytes.get(i + 4).is_some_and(u8::is_ascii_digit)
+        {
+            // Colon form: HH:MM. Whole-word like the bare form below, or the
+            // tail of a longer number reads as an hour: `123:45` is not 23:45.
+            Some((
+                (bytes[i] - b'0') * 10 + (bytes[i + 1] - b'0'),
+                (bytes[i + 3] - b'0') * 10 + (bytes[i + 4] - b'0'),
+                5usize,
+            ))
+        } else if whole_word
+            && bytes[i..].len() >= 4
+            && bytes[i..i + 4].iter().all(u8::is_ascii_digit)
+        {
+            // Bare form: HHMM, and `whole_word` is what keeps the tail of a
+            // longer number from being read as one.
+            Some((
+                (bytes[i] - b'0') * 10 + (bytes[i + 1] - b'0'),
+                (bytes[i + 2] - b'0') * 10 + (bytes[i + 3] - b'0'),
+                4usize,
+            ))
+        } else {
+            None
+        };
+        if let Some((hh, mm, len)) = digits {
+            // Marked as a time: the token right after the digits says so. This
+            // is what keeps a bare HHMM in a position, a serial or a count from
+            // being read as a clock. Two shapes count, and nothing else:
+            //
+            // * the digits run straight into a `Z` — `1200Z`, the maritime
+            //   shorthand for "1200 UTC";
+            // * the next word is `UTC`, after any spaces — `1200 UTC`.
+            //
+            // Matched over bytes rather than a `&str` slice: `word[..3]` panics
+            // where byte 3 is inside a multi-byte character, and the body is
+            // only ASCII when it came from the decoder — a `NavtexMessage`
+            // arriving over the wire carries whatever the peer put in it.
+            let after = &text[i + len..];
+            let zulu = after.as_bytes().first().is_some_and(|c| c.eq_ignore_ascii_case(&b'Z'));
+            let word = after.trim_start().as_bytes();
+            let utc = word.len() >= 3
+                && word[..3].eq_ignore_ascii_case(b"UTC")
+                && word.get(3).is_none_or(|c| !c.is_ascii_alphabetic());
+            if hh < 24 && mm < 60 && (zulu || utc) {
+                return Some((hh, mm));
+            }
+            i += len;
+            continue;
+        }
+        i += 1;
+    }
+    None
 }
 
 /// Messages kept. A station transmits on a ten-minute slot every four hours
@@ -816,6 +965,44 @@ pub struct NavtexStatus {
     pub lost: u64,
     /// Whether the tones are being read the other way up.
     pub reverse: bool,
+}
+
+/// Most ACARS messages kept. A busy channel produces a few a minute and the
+/// pane is a rolling view, not a log.
+pub const ACARS_MESSAGE_MAX: usize = 300;
+
+/// One decoded ACARS message.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub struct AcarsMessage {
+    /// The mode character, as text.
+    pub mode: String,
+    /// The aircraft address, trimmed.
+    pub address: String,
+    /// The technical acknowledgement character.
+    pub ack: String,
+    /// The two-character message label.
+    pub label: String,
+    /// The block identifier.
+    pub block_id: String,
+    /// The message text.
+    pub text: String,
+    /// Whether the block-check sequence matched.
+    pub crc_ok: bool,
+    /// When it was decoded, Unix seconds UTC.
+    pub at: i64,
+}
+
+/// What the ACARS receiver is doing.
+#[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AcarsStatus {
+    /// Smoothed audio level, for a meter.
+    pub level: f32,
+    /// Messages received, newest last.
+    pub messages: Vec<AcarsMessage>,
+    /// Frames decoded with a good block check.
+    pub frames: u64,
+    /// Frames whose block check failed.
+    pub bad: u64,
 }
 
 /// Most frames kept for the monitor pane. A busy VHF channel produces a few a
@@ -878,6 +1065,7 @@ impl DigiStatus {
             tx_even: config.tx_even,
             transmitting: false,
             tx_watchdog: false,
+            tx_refused: None,
             transcript: Vec::new(),
             config,
             text_rx: String::new(),
@@ -887,6 +1075,7 @@ impl DigiStatus {
             rade: None,
             packet: None,
             navtex: None,
+            acars: None,
             aprs: None,
             js8: None,
             atchat: None,
@@ -895,6 +1084,7 @@ impl DigiStatus {
             clock_offset_s: None,
             cw: None,
             wspr: None,
+            pi4: None,
             qso: None,
         }
     }
@@ -1167,8 +1357,13 @@ impl HellVariant {
     }
 }
 
-/// One of the operator's CW message buttons — what the chip says, and what it
-/// sends (issue #374).
+/// One of the operator's message buttons — what the chip says, and what it
+/// sends (issues #374, #463).
+///
+/// Shared by the CW panel (through [`DigiConfig::cw_macros`]) and the keyboard
+/// modes (through [`DigiConfig::text_macros`]): the same label-and-text shape,
+/// drawn by the same control, kept in two lists because the two kinds of
+/// message differ.
 ///
 /// The label is kept apart from the text because a chip has to be readable at a
 /// glance and the text it sends is a sentence: a button showing
@@ -1209,6 +1404,62 @@ impl CwMacro {
     /// other station's callsign, so there is nothing true to substitute.
     pub fn expand(&self, my_call: &str, my_grid: &str) -> String {
         self.text.replace("{MYCALL}", my_call).replace("{MYGRID}", my_grid)
+    }
+}
+
+/// How the text drawn into a transmitted SSTV picture looks: the banner strip's
+/// gradient and outline, and the slot message's ink.
+///
+/// Its own struct rather than a dozen more `DigiConfig` fields, because it is
+/// one idea — "how do I want my picture to look" — and because `DigiConfig`
+/// rides the wire whole: one appended field means one protocol bump instead of
+/// six. The defaults reproduce the original look exactly (strip fades to black,
+/// banner text plain, message white on black), so an existing `digi.json` and
+/// an operator who never opens the editor both see no change.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SstvStyle {
+    /// Fade the banner strip to [`Self::banner_fill2`] at its bottom edge
+    /// instead of to black. The top colour is
+    /// [`DigiConfig::sstv_banner_fill`](DigiConfig::sstv_banner_fill).
+    pub banner_gradient: bool,
+    /// The colour the strip's gradient reaches at its bottom, when
+    /// [`Self::banner_gradient`] is on.
+    pub banner_fill2: [u8; 3],
+    /// Draw the banner text with an outline in [`Self::banner_outline_ink`].
+    pub banner_outline: bool,
+    pub banner_outline_ink: [u8; 3],
+    /// Fade the banner text from its ink to [`Self::banner_ink2`] across the
+    /// strip, left to right.
+    pub banner_ink_gradient: bool,
+    pub banner_ink2: [u8; 3],
+    /// Override every colour the picture's text would use — the banner's ink
+    /// and its gradient, and the slot message — with a horizontal rainbow.
+    /// Takes precedence over all of them.
+    pub rainbow_text: bool,
+    /// The colour the slot message is printed in.
+    pub message_ink: [u8; 3],
+    /// Draw the message text with an outline in [`Self::message_outline_ink`].
+    /// On by default, which is what the message has always been: white text
+    /// with a black edge, readable over any picture.
+    pub message_outline: bool,
+    pub message_outline_ink: [u8; 3],
+}
+
+impl Default for SstvStyle {
+    fn default() -> Self {
+        SstvStyle {
+            banner_gradient: false,
+            banner_fill2: [0, 0, 0],
+            banner_outline: false,
+            banner_outline_ink: [0, 0, 0],
+            banner_ink_gradient: false,
+            banner_ink2: [0, 0, 0],
+            rainbow_text: false,
+            message_ink: [255, 255, 255],
+            message_outline: true,
+            message_outline_ink: [0, 0, 0],
+        }
     }
 }
 
@@ -1887,6 +2138,64 @@ pub struct DigiConfig {
     /// that quietly kept its spots to itself would be missing the mode.
     #[serde(default = "yes")]
     pub wspr_upload: bool,
+    /// SSTV: how the text drawn into a transmitted picture looks — the banner
+    /// strip's gradient and outline, and the slot message's ink. See
+    /// [`SstvStyle`].
+    #[serde(default)]
+    pub sstv_style: SstvStyle,
+    /// CW: play the keyed sidetone through the local speakers as well as
+    /// sending it, so the operator hears what they are sending.
+    ///
+    /// Every other mode gets its feedback another way — the transmitted signal
+    /// is off the air, and a receiver that is not muted during the over lets
+    /// the operator hear it. On `Sound card (MCW)` the keyed tone goes to the
+    /// rig's sound card and nowhere else, so without this the operator sends in
+    /// silence. On by default; turn it off where the rig's own monitor or an
+    /// off-air copy already does the job, so the two do not double.
+    #[serde(default = "yes")]
+    pub cw_sidetone: bool,
+    /// CW: how long transmit is held after the last character or key release
+    /// before the carrier drops, in seconds. The idle between characters is
+    /// what makes typing feel like sending, and it is what a straight key
+    /// rests on between elements — but it has to end somewhere, and five
+    /// seconds is a long time to sit on an empty frequency. 0 drops transmit
+    /// as soon as the queue drains (subject to the straight key's hold).
+    #[serde(default = "cw_default_tx_idle_s")]
+    pub cw_tx_idle_s: f32,
+    /// FST4: the T/R period (15/30/60/120/300 s). The period is a property of
+    /// the contact rather than of the mode — all five share one waveform and
+    /// one message — so it is a setting here, exactly as JS8's speed is. See
+    /// [`crate::Fst4Period`].
+    #[serde(default)]
+    pub fst4_period: crate::Fst4Period,
+    /// Q65: the sub-mode — T/R period and tone-spacing letter together. The
+    /// sub-mode fixes both the period and the tone spacing rather than being
+    /// part of the mode, so it is a setting, exactly as FST4's period is. See
+    /// [`crate::Q65Mode`].
+    #[serde(default)]
+    pub q65_mode: crate::Q65Mode,
+    /// FSK441: the T/R period (15/30 s). A property of the contact rather than
+    /// of the mode — both periods share one waveform and one alphabet — so it
+    /// is a setting here. See [`crate::Fsk441Period`].
+    #[serde(default)]
+    pub fsk441_period: crate::Fsk441Period,
+    /// The same message buttons for the keyboard modes — PSK, RTTY, Olivia,
+    /// Thor: the working conditions or the weather an operator sends over and
+    /// over, typed once and kept across sessions (issue #463). A list of its
+    /// own rather than shared with the CW row above, because a CW abbreviation
+    /// and a PSK sentence are not the same message; identical in shape and
+    /// behaviour otherwise.
+    #[serde(default)]
+    pub text_macros: Vec<CwMacro>,
+    /// FT8: how hard the decoder works for weak signals — see [`Ft8Depth`].
+    /// The plain single-pass result is always emitted first whatever this says,
+    /// so it governs only the extra, subtracting batch.
+    #[serde(default)]
+    pub ft8_depth: Ft8Depth,
+}
+
+fn cw_default_tx_idle_s() -> f32 {
+    5.0
 }
 
 fn wspr_default_power() -> i16 {
@@ -1979,6 +2288,7 @@ impl Default for DigiConfig {
             cw_wpm: cw_default_wpm(),
             cw_farnsworth_wpm: 0.0,
             cw_macros: Vec::new(),
+            text_macros: Vec::new(),
             cw_speed_lock: false,
             cw_engine: crate::CwEngine::default(),
             send_on_enter: false,
@@ -2068,6 +2378,13 @@ impl Default for DigiConfig {
             wspr_hop: false,
             wspr_hop_bands: wspr_default_hop_bands(),
             wspr_upload: true,
+            sstv_style: SstvStyle::default(),
+            cw_sidetone: true,
+            cw_tx_idle_s: 5.0,
+            fst4_period: crate::Fst4Period::P60,
+            q65_mode: crate::Q65Mode::A30,
+            fsk441_period: crate::Fsk441Period::P30,
+            ft8_depth: Ft8Depth::default(),
         }
     }
 }
@@ -2517,13 +2834,36 @@ fn adif_visit(adif: &str, mut visit: impl FnMut(&[(String, String)])) {
 /// (ignored) and of a missing/short header. Used both for importing external
 /// logs and for ingesting downloaded QSL confirmations. The inverse of
 /// [`qso_log_to_adif`] for the fields sdroxide round-trips.
+///
+/// Records marked `SWL` are left out — see [`adif_to_qso_log_counting_swl`].
 pub fn adif_to_qso_log(adif: &str) -> Vec<QsoRecord> {
+    adif_to_qso_log_counting_swl(adif).0
+}
+
+/// [`adif_to_qso_log`], also saying how many records were left out for being
+/// marked `SWL`.
+///
+/// A record with `SWL` set is a received report — a station heard, not worked —
+/// which is what [`digi_decodes_to_adif`] writes for a listener. The logbook is
+/// contacts: it feeds the worked/new badges, awards and the QSL uploads, so a
+/// report read in as a contact would turn every station an SWL heard into one
+/// the log claims was worked. The count is for the import to say so, rather
+/// than report a file of reports as nothing added.
+pub fn adif_to_qso_log_counting_swl(adif: &str) -> (Vec<QsoRecord>, usize) {
     let mut records = Vec::new();
+    let mut swl = 0usize;
     // Each record is converted as it is tokenized: importing somebody's
     // fifty-thousand-QSO log should cost one `QsoRecord` per contact, not that
     // plus every field of every contact still held as a pair of `String`s.
-    adif_visit(adif, |fields| records.push(record_from_fields(fields)));
-    records
+    adif_visit(adif, |fields| {
+        let is_swl = fields.iter().any(|(k, v)| k == "SWL" && v.trim().eq_ignore_ascii_case("Y"));
+        if is_swl {
+            swl += 1;
+        } else {
+            records.push(record_from_fields(fields));
+        }
+    });
+    (records, swl)
 }
 
 fn record_from_fields(fields: &[(String, String)]) -> QsoRecord {
@@ -2640,9 +2980,191 @@ pub fn qso_log_to_text(records: &[QsoRecord]) -> String {
     out
 }
 
+/// A CSV field, quoted only where it has to be — a comma, a quote or a line
+/// break. A decoded message is usually bare text, but free-text and compound
+/// calls can carry any of those, and a spreadsheet is entitled to one column
+/// per cell.
+fn csv_field(s: &str) -> String {
+    if s.contains(',') || s.contains('"') || s.contains('\n') || s.contains('\r') {
+        format!("\"{}\"", s.replace('"', "\"\""))
+    } else {
+        s.to_string()
+    }
+}
+
+/// `slot_utc` as `YYYY-MM-DD HH:MM:SS`, UTC.
+fn decode_utc(dec: &Decode) -> String {
+    let (date, time) = adif_date_time(dec.slot_utc);
+    format!(
+        "{}-{}-{} {}:{}:{}",
+        &date[0..4],
+        &date[4..6],
+        &date[6..8],
+        &time[0..2],
+        &time[2..4],
+        &time[4..6]
+    )
+}
+
+/// The decode list as CSV: one row per decode, for a spreadsheet or a quick
+/// look in a text editor.
+///
+/// This is the short-wave listener's export. Nothing in the decode list is a
+/// contact, so there is no [`QsoRecord`] to write and the logbook's own ADIF and
+/// text exports have nothing to say about it (issue #433). Each decode comes
+/// with the receive dial it was heard on: a [`Decode`] carries the audio offset,
+/// not the absolute frequency, so the signal is that dial plus `audio_hz` — and
+/// the list survives a QSY inside the band, so the dial *now* is not the one an
+/// older decode was heard on. `mode` is the receiver's.
+pub fn digi_decodes_to_csv<'a>(
+    decodes: impl IntoIterator<Item = (&'a Decode, f64)>,
+    mode: Mode,
+) -> String {
+    let mut out = String::from("utc,snr_db,dt,freq_mhz,band,mode,call,to,grid,cq,message\r\n");
+    for (d, dial_hz) in decodes {
+        let freq = dial_hz + d.audio_hz as f64;
+        out.push_str(&format!(
+            "{},{},{:.2},{:.6},{},{},{},{},{},{},{}\r\n",
+            decode_utc(d),
+            d.snr_db,
+            d.dt,
+            freq / 1e6,
+            crate::Band::containing(freq).label(),
+            mode.label(),
+            csv_field(d.from.as_deref().unwrap_or("")),
+            csv_field(d.to.as_deref().unwrap_or("")),
+            d.grid.as_deref().unwrap_or(""),
+            if d.is_cq { "CQ" } else { "" },
+            csv_field(&d.message),
+        ));
+    }
+    out
+}
+
+/// One received decode as a bare ADIF record, ending in `<EOR>` — or `None`
+/// for a decode that names no sender.
+///
+/// A received report, not a contact: there is no report *sent*, no serial and no
+/// operator at this end, so those tags are left out rather than filled with a
+/// placeholder that would claim a QSO happened, and `SWL` says so in the field
+/// ADIF defines for it. Without that a logger — this program's own IMPORT
+/// included — reads every heard station as a worked one, and one that uploads
+/// to LoTW or Club Log sends them on as contacts. `CALL` is the station heard —
+/// what an SWL logs — and the decode's own figures ride in `APP_` fields ADIF
+/// reserves for exactly this, with the message in `COMMENT`.
+///
+/// A record needs a `CALL`, so free text and a sender heard only as an
+/// unresolved hash (`<...>`) have nothing to export: a logger rejects a record
+/// without one, or imports it with the call blank.
+pub fn digi_decode_to_adif_record(d: &Decode, dial_hz: f64, mode: Mode) -> Option<String> {
+    let call = d.from.as_deref()?;
+    let mut out = String::new();
+    let freq = dial_hz + d.audio_hz as f64;
+    let (date, time) = adif_date_time(d.slot_utc);
+    out.push_str(&adif_field("CALL", call));
+    out.push_str(&adif_field("SWL", "Y"));
+    out.push_str(&adif_field("QSO_DATE", &date));
+    out.push_str(&adif_field("TIME_ON", &time));
+    out.push_str(&adif_field("BAND", adif_band(freq)));
+    out.push_str(&adif_field("MODE", mode.label()));
+    out.push_str(&adif_field("FREQ", &format!("{:.6}", freq / 1e6)));
+    if let Some(g) = &d.grid {
+        out.push_str(&adif_field("GRIDSQUARE", g));
+    }
+    if !d.message.trim().is_empty() {
+        out.push_str(&adif_field("COMMENT", &d.message));
+    }
+    out.push_str(&adif_field("APP_SDROXIDE_SNR", &d.snr_db.to_string()));
+    out.push_str(&adif_field("APP_SDROXIDE_DT", &format!("{:.2}", d.dt)));
+    out.push_str("<EOR>");
+    Some(out)
+}
+
+/// The whole decode list as an ADIF file, each decode with the dial it was heard
+/// on (see [`digi_decodes_to_csv`]), skipping the decodes that name no sender
+/// (see [`digi_decode_to_adif_record`]).
+pub fn digi_decodes_to_adif<'a>(
+    decodes: impl IntoIterator<Item = (&'a Decode, f64)>,
+    mode: Mode,
+) -> String {
+    let mut out = String::from(
+        "ADIF export from sdroxide — received reports (SWL)\r\n\
+         <ADIF_VER:5>3.1.4\r\n<PROGRAMID:8>sdroxide\r\n<EOH>\r\n",
+    );
+    for record in
+        decodes.into_iter().filter_map(|(d, dial_hz)| digi_decode_to_adif_record(d, dial_hz, mode))
+    {
+        out.push_str(&record);
+        out.push_str("\r\n");
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Issue #433: an SWL's received reports export without a contact to hang
+    /// them on — a CSV for a spreadsheet, and an ADIF whose records are honest
+    /// about having sent nothing.
+    #[test]
+    fn swl_decodes_export_as_csv_and_received_adif() {
+        let d = Decode {
+            slot_utc: 1_760_000_000,
+            snr_db: -7,
+            dt: 0.2,
+            audio_hz: 1500.0,
+            message: "CQ 19AT250 JO22".into(),
+            to: None,
+            from: Some("19AT250".into()),
+            grid: Some("JO22".into()),
+            is_cq: true,
+            cq_to: None,
+            free_text: false,
+            rr73_to: None,
+        };
+        let csv = digi_decodes_to_csv([(&d, 27_265_000.0)], Mode::Ft8);
+        assert!(
+            csv.starts_with("utc,snr_db,dt,freq_mhz,band,mode,call,to,grid,cq,message"),
+            "{csv}"
+        );
+        // The frequency is the dial plus the audio offset, and the band is the
+        // member band CB decodes live in — the one ADIF cannot name.
+        assert!(csv.contains("27.266500"), "dial + audio: {csv}");
+        assert!(csv.contains(",11M,FT8,19AT250,"), "band, mode and caller: {csv}");
+
+        // A message with a comma is quoted; a spreadsheet is one cell per column.
+        let mut comma = d.clone();
+        comma.message = "CQ, TEST".into();
+        let csv = digi_decodes_to_csv([(&comma, 27_265_000.0)], Mode::Ft8);
+        assert!(csv.contains("\"CQ, TEST\""), "a comma must be quoted: {csv}");
+
+        // Free text names nobody, so it has no record to be.
+        let free = Decode {
+            message: "TNX FER QSO".into(),
+            from: None,
+            grid: None,
+            is_cq: false,
+            free_text: true,
+            ..d.clone()
+        };
+        // Each decode is placed on the dial it was heard on, not the one the
+        // receiver has moved to since.
+        let later = Decode { slot_utc: d.slot_utc + 15, ..d.clone() };
+        let csv = digi_decodes_to_csv([(&later, 27_275_000.0), (&d, 27_265_000.0)], Mode::Ft8);
+        assert!(csv.contains("27.276500") && csv.contains("27.266500"), "per decode: {csv}");
+
+        let adif = digi_decodes_to_adif([(&d, 27_265_000.0), (&free, 27_265_000.0)], Mode::Ft8);
+        // Read back by the logbook's own import, a report is not a contact.
+        assert_eq!(adif_to_qso_log_counting_swl(&adif), (Vec::new(), 1), "{adif}");
+        assert!(adif.contains("<CALL:7>19AT250"), "the heard call: {adif}");
+        assert_eq!(adif.matches("<EOR>").count(), 1, "only the decode with a sender: {adif}");
+        assert!(adif.contains("<SWL:1>Y"), "a logger must not read it as a contact: {adif}");
+        assert!(adif.contains("<MODE:3>FT8"), "{adif}");
+        assert!(adif.contains("APP_SDROXIDE_SNR"), "the decode's own figure: {adif}");
+        assert!(!adif.contains("RST_SENT"), "an SWL report sends nothing: {adif}");
+        assert!(!adif.contains("RST_RCVD"), "and made no contact: {adif}");
+    }
 
     #[test]
     fn a_band_keyed_offset_survives_the_config_file() {
@@ -3122,6 +3644,23 @@ mod tests {
     }
 
     #[test]
+    fn adif_import_survives_tags_that_are_not_tags() {
+        // In the browser a parser panic aborts the page rather than the import,
+        // so malformed tags have to be survived here, not caught upstream.
+        for junk in [
+            "<call:99999999999999999999999>W1AW<eor>",
+            "<call:-1>W1AW<eor>",
+            "<:5>W1AW<eor>",
+            "<call:5:x>W1AW <eor",
+            "<qso_date:8>9999999<time_on:6>99 <eor>",
+            "<eoh><eoh><eor><eor><<<>>>",
+            "<call:3>Ä€ <freq:4>NaN <band:0> <eor>",
+        ] {
+            let _ = adif_to_qso_log(junk);
+        }
+    }
+
+    #[test]
     fn time_round_trips() {
         for &t in &[0i64, 1_609_459_260, 1_753_050_960, 2_000_000_000] {
             let (y, mo, d, h, mi, s) = utc_ymd_hms(t);
@@ -3129,6 +3668,67 @@ mod tests {
         }
         // A known civil date: 2021-01-01 00:01:00 UTC.
         assert_eq!(ymd_hms_to_unix(2021, 1, 1, 0, 1, 0), 1_609_459_260);
+    }
+
+    /// The time a NAVTEX message states, in the shapes stations actually send
+    /// (issue #212).
+    #[test]
+    fn a_navtex_body_time_is_read_where_it_is_marked() {
+        // The two markings: `UTC` after a space, and the maritime `Z` suffix.
+        assert_eq!(parse_navtex_time("GALE WARNING AT 1200 UTC"), Some((12, 0)));
+        assert_eq!(parse_navtex_time("WIND 0900Z INCREASING"), Some((9, 0)));
+        // Lower case and the colon form a few stations use.
+        assert_eq!(parse_navtex_time("issued 1200 utc"), Some((12, 0)));
+        assert_eq!(parse_navtex_time("FROM 06:30 UTC"), Some((6, 30)));
+        // The first reading wins when a body states several — a forecast table
+        // is not a clock.
+        assert_eq!(parse_navtex_time("1200 UTC then 1800 UTC"), Some((12, 0)));
+    }
+
+    /// A four-digit number that is not marked as a time is not one: positions,
+    /// serials and counts are full of them.
+    #[test]
+    fn an_unmarked_number_is_not_a_time() {
+        assert_eq!(parse_navtex_time("5103N 00109E"), None, "a position");
+        assert_eq!(parse_navtex_time("SERIAL 1200"), None, "a bare count");
+        assert_eq!(parse_navtex_time("CHANNEL 3184"), None);
+        // A time of day out of range is not a time either — 2560 is a serial.
+        assert_eq!(parse_navtex_time("2560 UTC"), None, "hour 25");
+        assert_eq!(parse_navtex_time("1299 UTC"), None, "minute 99");
+        // The tail of a longer number must not be read as HHMM either, in
+        // both the bare and the colon form.
+        assert_eq!(parse_navtex_time("REF 11200 UTC"), None);
+        assert_eq!(parse_navtex_time("REF 123:45 UTC"), None);
+    }
+
+    /// A body is ASCII when it came from the decoder — the CCIR 476 alphabet
+    /// has nothing else in it — but a `NavtexMessage` also arrives over the
+    /// wire, carrying whatever the peer put in it. Reading one must not take
+    /// the panel down.
+    #[test]
+    fn a_body_that_is_not_ascii_is_read_without_panicking() {
+        // A character boundary three bytes into the word after the digits:
+        // slicing a `&str` there panics.
+        assert_eq!(parse_navtex_time("1200 \u{e9}\u{e9}"), None);
+        assert_eq!(parse_navtex_time("\u{e9}\u{e9}\u{e9} 1200 UTC"), Some((12, 0)));
+        assert_eq!(parse_navtex_time("1200\u{e9}"), None);
+    }
+
+    /// The accessor reads the body, and a message with no time says so.
+    #[test]
+    fn the_message_accessor_reads_the_body() {
+        let mut m = NavtexMessage {
+            station: 'F',
+            kind: 'A',
+            serial: 12,
+            text: "GALE WARNING\nAT 1200 UTC".into(),
+            at: 0,
+            complete: true,
+            lost: 0,
+        };
+        assert_eq!(m.body_time_utc(), Some((12, 0)));
+        m.text = "NAVAREA ONE".into();
+        assert_eq!(m.body_time_utc(), None);
     }
 }
 

@@ -76,6 +76,11 @@ impl SdroxideApp {
             crate::chrome::paint_window_border(ctx, &r.response);
         }
         self.show_bands = open;
+        if self.show_bands {
+            // The IBP beacon and its countdown move every second; keep painting
+            // while the window is open rather than showing a stale slot.
+            crate::repaint::after_ms(ctx, 1000);
+        }
     }
 
     fn bands_body(&mut self, ui: &mut egui::Ui) {
@@ -166,6 +171,8 @@ impl SdroxideApp {
                     }
                 },
             );
+            self.ibp_section(ui);
+            self.meteor_section(ui);
         });
 
         ui.add_space(6.0);
@@ -176,4 +183,120 @@ impl SdroxideApp {
             .italics(),
         );
     }
+
+    /// The IBP beacon list at the foot of the BANDS window.
+    ///
+    /// The schedule is deterministic — eighteen beacons, five bands, a
+    /// three-minute cycle — so this is a clock and a table rather than a feed.
+    /// A beacon you can hear is a path that is open, measured rather than
+    /// forecast.
+    fn ibp_section(&self, ui: &mut egui::Ui) {
+        let now = crate::time::now_unix();
+        let home = sdroxide_types::grid_to_latlon(&self.my_grid());
+        let active = sdroxide_types::ibp_active_at(now, home);
+        let dim = |s: &str| RichText::new(s.to_string()).size(9.5).color(dim_ink());
+        ui.add_space(12.0);
+        ui.label(RichText::new("IBP BEACONS").size(10.0).strong().color(crate::theme::CYAN_DIM()));
+        ui.add_space(2.0);
+        ui.label(dim(&format!(
+            "NCDXF/IARU · next beacon in {} s",
+            sdroxide_types::ibp_seconds_left(now)
+        )));
+        ui.add_space(3.0);
+        for a in &active {
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(a.band.label).size(10.5).strong());
+                ui.label(RichText::new(format!("{:.3} MHz", a.band.freq_hz / 1e6)).size(10.5));
+                ui.label(RichText::new(a.beacon.callsign).size(11.0).strong());
+                ui.label(dim(a.beacon.location));
+                if let (Some(b), Some(d)) = (a.bearing_deg, a.distance_km) {
+                    ui.label(dim(&format!(
+                        "{} · {:.0} km",
+                        sdroxide_solar::satellites::compass(b),
+                        d
+                    )));
+                }
+            })
+            .response
+            .on_hover_text(format!(
+                "{} at {} — hearing it means the {} path is open. Each beacon steps up a \
+                 band every 10 s, so this row changes every slot.",
+                a.beacon.callsign, a.beacon.location, a.band.label
+            ));
+        }
+    }
+
+    /// The meteor-shower list at the foot of the BANDS window.
+    ///
+    /// The one propagation forecast that has nothing to do with the ionosphere:
+    /// a shower's radiant and its date window are fixed, so what is shown is
+    /// whether it is active now, how strong its peak is, and whether the radiant
+    /// is above this station's horizon. Radiants are placed for the operator's
+    /// own locator, which is what makes "is it up" true here rather than on
+    /// average.
+    fn meteor_section(&self, ui: &mut egui::Ui) {
+        let Some((lat, lon)) = sdroxide_types::grid_to_latlon(&self.my_grid()) else {
+            return;
+        };
+        let active = sdroxide_solar::active_at(lat, lon, crate::time::now_unix());
+        if active.is_empty() {
+            return;
+        }
+        let dim = |s: &str| RichText::new(s.to_string()).size(9.5).color(dim_ink());
+        ui.add_space(12.0);
+        ui.label(
+            RichText::new("METEOR SHOWERS").size(10.0).strong().color(crate::theme::CYAN_DIM()),
+        );
+        ui.add_space(2.0);
+        ui.label(dim(&format!("radiants placed for {lat:.0}°, {lon:.0}°")));
+        ui.add_space(3.0);
+        for a in &active {
+            let s = a.shower;
+            ui.horizontal(|ui| {
+                ui.label(RichText::new(s.name).size(11.0).strong());
+                ui.label(dim(s.code));
+                ui.label(RichText::new(format!("ZHR {}", s.zhr)).size(10.5));
+                if a.at_peak() {
+                    ui.label(RichText::new("PEAK").size(9.5).strong().color(crate::theme::GREEN()));
+                }
+                if a.radiant_up() {
+                    ui.label(
+                        RichText::new(format!(
+                            "radiant {:.0}° {}",
+                            a.alt_deg,
+                            sdroxide_solar::satellites::compass(a.az_deg)
+                        ))
+                        .size(10.5),
+                    );
+                } else {
+                    ui.label(
+                        RichText::new(format!("radiant down ({:.0}°)", a.alt_deg))
+                            .size(10.5)
+                            .color(dim_ink()),
+                    );
+                }
+            })
+            .response
+            .on_hover_text(format!(
+                "{} ({}) — {} km/s, parent {}. Peak rate ZHR {} around {}.\n\nA radiant \
+                 above the horizon means the trails can reach you; a fast shower leaves \
+                 longer-lived ionised trails for meteor scatter on 6 m and 2 m, and the \
+                 brief 10 m openings.",
+                s.name,
+                s.code,
+                s.velocity_kms,
+                s.parent,
+                s.zhr,
+                peak_label(s.peak),
+            ));
+        }
+    }
+}
+
+/// "3 Jan" from a `(month, day)` pair, for the hover.
+fn peak_label(peak: (u32, u32)) -> String {
+    const MONTHS: [&str; 12] =
+        ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+    let name = MONTHS.get(peak.0.saturating_sub(1) as usize).copied().unwrap_or("?");
+    format!("{} {name}", peak.1)
 }

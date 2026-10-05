@@ -318,7 +318,7 @@ fn wrl_contact_json(fields: &[(String, String)], my_call: &str) -> Result<String
         .map_err(|_| "WRL: the QSO's frequency is not a number".to_string())?;
 
     let mut out = String::from("{");
-    let mut field = |out: &mut String, name: &str, value: &str| {
+    let field = |out: &mut String, name: &str, value: &str| {
         out.push_str(&format!("\"{name}\":\"{}\",", json_escape(value)));
     };
     field(&mut out, "programId", "sdroxide");

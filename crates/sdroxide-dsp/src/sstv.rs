@@ -138,6 +138,9 @@ enum Chan {
     B,
     /// Luma.
     Y,
+    /// Luma of the *second* image row a PD line carries — see
+    /// [`SstvMode::rows_per_line`]. Nothing else in the family has one.
+    Y2,
     /// R-Y chroma (Cr).
     Cr,
     /// B-Y chroma (Cb).
@@ -171,6 +174,26 @@ fn martin_timing(px: f64) -> Timing {
     Timing { sync: 0.004_862, sync_hz: SYNC_HZ, sep: 0.000_572, sep_hz: 1500.0, px }
 }
 
+/// The PD family's pixel time, seconds. Everything else about a PD line is
+/// shared: a 20 ms sync, a 2.08 ms porch, and four full-width scans.
+///
+/// From JL Barber N7CXI's 2000 mode specification (cross-checked against
+/// `windytan/slowrx`'s `modespec.c`). Each one reproduces the published line
+/// time exactly — PD90 is 20 + 2.08 + 4 × 320 × 0.532 = 703.04 ms — which is
+/// the check worth making on a transcribed table, because a pixel time that is
+/// out by a percent still decodes into a picture, just a sheared one.
+fn pd_pixel_time(mode: SstvMode) -> f64 {
+    match mode {
+        SstvMode::Pd50 => 0.000_286,
+        SstvMode::Pd90 => 0.000_532,
+        SstvMode::Pd120 => 0.000_190,
+        SstvMode::Pd160 => 0.000_382,
+        SstvMode::Pd180 => 0.000_286,
+        SstvMode::Pd240 => 0.000_382,
+        _ => 0.000_286, // Pd290
+    }
+}
+
 /// The ordered segments for one scan line of `mode` at image width `w`.
 /// Robot modes carry their (per-line-varying) chroma channel via `line`.
 fn line_segments(mode: SstvMode, w: u16, line: u16) -> Vec<Seg> {
@@ -197,7 +220,16 @@ fn line_segments(mode: SstvMode, w: u16, line: u16) -> Vec<Seg> {
         SstvMode::Martin1 | SstvMode::Martin2 => {
             let px = if mode == SstvMode::Martin1 { 0.000_457_6 } else { 0.000_228_8 };
             let t = martin_timing(px);
-            // Martin order: SYNC · sep · G · sep · B · sep · R.
+            // Martin order: SYNC · porch · G · sep · B · sep · R · sep.
+            //
+            // Four separators, not three: a porch after the sync *and* one
+            // after every scan, the last one included. Without that trailing
+            // pulse the line comes to 445.874 ms against the published
+            // 446.446 — 0.13 % short, which the receiver never notices because
+            // it re-locks to the sync every line, and which shears a
+            // transmitted picture by a third of a line by the bottom. Found by
+            // pinning the line times against the published table rather than
+            // by looking at the plan.
             vec![
                 Seg::Tone { hz: t.sync_hz, dur: t.sync },
                 Seg::Tone { hz: t.sep_hz, dur: t.sep },
@@ -206,6 +238,7 @@ fn line_segments(mode: SstvMode, w: u16, line: u16) -> Vec<Seg> {
                 Seg::Scan { chan: B, width: w, px: t.px },
                 Seg::Tone { hz: t.sep_hz, dur: t.sep },
                 Seg::Scan { chan: R, width: w, px: t.px },
+                Seg::Tone { hz: t.sep_hz, dur: t.sep },
             ]
         }
         SstvMode::Robot72 => {
@@ -236,6 +269,46 @@ fn line_segments(mode: SstvMode, w: u16, line: u16) -> Vec<Seg> {
                 Seg::Tone { hz: sep_hz, dur: 0.0045 },
                 Seg::Tone { hz: 1900.0, dur: 0.0015 },
                 Seg::Scan { chan, width: cw, px: 0.000_275 },
+            ]
+        }
+        SstvMode::WraaseSc2_180 | SstvMode::WraaseSc2_120 => {
+            // Wraase SC-2: sync, a short porch, then R, G, B at full width and
+            // no separators between them — the one common family that sends
+            // red first.
+            // Scan time / width, derived from the published line times so the
+            // total comes out exactly: SC-2 180 is three 235.000 ms scans,
+            // SC-2 120 three of 156.502506 ms. (slowrx's own pixel times are
+            // rounded and reproduce neither of its own line times, which is
+            // the sort of thing only a test on the total ever notices.)
+            let px =
+                if mode == SstvMode::WraaseSc2_180 { 0.235 / 320.0 } else { 0.156_502_506 / 320.0 };
+            vec![
+                Seg::Tone { hz: SYNC_HZ, dur: 0.005_522_5 },
+                Seg::Tone { hz: 1500.0, dur: 0.000_5 },
+                Seg::Scan { chan: R, width: w, px },
+                Seg::Scan { chan: G, width: w, px },
+                Seg::Scan { chan: B, width: w, px },
+            ]
+        }
+        SstvMode::Pd50
+        | SstvMode::Pd90
+        | SstvMode::Pd120
+        | SstvMode::Pd160
+        | SstvMode::Pd180
+        | SstvMode::Pd240
+        | SstvMode::Pd290 => {
+            // Two image rows per sync: this row's luma, then one pair of
+            // chroma scans shared between the two, then the next row's luma.
+            // The chroma is full width here, not halved — PD saves its air
+            // time vertically rather than horizontally.
+            let px = pd_pixel_time(mode);
+            vec![
+                Seg::Tone { hz: SYNC_HZ, dur: 0.020 },
+                Seg::Tone { hz: 1500.0, dur: 0.002_08 },
+                Seg::Scan { chan: Y, width: w, px },
+                Seg::Scan { chan: Cr, width: w, px },
+                Seg::Scan { chan: Cb, width: w, px },
+                Seg::Scan { chan: Y2, width: w, px },
             ]
         }
     }
@@ -336,7 +409,14 @@ impl SstvTx {
             push(&mut plan, SYNC_HZ, 0.009);
         }
 
-        for y in 0..h as usize {
+        // One pass per *transmitted* line, which is two image rows in the PD
+        // family and one everywhere else.
+        let rows = mode.rows_per_line().max(1) as usize;
+        for y in (0..h as usize).step_by(rows) {
+            // The second row a PD line carries; the last line of an
+            // odd-height picture repeats the first rather than sending a row
+            // that is not there.
+            let y2 = (y + 1).min(h as usize - 1);
             for seg in line_segments(mode, w, y as u16) {
                 match seg {
                     Seg::Tone { hz, dur } => push(&mut plan, hz, dur),
@@ -350,8 +430,24 @@ impl SstvTx {
                                 Chan::G => g,
                                 Chan::B => b,
                                 Chan::Y => rgb_to_yuv(r, g, b).0,
-                                Chan::Cr => rgb_to_yuv(r, g, b).1,
-                                Chan::Cb => rgb_to_yuv(r, g, b).2,
+                                Chan::Y2 => {
+                                    let (r2, g2, b2) = px_at(sx, y2);
+                                    rgb_to_yuv(r2, g2, b2).0
+                                }
+                                // A PD line's chroma belongs to both of its
+                                // rows, so it is the mean of the two rather
+                                // than the first one's — which is what makes
+                                // the pair look like one picture instead of
+                                // combed. On every other mode `rows` is 1 and
+                                // this averages a row with itself.
+                                Chan::Cr | Chan::Cb => {
+                                    let (r2, g2, b2) = px_at(sx, y2);
+                                    let a = rgb_to_yuv(r, g, b);
+                                    let c = rgb_to_yuv(r2, g2, b2);
+                                    let (u, v2) =
+                                        if chan == Chan::Cr { (a.1, c.1) } else { (a.2, c.2) };
+                                    ((u as u16 + v2 as u16) / 2) as u8
+                                }
                             };
                             // Cumulative-exact per-pixel timing (no drift/slant).
                             push(&mut plan, value_to_hz(v), px);
@@ -477,6 +573,15 @@ pub enum SstvEvent {
     /// A station identified itself in tones after its picture — the FSK ID
     /// every SSTV program and unattended repeater sends and reads.
     FskId(String),
+    /// A header arrived, with good parity, for a mode this decoder does not
+    /// have. `name` is the mode where the code is an assigned one.
+    ///
+    /// Worth an event rather than a discard: at that moment the receiver knows
+    /// precisely what is being sent and precisely why no picture is coming,
+    /// and it is the only moment anything does. Silence here is what made
+    /// issue #421 read as a broken decoder rather than as an unimplemented
+    /// mode.
+    UnsupportedMode { code: u8, name: Option<&'static str> },
 }
 
 #[derive(PartialEq)]
@@ -866,6 +971,17 @@ impl SstvRx {
             }
         } else {
             self.vis_state.leader = self.vis_state.leader.saturating_sub(3);
+            // A start bit has to follow a leader that is still *recent*. The
+            // flag used to be sticky for the whole hunt, so every 1200 Hz sync
+            // pulse of every picture after it went on being offered as a
+            // candidate header — harmless while an unrecognised code was
+            // dropped in silence, and a stream of false "unsupported mode"
+            // reports once one is not. The accumulator drains in about 100 ms,
+            // which is well inside the 30 ms between the leader and the start
+            // bit it has to survive.
+            if self.vis_state.leader == 0 {
+                self.vis_state.leader_seen = false;
+            }
         }
         // Rising edge into a 1200 Hz pulse after a leader → candidate start bit.
         if is_sync && !self.vis_state.was_sync && self.vis_state.leader_seen {
@@ -883,27 +999,59 @@ impl SstvRx {
                 self.vis_state.cands.remove(0);
                 let mut code = 0u8;
                 let mut parity = 0u8;
+                // Every VIS bit is 1100 or 1300 Hz. A candidate whose bit
+                // slots are up at the 1900 Hz leader is not a header at all —
+                // which is what the *break* pulse in the middle of the
+                // calibration header looks like, since it is a rising edge
+                // into 1200 Hz after a leader just like the start bit is. It
+                // used to be decoded anyway, reading the leader as eight zero
+                // bits with matching parity; harmless while an unknown code
+                // was silently dropped, and a false "unsupported mode" report
+                // the moment one is not.
+                let mut looks_like_vis = true;
                 for b in 0..7 {
                     let centre = start as f64 + (1.5 + b as f64) * bit;
-                    if self.hz_at(centre as u64) < 1200.0 {
+                    let hz = self.hz_at(centre as u64);
+                    if hz > 1600.0 {
+                        looks_like_vis = false;
+                    }
+                    if hz < 1200.0 {
                         code |= 1 << b; // 1100 Hz = 1
                         parity ^= 1;
                     }
                 }
-                let pbit =
-                    if self.hz_at((start as f64 + 8.5 * bit) as u64) < 1200.0 { 1 } else { 0 };
-                if parity == pbit {
-                    if let Some(mode) = SstvMode::from_vis(code) {
-                        // Image data begins after the stop bit (start + 10 bits);
-                        // Scottie prefixes a 9 ms starting sync before line 0.
-                        let mut first = start as f64 + 10.0 * bit;
-                        if matches!(
-                            mode,
-                            SstvMode::Scottie1 | SstvMode::Scottie2 | SstvMode::ScottieDx
-                        ) {
-                            first += 0.009 * self.rate;
+                let phz = self.hz_at((start as f64 + 8.5 * bit) as u64);
+                if phz > 1600.0 {
+                    looks_like_vis = false;
+                }
+                let pbit = if phz < 1200.0 { 1 } else { 0 };
+                if looks_like_vis && parity == pbit {
+                    match SstvMode::from_vis(code) {
+                        Some(mode) => {
+                            // Image data begins after the stop bit (start + 10
+                            // bits); Scottie prefixes a 9 ms starting sync
+                            // before line 0.
+                            let mut first = start as f64 + 10.0 * bit;
+                            if matches!(
+                                mode,
+                                SstvMode::Scottie1 | SstvMode::Scottie2 | SstvMode::ScottieDx
+                            ) {
+                                first += 0.009 * self.rate;
+                            }
+                            self.begin_image(mode, first as u64, out);
                         }
-                        self.begin_image(mode, first as u64, out);
+                        // A header that checks out for a mode we cannot draw.
+                        // Said once per header rather than swallowed — see
+                        // `SstvEvent::UnsupportedMode`. Code 0 is not a mode
+                        // anyone has ever been assigned, so a candidate that
+                        // reads as one is a misread and says nothing.
+                        None if code != 0 && self.preceded_by_leader(start) => {
+                            out.push(SstvEvent::UnsupportedMode {
+                                code,
+                                name: SstvMode::unsupported_name(code),
+                            })
+                        }
+                        None => {}
                     }
                 }
             }
@@ -911,6 +1059,35 @@ impl SstvRx {
 
         // No VIS yet? Try to lock onto the sync cadence of the selected mode.
         self.try_freerun(out);
+    }
+
+    /// Whether the 20 ms before `start` really is the 1900 Hz leader.
+    ///
+    /// Only asked before *reporting* an unrecognised code, never before
+    /// decoding a recognised one: a missed report costs a line of explanation,
+    /// and a missed decode costs the picture.
+    ///
+    /// The hunt pushes a candidate at every rising edge into 1200 Hz while a
+    /// leader is anywhere in recent memory, and the VIS bits themselves sweep
+    /// through 1200 Hz on their way from 1300 to 1100 — so a header's own data
+    /// bits produce candidates of their own, a couple of which read as a code
+    /// with matching parity. They are harmless as decodes (their code is not a
+    /// mode) and actively wrong as reports, where the last one to arrive would
+    /// overwrite the real mode's name. A start bit is preceded by the leader;
+    /// a data bit is preceded by another data bit.
+    ///
+    /// Sampled at several points and decided by majority, so noise on one of
+    /// them does not cost the explanation.
+    fn preceded_by_leader(&self, start: u64) -> bool {
+        let mut near = 0u32;
+        for k in 1..=5u64 {
+            let back = (k as f64 * 0.004 * self.rate) as u64;
+            let idx = start.saturating_sub(back);
+            if (self.hz_at(idx) - VIS_LEADER_HZ).abs() < 120.0 {
+                near += 1;
+            }
+        }
+        near >= 3
     }
 
     /// Total samples per scan line for `mode`, at line index `line` (only the
@@ -954,8 +1131,12 @@ impl SstvRx {
         }
         let run = self.sync_run;
         self.sync_run = 0;
-        // Plausible sync length across all modes (~4.9 ms Martin .. 9 ms Scottie).
-        if (run as f64) < 0.003 * self.rate || (run as f64) > 0.014 * self.rate {
+        // Plausible sync length across all modes: 5.5 ms (Wraase SC-2) through
+        // 9 ms (Scottie/Robot) to **20 ms** (the whole PD family), with a
+        // margin either side. The old ceiling was 14 ms, which excluded every
+        // PD mode — so a PD picture tuned into mid-transmission could never
+        // free-run lock however long it ran (issue #421).
+        if (run as f64) < 0.003 * self.rate || (run as f64) > 0.028 * self.rate {
             return;
         }
         let center = self.sample_idx.saturating_sub((run / 2) as u64);
@@ -1024,10 +1205,17 @@ impl SstvRx {
         // and clock slant on real off-air signals).
         let (w, h) = self.mode.dimensions();
         let start = self.realign_sync(self.line_start, self.mode, w, self.line);
-        let rgb = self.decode_line(self.mode, w, self.line, start);
-        out.push(SstvEvent::Line { y: self.line, rgb });
+        // One transmitted line is two picture rows in the PD family — see
+        // `SstvMode::rows_per_line` — so this hands back a row at a time and
+        // the caller sees the same stream of `Line` events either way.
+        for (n, rgb) in self.decode_line(self.mode, w, self.line, start).into_iter().enumerate() {
+            let y = self.line + n as u16;
+            if y < h {
+                out.push(SstvEvent::Line { y, rgb });
+            }
+        }
 
-        self.line += 1;
+        self.line += self.mode.rows_per_line().max(1);
         self.line_start = start + line_samples;
         if self.line >= h {
             out.push(SstvEvent::ImageComplete);
@@ -1086,13 +1274,23 @@ impl SstvRx {
         }
     }
 
-    fn decode_line(&mut self, mode: SstvMode, w: u16, line: u16, start: u64) -> Vec<u8> {
+    /// Decode one transmitted line into its picture rows: one for every mode
+    /// but the PD family, two for that.
+    fn decode_line(&mut self, mode: SstvMode, w: u16, line: u16, start: u64) -> Vec<Vec<u8>> {
         let mut r = vec![0u8; w as usize];
         let mut g = vec![0u8; w as usize];
         let mut b = vec![0u8; w as usize];
         let mut y = vec![0u8; w as usize];
+        let mut y2 = vec![0u8; w as usize];
         let mut cr = self.last_cr.clone();
         let mut cb = self.last_cb.clone();
+        // A PD line's chroma is full width, so the buffers this mode's rows
+        // came in with (sized for the Robot modes' half-width chroma) are the
+        // wrong shape for it.
+        if mode.rows_per_line() > 1 {
+            cr = vec![128u8; w as usize];
+            cb = vec![128u8; w as usize];
+        }
 
         let mut t = start as f64;
         for seg in line_segments(mode, w, line) {
@@ -1111,6 +1309,7 @@ impl SstvRx {
                             Chan::G => g[x] = v,
                             Chan::B => b[x] = v,
                             Chan::Y => y[x] = v,
+                            Chan::Y2 => y2[x] = v,
                             Chan::Cr => cr[cri] = v,
                             Chan::Cb => cb[cbi] = v,
                         }
@@ -1122,23 +1321,35 @@ impl SstvRx {
 
         let robot = matches!(mode, SstvMode::Robot72 | SstvMode::Robot36);
         if robot {
+            // Robot 36 sends one chroma per line and the other row's is
+            // carried over; PD sends both, every line, and has nothing to
+            // remember.
             self.last_cr = cr.clone();
             self.last_cb = cb.clone();
         }
+        let pd = mode.rows_per_line() > 1;
 
-        let mut rgb = vec![0u8; w as usize * 3];
-        for x in 0..w as usize {
-            let (rr, gg, bb) = if robot {
-                let cx = (x / 2).min(cr.len() - 1);
-                yuv_to_rgb(y[x], cr[cx], cb[cx])
-            } else {
-                (r[x], g[x], b[x])
-            };
-            rgb[x * 3] = rr;
-            rgb[x * 3 + 1] = gg;
-            rgb[x * 3 + 2] = bb;
+        // One row for most modes, two for PD — where the second row is the
+        // same chroma with the second luma scan over it.
+        let mut rows: Vec<Vec<u8>> = Vec::with_capacity(if pd { 2 } else { 1 });
+        for luma in [&y, &y2].into_iter().take(if pd { 2 } else { 1 }) {
+            let mut rgb = vec![0u8; w as usize * 3];
+            for x in 0..w as usize {
+                let (rr, gg, bb) = if robot {
+                    let cx = (x / 2).min(cr.len() - 1);
+                    yuv_to_rgb(y[x], cr[cx], cb[cx])
+                } else if pd {
+                    yuv_to_rgb(luma[x], cr[x], cb[x])
+                } else {
+                    (r[x], g[x], b[x])
+                };
+                rgb[x * 3] = rr;
+                rgb[x * 3 + 1] = gg;
+                rgb[x * 3 + 2] = bb;
+            }
+            rows.push(rgb);
         }
-        rgb
+        rows
     }
 }
 
@@ -1331,7 +1542,9 @@ mod tests {
                 match e {
                     SstvEvent::ModeDetected(m) => detected = Some(m),
                     SstvEvent::Line { .. } => lines += 1,
-                    SstvEvent::ImageComplete | SstvEvent::FskId(_) => {}
+                    SstvEvent::ImageComplete
+                    | SstvEvent::FskId(_)
+                    | SstvEvent::UnsupportedMode { .. } => {}
                 }
             }
             guard += 1;
@@ -1347,6 +1560,193 @@ mod tests {
         }
         assert_eq!(detected, Some(mode), "VIS mode should be recovered");
         assert!(lines > (h as usize) / 2, "should decode most lines, got {lines}");
+    }
+
+    /// Every mode, encoder into decoder: the VIS is read back, the picture
+    /// comes out the right height, and the pixels are roughly what went in.
+    ///
+    /// One test over `SstvMode::ALL` rather than one per mode, because what
+    /// has to hold is a property of the table: a mode added to it with a pixel
+    /// time transcribed wrongly still produces a picture, just a sheared one,
+    /// and the only thing that catches that is decoding it back and looking at
+    /// where the colours landed. It is also what proves the PD family's
+    /// two-rows-per-line plumbing, which nothing else in the file exercises.
+    #[test]
+    fn every_mode_round_trips_through_its_own_decoder() {
+        let rate = 48_000.0;
+        for mode in SstvMode::ALL {
+            let (w, h) = mode.dimensions();
+            // Three vertical bars — red, green, blue — so a decode that has
+            // the channels or the timing wrong cannot pass by accident.
+            let mut rgb = vec![0u8; w as usize * h as usize * 3];
+            for yy in 0..h as usize {
+                for xx in 0..w as usize {
+                    let i = (yy * w as usize + xx) * 3;
+                    let band = xx * 3 / w as usize;
+                    rgb[i + band.min(2)] = 220;
+                }
+            }
+            let mut tx = SstvTx::new(mode, &rgb, w, h, rate, 0.0);
+            let mut rx = SstvRx::new(rate);
+            let mut events = Vec::new();
+            let mut block = vec![0.0f32; 8192];
+            let mut detected = None;
+            let mut got = vec![0u8; w as usize * h as usize * 3];
+            let mut lines = 0usize;
+            let mut guard = 0;
+            while !tx.done() && guard < 400_000 {
+                let n = tx.next_block(&mut block);
+                rx.process(&block[..n], &mut events);
+                for e in events.drain(..) {
+                    match e {
+                        SstvEvent::ModeDetected(m) => detected = Some(m),
+                        SstvEvent::Line { y, rgb: row } => {
+                            lines += 1;
+                            let at = y as usize * w as usize * 3;
+                            if at + row.len() <= got.len() {
+                                got[at..at + row.len()].copy_from_slice(&row);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                guard += 1;
+            }
+            rx.process(&vec![0.0f32; 48_000], &mut events);
+            for e in events.drain(..) {
+                if let SstvEvent::Line { y, rgb: row } = e {
+                    lines += 1;
+                    let at = y as usize * w as usize * 3;
+                    if at + row.len() <= got.len() {
+                        got[at..at + row.len()].copy_from_slice(&row);
+                    }
+                }
+            }
+            assert_eq!(detected, Some(mode), "{} VIS not recovered", mode.label());
+            assert!(
+                lines > (h as usize) / 2,
+                "{}: only {lines} of {h} lines decoded",
+                mode.label()
+            );
+            // Sample the middle of each colour bar, a third of the way down,
+            // and check the right channel is the dominant one.
+            let yy = h as usize / 3;
+            for (band, chan) in [(0usize, 0usize), (1, 1), (2, 2)] {
+                let xx = (band * 2 + 1) * w as usize / 6;
+                let i = (yy * w as usize + xx) * 3;
+                let px = [got[i], got[i + 1], got[i + 2]];
+                let others = (0..3).filter(|&c| c != chan).map(|c| px[c]).max().unwrap();
+                assert!(
+                    px[chan] > 100 && px[chan] as i32 > others as i32 + 40,
+                    "{}: bar {band} decoded as {px:?}, expected channel {chan} to dominate",
+                    mode.label()
+                );
+            }
+        }
+    }
+
+    /// The published line times, recomputed from the segment plan. A pixel
+    /// time transcribed with a digit out still makes a picture; it is the
+    /// *total* that gives it away, so that is what is pinned.
+    #[test]
+    fn the_line_times_are_the_published_ones() {
+        let rx = SstvRx::new(1_000_000.0); // µs per sample: read the plan directly
+        for (mode, ms) in [
+            (SstvMode::Scottie1, 428.22),
+            (SstvMode::Scottie2, 277.692),
+            (SstvMode::ScottieDx, 1_050.3),
+            (SstvMode::Martin1, 446.446),
+            (SstvMode::Martin2, 226.798),
+            (SstvMode::Robot72, 300.0),
+            (SstvMode::Robot36, 150.0),
+            (SstvMode::WraaseSc2_180, 711.0225),
+            (SstvMode::WraaseSc2_120, 475.53),
+            (SstvMode::Pd50, 388.16),
+            (SstvMode::Pd90, 703.04),
+            (SstvMode::Pd120, 508.48),
+            (SstvMode::Pd160, 804.416),
+            (SstvMode::Pd180, 754.24),
+            (SstvMode::Pd240, 1_000.0),
+            (SstvMode::Pd290, 937.28),
+        ] {
+            let got = rx.line_period_samples(mode, 0) / 1000.0;
+            assert!(
+                (got - ms).abs() < 0.05,
+                "{}: line is {got:.4} ms, published {ms} ms",
+                mode.label()
+            );
+        }
+    }
+
+    /// The PD family is the only one that carries two picture rows per sync.
+    #[test]
+    fn only_the_pd_modes_carry_two_rows_a_line() {
+        for m in SstvMode::ALL {
+            let want = matches!(
+                m,
+                SstvMode::Pd50
+                    | SstvMode::Pd90
+                    | SstvMode::Pd120
+                    | SstvMode::Pd160
+                    | SstvMode::Pd180
+                    | SstvMode::Pd240
+                    | SstvMode::Pd290
+            );
+            assert_eq!(m.rows_per_line() == 2, want, "{}", m.label());
+        }
+    }
+
+    /// A header for a mode this build does not have is reported, not
+    /// swallowed — the whole of issue #421's "the decoder isn't starting
+    /// reception" with a perfect signal on the waterfall.
+    #[test]
+    fn an_unimplemented_mode_says_so_instead_of_going_quiet() {
+        let rate = 48_000.0;
+        // Pasokon P3's VIS, sent by hand: leader, break, leader, start bit,
+        // seven data bits LSB first, parity, stop.
+        let code = 0x71u8;
+        let mut audio: Vec<f32> = Vec::new();
+        let mut phase = 0.0f64;
+        let mut tone = |hz: f64, dur: f64, audio: &mut Vec<f32>| {
+            for _ in 0..(dur * rate) as usize {
+                phase += TAU * hz / rate;
+                audio.push((phase.sin() as f32) * 0.5);
+            }
+        };
+        tone(1900.0, 0.300, &mut audio);
+        tone(1200.0, 0.010, &mut audio);
+        tone(1900.0, 0.300, &mut audio);
+        tone(1200.0, 0.030, &mut audio);
+        let mut parity = 0u8;
+        for bit in 0..7 {
+            let one = (code >> bit) & 1 == 1;
+            parity ^= one as u8;
+            tone(if one { 1100.0 } else { 1300.0 }, 0.030, &mut audio);
+        }
+        tone(if parity == 1 { 1100.0 } else { 1300.0 }, 0.030, &mut audio);
+        tone(1200.0, 0.030, &mut audio);
+        tone(1500.0, 0.500, &mut audio);
+
+        let mut rx = SstvRx::new(rate);
+        let mut events = Vec::new();
+        for chunk in audio.chunks(4096) {
+            rx.process(chunk, &mut events);
+        }
+        let reported: Vec<_> = events
+            .iter()
+            .filter_map(|e| match e {
+                SstvEvent::UnsupportedMode { code, name } => Some((*code, *name)),
+                _ => None,
+            })
+            .collect();
+        // Exactly one report: the break pulse in the middle of the header is
+        // also a rising edge into 1200 Hz after a leader, and must not be
+        // mistaken for a second header.
+        assert_eq!(reported, vec![(0x71, Some("Pasokon P3"))]);
+        assert!(
+            !events.iter().any(|e| matches!(e, SstvEvent::ModeDetected(_))),
+            "nothing may be decoded for a mode we do not have"
+        );
     }
 
     #[test]
@@ -1407,7 +1807,9 @@ mod tests {
                 match e {
                     SstvEvent::ModeDetected(m) => detected = Some(m),
                     SstvEvent::Line { .. } => lines += 1,
-                    SstvEvent::ImageComplete | SstvEvent::FskId(_) => {}
+                    SstvEvent::ImageComplete
+                    | SstvEvent::FskId(_)
+                    | SstvEvent::UnsupportedMode { .. } => {}
                 }
             }
         }

@@ -202,6 +202,7 @@ impl FsqController {
             tx_even: false,
             transmitting: self.keyed,
             tx_watchdog: false,
+            tx_refused: None,
             transcript: Vec::new(),
             config: self.cfg.clone(),
             text_rx: self.rx_text.clone(),
@@ -211,6 +212,7 @@ impl FsqController {
             rade: None,
             packet: None,
             navtex: None,
+            acars: None,
             aprs: None,
             js8: None,
             atchat: None,
@@ -219,6 +221,7 @@ impl FsqController {
             clock_offset_s: None,
             cw: None,
             wspr: None,
+            pi4: None,
             qso: None,
         }
     }

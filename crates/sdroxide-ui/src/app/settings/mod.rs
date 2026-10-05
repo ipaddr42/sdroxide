@@ -18,6 +18,7 @@
 pub(in crate::app) mod controls;
 pub(in crate::app) mod general;
 pub(in crate::app) mod net;
+pub(in crate::app) mod profiles;
 pub(in crate::app) mod radio;
 pub(in crate::app) mod relay;
 #[cfg(not(target_arch = "wasm32"))]
@@ -26,22 +27,26 @@ pub(in crate::app) mod servers;
 pub(in crate::app) mod tle;
 pub(in crate::app) mod ui_tab;
 
+pub(in crate::app) mod alerts;
+
 use eframe::egui::{self, Color32, ComboBox, RichText};
 use sdroxide_types::{Command, LoginTarget, LookupProvider, NetworkConfig, UploadTarget};
 
+use self::alerts::alerts_settings;
 use self::controls::settings_controls_tab;
 use self::general::{device_combo, region_combo, remote_access_settings};
 use self::net::{
     broadcast_stations_settings, net_heading, net_row, net_secret, operator_identity_note,
     settings_freedv_tab,
 };
+use self::profiles::settings_profiles_tab;
 use self::radio::{
     settings_airspy_tab, settings_airspyhf_tab, settings_cat_tab, settings_elad_tab,
     settings_fobos_tab, settings_hackrf_tab, settings_hpsdr_tab, settings_hydrasdr_tab,
     settings_icomnet_tab, settings_kiwisdr_tab, settings_lime_tab, settings_pluto_tab,
     settings_rtlsdr_tab, settings_rtltcp_tab, settings_rx888_tab, settings_sdrplay_tab,
     settings_smartsdr_tab, settings_soapy_devices, settings_soapy_tab, settings_spyserver_tab,
-    settings_tci_tab,
+    settings_tci_tab, settings_usb_audio_tab,
 };
 #[cfg(not(target_arch = "wasm32"))]
 use self::remote::settings_remote_tab;
@@ -51,7 +56,7 @@ use self::servers::{
 use self::tle::settings_tle_tab;
 use self::ui_tab::settings_ui_tab;
 use crate::app::SdroxideApp;
-use crate::app::persist::{persist_speech_settings, persist_ui_settings};
+use crate::app::persist::{persist_alerts_settings, persist_speech_settings, persist_ui_settings};
 use crate::chrome::StyledCombo;
 use crate::theme::ThemedScroll as _;
 
@@ -66,6 +71,7 @@ pub(in crate::app) enum SettingsTab {
     General,
     Radio,
     Ui,
+    Alerts,
     Controls,
     Spots,
     FreeDv,
@@ -85,6 +91,9 @@ pub(in crate::app) enum SettingsTab {
     #[cfg(not(target_arch = "wasm32"))]
     Remote,
     Tle,
+    /// Named working setups (issue #197): the operator's saved snapshots of how
+    /// the station is set up, each put back on whole by one click.
+    Profiles,
 }
 
 /// A "Test connection" button's state: still asking, or an answer.
@@ -166,6 +175,14 @@ pub(in crate::app) struct SettingsIo<'a> {
     rx_site: &'a mut Option<sdroxide_types::RxSite>,
     audio_pick: &'a mut Option<(bool, Option<String>)>,
     hpsdr_discover: &'a mut bool,
+    /// The name being typed in the Profiles tab's save box. Owned on the app:
+    /// the dialog lives across taps of the tab bar, and a half-typed name is
+    /// not a setting.
+    profile_name: &'a mut String,
+    /// Set when a profile was put on: the engine rewrites the digital
+    /// identity in place, so the screen's editable copy must be re-seeded —
+    /// see `SdroxideApp::profile_apply_pending`.
+    digi_reseed: &'a mut bool,
     /// Re-enumerate the USB bus for RTL-SDR dongles. Cheap and non-invasive —
     /// no device is opened — so it cannot disturb a running stream.
     rtlsdr_rescan: &'a mut bool,
@@ -318,6 +335,14 @@ pub(in crate::app) struct SettingsIo<'a> {
     /// The TEST button was pressed; answered after the closure, where the
     /// announcer is reachable.
     speech_test: &'a mut bool,
+    /// Audible alerts, edited in place and written back after the window
+    /// closure like [`Self::speech_edit`].
+    alerts_edit: &'a mut sdroxide_types::AlertSettings,
+    /// How the alarm sink is doing, read from the settings tab.
+    alerts_status: &'a crate::app::alerts::AlertStatus,
+    /// The TEST button was pressed; answered after the closure, where the
+    /// alarm runtime is reachable.
+    alerts_test: &'a mut bool,
     /// The station's IARU region. Applied and sent the moment it changes —
     /// there is no APPLY step on the General tab, and the whole point of it is
     /// that the band plan follows immediately.
@@ -519,6 +544,55 @@ fn transverter_table(ui: &mut egui::Ui, cfg: &mut sdroxide_types::RadioConfig) {
             RichText::new("Takes effect on Apply / reconnect, like the converter offset above.")
                 .weak(),
         );
+    });
+}
+
+/// The operator's hard ceiling on transmit drive (issue #504).
+///
+/// Drawn above the band calibration because it is the other kind of thing: the
+/// table trims the control, this one stops it. On a transmitter whose I/Q
+/// amplitude *is* the drive — an HPSDR set pins the protocol's own drive
+/// register at full scale and modulates the samples instead — the top of the
+/// Drive slider is the finals wide open, and an ANAN-7000DLE reaches twice its
+/// rated power with most of the control's travel still to go.
+fn drive_ceiling_row(ui: &mut egui::Ui, cfg: &mut sdroxide_types::RadioConfig) {
+    ui.add_space(10.0);
+    ui.separator();
+    ui.add_space(4.0);
+    ui.label(
+        RichText::new("Maximum transmit drive").size(14.0).strong().color(crate::theme::CYAN()),
+    );
+    ui.add_space(2.0);
+    ui.label(
+        RichText::new(
+            "A hard limit the Drive and TUNE controls cannot be taken past, applied after the              band calibration below so nothing can lift the drive back over it. Set it where              the radio makes its rated power and the whole of the Drive control becomes usable              — on a transmitter that modulates its own samples (HPSDR, LimeSDR, PlutoSDR,              HackRF) full drive is the transmitter wide open, which on a high-gain amplifier is              well past what its finals are rated for. Off means the controls reach full drive.",
+        )
+        .weak(),
+    );
+    ui.add_space(6.0);
+    ui.horizontal(|ui| {
+        let mut on = cfg.tx_drive_max.is_some();
+        if crate::chrome::checkbox(ui, &mut on, "Limit drive to").changed() {
+            // Starting at the top rather than at a guess: a ceiling this
+            // dialog invented would be a power limit the operator did not
+            // measure, and one they might trust. Turning it on changes
+            // nothing until they bring it down to what their meter says.
+            cfg.tx_drive_max = on.then_some(1.0);
+        }
+        let mut pct = cfg.tx_drive_max.unwrap_or(1.0) * 100.0;
+        if ui
+            .add_enabled(
+                on,
+                egui::DragValue::new(&mut pct).speed(0.5).range(1.0..=100.0).suffix(" %"),
+            )
+            .on_hover_text(
+                "Per cent of full drive. Key the radio into a dummy load and bring this down                  until the meter reads the power the amplifier is rated for.",
+            )
+            .changed()
+        {
+            cfg.tx_drive_max = Some((pct / 100.0).clamp(0.01, 1.0));
+        }
+        ui.label(RichText::new("Applies immediately, on every band and to TUNE as well.").weak());
     });
 }
 
@@ -726,6 +800,10 @@ fn iface_opts(soapy_supported: bool) -> Vec<sdroxide_types::Backend> {
     // dlopen at runtime rather than linked, so nothing here needs it
     // installed to build or to see this entry — only to open it.
     opts.push(sdroxide_types::Backend::Fobos);
+    // Pure Rust over the machine's own sound cards, in every build variant.
+    // Nothing to install and nothing to enumerate free — the radio is the two
+    // device names picked here.
+    opts.push(sdroxide_types::Backend::UsbAudio);
     // Case-folded so HackRF lands under H beside HPSDR rather than after
     // it, which a byte-order sort would do.
     opts.sort_by_key(|b| b.label().to_ascii_lowercase());
@@ -745,6 +823,7 @@ fn free_device_probe(backend: sdroxide_types::Backend) -> Option<sdroxide_types:
     use sdroxide_types::{Backend as B, DeviceProbe as P};
     Some(match backend {
         B::Cat => P::RadioAudio,
+        B::UsbAudio => P::RadioAudio,
         B::RtlSdr => P::RtlSdr,
         B::Rx888 => P::Rx888,
         B::AirspyHf => P::AirspyHf,
@@ -944,9 +1023,14 @@ impl SdroxideApp {
         // Edits collected here and applied after the window closure, which
         // borrows `&self` and so can't touch `&mut self.ctrl`.
         let mut audio_pick: Option<(bool, Option<String>)> = None;
+        let mut profile_name = std::mem::take(&mut self.profile_name_edit);
+        let mut digi_reseed = false;
         let mut speech_edit = self.speech.settings().clone();
         let speech_status = self.speech.status();
         let mut speech_test = false;
+        let mut alerts_edit = self.alerts.settings();
+        let alerts_status = self.alerts.status();
+        let mut alerts_test = false;
         let mut hpsdr_discover = false;
         let mut rtlsdr_rescan = false;
         let mut rx888_rescan = false;
@@ -1111,6 +1195,8 @@ impl SdroxideApp {
                             rx_site: &mut rx_site,
                             audio_pick: &mut audio_pick,
                             hpsdr_discover: &mut hpsdr_discover,
+                            profile_name: &mut profile_name,
+                            digi_reseed: &mut digi_reseed,
                             rtlsdr_rescan: &mut rtlsdr_rescan,
                             rx888_rescan: &mut rx888_rescan,
                             airspyhf_rescan: &mut airspyhf_rescan,
@@ -1163,6 +1249,9 @@ impl SdroxideApp {
                             speech_voices: &self.speech_voices,
                             speech_status: &speech_status,
                             speech_test: &mut speech_test,
+                            alerts_edit: &mut alerts_edit,
+                            alerts_status: &alerts_status,
+                            alerts_test: &mut alerts_test,
                             net_sync: &mut net_sync,
                             tci_srv_edit: &mut tci_srv_edit,
                             tci_srv_apply: &mut tci_srv_apply,
@@ -1205,6 +1294,13 @@ impl SdroxideApp {
         self.show_settings = open;
         self.settings_tab = tab;
         self.settings_upload_tab = upload_tab;
+        self.profile_name_edit = profile_name;
+        // Not `digi_cfg_seeded` itself: that flag is true once the copy *is*
+        // seeded, so writing the request into it marked a stale copy — or,
+        // before any digital status had arrived, an empty default one — as
+        // current. And not cleared here either, or a status already on its way
+        // from before the apply would re-seed the old callsign.
+        self.profile_apply_pending |= digi_reseed;
         // The multi-radio shell drains these after the frame.
         self.radio_tab_requests.append(&mut radio_tab_reqs);
         {
@@ -1595,6 +1691,16 @@ impl SdroxideApp {
         if speech_test {
             self.speech.announcer.say_sample(ctx.input(|i| i.time));
         }
+        if alerts_edit != self.alerts.settings() {
+            // Live, like speech: a changed volume or rule reaches the running
+            // worker on the next decode, and a changed device or master toggle
+            // swaps the sink.
+            self.alerts.set_settings(alerts_edit.clone());
+            persist_alerts_settings(&alerts_edit);
+        }
+        if alerts_test {
+            self.alerts.test();
+        }
         // Written as it is typed, like the control bindings: the server rereads
         // the file for every sign-in, so there is no APPLY step to hang this
         // off. Gated on owning the server, so a remote client cannot write its
@@ -1670,6 +1776,7 @@ impl SdroxideApp {
             (SettingsTab::General, "General"),
             (SettingsTab::Radio, "Radio"),
             (SettingsTab::Ui, "UI"),
+            (SettingsTab::Alerts, "Alerts"),
             (SettingsTab::Controls, "Controls"),
             (SettingsTab::Spots, "Spots"),
             (SettingsTab::FreeDv, "FreeDV"),
@@ -1683,6 +1790,7 @@ impl SdroxideApp {
         #[cfg(not(target_arch = "wasm32"))]
         tabs.push((SettingsTab::Remote, "Remote"));
         tabs.push((SettingsTab::Tle, "TLE"));
+        tabs.push((SettingsTab::Profiles, "Profiles"));
         // Wrapped: the tab strip no longer fits the window's width on one line.
         // Real tabs rather than chips — a chip strip standing in for a tab strip
         // reads as a row of buttons that happen to stay pressed, with nothing to
@@ -1698,15 +1806,14 @@ impl SdroxideApp {
         // and the page they open.
         ui.add_space(8.0);
 
-        let backend = io.radio_edit.as_ref().map(|c| c.backend);
-
         match io.tab {
             SettingsTab::General => {
-                // Which build this is, taken from the crate metadata at compile
-                // time — so a bug report can name the version without the
-                // operator having to find the binary.
+                // Which build this is — so a bug report can name the version
+                // without the operator having to find the binary. Stamped, so
+                // a nightly says so here rather than naming the release it was
+                // cut from; a release reads exactly as it always did.
                 ui.label(
-                    RichText::new(format!("SDRoxide {}", env!("CARGO_PKG_VERSION")))
+                    RichText::new(format!("SDRoxide {}", sdroxide_version::VERSION))
                         .size(15.0)
                         .strong(),
                 );
@@ -1803,65 +1910,19 @@ impl SdroxideApp {
                 ui.add_space(10.0);
                 ui.separator();
                 ui.add_space(6.0);
+                self.settings_mode_defaults(ui, cmds);
+
+                ui.add_space(10.0);
+                ui.separator();
+                ui.add_space(6.0);
+                // This screen's own speaker and microphone, and nothing else.
+                // The *radio's* sound card and the gain on what comes back off
+                // it are the radio's, not the program's, and live on the Radio
+                // tab beside the rest of that interface's settings — a station
+                // running two rigs at once runs two interfaces at once, and one
+                // pair of pickers on a shared page could only describe one of
+                // them (issue #474).
                 self.settings_user_audio(ui, io.audio_pick);
-                if let Some(cfg) = io.radio_edit.as_mut() {
-                    crate::app::settings::general::settings_rx_audio_gain(ui, cfg);
-                }
-                // The radio's own sound card is only used by the CAT / Audio
-                // interface; every other backend carries its audio in-band.
-                //
-                // These are the cards on the machine the *rig* is plugged into,
-                // asked for by name rather than taken from `audio_devices` —
-                // that list is this screen's own speaker and microphone, and
-                // offering a laptop's built-in mic as the shack transceiver's
-                // transmit path would be worse than offering nothing at all.
-                if backend == Some(Backend::Cat) && self.radio_audio_devices.is_none() {
-                    ui.add_space(8.0);
-                    ui.label(RichText::new("Radio audio (sound card)").strong());
-                    ui.label(
-                        RichText::new(
-                            "Waiting for the sound cards on the machine the radio is plugged \
-                             into.",
-                        )
-                        .weak(),
-                    );
-                }
-                if backend == Some(Backend::Cat)
-                    && let (Some((inputs, outputs)), Some(cfg)) =
-                        (self.radio_audio_devices.as_ref(), io.radio_edit.as_mut())
-                {
-                    ui.add_space(8.0);
-                    ui.label(RichText::new("Radio audio (sound card)").strong());
-                    egui::Grid::new("radio-audio").num_columns(2).spacing([12.0, 6.0]).show(
-                        ui,
-                        |ui| {
-                            let (ci, co) =
-                                (cfg.radio_audio_in.clone(), cfg.radio_audio_out.clone());
-                            ui.label("From radio (RX)");
-                            device_combo(ui, "r-in", inputs, &ci, |n| cfg.radio_audio_in = n);
-                            ui.end_row();
-                            ui.label("To radio (TX)");
-                            device_combo(ui, "r-out", outputs, &co, |n| cfg.radio_audio_out = n);
-                            ui.end_row();
-                        },
-                    );
-                    ui.add_space(4.0);
-                    ui.horizontal(|ui| {
-                        if ui
-                            .button("Apply / reconnect")
-                            .on_hover_text("Reopen the CAT rig with these sound cards — no restart")
-                            .clicked()
-                        {
-                            *io.apply_iface = true;
-                        }
-                        ui.add(
-                            egui::Label::new(
-                                RichText::new("Reconnects the radio without restarting.").weak(),
-                            )
-                            .wrap(),
-                        );
-                    });
-                }
 
                 if let Some(access) = io.access_edit.as_deref_mut() {
                     ui.add_space(10.0);
@@ -2245,6 +2306,7 @@ impl SdroxideApp {
                 // selected above, so it sits here rather than in one of the
                 // per-backend sections below.
                 if self.tx_capable() {
+                    drive_ceiling_row(ui, cfg);
                     drive_trim_table(ui, cfg);
                     ui.separator();
                     ui.label(
@@ -2338,8 +2400,21 @@ impl SdroxideApp {
                         self.caps.as_ref(),
                         &self.state.antenna_rx,
                         self.state.rx_antenna,
+                        self.radio_audio_devices
+                            .as_ref()
+                            .map(|(i, o)| (i.as_slice(), o.as_slice())),
                         io.can_probe,
+                        io.apply_iface,
                         cmds,
+                    ),
+                    Backend::UsbAudio => settings_usb_audio_tab(
+                        ui,
+                        self.radio_audio_devices
+                            .as_ref()
+                            .map(|(i, o)| (i.as_slice(), o.as_slice())),
+                        io.radio_edit,
+                        io.apply_iface,
+                        io.can_probe,
                     ),
                     Backend::Tci => settings_tci_tab(
                         ui,
@@ -2589,6 +2664,15 @@ impl SdroxideApp {
                     self.audio_devices.as_ref().map(|d| d.outputs.as_slice()).unwrap_or(&[]),
                     io.speech_status,
                     io.speech_test,
+                );
+            }
+            SettingsTab::Alerts => {
+                alerts_settings(
+                    ui,
+                    io.alerts_edit,
+                    self.audio_devices.as_ref().map(|d| d.outputs.as_slice()).unwrap_or(&[]),
+                    io.alerts_status,
+                    io.alerts_test,
                 );
             }
             SettingsTab::Spots => {
@@ -3060,6 +3144,13 @@ impl SdroxideApp {
                 });
                 ui.add_space(6.0);
                 let target = *io.upload_tab;
+                // The service tick is meaningless with the master switch off,
+                // and leaving it live is how an operator ends up with a lit
+                // "Auto-upload each new QSO to X" and nothing ever pushed. Grey
+                // it until the master is on; the credentials below stay
+                // editable, so a service can still be set up before auto-upload
+                // is switched on.
+                let auto_on = io.net_edit.auto_upload;
                 let enable = match target {
                     UploadTarget::Eqsl => &mut io.net_edit.auto_upload_eqsl,
                     UploadTarget::QrzLogbook => &mut io.net_edit.auto_upload_qrz,
@@ -3067,16 +3158,23 @@ impl SdroxideApp {
                     UploadTarget::ClubLog => &mut io.net_edit.auto_upload_clublog,
                     UploadTarget::Wrl => &mut io.net_edit.auto_upload_wrl,
                 };
-                crate::chrome::checkbox(
-                    ui,
-                    enable,
-                    format!("Auto-upload each new QSO to {}", target.label()),
-                );
-                if !io.net_edit.auto_upload {
+                ui.add_enabled_ui(auto_on, |ui| {
+                    crate::chrome::checkbox(
+                        ui,
+                        enable,
+                        format!("Auto-upload each new QSO to {}", target.label()),
+                    )
+                    .on_disabled_hover_text(
+                        "Turn on \"Auto-upload each new QSO\" above first — a service \
+                         ticked here is not pushed until it is.",
+                    );
+                });
+                if !auto_on {
                     ui.label(
                         RichText::new(
-                            "Auto-upload is off above, so nothing is pushed automatically \
-                             yet — the per-QSO UP button in the logbook still works.",
+                            "Auto-upload is off above, so the service ticks are disabled and \
+                             nothing is pushed automatically yet — the per-QSO UP button in the \
+                             logbook still works.",
                         )
                         .size(10.5)
                         .color(crate::theme::gray(140)),
@@ -3262,6 +3360,7 @@ impl SdroxideApp {
                 self.remote_status.as_ref(),
             ),
             SettingsTab::Tle => settings_tle_tab(ui, io),
+            SettingsTab::Profiles => settings_profiles_tab(ui, io, cmds, &self.profiles),
         }
     }
 

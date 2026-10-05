@@ -21,3 +21,6 @@ crates/sdroxide-web/dist/index.html
 
 # AtCHAT / file-transfer received files (runtime output)
 received/
+
+# Release notes drafted for the GitHub release page, not part of the tree.
+/RELEASE_NOTES*.md

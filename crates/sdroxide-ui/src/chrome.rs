@@ -646,19 +646,22 @@ pub fn red_panel<R>(ui: &mut Ui, add: impl FnOnce(&mut Ui) -> R) -> R {
 /// A slider with a visible dark track. egui draws the slider rail with
 /// `widgets.inactive.bg_fill`, which equals the module background here, so
 /// the empty portion of the track would otherwise be invisible.
+///
+/// For a rail that runs across the panel. A vertical one goes through
+/// [`slider_vertical`], which reads the same measurement as a height.
 pub fn slider(ui: &mut Ui, slider: egui::Slider<'_>) -> Response {
-    // A fatter rail where the handle is dragged with a finger. Set here rather
-    // than in the theme so the handful of raw `Slider`s elsewhere keep theirs.
-    let rail = if crate::layout::tier(ui.ctx()).touch() { 12.0 } else { 6.0 };
-    ui.scope(|ui| {
-        ui.visuals_mut().widgets.inactive.bg_fill = theme::INPUT_BG();
-        ui.visuals_mut().widgets.hovered.bg_fill = theme::INPUT_BG();
-        ui.spacing_mut().slider_rail_height = rail;
-        // The rail, the trailing fill and the knob are all chrome, so the whole
-        // widget goes through the skin — see [`reskin`].
-        reskin(ui, Skin::Whole, Depth::Recessed, |ui| ui.add(slider))
-    })
-    .inner
+    // No caller of this one shows a value, so the rail is the whole width.
+    let width = fit_rail(ui, 0.0);
+    skinned_slider(ui, Some(width), slider)
+}
+
+/// [`slider`] for a rail that runs up the box rather than across it.
+///
+/// A vertical `Slider` reads `slider_width` as its *height*, so this one is
+/// kept away from [`fit_rail`] — which is about what is left of a row's width,
+/// and would hand a tall rail a short one's number.
+pub fn slider_vertical(ui: &mut Ui, slider: egui::Slider<'_>) -> Response {
+    skinned_slider(ui, None, slider)
 }
 
 /// [`slider`] whose value readout never measures narrower than `readout_w`.
@@ -669,17 +672,96 @@ pub fn slider(ui: &mut Ui, slider: egui::Slider<'_>) -> Response {
 /// oscillates between two numbers for as long as the pointer is held there
 /// (issue #429). Pinned to the widest the readout gets, the rail stays put.
 pub fn slider_readout(ui: &mut Ui, readout_w: f32, slider: egui::Slider<'_>) -> Response {
+    // The gap and the readout ride beside the rail, so they come off the line
+    // before the rail is fitted to what is left of it (see [`fit_rail`]).
+    let beside = {
+        let spacing = ui.spacing();
+        spacing.item_spacing.x + spacing.interact_size.x.max(readout_w)
+    };
+    let width = fit_rail(ui, beside);
     ui.scope(|ui| {
         let size = &mut ui.spacing_mut().interact_size;
         size.x = size.x.max(readout_w);
-        self::slider(ui, slider)
+        skinned_slider(ui, Some(width), slider)
     })
     .inner
 }
 
 /// [`slider`] that may be greyed out — `ui.add_enabled`, with a skin.
 pub fn slider_enabled(ui: &mut Ui, enabled: bool, slider: egui::Slider<'_>) -> Response {
-    ui.add_enabled_ui(enabled, |ui| self::slider(ui, slider)).inner
+    // Fitted out here, not inside: `add_enabled_ui` opens a child `Ui`, and
+    // from in there the wrapping row is no longer visible (see [`fit_rail`]).
+    let width = fit_rail(ui, 0.0);
+    ui.add_enabled_ui(enabled, |ui| skinned_slider(ui, Some(width), slider)).inner
+}
+
+/// The skin every slider here wears, with `width` — where the caller measured
+/// one — as the rail's own extent.
+fn skinned_slider(ui: &mut Ui, width: Option<f32>, slider: egui::Slider<'_>) -> Response {
+    // A fatter rail where the handle is dragged with a finger. Set here rather
+    // than in the theme so the handful of raw `Slider`s elsewhere keep theirs.
+    let rail = if crate::layout::tier(ui.ctx()).touch() { 12.0 } else { 6.0 };
+    ui.scope(|ui| {
+        ui.visuals_mut().widgets.inactive.bg_fill = theme::INPUT_BG();
+        ui.visuals_mut().widgets.hovered.bg_fill = theme::INPUT_BG();
+        ui.spacing_mut().slider_rail_height = rail;
+        if let Some(w) = width {
+            ui.spacing_mut().slider_width = w;
+        }
+        // The rail, the trailing fill and the knob are all chrome, so the whole
+        // widget goes through the skin — see [`reskin`].
+        reskin(ui, Skin::Whole, Depth::Recessed, |ui| ui.add(slider))
+    })
+    .inner
+}
+
+/// The narrowest a rail may be squeezed to before the row breaks instead. Below
+/// this a slider is more a gesture at a control than one that can be set.
+const MIN_RAIL_W: f32 = 80.0;
+
+/// How wide a rail may be on what is left of a wrapping row, breaking the row
+/// first where even a squeezed one will not fit. `beside` is whatever the
+/// widget draws next to the rail — the gap and its value readout, or nothing
+/// for a bare one.
+///
+/// Two things make this necessary.
+///
+/// Nothing skinned here wraps on its own: every one of these widgets is built
+/// inside a `Ui::scope`, and a scope is handed whatever is left of the line as
+/// its *whole* region and then quietly overflows it, so egui's wrapping never
+/// sees the size that did not fit. The parent afterwards grows to include the
+/// overflow, which widens the row for everything after it, and a popup — which
+/// egui will move onto the screen but cannot shrink — comes out wider than the
+/// screen with the far end unreachable. That is how the TX menu's Mic rail
+/// ended up hanging off the side of a 360 pt phone, with no way to touch it
+/// (issue #516).
+///
+/// And a rail is the elastic part of a control row. A label has the width of
+/// its word and a readout the width of its widest value, but a slider reads the
+/// same at 140 pt as at 220 — so the rail gives way first, and the row breaks
+/// only when it has nothing left to give. Breaking sooner would leave a label
+/// stranded at the end of one line with its rail alone on the next.
+fn fit_rail(ui: &mut Ui, beside: f32) -> f32 {
+    let want = ui.spacing().slider_width;
+    let layout = ui.layout();
+    if !layout.main_wrap || layout.main_dir != egui::Direction::LeftToRight {
+        return want;
+    }
+    // The floor is the rail's own width wherever that is already below it: a
+    // deliberately short rail is not widened to meet a minimum meant for a
+    // long one.
+    let floor = MIN_RAIL_W.min(want);
+    // What is left of *this* line, which is not what `available_width` reports:
+    // for a wrapping layout egui answers with the width of a whole fresh row,
+    // on the reasoning that anything too wide will wrap into one. Nothing built
+    // in a scope ever does, so the remainder has to be measured here.
+    let mut left = ui.max_rect().right() - ui.cursor().left() - beside;
+    let at_line_start = ui.cursor().left() <= ui.max_rect().left() + 0.5;
+    if left + 0.5 < floor && !at_line_start {
+        ui.end_row();
+        left = ui.max_rect().width() - beside;
+    }
+    want.min(left).max(floor)
 }
 
 // ---------------------------------------------------------------------------
@@ -1439,6 +1521,49 @@ pub fn chip_link(ui: &mut Ui, selected: bool, size: egui::Vec2) -> Response {
         for dx in [-0.55, 0.55] {
             p.circle_stroke(Pos2::new(c.x + dx * r, c.y), r, stroke);
         }
+    }
+    resp
+}
+
+/// A chip carrying an anticlockwise arrow — "put it back" — instead of a label,
+/// at an exact size. Painted rather than typed for the reason [`chip_link`]
+/// gives, and inked the same way.
+///
+/// The RX box's way back to a mode's defaults. That box keeps the chip's room
+/// in every mode whether it is showing or not, so the box does not widen under
+/// the click that makes it appear — and the word DEFAULTS, at 79 pt, cost the
+/// narrowest desktop strip a whole row to keep room for.
+pub fn chip_reset(ui: &mut Ui, size: egui::Vec2) -> Response {
+    let resp = chip_impl(ui, false, RichText::new(""), None, Sense::click(), Some(size));
+    if ui.is_rect_visible(resp.rect) {
+        let ink = ui.style().interact_selectable(&resp, false).fg_stroke.color;
+        let stroke = Stroke::new((size.y * 0.07).clamp(1.4, 2.2), ink);
+        let r = resp.rect.height() * 0.26;
+        let c = resp.rect.center();
+        let at = |a: f32| Pos2::new(c.x + r * a.cos(), c.y + r * a.sin());
+        // Seven-eighths of a circle, run anticlockwise on screen (the angle
+        // falls, y being down) from the left round through the bottom, the
+        // right and the top, so the gap — and the head — sit at the upper left.
+        let (from, to) = (std::f32::consts::PI, -0.75 * std::f32::consts::PI);
+        const STEPS: usize = 28;
+        let arc: Vec<Pos2> =
+            (0..=STEPS).map(|i| at(from + (to - from) * i as f32 / STEPS as f32)).collect();
+        let p = ui.painter();
+        p.add(Shape::line(arc, stroke));
+        // The head, pointing along the way the arc was travelling.
+        let end = at(to);
+        let dir = vec2(to.sin(), -to.cos());
+        let out = vec2(to.cos(), to.sin());
+        let a = r * 0.75;
+        p.add(Shape::convex_polygon(
+            vec![
+                end + dir * a * 0.6,
+                end - dir * a * 0.4 + out * a * 0.55,
+                end - dir * a * 0.4 - out * a * 0.55,
+            ],
+            ink,
+            Stroke::NONE,
+        ));
     }
     resp
 }
@@ -2230,6 +2355,11 @@ mod tests {
     /// Open a menu popup from a chip on a `screen`-sized viewport and return the
     /// rect it took.
     fn menu_popup_rect(screen: egui::Vec2) -> Rect {
+        menu_popup_rect_of(screen, a_long_menu)
+    }
+
+    /// [`menu_popup_rect`] for a menu of the caller's own.
+    fn menu_popup_rect_of(screen: egui::Vec2, content: fn(&mut Ui)) -> Rect {
         let ctx = egui::Context::default();
         let tier = crate::layout::tier_for(screen, sdroxide_types::LayoutMode::Auto);
         crate::layout::set_tier(&ctx, tier);
@@ -2243,14 +2373,14 @@ mod tests {
         ctx.run_ui(input(), |ui| {
             let btn = chip(ui, false, "MENU");
             id = Some(egui::Popup::default_response_id(&btn));
-            menu_popup(ui, &btn, a_long_menu);
+            menu_popup(ui, &btn, content);
         })
         .drop_without_applying_deltas();
         let id = id.expect("the chip was drawn");
         egui::Popup::open_id(&ctx, id);
         ctx.run_ui(input(), |ui| {
             let btn = chip(ui, false, "MENU");
-            menu_popup(ui, &btn, a_long_menu);
+            menu_popup(ui, &btn, content);
         })
         .drop_without_applying_deltas();
         ctx.memory(|m| m.area_rect(id)).expect("the popup was shown")
@@ -2273,6 +2403,53 @@ mod tests {
             assert!(
                 r.left() >= 0.0 && r.right() <= screen.x,
                 "{screen:?}: popup spans {}..{}",
+                r.left(),
+                r.right()
+            );
+        }
+    }
+
+    /// The shape of a control menu: a chip, then label-and-rail pairs, exactly
+    /// as `tx_controls` lays the TX menu out.
+    fn a_menu_of_rails(ui: &mut Ui) {
+        fn readout_w(ui: &Ui, text: &str) -> f32 {
+            let w = text_width(ui, text, egui::TextStyle::Body.resolve(ui.style()))
+                + 2.0 * ui.spacing().button_padding.x;
+            w.max(ui.spacing().interact_size.x)
+        }
+        control_row(ui, true, |ui| {
+            chip(ui, false, " > ");
+            let pct = |v: f64, _: std::ops::RangeInclusive<usize>| format!("{:.0}%", v * 100.0);
+            for name in ["Drive", "Tune"] {
+                ui.label(name);
+                let mut v = 1.0f32;
+                slider_readout(
+                    ui,
+                    readout_w(ui, "100%"),
+                    egui::Slider::new(&mut v, 0.0..=1.0).show_value(true).custom_formatter(pct),
+                );
+            }
+            ui.label("Mic");
+            let mut mic = 0.5f32;
+            slider(ui, egui::Slider::new(&mut mic, 0.0..=1.0).show_value(false));
+        });
+    }
+
+    /// The rails in a menu have to fit it, and a rail does not wrap on its own:
+    /// it is built inside a scope, which is handed the rest of the line and
+    /// overflows it in silence. On a 360 pt phone that put the TX menu's Mic
+    /// rail off the side of the screen where no finger could reach it — the
+    /// whole of issue #516 — and, because the row widens to take the overflow,
+    /// every control after it as well.
+    #[test]
+    fn a_menu_of_rails_fits_the_screen_it_opens_on() {
+        for screen in
+            [vec2(360.0, 800.0), vec2(393.0, 852.0), vec2(852.0, 393.0), vec2(768.0, 1024.0)]
+        {
+            let r = menu_popup_rect_of(screen, a_menu_of_rails);
+            assert!(
+                r.left() >= 0.0 && r.right() <= screen.x,
+                "{screen:?}: the rails put the menu at {}..{}",
                 r.left(),
                 r.right()
             );

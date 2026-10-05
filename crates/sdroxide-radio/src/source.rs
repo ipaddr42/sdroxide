@@ -4,7 +4,7 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use crate::{Complex32, Result};
-use sdroxide_types::Mode;
+use sdroxide_types::{Mode, Vfo};
 
 /// Corner frequency of the front-end DC blocker. Low enough to be invisible at
 /// any device rate (10 ppm of a 2 Msps span), high enough to settle in ~8 ms.
@@ -448,6 +448,20 @@ pub trait IqSource: Send {
     fn adc_overload(&mut self) -> Option<bool> {
         None
     }
+    /// What this radio's adaptive-predistortion loop is doing, where it runs
+    /// one — see [`sdroxide_types::PsMeter`].
+    ///
+    /// Polled on the meter tick in receive as well as transmit. A loop that
+    /// never locks is PureSignal's ordinary failure and it is invisible from
+    /// the air: the transmitter simply goes out uncorrected, exactly as it
+    /// would have if the feature were off. The operator's only way to tell the
+    /// two apart used to be the log (issue #441).
+    ///
+    /// `None` on every radio that is not running one, which is nearly all of
+    /// them. Default: none.
+    fn puresignal(&mut self) -> Option<sdroxide_types::PsMeter> {
+        None
+    }
     /// The rig's own S-meter in dBm, polled by the engine while receiving.
     ///
     /// For a source that hands us already-demodulated audio (a CAT rig on a
@@ -618,6 +632,24 @@ pub trait IqSource: Send {
     fn cw_iq_on_vfo(&self) -> bool {
         false
     }
+
+    /// The operator has taken up the other VFO, which now sits on `hz`.
+    ///
+    /// For a rig with its own pair, so that the one on its front panel is the
+    /// one being worked: an FDM-DUO's window rides on whichever of its VFOs is
+    /// selected, so mirroring the choice puts the radio's own display, its
+    /// knob and its A/B button on the same dial as sdroxide's.
+    ///
+    /// The frequency comes along because the two are one decision at the
+    /// radio's end — selecting a VFO that is holding a stale number moves the
+    /// receiver there until the dial arrives, and the pair sent together is
+    /// what avoids that.
+    ///
+    /// Default: nothing. Most front ends have no second VFO to select, and a
+    /// rig kept deliberately on one of them (see the ELAD source, where the
+    /// dial is *read* with a command that always answers VFO A) must stay
+    /// there — which is why this is opt-in rather than a rule.
+    fn select_vfo(&mut self, _vfo: Vfo, _hz: f64) {}
 
     /// Drain any out-of-band changes the rig reported (dial/mode moved on the
     /// radio). Default: none.
@@ -1359,6 +1391,16 @@ impl IqSource for ConvertedSource {
         self.inner.cw_iq_on_vfo()
     }
 
+    /// Forwarded: which VFO is in use is a fact about the rig, and a converter
+    /// in front of it does not change which one that is. The frequency arrives
+    /// as the operator's and the rig wants its own, so it takes the offset the
+    /// way [`Self::set_center_hz`] gives it — `dial + rx_offset`, through the
+    /// step the dial falls in. [`Self::down`] is the other direction, and sent a
+    /// transverter's VFO B to a frequency below DC.
+    fn select_vfo(&mut self, vfo: Vfo, hz: f64) {
+        self.inner.select_vfo(vfo, hz + self.plan.step_for(hz).rx_offset_hz);
+    }
+
     fn read(&mut self, buf: &mut [Complex32]) -> Result<usize> {
         self.inner.read(buf)
     }
@@ -1501,6 +1543,9 @@ impl IqSource for ConvertedSource {
     }
     fn adc_overload(&mut self) -> Option<bool> {
         self.inner.adc_overload()
+    }
+    fn puresignal(&mut self) -> Option<sdroxide_types::PsMeter> {
+        self.inner.puresignal()
     }
 
     fn rx_signal_dbm(&mut self) -> Option<f32> {

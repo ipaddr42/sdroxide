@@ -60,6 +60,7 @@ fn entry_row(
     let net_col = match e.network {
         PublicSdrNetwork::KiwiSdr => crate::theme::CYAN(),
         PublicSdrNetwork::SpyServer => crate::theme::PINK(),
+        PublicSdrNetwork::SdrList => crate::theme::GREEN(),
     };
     /// What the buttons (or the refusal text) need on the right.
     const ACTIONS_W: f32 = 172.0;
@@ -314,10 +315,14 @@ impl SdroxideApp {
         let visible: Vec<&PublicSdrEntry> = entries
             .iter()
             .filter(|e| {
-                let net_on = match e.network {
-                    PublicSdrNetwork::SpyServer => self.public_sdr_nets_shown[0],
-                    PublicSdrNetwork::KiwiSdr => self.public_sdr_nets_shown[1],
-                };
+                // Indexed by the network's own position in `ALL`, so adding
+                // one is a single edit there rather than an arm here that is
+                // easy to forget.
+                let net_on = PublicSdrNetwork::ALL
+                    .iter()
+                    .position(|n| *n == e.network)
+                    .and_then(|i| self.public_sdr_nets_shown.get(i).copied())
+                    .unwrap_or(true);
                 net_on
                     && (!self.public_sdr_free_only || e.blocked_reason().is_none())
                     && (!self.public_sdr_in_band || e.covers(dial_hz))
@@ -452,12 +457,15 @@ impl SdroxideApp {
                     } else {
                         "—".to_string()
                     };
+                    let per_net = PublicSdrNetwork::ALL
+                        .iter()
+                        .map(|n| format!("{} {}", dir.count(*n), n.label()))
+                        .collect::<Vec<_>>()
+                        .join(" · ");
                     ui.label(
                         RichText::new(format!(
-                            "{} receivers · {} SpyServer · {} KiwiSDR · fetched {age} ago",
+                            "{} receivers · {per_net} · fetched {age} ago",
                             dir.entries.len(),
-                            dir.count(PublicSdrNetwork::SpyServer),
-                            dir.count(PublicSdrNetwork::KiwiSdr),
                         ))
                         .size(11.0)
                         .color(crate::theme::gray(150)),

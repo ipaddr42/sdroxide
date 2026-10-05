@@ -21,7 +21,7 @@
 //! hardware has one of — the reference trim, and on an RSPdx the HDR path —
 //! which are marked where they appear.
 
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU8, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU8, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -230,6 +230,17 @@ pub(crate) struct Shared {
     pub alive: AtomicBool,
     /// The service said the ADC is overloaded (and has not yet said corrected).
     pub overload: AtomicBool,
+    /// Entries into overload since the session thread last reported one.
+    ///
+    /// The callback counts; the reporting happens on our own thread so that it
+    /// can be rate-limited. A receiver sitting right at the overload threshold
+    /// toggles several times a second — measured at five to ten on an RSPdx on
+    /// a wire antenna in a strong broadcast band — and a line per transition
+    /// buries every other message in the log.
+    pub overload_events: AtomicU32,
+    /// Which tuners those entries came from, in the bits
+    /// [`Shared::overload_ack_pending`] uses.
+    pub overload_tuners: AtomicU8,
     /// Which tuners have an overload message waiting for the mandatory
     /// acknowledgement, which must come from the session thread rather than
     /// the callback: bit 0 is tuner A, bit 1 is tuner B. A mask rather than a
@@ -255,6 +266,8 @@ impl Shared {
         Shared {
             alive: AtomicBool::new(true),
             overload: AtomicBool::new(false),
+            overload_events: AtomicU32::new(0),
+            overload_tuners: AtomicU8::new(0),
             overload_ack_pending: AtomicU8::new(0),
             removed: AtomicBool::new(false),
             t: [TunerShared::new(), TunerShared::new()],

@@ -171,6 +171,10 @@ pub enum DuoSub {
     /// `0xF2` — write the DDC tuning word. The low sixteen bits go in `wValue`
     /// and the next eight in the *low* byte of `wIndex`, beside this code.
     Tune = 0xF2,
+    /// `0xF5` — read back what the radio is tuned to: eleven bytes carrying
+    /// the receive frequency and the DDC word the radio put in its own FPGA.
+    /// See [`decode_tune_read`].
+    TuneRead = 0xF5,
     /// `0xFC` — read three status bytes. Bit 2 of the third says the CAT
     /// command buffer is still busy with the last command.
     Status = 0xFC,
@@ -190,6 +194,54 @@ pub const STATUS_CAT_BUSY: u8 = 0x04;
 /// Longest a CAT command written through the USB gateway may be. Fixed-length:
 /// the request always carries sixteen bytes whatever the command is.
 pub const CAT_FRAME_LEN: usize = 16;
+
+/// Bytes in a [`DuoSub::TuneRead`] reply.
+pub const TUNE_READ_LEN: u16 = 11;
+
+/// What an FDM-DUO says it is tuned to.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DuoTuning {
+    /// The receive frequency, in Hz.
+    pub hz: f64,
+    /// The DDC tuning word the radio has in its own FPGA — the same number
+    /// [`tuning_word`] computes for [`Self::hz`] against the calibrated clock.
+    pub word: u32,
+    /// The last byte of the reply, kept raw. On an FDM-DUO with hardware 2.9
+    /// and firmware 4.9 it reads `0x10` at rest and `0x11` while the dial is
+    /// turning, but two values seen on one radio are not a specification, so
+    /// nothing here acts on it.
+    pub status: u8,
+}
+
+/// Decode a [`DuoSub::TuneRead`] reply, or `None` if it is not one.
+///
+/// The frame, from an FDM-DUO sitting on 940 kHz:
+///
+/// ```text
+/// F5  00 0E 57 E0  01 F5 58 21  00 10
+/// ^   ^            ^            ^
+/// |   |            |            status
+/// |   |            the DDC tuning word, big-endian
+/// |   the frequency in Hz, big-endian: 940000
+/// the sub-command, echoed
+/// ```
+///
+/// Both halves are worth having. The frequency is what the operator's knob
+/// moves and the only way to follow it without the CAT serial port; the word is
+/// the radio's own arithmetic, which on the bench matched [`tuning_word`] to
+/// the bit at 940 kHz and at 991.3 kHz — but only with the EEPROM clock
+/// correction applied, which is what makes it a check on that too.
+pub fn decode_tune_read(reply: &[u8]) -> Option<DuoTuning> {
+    if reply.len() < TUNE_READ_LEN as usize || reply[0] != DuoSub::TuneRead as u8 {
+        return None;
+    }
+    let be32 = |b: &[u8]| u32::from_be_bytes([b[0], b[1], b[2], b[3]]);
+    Some(DuoTuning {
+        hz: f64::from(be32(&reply[1..5])),
+        word: be32(&reply[5..9]),
+        status: reply[10],
+    })
+}
 
 /// `wIndex` for every EEPROM read. Not a meaningful index — it is the constant
 /// the device wants beside the address.
@@ -407,6 +459,41 @@ mod tests {
         assert!(!Model::S2.transmits());
         assert_eq!(Model::S1.clock_hz(), Model::Duo.clock_hz() / 2.0);
         assert_eq!(Model::S1.rx_range_hz().1, 30_000_000.0);
+    }
+
+    /// Frames read off an FDM-DUO (hardware 2.9, firmware 4.9) at two dial
+    /// settings, which is where every byte of the layout comes from.
+    #[test]
+    fn a_tune_read_gives_back_the_frequency_the_radio_is_on() {
+        let at_940 = [0xF5, 0x00, 0x0E, 0x57, 0xE0, 0x01, 0xF5, 0x58, 0x21, 0x00, 0x10];
+        let t = decode_tune_read(&at_940).expect("a well-formed reply");
+        assert_eq!(t.hz, 940_000.0);
+        assert_eq!(t.word, 0x01F5_5821);
+
+        let at_991_3 = [0xF5, 0x00, 0x0F, 0x20, 0x44, 0x02, 0x10, 0xB4, 0x71, 0x00, 0x11];
+        let t = decode_tune_read(&at_991_3).expect("a well-formed reply");
+        assert_eq!(t.hz, 991_300.0);
+        assert_eq!(t.word, 0x0210_B471);
+    }
+
+    /// The radio's own word and ours are the same arithmetic — against the
+    /// *calibrated* clock. Nominal misses by several hundred counts, which is
+    /// how this doubles as a check that the EEPROM correction is applied.
+    #[test]
+    fn the_radios_own_tuning_word_matches_the_one_this_crate_computes() {
+        let clock = 122_880_000.0 - 2678.0; // this unit's EEPROM correction
+        assert_eq!(tuning_word(940_000.0, clock), 0x01F5_5821);
+        assert_eq!(tuning_word(991_300.0, clock), 0x0210_B471);
+        assert_ne!(tuning_word(940_000.0, 122_880_000.0), 0x01F5_5821);
+    }
+
+    #[test]
+    fn a_reply_that_is_not_a_tune_read_is_refused() {
+        assert_eq!(decode_tune_read(&[]), None);
+        // Right length, wrong sub-command echoed.
+        assert_eq!(decode_tune_read(&[0xFC; 11]), None);
+        // Right sub-command, too short to hold the fields.
+        assert_eq!(decode_tune_read(&[0xF5, 0x00, 0x0E, 0x57]), None);
     }
 
     #[test]

@@ -1311,7 +1311,212 @@ use sdroxide_types::{
 /// costs every picture sent while it runs out (issue #397). Appended, so no
 /// surviving discriminant moved, but a v145 station has no name for it and
 /// fails to decode the message carrying it.
-pub const PROTO_VERSION: u16 = 146;
+///
+/// v147: [`sdroxide_types::Backend`] gains `UsbAudio`, a radio with no control
+/// port — receive and transmit over two sound cards, keyed by the rig's own
+/// VOX (PR #456). Appended, so no surviving discriminant moved, but `Backend`
+/// rides inside `RadioConfig` and so inside `ServerMsg::RadioConfig` and
+/// `Command::SetRadioConfig`: a v146 peer handed one fails to decode the
+/// message carrying it.
+///
+/// v148: HD Radio reception — the FM digital sidecar (issue #437). `Mode::HdRadio`,
+/// `ServerMsg::Hd` carrying `HdRadioStatus`, and `Command::SetHdProgram` for the
+/// HD-2 subchannels, all appended last so no surviving discriminant moved, but a
+/// v147 peer handed any of them fails to decode the message carrying it.
+///
+/// v149: [`sdroxide_types::Meters`] gains `puresignal`, what the adaptive
+/// predistortion loop is doing on a radio running one (issue #441). Appended
+/// last, but `Meters` is a struct in a non-self-describing encoding: a v148
+/// peer reads the extra bytes as the start of the next field and fails to
+/// decode every meter update.
+///
+/// v150: the SSTV vocabulary grows — [`sdroxide_types::SstvMode`] gains the PD
+/// family and the two Wraase SC-2 modes, and [`sdroxide_types::SstvStatus`]
+/// gains `unsupported`, the name of a mode a header arrived for and this build
+/// cannot draw (issue #421). The variants are appended so no surviving
+/// discriminant moved, but a v149 peer has no name for the new ones and reads
+/// the status's extra field as the start of the next, so every SSTV update
+/// fails to decode.
+///
+/// v151: [`sdroxide_types::PublicSdrNetwork`] gains `SdrList`, the
+/// `sdr-list.xyz` directory of PhantomSDR-Plus and friends (issue #482).
+/// Appended, so no surviving discriminant moved, but it rides inside
+/// `ProbeAnswer::PublicSdrs`: a v150 client handed a receiver from that
+/// directory fails to decode the whole answer, and its browse window stays
+/// empty rather than showing the two lists it does know.
+///
+/// v152: the CW keyboard straight key (issue #322). `Command::CwStraight` and
+/// `Command::CwKey`, appended last so no surviving discriminant moved, but a
+/// v151 peer has no name for either and fails to decode the message carrying it.
+///
+/// v153: station profiles (issue #197). `Command` gains `ProfileSave`,
+/// `ProfileApply` and `ProfileDelete`, appended last so no surviving
+/// discriminant moved, but a v152 station has no name for them and fails to
+/// decode the message carrying one. `ServerMsg` gains `Profiles`, the names
+/// to offer, appended last for the same reason: a v152 client handed the list
+/// fails to decode it.
+///
+/// v154: ACARS, the VHF airband airline datalink (issue #436). `Mode::Acars` is
+/// appended last, so no surviving discriminant moved, but a v153 peer has no
+/// name for it. The status rides the existing `RadioEvent::Ft8Status` /
+/// `ServerMsg::Ft8Status`, so there is no new message — but `DigiStatus` gains
+/// a trailing `acars` field, and postcard numbers struct fields by position, so
+/// a v153 peer desynchronises on the tail of every `DigiStatus`. The field is
+/// last, so no surviving field moved.
+///
+/// v155: per-mode settings. The engine applies AGC, squelch, noise reduction
+/// and the rest from a profile when the mode changes, and remembers what the
+/// operator changes while a mode is selected, so `Command` gains
+/// `ResetModeDefaults` — appended, so no surviving discriminant moved. The
+/// profiles themselves travel as receiver state, so a v154 peer's state decode
+/// is unchanged; it just cannot ask for a reset. Numbered after ACARS because
+/// that landed upstream first (the two were in flight together).
+///
+/// v156: HD Radio's decoder is `libnrsc5`, loaded at run time rather than built
+/// in (issue #488), so whether the mode works is the station's to say.
+/// [`sdroxide_types::RadioState`] gains `hd_radio_unavailable`, the reason to
+/// show on the greyed-out mode. Appended last, but postcard numbers struct
+/// fields by position: a v155 peer reads the extra bytes as the start of
+/// whatever follows the state, and fails to decode `HelloAck` and every state
+/// update.
+///
+/// v157: SSTV picture styling, `DigiConfig::sstv_style` (an
+/// `sdroxide_types::SstvStyle`) — the banner strip's gradient and outline, the
+/// banner text's colour, gradient and outline, a rainbow override for all the
+/// picture's text, and the slot message's ink and outline. One appended field
+/// rather than a dozen, and it lets a station give its picture a look rather
+/// than one flat colour. Appended to `DigiConfig`'s tail, and `DigiConfig` rides
+/// `Command::SetDigiConfig` and `DigiStatus` whole, so a v156 peer reads the
+/// extra bytes as the start of the next field and fails to decode every digital
+/// status.
+///
+/// v158: the (tr)uSDX family. [`sdroxide_types::CatConfig`] gains
+/// `trusdx_audio`, which picks between audio in the CAT stream and a USB sound
+/// card. `CatConfig` rides `Command::SetRadioConfig` whole, so the field sits
+/// mid-struct on the wire even appended last in the struct, and a peer without
+/// it runs off the end.
+///
+/// v159: NR2, the fifth noise-reduction engine — WDSP's Ephraim-Malah denoiser
+/// ported to `sdroxide-dsp`. [`sdroxide_types::NrLevel`] gains `Nr2Low`,
+/// `Nr2Med` and `Nr2High`, appended last so no surviving discriminant moved.
+/// `NrLevel` rides `RadioState::noise_reduction` and `Command::SetNoiseReduction`,
+/// so a v158 peer has no name for the three and fails to decode the state or the
+/// command carrying one — but only once NR2 is actually selected, since nothing
+/// else emits them.
+///
+/// v160: the CW panel is told whether the radio keys itself.
+/// [`sdroxide_types::CwStatus`] gains `rig_keys_itself`, appended last, so the
+/// panel can grey the straight key out with a reason instead of lighting it on
+/// a rig that will never hand-key (issue #495). `CwStatus` rides
+/// `DigiStatus::cw`, which is sent whenever a CW engine is running, so a v159
+/// peer reads the extra byte as the start of the next field and fails to decode
+/// every digital status.
+///
+/// v161: the HFDL ground-network decoder's settings, [`sdroxide_types::RadioState`]
+/// gains `hfdl` (issue #497). Appended to `RadioState`'s tail, and `RadioState`
+/// crosses whole, so a v160 peer reads the extra bytes as the start of the next
+/// field and fails to decode every state — the same break `RadioState`'s other
+/// appended decoders caused, and the same fix (the two sides must run in
+/// lockstep). The live decode log is engine-side only
+/// (`RadioEvent::HfdlStatus`), bridged nowhere.
+///
+/// v162: two CW conveniences from the same report (issue #495).
+/// `DigiConfig::cw_sidetone` plays the keyed tone through the local speakers so
+/// a `Sound card (MCW)` operator hears what they are sending, and
+/// `DigiConfig::cw_tx_idle_s` makes the transmit-hold after the last character
+/// or key release configurable. Both appended to `DigiConfig`'s tail, and
+/// `DigiConfig` rides `Command::SetDigiConfig` and `DigiStatus` whole, so a
+/// v161 peer reads the extra bytes as the start of the next field and fails to
+/// decode every digital status.
+///
+/// v163: the CW straight key's self-decode, `CwStatus::sent_text` — what the
+/// operator's own keying decoded to, so the straight key shows its characters
+/// the way the text keyer shows typed ones (issue #495 follow-up). Appended to
+/// `CwStatus`'s tail, after `rig_keys_itself`; `CwStatus` rides inside
+/// `DigiStatus`, which crosses whole, so a v162 peer reads the extra bytes as
+/// the start of the next field and fails to decode every digital status.
+///
+/// v164: PI4, the "Next Generation Beacon" propagation-beacon mode.
+/// `Mode::Pi4` is appended, as is `ServerMsg::Pi4Spots`, so no surviving
+/// discriminant moves; `DigiStatus` gained `pi4: Option<Pi4Status>` on its
+/// tail, the same shape `wspr` already has, and `DigiStatus` rides whole, so
+/// a v163 peer reads the extra bytes as the start of the next field and
+/// fails to decode every digital status.
+///
+/// v165: band-decoder relay outputs (issue #442) — the HPSDR OC table's idea
+/// (a per-band RX/TX output word), generalised to the generic T/R-switch
+/// relay bank so a USB relay board, GPIO header, HID relay or external
+/// command can switch an outboard filter or transverter by band too, not
+/// only HPSDR's own seven-pin bus. `RelayRole` gains `BandDecoder`, appended,
+/// so no surviving discriminant moves; `RelayConfig` gains
+/// `band_table: Vec<RelayBandRow>` on its tail, and `RelayConfig` rides
+/// whole inside `Command::SetRelayConfig`, so a v164 peer reads the extra
+/// bytes as the start of the next field and fails to decode the command.
+///
+/// v166: MSK144, the meteor-scatter mode. `Mode::Msk144` is appended to that
+/// enum, so no surviving discriminant moves. No new wire type: a decode is an
+/// ordinary `Decode` with the burst's time into the slot as its `dt`, and the
+/// mode is receive-only. `Mode` rides `RadioState`, so a v165 peer handed one
+/// runs off the end of the enum — the same break every appended `Mode` causes.
+///
+/// v167: JT65 and JT9, the weak-signal slotted modes from mfsk-core.
+/// `Mode::Jt65` and `Mode::Jt9` are appended to that enum, so no surviving
+/// discriminant moves. No new wire type: a JT decode is an ordinary
+/// `Decode` and rides the existing `RadioEvent::Ft8Decodes` path, and the modes
+/// are receive-only so nothing else is added. `Mode` is postcard-encoded by
+/// declaration index and rides `RadioState`, so a v166 peer handed one runs
+/// off the end of the enum — the same break every appended `Mode` causes, and
+/// the same fix (the two sides run in lockstep).
+///
+/// v168: FST4, the slow weak-signal mode. `Mode::Fst4` is appended to that
+/// enum and `DigiConfig` gains `fst4_period` (`Fst4Period`) on its tail, since
+/// the period is a setting rather than part of the mode. `DigiConfig` rides
+/// `Command::SetDigiConfig` and `DigiStatus` whole, so a v167 peer reads the
+/// extra bytes as the start of the next field and fails to decode every
+/// digital status — the same break as v162's appended CW settings.
+///
+/// v169: Q65, the modern weak-signal mode. `Mode::Q65` is appended to that
+/// enum and `DigiConfig` gains `q65_mode` (`Q65Mode`) on its tail, since the
+/// sub-mode fixes the period and the tone spacing rather than being part of the
+/// mode. `DigiConfig` rides `Command::SetDigiConfig` and `DigiStatus` whole, so
+/// a v168 peer reads the extra bytes as the start of the next field and fails
+/// to decode every digital status — the same break as v162's appended CW
+/// settings.
+///
+/// v170: FSK441, the original meteor-scatter mode. `Mode::Fsk441` is appended
+/// to that enum and `DigiConfig` gains `fsk441_period` (`Fsk441Period`) on its
+/// tail, since the period is a setting rather than part of the mode. The
+/// decoder is the fork's own — mfsk-core has no FSK441 — so it lives in
+/// `sdroxide-dsp`; on the wire a decode is an ordinary `Decode` with the ping's
+/// time into the slot as its `dt`. `DigiConfig` rides
+/// `Command::SetDigiConfig` and `DigiStatus` whole, so a v169 peer reads the
+/// extra bytes as the start of the next field and fails to decode every
+/// digital status — the same break as v162's appended CW settings.
+///
+/// v171: FSK441's transmit half. `DigiStatus` gains `tx_refused`
+/// (`Option<String>`) on its tail, the reason a key-up was refused — an empty
+/// message box, most often — so a panel can say why rather than looking armed
+/// and doing nothing. `DigiStatus` rides whole, so a v170 peer reads the extra
+/// bytes as the start of the next field and fails to decode every digital
+/// status. No new wire type: FSK441's transmit runs through the ordinary digi
+/// engine seam (`DigiTxText`/`DigiTxActive`).
+///
+/// v172: editable message buttons for the keyboard modes (PSK / RTTY / Olivia
+/// / Thor — issue #463). `DigiConfig` gains `text_macros` (`Vec<CwMacro>`) on
+/// its tail: the same label-and-text buttons the CW panel has, on a list of
+/// their own. `DigiConfig` rides `Command::SetDigiConfig` and `DigiStatus`
+/// whole, so a v171 peer reads the extra bytes as the start of the next field
+/// and fails to decode every digital status — the same break as v170's appended
+/// FSK441 period.
+///
+/// v173: selectable FT8 decode depth. `DigiConfig` gains `ft8_depth`
+/// (`Ft8Depth`) on its tail — `Fast` / `Normal` / `Deep`, how hard the decoder
+/// works for weak signals (no subtraction / flat multi-pass SIC / the
+/// checkpointed pass). `DigiConfig` rides `Command::SetDigiConfig` and
+/// `DigiStatus` whole, so a v172 peer reads the extra byte as the start of the
+/// next field and fails to decode every config — the same break as v172's
+/// appended message buttons.
+pub const PROTO_VERSION: u16 = 173;
 const VERSION_BYTE: u8 = 0x12;
 
 #[derive(Debug, thiserror::Error)]
@@ -1745,6 +1950,31 @@ pub enum ServerMsg {
     ///
     /// Appended last, for the usual reason.
     CapabilitiesUpdated(DeviceCaps),
+
+    /// What the HD Radio decoder has made of the digital FM broadcast on the
+    /// main receiver. A snapshot — see [`sdroxide_types::HdRadioStatus`].
+    ///
+    /// Like DRM, the decoding happens where the radio is and only the result
+    /// travels, because the whole decoder sits in a vendored C library that
+    /// never reaches the browser.
+    ///
+    /// Appended last, for the usual reason.
+    Hd(sdroxide_types::HdRadioStatus),
+
+    /// `RadioEvent::Profiles`: the names of the station's saved profiles
+    /// (issue #197), the list the settings dialog's Profiles tab offers. Sent
+    /// on connect and after every save, apply and delete — without it a remote
+    /// screen showed "no profiles saved" beside a station full of them, and a
+    /// Save it made never appeared.
+    ///
+    /// Appended last, for the usual reason.
+    Profiles(Vec<String>),
+    /// `RadioEvent::Pi4Spots`: what a PI4 slot decoded — the same shape of
+    /// thing [`ServerMsg::WsprSpots`] is, for the same reason: a beacon
+    /// reception is a measurement, not a message addressed to anyone.
+    ///
+    /// Appended last, for the usual reason.
+    Pi4Spots(Vec<sdroxide_types::Pi4Spot>),
 }
 
 /// One radio in a station's roster, as a client sees it.
@@ -1815,6 +2045,10 @@ mod tests {
         let m = ServerMsg::State(RadioState::default());
         let bytes = encode(&m).unwrap();
         let back: ServerMsg = decode(&bytes).unwrap();
+        assert_eq!(back, m);
+
+        let m = ServerMsg::Profiles(vec!["Contest".into(), "DX".into()]);
+        let back: ServerMsg = decode(&encode(&m).unwrap()).unwrap();
         assert_eq!(back, m);
 
         // The station-roster edits, and the announcement that answers them.
@@ -2189,6 +2423,52 @@ mod tests {
         sdroxide_types::StationConfig::default()
     }
 
+    /// The T/R switch's configuration, both ways, with a band decoder in it
+    /// (issue #442). The role and the band table are its newest parts, and a
+    /// row that decoded onto the wrong band or into the wrong word would
+    /// switch the wrong filter. Filled in rather than defaulted, for
+    /// `roundtrip_radio_config`'s reason.
+    #[test]
+    fn roundtrip_relay_config() {
+        use sdroxide_types::{
+            Band, RelayBandRow, RelayChannel, RelayConfig, RelayLink, RelayRole, StationConfig,
+        };
+
+        let relay = RelayConfig {
+            link: RelayLink::Hid,
+            device: "/dev/hidraw3".into(),
+            channels: vec![
+                RelayChannel {
+                    index: 1,
+                    role: RelayRole::SdrAntenna,
+                    label: "SDR".into(),
+                    active_high: true,
+                    lead_ms: 15,
+                    hold_ms: 30,
+                },
+                RelayChannel {
+                    index: 4,
+                    role: RelayRole::BandDecoder,
+                    label: "20 m BPF".into(),
+                    active_high: false,
+                    lead_ms: 8,
+                    hold_ms: 12,
+                },
+            ],
+            band_table: vec![
+                RelayBandRow { band: Band::M20, rx_mask: 0b1000, tx_mask: 0b1000 },
+                RelayBandRow { band: Band::Gen, rx_mask: 0, tx_mask: 0b1000 },
+            ],
+            ..RelayConfig::default()
+        };
+        let cmd = ClientMsg::Command(Command::SetRelayConfig(Box::new(relay.clone())));
+        let back: ClientMsg = decode(&encode(&cmd).unwrap()).unwrap();
+        assert_eq!(back, cmd);
+        let m = ServerMsg::StationConfig(Box::new(StationConfig { relay, ..no_station() }));
+        let back: ServerMsg = decode(&encode(&m).unwrap()).unwrap();
+        assert_eq!(back, m);
+    }
+
     /// The interface configuration, both ways.
     ///
     /// Worth its own test for `roundtrip_station_config`'s reason: every field
@@ -2397,6 +2677,62 @@ mod tests {
         // And a mode with no entry still reaches the carrier default across the
         // wire, which is the property that makes the map need no migration.
         assert_eq!(s.config.tx_level_for(Mode::Psk), 1.0);
+    }
+
+    /// The settings the slotted weak-signal modes keep in `DigiConfig` — FST4's
+    /// period, Q65's sub-mode, FSK441's period — cross the wire at values other
+    /// than their defaults, as do the modes themselves. A field appended in the
+    /// wrong place, or a `Mode` discriminant that moved, decodes into the wrong
+    /// setting rather than failing; only a non-default value shows it.
+    #[test]
+    fn roundtrip_weak_signal_mode_settings() {
+        use sdroxide_types::{DigiConfig, Fsk441Period, Fst4Period, Mode, Q65Mode};
+
+        let cfg = DigiConfig {
+            my_call: "OE1XYZ".into(),
+            fst4_period: Fst4Period::P300,
+            q65_mode: Q65Mode::D120,
+            fsk441_period: Fsk441Period::P15,
+            ..DigiConfig::default()
+        };
+        let m = ClientMsg::Command(Command::SetDigiConfig(cfg.clone()));
+        assert_eq!(decode::<ClientMsg>(&encode(&m).unwrap()).unwrap(), m);
+
+        for mode in [Mode::Msk144, Mode::Jt65, Mode::Jt9, Mode::Fst4, Mode::Q65, Mode::Fsk441] {
+            let mut status = DigiStatus::idle(cfg.clone());
+            status.mode = mode;
+            let m = ServerMsg::Ft8Status(status);
+            let back = decode::<ServerMsg>(&encode(&m).unwrap()).unwrap();
+            assert_eq!(back, m, "{mode:?}");
+            let ServerMsg::Ft8Status(s) = back else { panic!("not a status") };
+            assert_eq!(s.mode, mode);
+            assert_eq!(s.config.fst4_period, Fst4Period::P300);
+            assert_eq!(s.config.q65_mode, Q65Mode::D120);
+            assert_eq!(s.config.fsk441_period, Fsk441Period::P15);
+        }
+    }
+
+    /// Why HD Radio is greyed out is the station's to say, and it reaches a
+    /// remote client on the state, in the connect reply and in every update.
+    #[test]
+    fn roundtrip_hd_radio_unavailable() {
+        let state = RadioState {
+            hd_radio_unavailable: Some("no libnrsc5 on the station".into()),
+            ..RadioState::default()
+        };
+        let msgs = [
+            ServerMsg::State(state.clone()),
+            ServerMsg::HelloAck {
+                proto: PROTO_VERSION,
+                caps: DeviceCaps::default(),
+                state,
+                rx_codec: AudioCodec::Opus48kMono,
+                tx_codec: AudioCodec::Pcm16_48k,
+            },
+        ];
+        for m in &msgs {
+            assert_eq!(&decode::<ServerMsg>(&encode(m).unwrap()).unwrap(), m);
+        }
     }
 
     /// Whether CW leaves as audio is a capability, and the client needs it to

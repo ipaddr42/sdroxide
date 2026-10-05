@@ -60,13 +60,19 @@ pub fn make_modulator(mode: Mode, rate: f64, passband: (f32, f32)) -> Option<Box
         | Mode::PacketHf
         // AtChat COFDM rides the same USB path as the keyboard modes.
         | Mode::AtChat
-        | Mode::Rade => Some(Box::new(SsbMod::new(rate, lo, hi))),
+        | Mode::Rade
+        // FSK441 is four audio tones on a sideband, keyed by the digi engine's
+        // transmit path. Without this a manual PTT on an SDR sent a bare
+        // carrier under an FSK441 label.
+        | Mode::Fsk441 => Some(Box::new(SsbMod::new(rate, lo, hi))),
         Mode::Am | Mode::Sam | Mode::Dsb => Some(Box::new(AmMod::new(rate))),
         // ISB is receive only: transmitting it wants two modulators feeding
         // one linear amplifier, which is a station, not a setting. No
         // modulator means the transmit gate refuses the over rather than
         // putting something else on the air under an ISB label.
         Mode::Isb => None,
+        // ACARS is receive only — an airline service, not an amateur one.
+        Mode::Acars => None,
         // VHF SSTV modulates the carrier through the voice FM path — see the
         // demodulator, which is its other half: the picture goes into an FM
         // transmitter exactly as speech would.
@@ -85,10 +91,35 @@ pub fn make_modulator(mode: Mode, rate: f64, passband: (f32, f32)) -> Option<Box
         // (`Engine::tx_block_digi`).
         // DRM joins them for a plainer reason than CW's: it is a broadcast
         // system. There is no amateur DRM transmission to make, and a
-        // receiver that could key one has no business doing so.
-        Mode::Cw | Mode::Wfm | Mode::Spec | Mode::Drm | Mode::Adsb | Mode::Vdl2 | Mode::Ais => {
-            None
-        }
+        // receiver that could key one has no business doing so. HD Radio is
+        // the same — a broadcast system, receive only.
+        // PI4 is receive only here — a decoder for a beacon network's
+        // signal, not a beacon implementation (see `Mode::Pi4`'s own doc
+        // comment) — so like ACARS and ISB it has no modulator to transmit
+        // with. JT65/JT9 are receive-only in this build too: transmit is not
+        // wired yet, so there is no modulator rather than one that would put
+        // something unsequenced on the air under a JT label.
+        // FST4 is receive-only in this build too: transmit needs a
+        // sequencer, so there is no modulator rather than one that would put
+        // an unsequenced burst on the air under an FST4 label.
+        // Q65 is receive-only in this build too: transmit needs a
+        // sequencer, so there is no modulator rather than one that would put
+        // an unsequenced burst on the air under a Q65 label.
+        Mode::Pi4
+        | Mode::Cw
+        | Mode::Wfm
+        | Mode::Spec
+        | Mode::Drm
+        | Mode::HdRadio
+        | Mode::Adsb
+        | Mode::Vdl2
+        | Mode::Ais
+        | Mode::Hfdl
+        | Mode::Msk144
+        | Mode::Jt65
+        | Mode::Jt9
+        | Mode::Fst4
+        | Mode::Q65 => None,
     }
 }
 

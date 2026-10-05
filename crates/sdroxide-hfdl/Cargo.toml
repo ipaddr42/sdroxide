@@ -1,0 +1,22 @@
+[package]
+name = "sdroxide-hfdl"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# Native-only: the HFDL (ARINC 635) ground-network decoder runs server-side in
+# the engine, off a dedicated downconversion of the raw IQ, like the QO-100
+# beacon and ISM lanes. Not linked by the wasm client.
+#
+# The demodulation is done by `airframesio/xng`'s `xng-mode-hfdl` crate (MIT/
+# Apache-2.0) — a clean-room implementation from ICAO Annex 10 Vol III Ch. 11 /
+# ARINC 635 (see that crate's PROVENANCE.md). This crate is the threading
+# wrapper and the wire-type mapping only; the protocol facts live upstream.
+
+[dependencies]
+sdroxide-types.workspace = true
+sdroxide-dsp.workspace = true
+crossbeam-channel.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+xng-mode-hfdl.workspace = true

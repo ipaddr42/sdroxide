@@ -420,6 +420,9 @@ pub(crate) fn rx_thread(mut conn: Connection, shared: Arc<Shared>, mut ring: Pro
     // across redials so each replacement inherits what the last one learnt —
     // see `Connection::set_payload_deadline`.
     let mut payload_deadline = conn.payload_deadline();
+    // A silent socket asks the board whether it is still answering, and is
+    // replaced at once if it is — see `iiod::Patient` (issues #377, #418).
+    conn.enable_wedge_probe();
 
     while shared.alive.load(Ordering::Relaxed) {
         let want_pairs = shared.rx_pairs.load(Ordering::Relaxed).clamp(1, max_pairs);
@@ -503,17 +506,27 @@ pub(crate) fn rx_thread(mut conn: Connection, shared: Arc<Shared>, mut ring: Pro
             // longer makes sense — is this connection being finished, which is
             // not the same as the radio being finished. Replace it in place.
             Err(e) => {
+                // Unless it was finished on purpose. `release` shuts this
+                // socket down to break the read it is blocked in, and from
+                // here that is indistinguishable from the far end hanging up —
+                // "the server closed the connection with N bytes still due".
+                // Reported as a fault and redialled, it made the end of every
+                // `probe` run read as `iiod` crashing (issue #470).
+                if !shared.alive.load(Ordering::Relaxed) {
+                    break;
+                }
                 if blind_redials >= MAX_BLIND_REDIALS {
                     shared.die("the receive stream", &e);
                     break;
                 }
                 blind_redials += 1;
                 // A payload that ran out of time on a socket which had been
-                // delivering samples is not a wedge — it is a link with less
-                // headroom than it is being asked for, and the bytes were on
-                // their way. Replacing the socket throws away a transfer that
-                // would have finished, so the replacement gets longer before
-                // the same call is made about it.
+                // delivering samples. Not a stuck socket — the probe would
+                // have ended that within a second, on the board answering a
+                // fresh connection — but a board that stopped answering
+                // anyone: the pause of issue #288, its processor too busy to
+                // feed the network. The bytes were on their way, so the
+                // replacement gets longer before the same call is made.
                 if e.is_payload_stall() && stats.total_samples > 0 {
                     // Announced *after* the clamp, not before it: the ceiling
                     // is real, and a log that keeps promising a longer wait it
@@ -523,21 +536,25 @@ pub(crate) fn rx_thread(mut conn: Connection, shared: Arc<Shared>, mut ring: Pro
                     let effective = conn.payload_deadline();
                     if effective > payload_deadline {
                         tracing::info!(
-                            "PlutoSDR: the receive link stalls under load — allowing a payload \
-                             {:.1}s to arrive before the socket is replaced",
+                            "PlutoSDR: the board stops answering for seconds at a time — \
+                             allowing a payload {:.1}s to arrive before the socket is replaced",
                             effective.as_secs_f64()
                         );
                     } else {
                         tracing::info!(
-                            "PlutoSDR: the receive link is still stalling at the longest payload \
-                             wait this connection will take ({:.1}s) — the link, not the radio: \
-                             lower the sample rate, or put the board on its own network segment",
+                            "PlutoSDR: the board is still going quiet for longer than the \
+                             longest payload wait this connection will take ({:.1}s), and a \
+                             fresh connection gets no answer meanwhile either — the board, not \
+                             the link: a lower sample rate lightens its load, and so does \
+                             stopping what else it runs beside iiod (see the manual's PlutoSDR \
+                             section)",
                             effective.as_secs_f64()
                         );
                     }
                     payload_deadline = effective;
                 }
                 let Some(mut fresh) = redial_rx(&shared, &e) else { break };
+                fresh.enable_wedge_probe();
                 fresh.set_payload_deadline(payload_deadline);
                 payload_deadline = fresh.payload_deadline();
                 conn = fresh;

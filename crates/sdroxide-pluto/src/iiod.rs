@@ -58,7 +58,35 @@ pub const DEFAULT_PORT: u16 = 30431;
 
 /// How long one socket read may block before [`Patient`] looks at the clock
 /// again. This is a polling granularity, not a deadline — see [`IO_DEADLINE`].
-const IO_POLL: Duration = Duration::from_secs(1);
+///
+/// Fine enough that [`PAYLOAD_PROBE_AFTER`] is kept to within a poll.
+const IO_POLL: Duration = Duration::from_millis(250);
+
+/// How long a payload may go silent on a probed connection before the board is
+/// asked, on a connection of its own, whether it is still answering — see
+/// [`Patient`]'s probe.
+///
+/// A 128 KiB chunk crosses in ~16 ms at 2 Msps, and a lost segment is
+/// retransmitted inside a couple of hundred, so half a second of nothing is
+/// already past anything a working connection does.
+const PAYLOAD_PROBE_AFTER: Duration = Duration::from_millis(500);
+
+/// The same, for a `READBUF` reply that has not begun. Later, because the
+/// server itself may legitimately sit on a request for [`SERVER_TIMEOUT_MS`]
+/// before answering `-ETIMEDOUT`; past that, a healthy daemon has said
+/// something.
+const REPLY_PROBE_AFTER: Duration = Duration::from_millis(SERVER_TIMEOUT_MS as u64 + 1_000);
+
+/// How long the probe gives the board to accept a connection and answer
+/// `VERSION`. A board that is answering at all does it in milliseconds —
+/// 5.9 ms was measured on a LibreSDR whose stalled socket had been silent for
+/// eight seconds. One that is too busy to answer in this long is the board
+/// that has paused, which is waited out rather than redialled around.
+const PROBE_TIMEOUT: Duration = Duration::from_millis(250);
+
+/// How often a silence that the board was *not* answering through is probed
+/// again, so a board that recovers while this socket does not is noticed.
+const PROBE_EVERY: Duration = Duration::from_millis(500);
 
 /// How long a read may go without a single byte before the connection counts as
 /// dead, *while waiting for a reply to begin*.
@@ -98,6 +126,11 @@ const IO_DEADLINE: Duration = Duration::from_secs(8);
 /// recovers, so [`Connection::set_payload_deadline`] lets the receive thread
 /// raise it when the evidence says the stalls are the transport rather than a
 /// wedge. See [`MAX_PAYLOAD_DEADLINE`].
+///
+/// On the receive stream this is the backstop now, not the detector: the probe
+/// in [`Patient`] settles a stuck socket after [`PAYLOAD_PROBE_AFTER`], so
+/// what still runs this deadline out is a board that stopped answering
+/// altogether.
 const PAYLOAD_DEADLINE: Duration = Duration::from_secs(2);
 
 /// The most [`Connection::set_payload_deadline`] may stretch a payload read
@@ -160,6 +193,30 @@ const SERVER_TIMEOUT_MS: u32 = 3_000;
 /// Retrying *here*, underneath `BufReader`, is what makes recovery safe: the
 /// framing layers above never see a partial read, so nothing has to reason about
 /// how far into a payload the gap fell.
+///
+/// # Asking the board (issues #377, #418)
+///
+/// Waiting is only the right answer if the bytes are coming. Two faults look
+/// identical from inside one silent socket, and want opposite treatment:
+///
+/// - **The board has paused** (issue #288): its own processor too busy to
+///   feed the network for a second or two. Every connection goes quiet with
+///   it, the bytes arrive when it recovers, and redialling costs a socket and
+///   a buffer reopen for a transfer that was going to finish.
+/// - **This one socket is stuck** (issues #377, #418): the daemon answers a
+///   fresh connection in milliseconds while this one delivers nothing, for as
+///   long as anyone cares to wait — the stalls in the #377 and #447 logs ran
+///   out the longest deadline they were given, six seconds, time after time,
+///   and every redial after one worked at once. Waiting on that is dead
+///   audio, seconds per stall.
+///
+/// So on a connection with a probe address, a silence that outlasts
+/// [`PAYLOAD_PROBE_AFTER`] (or [`REPLY_PROBE_AFTER`] before a reply) is put
+/// to the board itself: a connection of its own, `VERSION`, and
+/// [`PROBE_TIMEOUT`] to answer. An answer means the socket is stuck and the
+/// read ends with [`Wedged`], for the caller to redial on at once; no answer
+/// means the board has paused, and the read waits on as it always did,
+/// asking again every [`PROBE_EVERY`].
 struct Patient {
     inner: TcpStream,
     trace: Trace,
@@ -168,6 +225,12 @@ struct Patient {
     /// [`Connection::read_exact_into`], which is the only place that knows the
     /// server has already committed to the bytes we are waiting for.
     deadline: Duration,
+    /// Where to dial to ask whether the board is still answering, on the one
+    /// connection that asks — see [`Connection::enable_wedge_probe`].
+    probe_addr: Option<SocketAddr>,
+    /// How long this read's silence may last before the board is asked, or
+    /// `None` for a read that never asks. Set around the waits it applies to.
+    probe_after: Option<Duration>,
 }
 
 /// Errors that mean "nothing yet", as opposed to "this connection is finished".
@@ -177,14 +240,111 @@ fn is_transient(e: &std::io::Error) -> bool {
     matches!(e.kind(), WouldBlock | TimedOut | Interrupted)
 }
 
+/// A socket the board is no longer sending on, although it is answering: the
+/// verdict of [`Patient`]'s probe. Carried inside the `io::Error` a read ends
+/// with, so it reaches the log in the words that say what to do about it.
+#[derive(Debug)]
+pub struct Wedged {
+    /// How long this socket had been silent.
+    pub silent: Duration,
+    /// How long the board took to answer a fresh connection meanwhile.
+    pub answered_in: Duration,
+}
+
+impl std::fmt::Display for Wedged {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "nothing on this socket for {:.1}s while the board answered a fresh connection in \
+             {} ms — the socket is stuck, not the radio",
+            self.silent.as_secs_f64(),
+            self.answered_in.as_millis()
+        )
+    }
+}
+
+impl std::error::Error for Wedged {}
+
+/// Ask the board, on a connection of its own, whether it is still answering.
+/// Answers how long it took, or `None` if nothing came within
+/// [`PROBE_TIMEOUT`].
+fn probe_board(addr: SocketAddr) -> Option<Duration> {
+    let started = Instant::now();
+    let sock = TcpStream::connect_timeout(&addr, PROBE_TIMEOUT).ok()?;
+    let left = PROBE_TIMEOUT.saturating_sub(started.elapsed()).max(Duration::from_millis(1));
+    sock.set_read_timeout(Some(left)).ok()?;
+    sock.set_write_timeout(Some(left)).ok()?;
+    let _ = sock.set_nodelay(true);
+    (&sock).write_all(b"VERSION\r\n").ok()?;
+    let mut line = String::new();
+    BufReader::new(&sock).read_line(&mut line).ok()?;
+    let answered_in = started.elapsed();
+    let _ = (&sock).write_all(b"EXIT\r\n");
+    (!line.trim().is_empty()).then_some(answered_in)
+}
+
+impl Patient {
+    /// One read that does not wait: bytes that arrived while the probe was out
+    /// mean the socket was moving after all. `None` if there are none.
+    fn read_now(&mut self, buf: &mut [u8]) -> std::io::Result<Option<usize>> {
+        self.inner.set_nonblocking(true)?;
+        let outcome = self.inner.read(buf);
+        self.inner.set_nonblocking(false)?;
+        match outcome {
+            Ok(n) => Ok(Some(n)),
+            Err(ref e) if is_transient(e) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+}
+
 impl Read for Patient {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         let start = Instant::now();
         let mut stalled = false;
+        let mut probe_at = self.probe_addr.and(self.probe_after);
         loop {
             match self.inner.read(buf) {
                 Err(ref e) if is_transient(e) && start.elapsed() < self.deadline => {
                     stalled = true;
+                    let (Some(addr), Some(at)) = (self.probe_addr, probe_at) else { continue };
+                    let silent = start.elapsed();
+                    if silent < at {
+                        continue;
+                    }
+                    match probe_board(addr) {
+                        Some(answered_in) => {
+                            if let Some(n) = self.read_now(buf)? {
+                                if n == 0 {
+                                    // Closed from the far end meanwhile, which the
+                                    // caller reports as such.
+                                    return Ok(0);
+                                }
+                                self.trace.note(format!(
+                                    "~~ read stalled {:.1}s and then resumed while the board was \
+                                     being asked",
+                                    start.elapsed().as_secs_f64()
+                                ));
+                                return Ok(n);
+                            }
+                            let wedged = Wedged { silent, answered_in };
+                            self.trace.note(format!("~~ {wedged}; replacing it"));
+                            return Err(std::io::Error::other(wedged));
+                        }
+                        None => {
+                            // Worth a line each time: whether the board or the
+                            // socket went quiet is the half of this fault that
+                            // is still not understood.
+                            self.trace.note(format!(
+                                "~~ nothing on this socket for {:.1}s, and no answer from the \
+                                 board on a fresh connection either within {} ms — it has \
+                                 paused; waiting",
+                                silent.as_secs_f64(),
+                                PROBE_TIMEOUT.as_millis()
+                            ));
+                            probe_at = Some(start.elapsed() + PROBE_EVERY);
+                        }
+                    }
                 }
                 outcome => {
                     if stalled {
@@ -240,7 +400,13 @@ impl Connection {
         // Nagle would hold them back waiting for company that never comes.
         let _ = sock.set_nodelay(true);
         let writer = sock.try_clone().map_err(|e| Error::io("clone socket", e))?;
-        let patient = Patient { inner: sock, trace: trace.clone(), deadline: IO_DEADLINE };
+        let patient = Patient {
+            inner: sock,
+            trace: trace.clone(),
+            deadline: IO_DEADLINE,
+            probe_addr: None,
+            probe_after: None,
+        };
         let mut conn = Connection {
             reader: BufReader::with_capacity(64 * 1024, patient),
             writer,
@@ -271,6 +437,16 @@ impl Connection {
     /// How long this connection currently allows a stalled payload read.
     pub fn payload_deadline(&self) -> Duration {
         self.payload_deadline
+    }
+
+    /// Have a silent `READBUF` on this connection ask the board whether it is
+    /// still answering, and end with [`Wedged`] when it is — see [`Patient`].
+    ///
+    /// For the receive stream only. A control command can legitimately take
+    /// its time on a board that is answering everything else — `initialize`
+    /// runs for seconds — so silence there says nothing about the socket.
+    pub fn enable_wedge_probe(&mut self) {
+        self.reader.get_mut().probe_addr = self.writer.peer_addr().ok();
     }
 
     // ---- commands -------------------------------------------------------
@@ -407,6 +583,15 @@ impl Connection {
     /// scan elements than we asked for, which would be decoded as garbage
     /// samples — worth failing on rather than passing off as signal.
     pub fn read_buf(&mut self, dev: &str, channels: usize, out: &mut [u8]) -> Result<usize> {
+        // Only this command's waits ask the board, and on every way out of it
+        // the next command's do not.
+        self.reader.get_mut().probe_after = Some(REPLY_PROBE_AFTER);
+        let outcome = self.read_buf_chunks(dev, channels, out);
+        self.reader.get_mut().probe_after = None;
+        outcome
+    }
+
+    fn read_buf_chunks(&mut self, dev: &str, channels: usize, out: &mut [u8]) -> Result<usize> {
         let cmd = format!("READBUF {dev} {}", out.len());
         self.send(&cmd)?;
         let want_mask = channel_mask(channels);
@@ -609,6 +794,10 @@ impl Connection {
         let total = payload_total(self.payload_deadline);
         let started = Instant::now();
         let mut filled = 0usize;
+        // A payload is asked about sooner than a reply: the bytes are already
+        // in the server's hand, so a silence here is never the device.
+        let probe_after = self.reader.get_ref().probe_after.map(|_| PAYLOAD_PROBE_AFTER);
+        self.reader.get_mut().probe_after = probe_after;
         let outcome = loop {
             // Each wait is the shorter of this connection's patience for one
             // silence and what is left of the whole chunk's budget, so however
@@ -656,6 +845,8 @@ impl Connection {
             }
         };
         self.reader.get_mut().deadline = IO_DEADLINE;
+        // Back to the reply wait's, for the next chunk of the same `READBUF`.
+        self.reader.get_mut().probe_after = probe_after.map(|_| REPLY_PROBE_AFTER);
         outcome
     }
 

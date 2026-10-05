@@ -4,7 +4,7 @@
 
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, UdpSocket};
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU16, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -16,11 +16,32 @@ use crate::discovery;
 use crate::{protocol1, protocol2};
 use sdroxide_types::{HpsdrIoRxInput, HpsdrOcPlan};
 
-/// Host→radio TX I/Q rate. **Both** protocols transmit at 48 kHz: Protocol 2
-/// feeds the DUC directly, and Protocol 1's EP2 stream (speaker audio + TX I/Q)
-/// is fixed at 48 kHz by the spec regardless of the RX/DDC rate — the radio
-/// drains it at 48 ksps no matter how fast EP6 comes back.
+/// Host→radio TX I/Q rate on **Protocol 1**. The EP2 stream (speaker audio +
+/// TX I/Q) is fixed at 48 kHz by the spec regardless of the RX/DDC rate — the
+/// radio drains it at 48 ksps no matter how fast EP6 comes back.
 pub const TX_RATE_HZ: u32 = 48_000;
+
+/// Host→radio TX I/Q rate on **Protocol 2**. The DUC is fed at 192 kHz, four
+/// times Protocol 1's rate, and the board drains the transmit FIFO at exactly
+/// that: piHPSDR's `new_protocol_txiq_thread` ships one 240-sample datagram
+/// every 1250 µs (240 / 0.00125 s = 192000), its simulator empties the modelled
+/// FIFO at `192000.0` samples a second, and rustyHPSDR — the reference these
+/// offsets came from — sets `output_rate = 192000` for protocol 2 against
+/// 48000 for protocol 1.
+///
+/// sdroxide fed the DUC at 48 kHz on both protocols until issue #440. The
+/// packets were well-formed and the board accepted them, so nothing reported an
+/// error; it simply ran the transmit FIFO dry three samples in four. A carrier
+/// survives that — a tune is one sample value repeated, so starving it changes
+/// nothing, which is why TUNE was always clean — but speech came out chopped
+/// and unintelligible. That is the shape of the bug to recognise: **clean tune,
+/// garbled voice, on transmit only**.
+pub const TX_RATE_HZ_P2: u32 = 192_000;
+
+/// The TX I/Q rate `protocol` drains its transmit stream at.
+pub fn tx_rate_for_protocol(protocol: u8) -> u32 {
+    if protocol == 2 { TX_RATE_HZ_P2 } else { TX_RATE_HZ }
+}
 /// Resend keep-alive/high-priority state at least this often so the radio's
 /// watchdog does not stop the stream.
 pub(crate) const WATCHDOG: Duration = Duration::from_millis(50);
@@ -53,6 +74,35 @@ pub fn board_is_hermes_lite(board: &str) -> bool {
 /// settings, so we must not write it there.
 pub fn board_has_lna_gain(board: &str) -> bool {
     board_is_hermes_lite(board)
+}
+
+/// Whether a board can have an N2ADR HL2IOBoard on it.
+///
+/// The IO board is a Hermes-Lite 2 accessory: it hangs off that board's I2C bus
+/// and its receive-input switching is an HL2 arrangement. No Metis, Hermes,
+/// Angelia, Orion or Saturn has one, so anything that names the IO board — a
+/// setting, a warning — has to ask this first rather than say it to every
+/// board in the family (issue #518).
+pub fn board_has_io_board(board: &str) -> bool {
+    board_is_hermes_lite(board)
+}
+
+/// Whether a board is an ANAN-7000/8000 (Orion 2) or ANAN-G2 (Saturn).
+///
+/// These two are the boards with **two** ADCs and two Alex filter chains, and
+/// their filter chain is laid out differently from every other board's: band-
+/// pass filters on receive instead of high-pass ones, and a receive path that
+/// does not run through the transmit low-pass filters. Both facts change what
+/// goes into the Protocol 2 packets, so they are one question asked in one
+/// place.
+///
+/// Matched by substring, because the name this crate carries is the *display*
+/// name discovery built — "Orion 2 (ANAN-7000/8000)", "Saturn (ANAN-G2)" — and
+/// the equality test that used to stand in for this (`"Saturn" | "Orion2"`)
+/// could never be true of either of them. That is why every Saturn and ANAN-7000
+/// was told in its General packet that it had one Alex chain rather than two.
+pub fn board_is_orion2_class(board: &str) -> bool {
+    board.starts_with("Orion 2") || board.starts_with("Saturn")
 }
 
 /// Clamp a dB value to the LNA range and encode it as the 6-bit wire value.
@@ -612,6 +662,8 @@ pub(crate) struct ThreadCtx {
     /// [`HpsdrRx::pa_temp_c`]. [`TEMP_UNKNOWN`] until the board reports one —
     /// which most of them never do.
     pub temp_centi_c: Arc<AtomicI32>,
+    pub fwd_power_raw: Arc<AtomicU16>,
+    pub rev_power_raw: Arc<AtomicU16>,
     pub tx: Consumer<f32>,
     pub ctrl: Receiver<Ctrl>,
 }
@@ -624,6 +676,18 @@ pub(crate) struct ThreadCtx {
 /// has to be told apart from one that is genuinely 0 °C — a Hermes-Lite in a
 /// cold shack in February reads exactly that.
 pub const TEMP_UNKNOWN: i32 = i32::MIN;
+
+/// Sentinel for HL2 forward/reverse ADC readings before the first report.
+pub const POWER_UNKNOWN: u16 = u16::MAX;
+
+/// Empirical HL2 coupler calibration determined against an external SWR meter.
+/// Applied to |Gamma| = REV/FWD before converting to SWR.
+const HL2_SWR_GAMMA_CAL: f32 = 1.23;
+
+/// The SWR an HL2 reports once the reflected reading reaches the forward one:
+/// the top of the range the SWR guard can be set to, so a pegged bridge trips
+/// it at any limit. The same ceiling the Icom meter curve ends at.
+const HL2_SWR_MAX: f32 = sdroxide_types::SWR_LIMIT_MAX;
 
 /// What every stream of one connection shares. Dropping the last handle stops
 /// the stream and shuts the network thread down.
@@ -664,6 +728,8 @@ struct DevInner {
     /// The board's own temperature, hundredths of a degree — see
     /// [`TEMP_UNKNOWN`].
     temp_centi_c: Arc<AtomicI32>,
+    fwd_power_raw: Arc<AtomicU16>,
+    rev_power_raw: Arc<AtomicU16>,
     /// The TX ring's feed end, claimable exactly once — by DDC 0's stream.
     tx_endpoint: Mutex<Option<Producer<f32>>>,
     /// Which DDCs have a live [`HpsdrRx`], so one cannot be vended twice: two
@@ -755,10 +821,10 @@ impl HpsdrBoard {
                  rate {rate:.0} Hz"
             );
         }
-        // Both protocols take TX I/Q at 48 kHz: Protocol 2 through the DUC, and
-        // Protocol 1 through the EP2 frames, whose sample rate is fixed at
-        // 48 kHz regardless of the RX rate.
-        let tx_rate = TX_RATE_HZ as f64;
+        // The two protocols take TX I/Q at different rates, and neither of them
+        // is the RX rate: Protocol 1's EP2 frames are fixed at 48 kHz, and
+        // Protocol 2's DUC is fed at 192 kHz (issue #440).
+        let tx_rate = tx_rate_for_protocol(protocol) as f64;
         let lna_gain_db = lna_gain_db.clamp(LNA_GAIN_MIN_DB, LNA_GAIN_MAX_DB);
         if board_has_lna_gain(&board) {
             tracing::info!("HPSDR: initial {LNA_GAIN_ELEMENT} gain {lna_gain_db:+.0} dB");
@@ -814,6 +880,8 @@ impl HpsdrBoard {
         let conn_id = claim_connection(IpAddr::V4(ip));
         let radio_ptt = Arc::new(AtomicBool::new(false));
         let temp_centi_c = Arc::new(AtomicI32::new(TEMP_UNKNOWN));
+        let fwd_power_raw = Arc::new(AtomicU16::new(POWER_UNKNOWN));
+        let rev_power_raw = Arc::new(AtomicU16::new(POWER_UNKNOWN));
         let lna_gain_centi_db = Arc::new(AtomicI32::new((lna_gain_db * 100.0) as i32));
         let adc_overload = Arc::new(AtomicBool::new(false));
         if auto_gain.enabled && board_has_lna_gain(&board) {
@@ -844,6 +912,8 @@ impl HpsdrBoard {
             adc_overload: Arc::clone(&adc_overload),
             radio_ptt: Arc::clone(&radio_ptt),
             temp_centi_c: Arc::clone(&temp_centi_c),
+            fwd_power_raw: Arc::clone(&fwd_power_raw),
+            rev_power_raw: Arc::clone(&rev_power_raw),
             tx: tx_cons,
             ctrl: ctrl_rx,
         };
@@ -879,6 +949,8 @@ impl HpsdrBoard {
                 transmitting: Arc::new(AtomicBool::new(false)),
                 radio_ptt,
                 temp_centi_c,
+                fwd_power_raw,
+                rev_power_raw,
                 tx_endpoint: Mutex::new(Some(tx_prod)),
                 attached: Mutex::new(std::collections::HashSet::new()),
             }),
@@ -920,6 +992,14 @@ impl HpsdrBoard {
         self.inner.sample_rate_hz
     }
 
+    /// The rate this board drains transmit I/Q at — 48 kHz on Protocol 1,
+    /// 192 kHz on Protocol 2 (see [`TX_RATE_HZ_P2`]). Not the receive rate, and
+    /// not the same on the two protocols, so anything that has to line the two
+    /// streams up asks rather than assuming.
+    pub fn tx_rate_hz(&self) -> f64 {
+        self.inner.tx_rate_hz
+    }
+
     /// How many DDCs this connection can serve: the Protocol 2 framing's
     /// eight, or Protocol 1's one (its frame layout carries a single receiver
     /// here).
@@ -933,6 +1013,11 @@ impl HpsdrBoard {
     /// Whether this board has a front-end gain this crate can command.
     pub fn has_lna_gain(&self) -> bool {
         board_has_lna_gain(&self.inner.board)
+    }
+
+    /// Whether this board can have an N2ADR HL2IOBoard on it.
+    pub fn has_io_board(&self) -> bool {
+        board_has_io_board(&self.inner.board)
     }
 
     /// Attach DDC `ddc` and start its stream. Refused beyond
@@ -1026,6 +1111,26 @@ impl Drop for HpsdrRx {
     }
 }
 
+/// Calculate Hermes-Lite 2 SWR from Protocol-1 detector ADC amplitudes.
+///
+/// `None` only with no forward drive to measure against. A reflected reading
+/// at or above the forward one (after calibration) is the worst the bridge can
+/// say, not an unreadable one: an open or a shorted feed reads exactly that,
+/// and reporting nothing there left the SWR guard blind to the fault it exists
+/// for. So it pegs at [`HL2_SWR_MAX`]. Nor are the two ever swapped: a
+/// reflected reading larger than the forward one is a bad load, and reading
+/// it the other way round made it a good one.
+fn hl2_swr_from_raw(fwd: u16, rev: u16) -> Option<f32> {
+    if fwd <= 6 {
+        return None;
+    }
+    let gamma = (rev as f32 / fwd as f32) * HL2_SWR_GAMMA_CAL;
+    if gamma >= 1.0 {
+        return Some(HL2_SWR_MAX);
+    }
+    Some(((1.0 + gamma) / (1.0 - gamma)).min(HL2_SWR_MAX))
+}
+
 impl HpsdrRx {
     /// Which DDC this stream is (0-based, as the wire counts them).
     pub fn ddc(&self) -> u8 {
@@ -1039,6 +1144,27 @@ impl HpsdrRx {
 
     pub fn sample_rate_hz(&self) -> f64 {
         self.dev.sample_rate_hz
+    }
+
+    /// See [`HpsdrBoard::tx_rate_hz`].
+    pub fn tx_rate_hz(&self) -> f64 {
+        self.dev.tx_rate_hz
+    }
+
+    /// Hermes-Lite 2 SWR from Protocol-1 forward/reverse detector readings.
+    pub fn swr(&self) -> Option<f32> {
+        if self.dev.protocol != 1 || !board_is_hermes_lite(&self.dev.board) {
+            return None;
+        }
+
+        let fwd = self.dev.fwd_power_raw.load(Ordering::Relaxed);
+        let rev = self.dev.rev_power_raw.load(Ordering::Relaxed);
+
+        if fwd == POWER_UNKNOWN || rev == POWER_UNKNOWN {
+            return None;
+        }
+
+        hl2_swr_from_raw(fwd, rev)
     }
 
     pub fn board(&self) -> &str {
@@ -1274,6 +1400,25 @@ fn clamp_rate(hz: f64, protocol: u8) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The IO board is a Hermes-Lite 2 accessory. Issue #518: a Hermes was
+    /// told its IO board's receive input was set wrong, which is advice about
+    /// a board it cannot have and a setting it is never offered.
+    #[test]
+    fn only_a_hermes_lite_can_have_an_io_board() {
+        assert!(board_has_io_board("Hermes-Lite 2"));
+        assert!(board_has_io_board("Hermes-Lite"));
+        for other in [
+            "Hermes (ANAN-10/10E/100/100B)",
+            "Metis",
+            "Angelia (ANAN-100D)",
+            "Orion 2 (ANAN-7000/8000)",
+            "Saturn (ANAN-G2)",
+            "HPSDR",
+        ] {
+            assert!(!board_has_io_board(other), "{other} has no IO board to warn about");
+        }
+    }
 
     /// Fast attack, slow decay, and neither of them free-running. Issue #362.
     #[test]
@@ -1523,10 +1668,71 @@ mod tests {
         assert_eq!(recall_probe("192.0.2.54".parse().unwrap()), None);
     }
 
+    /// The two-ADC boards, matched on the *display* name discovery builds.
+    /// The equality test this replaced (`"Saturn" | "Orion2"`) matched neither
+    /// of them, so every ANAN-7000 and ANAN-G2 was told it had one Alex chain.
     #[test]
-    fn tx_rate_is_48k_for_both_protocols() {
-        // Protocol 1's EP2 stream is 48 kHz regardless of the DDC rate, so the
-        // modulator must never be told to produce at the RX rate.
+    fn the_two_adc_boards_are_recognised_by_the_name_discovery_gives_them() {
+        assert!(board_is_orion2_class("Saturn (ANAN-G2)"));
+        assert!(board_is_orion2_class("Orion 2 (ANAN-7000/8000)"));
+        // Not the single-ADC Orion.
+        assert!(!board_is_orion2_class("Orion (ANAN-200D)"));
+        assert!(!board_is_orion2_class("Hermes (ANAN-10/10E/100/100B)"));
+        assert!(!board_is_orion2_class("Hermes-Lite 2"));
+        assert!(!board_is_orion2_class("HPSDR"));
+    }
+
+    /// Neither protocol transmits at the receive rate, and the two do not
+    /// transmit at the same rate as each other (issue #440): Protocol 1's EP2
+    /// stream is 48 kHz whatever the DDC is doing, and Protocol 2's DUC is fed
+    /// at 192 kHz. Feeding a Protocol 2 board 48 kHz starves its transmit FIFO
+    /// three samples in four — a clean carrier, unintelligible speech.
+    #[test]
+    fn each_protocol_transmits_at_its_own_rate() {
         assert_eq!(TX_RATE_HZ, 48_000);
+        assert_eq!(TX_RATE_HZ_P2, 192_000);
+        assert_eq!(tx_rate_for_protocol(1), 48_000);
+        assert_eq!(tx_rate_for_protocol(2), 192_000);
+    }
+}
+
+#[cfg(test)]
+mod hl2_swr_regression_tests {
+    use super::{HL2_SWR_MAX, hl2_swr_from_raw};
+
+    #[test]
+    fn known_hl2_reading_is_about_1_30_to_1() {
+        let swr = hl2_swr_from_raw(1803, 192).expect("valid SWR");
+        assert!((swr - 1.30).abs() < 0.01, "SWR was {swr}");
+    }
+
+    /// An open or a short reflects about what goes forward. That is the
+    /// reading the SWR guard exists for, so it pegs the meter rather than
+    /// reporting nothing — and a reflection larger than the forward reading is
+    /// never read the other way round as a good match.
+    #[test]
+    fn a_reflection_at_or_above_forward_pegs_the_meter() {
+        assert_eq!(hl2_swr_from_raw(192, 1803), Some(HL2_SWR_MAX));
+        assert_eq!(hl2_swr_from_raw(1000, 1000), Some(HL2_SWR_MAX));
+        // Past |Γ| = 1 after calibration, but short of rev = fwd.
+        assert_eq!(hl2_swr_from_raw(1000, 850), Some(HL2_SWR_MAX));
+    }
+
+    /// More reflected power never reads as a better match.
+    #[test]
+    fn swr_rises_with_the_reflected_reading() {
+        let mut last = 1.0f32;
+        for rev in (0..=1200).step_by(10) {
+            let swr = hl2_swr_from_raw(1000, rev).expect("driven");
+            assert!(swr >= last, "rev {rev}: {swr} fell below {last}");
+            last = swr;
+        }
+        assert_eq!(last, HL2_SWR_MAX);
+    }
+
+    #[test]
+    fn no_forward_drive_has_no_meaningful_swr() {
+        assert_eq!(hl2_swr_from_raw(0, 0), None);
+        assert_eq!(hl2_swr_from_raw(6, 0), None);
     }
 }

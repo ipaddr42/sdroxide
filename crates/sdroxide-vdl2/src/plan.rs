@@ -144,9 +144,47 @@ pub fn window_center_for(hw_center_hz: f64, hw_rate_hz: f64, window_rate_hz: f64
     ideal_center_hz().clamp(hw_center_hz - slack, hw_center_hz + slack)
 }
 
+/// The target to give the window down-converter on a front end running at
+/// `device_rate_hz`.
+///
+/// A fixed target does not land on the same rung of the decimation ladder on
+/// every front end, because a [`sdroxide_dsp::Ddc`] rounds to the *nearest*
+/// whole decimation. Half a megahertz is fine on a 2.4 Msps receiver, but on a
+/// 768 kSPS one it rounds `1.536` up to `2` and lands on 384 kHz, which reaches
+/// only ten of the fourteen channels and drops the Common Signalling Channel at
+/// 136.975 MHz (issue #548).
+///
+/// So the nominal target is kept wherever its rung holds the whole plan, and
+/// otherwise the *narrowest* rung that still does is asked for: 600 kHz on a
+/// 1.8 Msps RTL-SDR rather than all 1.8 MHz of it, because every channel's
+/// down-converter runs at the window rate and the cost scales with it. A front
+/// end too narrow to hold the plan at any rung is left at its own rate, and the
+/// panel says how much of the plan it reaches.
+///
+/// "Holds the plan" is measured with [`channels_in_window`], not against
+/// [`VDL2_PLAN_RATE_HZ`](sdroxide_types::VDL2_PLAN_RATE_HZ): that constant is
+/// rounded up, and a 466 666.67 Hz window (1.4 and 2.8 Msps) holds every
+/// channel while sitting a third of a hertz under it.
+pub fn window_target_rate_for(device_rate_hz: f64) -> f64 {
+    let window_for = |target: f64| sdroxide_dsp::Ddc::rate_for(device_rate_hz, target);
+    let holds = |rate: f64| channels_in_window(ideal_center_hz(), rate).len() == CHANNELS.len();
+    let nominal = WINDOW_TARGET_RATE_HZ.min(device_rate_hz);
+    if holds(window_for(nominal)) {
+        return nominal;
+    }
+    // Every rung the ladder has is reached by asking for the device rate over a
+    // whole number; keep the narrowest one that still holds the plan.
+    (1..=64)
+        .map(|d| device_rate_hz / f64::from(d))
+        .filter(|&target| holds(window_for(target)))
+        .min_by(|a, b| window_for(*a).total_cmp(&window_for(*b)))
+        .unwrap_or(device_rate_hz)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sdroxide_types::VDL2_PLAN_RATE_HZ;
 
     /// The plan's span and its ideal centre are derived from the table, so
     /// adding a channel moves them rather than leaving them stale.
@@ -183,6 +221,93 @@ mod tests {
                 CHANNELS.len(),
                 "{in_rate} gives a {rate} Hz window holding only {got:?}"
             );
+        }
+    }
+
+    /// The window target is derived from the device rate, so a front end whose
+    /// nominal target would round under the plan still holds all fourteen
+    /// channels.
+    ///
+    /// The Airspy HF+ is the case this exists for: `Ddc::rate_for(768_000,
+    /// 500_000)` rounds 1.536 up to 2 and lands on 384 kHz, which reaches ten
+    /// channels and drops the Common Signalling Channel at 136.975 MHz. That is
+    /// issue #548 — an HF+ decoding only the middle of the plan while an
+    /// RTL-SDR at 2.4 Msps gets all of it.
+    #[test]
+    fn the_window_target_holds_the_plan_on_the_airspy_hf_rates() {
+        for &in_rate in &[768_000.0f64, 912_000.0] {
+            let target = window_target_rate_for(in_rate);
+            let rate = sdroxide_dsp::Ddc::rate_for(in_rate, target);
+            let got = channels_in_window(ideal_center_hz(), rate);
+            assert_eq!(
+                got.len(),
+                CHANNELS.len(),
+                "{in_rate} gives a {rate} Hz window holding only {got:?}"
+            );
+            assert!(got.contains(&(CHANNELS.len() - 1)), "the CSC is not reached");
+        }
+    }
+
+    /// Every front end wide enough to hold the plan does, whatever its rate,
+    /// because the target is chosen against the decimation ladder rather than
+    /// fixed. This is the sweep that would have caught #548.
+    #[test]
+    fn every_wide_enough_front_end_reaches_the_whole_plan() {
+        let mut rate = VDL2_PLAN_RATE_HZ;
+        while rate <= 20_000_000.0 {
+            let target = window_target_rate_for(rate);
+            let got =
+                channels_in_window(ideal_center_hz(), sdroxide_dsp::Ddc::rate_for(rate, target));
+            assert_eq!(got.len(), CHANNELS.len(), "{rate} Hz reaches only {got:?}");
+            rate *= 1.03;
+        }
+    }
+
+    /// Where the nominal target rounds under the plan, the window is the
+    /// narrowest rung that holds it — not the whole device rate, which would
+    /// run all fourteen channel down-converters on up to four times the
+    /// samples. Every front end the nominal target already served keeps the
+    /// window it had.
+    #[test]
+    fn the_window_is_the_narrowest_rung_that_holds_the_plan() {
+        let window = |in_rate: f64| {
+            sdroxide_dsp::Ddc::rate_for(in_rate, window_target_rate_for(in_rate)).round()
+        };
+        // Fallbacks: the narrowest holding rung.
+        assert_eq!(window(1_800_000.0), 600_000.0);
+        assert_eq!(window(1_250_000.0), 625_000.0);
+        assert_eq!(window(768_000.0), 768_000.0);
+        assert_eq!(window(912_000.0), 912_000.0);
+        // Unchanged from the fixed target.
+        assert_eq!(window(2_400_000.0), 480_000.0);
+        assert_eq!(window(2_048_000.0), 512_000.0);
+        assert_eq!(window(10_000_000.0), 500_000.0);
+        assert_eq!(window(20_000_000.0), 500_000.0);
+        assert_eq!(window(32_400_000.0), 506_250.0);
+        assert_eq!(window(1_400_000.0), 466_667.0);
+        assert_eq!(window(2_800_000.0), 466_667.0);
+        // And no fallback rung is wider than it needs to be: the next one down
+        // the ladder loses a channel.
+        for in_rate in [1_800_000.0f64, 1_250_000.0, 768_000.0, 912_000.0] {
+            let w = window(in_rate);
+            let d = (in_rate / w).round() + 1.0;
+            let narrower = sdroxide_dsp::Ddc::rate_for(in_rate, in_rate / d);
+            assert!(
+                channels_in_window(ideal_center_hz(), narrower).len() < CHANNELS.len(),
+                "{in_rate}: {narrower} Hz would also hold the plan"
+            );
+        }
+    }
+
+    /// A front end narrower than the plan is left at its own rate and reaches
+    /// what it can — the target must never ask for more samples than exist.
+    #[test]
+    fn a_front_end_narrower_than_the_plan_stays_at_its_own_rate() {
+        for &in_rate in &[192_000.0f64, 384_000.0] {
+            assert_eq!(window_target_rate_for(in_rate), in_rate);
+            let rate = sdroxide_dsp::Ddc::rate_for(in_rate, window_target_rate_for(in_rate));
+            let got = channels_in_window(ideal_center_hz(), rate);
+            assert!(!got.is_empty() && got.len() < CHANNELS.len(), "{in_rate}: {got:?}");
         }
     }
 
@@ -230,7 +355,20 @@ mod tests {
     /// 136.900.
     #[test]
     fn no_channel_of_the_plan_reaches_another_channels_decision() {
-        for &window in &[480_000.0f64, 500_000.0, 506_250.0, 512_000.0, 250_000.0] {
+        for &window in &[
+            480_000.0f64,
+            500_000.0,
+            506_250.0,
+            512_000.0,
+            250_000.0,
+            // The rungs the device-derived target lands on where the nominal
+            // one would not hold the plan (1.8 Msps, 1.25 Msps, the HF+ rates).
+            466_666.67,
+            600_000.0,
+            625_000.0,
+            768_000.0,
+            912_000.0,
+        ] {
             let rate = sdroxide_dsp::Ddc::rate_for(window, CHANNEL_TARGET_RATE_HZ);
             let sps = rate / crate::demod::SYMBOL_RATE;
             assert!((3.0..20.0).contains(&sps), "{window} Hz gives {sps} samples per symbol");

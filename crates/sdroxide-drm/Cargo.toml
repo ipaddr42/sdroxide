@@ -15,6 +15,9 @@ license.workspace = true
 # be a dependency of any wasm-targeted crate.
 
 [dependencies]
+# The faad2 Dream decodes its AAC with, stock with `DRM_SUPPORT`. See
+# `crates/sdroxide-faad2`.
+sdroxide-faad2.workspace = true
 sdroxide-types.workspace = true
 sdroxide-dsp.workspace = true
 num-complex.workspace = true

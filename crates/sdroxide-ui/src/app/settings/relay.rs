@@ -232,6 +232,10 @@ pub(in crate::app) fn settings_relay_tab(
             cfg.gpio_lines.resize(want, 0);
         }
     }
+    // Not offered where every contact is one on/off — see
+    // `RelayLink::switches_contacts_separately`. A contact that already has
+    // the job keeps showing it, so the refusal below names something visible.
+    let band_decoder_ok = cfg.link.switches_contacts_separately();
     let mut remove: Option<usize> = None;
     let cols = if gpio { 8 } else { 7 };
     egui::Grid::new("relay-channels").num_columns(cols).spacing([10.0, 6.0]).show(ui, |ui| {
@@ -282,8 +286,12 @@ pub(in crate::app) fn settings_relay_tab(
                         RelayRole::SdrAntenna,
                         RelayRole::Amplifier,
                         RelayRole::Aux,
+                        RelayRole::BandDecoder,
                         RelayRole::Unused,
                     ] {
+                        if r == RelayRole::BandDecoder && !band_decoder_ok && ch.role != r {
+                            continue;
+                        }
                         if ui.selectable_label(ch.role == r, r.label()).clicked() {
                             ch.role = r;
                             let (lead, hold) = r.default_timing();
@@ -293,7 +301,10 @@ pub(in crate::app) fn settings_relay_tab(
                     }
                 })
                 .response
-                .on_hover_text("Only decides the default timings — and what the log calls it");
+                .on_hover_text(
+                    "Decides the default timings and what the log calls it — and, for a band \
+                     decoder, that the contact follows the band table below",
+                );
             let mut high = ch.active_high;
             if ui
                 .checkbox(&mut high, "")
@@ -305,19 +316,27 @@ pub(in crate::app) fn settings_relay_tab(
             {
                 ch.active_high = high;
             }
+            let band_decoder = ch.role == RelayRole::BandDecoder;
             ui.add(egui::DragValue::new(&mut ch.lead_ms).range(0..=200).suffix(" ms"))
-                .on_hover_text(
+                .on_hover_text(if band_decoder {
+                    "How long before RF this contact moves from its band's RX word to its TX \
+                     word. A retune moves it at once; this is for key-down, when a \
+                     transmit-only filter has to be in circuit before the power is."
+                } else {
                     "Closed this long before RF. A small coax relay throws in 5 to 15 ms. \
                      Transmit waits for the longest of these, so a large value is an audible \
-                     gap in the receive audio; anything over 250 ms is ignored.",
-                );
+                     gap in the receive audio; anything over 250 ms is ignored."
+                });
             ui.add(egui::DragValue::new(&mut ch.hold_ms).range(0..=2000).suffix(" ms"))
-                .on_hover_text(
+                .on_hover_text(if band_decoder {
+                    "How long after RF stops this contact goes back from its TX word to its \
+                     RX word."
+                } else {
                     "Opened this long after RF stops. Longer than the lead on purpose: letting \
                      the antenna back a moment late costs nothing, and letting it back early \
                      costs a front end. Zero is a real answer, and the right one for an \
-                     amplifier's key line.",
-                );
+                     amplifier's key line."
+                });
             ui.horizontal(|ui| {
                 if crate::chrome::chip_accent_enabled(
                     ui,
@@ -398,6 +417,8 @@ pub(in crate::app) fn settings_relay_tab(
         )
         .weak(),
     );
+
+    relay_band_table(ui, cfg);
 
     // ── the transmit sense input ────────────────────────────────────────────
     ui.add_space(12.0);
@@ -521,6 +542,125 @@ pub(in crate::app) fn settings_relay_tab(
         ui.add_space(4.0);
     }
     apply_button(ui, apply);
+}
+
+/// The per-band output table for this bank's [`RelayRole::BandDecoder`]
+/// channels — the same idea as the HPSDR OC table
+/// (`crate::app::settings::radio::hpsdr_oc_table`), generalised from that
+/// hardware's fixed seven anonymous pins to whichever channels on *this*
+/// board have actually been given the role, named the way the operator named
+/// them (issue #442).
+///
+/// Shown only once a channel has been given the role — a table with nothing
+/// to drive is a table that can only confuse.
+fn relay_band_table(ui: &mut egui::Ui, cfg: &mut RelayConfig) {
+    let decoders: Vec<(u8, String)> = cfg
+        .channels
+        .iter()
+        .filter(|c| c.role == RelayRole::BandDecoder)
+        .map(|c| (c.index, c.name()))
+        .collect();
+    if decoders.is_empty() {
+        return;
+    }
+    ui.add_space(10.0);
+    ui.separator();
+    ui.add_space(4.0);
+    ui.label(RichText::new("Band decoder outputs").size(14.0).strong().color(crate::theme::CYAN()));
+    ui.add_space(2.0);
+    ui.label(
+        RichText::new(
+            "One control word per band: bit 0 is contact 1, bit 1 contact 2 and so on, matching \
+             the numbering above. RX follows the receive dial's band; TX the band of whichever \
+             radio keyed, switched in on each contact's lead before RF and back after its hold \
+             — give them the same value for a filter that does not care which way the RF is \
+             going, and different ones for a receive-only preamp bypass or a transmit-only LPF \
+             bank. Bands left at 0 assert nothing. Applies on Apply / reconnect.",
+        )
+        .weak(),
+    );
+    ui.add_space(6.0);
+
+    let bands: Vec<sdroxide_types::Band> = sdroxide_types::Band::ALL
+        .iter()
+        .copied()
+        .filter(|b| *b == sdroxide_types::Band::Gen || b.edges().is_some())
+        .collect();
+    egui::Grid::new("relay-band-grid").num_columns(4).spacing([12.0, 4.0]).striped(true).show(
+        ui,
+        |ui| {
+            for h in ["Band", "RX", "TX", "Outputs asserted"] {
+                ui.label(RichText::new(h).weak().size(10.0));
+            }
+            ui.end_row();
+            for band in bands {
+                let i = cfg.band_table.iter().position(|r| r.band == band);
+                let (mut rx, mut tx) = i
+                    .map(|i| (cfg.band_table[i].rx_mask, cfg.band_table[i].tx_mask))
+                    .unwrap_or((0, 0));
+                if band == sdroxide_types::Band::Gen {
+                    ui.label("Other").on_hover_text(
+                        "Everywhere outside the amateur bands — short-wave listening, and \
+                         anything a transverter's dial lands on that no band covers.",
+                    );
+                } else {
+                    ui.label(band.label());
+                }
+                let a = band_mask_edit(ui, ("relay-band-rx", band), &mut rx);
+                let b = band_mask_edit(ui, ("relay-band-tx", band), &mut tx);
+                ui.label(RichText::new(decoder_channels_asserted(&decoders, rx, tx)).weak());
+                if a || b {
+                    match i {
+                        Some(i) if rx == 0 && tx == 0 => {
+                            cfg.band_table.remove(i);
+                        }
+                        Some(i) => {
+                            cfg.band_table[i] =
+                                sdroxide_types::RelayBandRow { band, rx_mask: rx, tx_mask: tx };
+                        }
+                        None => cfg.band_table.push(sdroxide_types::RelayBandRow {
+                            band,
+                            rx_mask: rx,
+                            tx_mask: tx,
+                        }),
+                    }
+                }
+                ui.end_row();
+            }
+        },
+    );
+}
+
+/// One control word, typed and shown as hexadecimal — see
+/// `crate::app::settings::radio::oc_byte_edit`, which this mirrors for a
+/// 32-bit mask rather than HPSDR's fixed seven-bit one.
+fn band_mask_edit(
+    ui: &mut egui::Ui,
+    id: impl std::hash::Hash + std::fmt::Debug,
+    word: &mut u32,
+) -> bool {
+    ui.push_id(id, |ui| {
+        ui.add(egui::DragValue::new(word).speed(1.0).hexadecimal(2, false, true).prefix("0x"))
+            .changed()
+    })
+    .inner
+}
+
+/// "SDR antenna, PA" for the channels a pair of words asserts, named the way
+/// the operator named them rather than by bit number — unlike HPSDR's fixed,
+/// anonymous seven pins, here the channels are known and naming them is
+/// strictly more useful than `crate::app::settings::radio::oc_pins`'s numbers.
+/// TX in parentheses when it differs, so the two directions read at a glance.
+fn decoder_channels_asserted(decoders: &[(u8, String)], rx: u32, tx: u32) -> String {
+    let list = |w: u32| -> String {
+        let names: Vec<&str> = decoders
+            .iter()
+            .filter(|(index, _)| w & (1u32 << (index.clamp(&1, &32) - 1)) != 0)
+            .map(|(_, name)| name.as_str())
+            .collect();
+        if names.is_empty() { "—".into() } else { names.join(", ") }
+    };
+    if rx == tx { list(rx) } else { format!("{} / TX {}", list(rx), list(tx)) }
 }
 
 fn apply_button(ui: &mut egui::Ui, apply: &mut bool) {

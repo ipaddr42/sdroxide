@@ -117,6 +117,7 @@ impl<'a> Speaker<'a> {
             Mode::Usb => "U S B",
             Mode::Cw => "C W",
             Mode::Am => "A M",
+            Mode::Acars => "A cars",
             Mode::Sam => "synchronous A M",
             Mode::Nfm => "narrow F M",
             Mode::Wfm => "wide F M",
@@ -153,7 +154,16 @@ impl<'a> Speaker<'a> {
             Mode::Js8 => "J S eight",
             // Pronounced "whisper" — the joke the name is built on.
             Mode::Wspr => "whisper",
+            // Spelt out like "F T eight" and "J S eight" above.
+            Mode::Pi4 => "P I four",
+            Mode::Msk144 => "M S K one forty four",
+            Mode::Jt65 => "J T sixty five",
+            Mode::Jt9 => "J T nine",
+            // Spelt out like "F T eight" above.
+            Mode::Fst4 => "F S T four",
+            Mode::Q65 => "Q sixty five",
             Mode::Drm => "D R M",
+            Mode::HdRadio => "H D radio",
             Mode::Adsb => "A D S B",
             // Spelt out like every other number in this table — "F T eight",
             // "J S eight". A bare digit is not something the phonemizer can
@@ -161,6 +171,9 @@ impl<'a> Speaker<'a> {
             // and is dropped, leaving "V D L".
             Mode::Vdl2 => "V D L two",
             Mode::Ais => "A I S",
+            // Spelt out for the same reason every other initialism here is.
+            Mode::Hfdl => "H F D L",
+            Mode::Fsk441 => "F S K four forty one",
             Mode::AtChat => "at chat",
         }
     }
@@ -215,7 +228,7 @@ impl<'a> Speaker<'a> {
     /// Noise reduction, engine and strength.
     ///
     /// The engine name matters: an operator who has picked DeepFilterNet wants
-    /// to know that is what came on, and the four engines sound nothing alike.
+    /// to know that is what came on, and the five engines sound nothing alike.
     pub fn nr(&self, n: NrLevel) -> String {
         let s = match n {
             NrLevel::Off => "noise reduction off".to_string(),
@@ -228,6 +241,9 @@ impl<'a> Speaker<'a> {
             NrLevel::SpecLow => "spectral noise reduction low".into(),
             NrLevel::SpecMed => "spectral noise reduction medium".into(),
             NrLevel::SpecHigh => "spectral noise reduction high".into(),
+            NrLevel::Nr2Low => "N R 2 low".into(),
+            NrLevel::Nr2Med => "N R 2 medium".into(),
+            NrLevel::Nr2High => "N R 2 high".into(),
             NrLevel::DfLow => "deep filter low".into(),
             NrLevel::DfMed => "deep filter medium".into(),
             NrLevel::DfHigh => "deep filter high".into(),

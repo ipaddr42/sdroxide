@@ -23,6 +23,7 @@
 //! coarse-score gate on attempting OSD.
 
 use mfsk_core::engine::dsp::downsample::{DownsampleCfg, build_fft_cache, downsample_cached};
+use mfsk_core::engine::dsp::subtract::{GfskParams, SubtractCfg, refine_freq, subtract_tones_lpf};
 use mfsk_core::engine::equalize::equalize_local;
 use mfsk_core::engine::llr::{
     compute_llr_fast, compute_llr_partial, compute_snr_db, descramble_info, symbol_spectra,
@@ -80,9 +81,49 @@ const SYNC_Q_MIN: u32 = 8;
 /// runs FT4's decoder, so it inherits FT4's budget.
 const BP_MAX_ITER: u32 = 40;
 
+/// Rounds of successive interference cancellation.
+///
+/// FT2 takes the same treatment WSJT-X gives FT4: decode, subtract each
+/// decoded signal from the audio, and look again on what is left — which is
+/// the only way a weak signal inside a stronger neighbour's occupied
+/// bandwidth (167 Hz here, twice FT4's) is ever decoded. Two rounds are the
+/// measured choice for FT4 and find nothing more from a third. A round that
+/// decodes nothing new ends the loop: nothing was subtracted, so the next
+/// round would search the same audio at a lower floor, which costs a second
+/// full search in a 3.75 s slot and is not subtraction at all.
+const SIC_ROUNDS: usize = 2;
+
+/// Per-round coarse-sync floor multiplier, as mfsk-core's FT4 SIC uses: a
+/// later round looks deeper into the noise on a residual the strong signals
+/// have been removed from.
+const SIC_SYNC_FACTORS: [f32; 3] = [1.0, 0.75, 0.5];
+
+/// LPF half-length for the channel-tracking subtract — `subtractft4.f90`'s
+/// `NFILT=1400`. FT2's frame is FT4's at half the symbol length, so the same
+/// tracking bandwidth applies.
+const SIC_LPF_HALF: usize = 700;
+
+/// FT2 subtract configuration: 24 ms symbols, frame origin at 0.1 s, GFSK
+/// shaping exactly as [`crate::ft2::encode`] synthesizes it.
+const FT2_SUBTRACT: SubtractCfg = SubtractCfg {
+    sample_rate: 12_000.0,
+    tone_spacing_hz: Ft2::TONE_SPACING_HZ,
+    samples_per_symbol: Ft2::NSPS as usize,
+    base_offset_s: Ft2::TX_START_OFFSET_S,
+    gfsk: Some(GfskParams {
+        bt: Ft2::GFSK_BT,
+        hmod: Ft2::GFSK_HMOD,
+        ramp_samples: Ft2::NSPS as usize / 8,
+    }),
+};
+
 /// Decode one slot. `freq_min`/`freq_max` bound the audio search in Hz,
 /// `sync_min` is the coarse-sync floor (1.0–2.0 is the usual range) and
 /// `max_cand` caps how many candidates reach BP.
+///
+/// Multi-pass: decode, subtract each accepted signal from the residual, and
+/// search again — see [`SIC_ROUNDS`]. A single pass reports only the strongest
+/// signal at each audio offset, which on a busy slot is most of the band lost.
 pub fn decode_slot(
     audio: &[i16],
     freq_min: f32,
@@ -90,34 +131,62 @@ pub fn decode_slot(
     sync_min: f32,
     max_cand: usize,
 ) -> Vec<DecodeResult> {
-    let candidates = coarse_sync::<Ft2>(
-        AudioSource::Real(audio),
-        freq_min,
-        freq_max,
-        sync_min,
-        None,
-        max_cand,
-        RxGrid::real(DECODE_RATE as f32),
-    );
-    if candidates.is_empty() {
-        return Vec::new();
-    }
-    let fft_cache = build_fft_cache(audio, &FT2_DOWNSAMPLE);
+    let mut residual = audio.to_vec();
+    let mut all: Vec<DecodeResult> = Vec::new();
 
-    let mut out: Vec<DecodeResult> =
-        candidates.par_iter().filter_map(|c| process_candidate(c, &fft_cache)).collect();
-
-    // Two candidates a few hertz apart routinely resolve to the same
-    // transmission; keep the one with the cleaner sync.
-    out.sort_by(|a, b| b.sync_score.total_cmp(&a.sync_score));
-    let mut kept: Vec<DecodeResult> = Vec::with_capacity(out.len());
-    for r in out {
-        if !kept.iter().any(|k| k.info == r.info && (k.freq_hz - r.freq_hz).abs() < 20.0) {
-            kept.push(r);
+    for &factor in SIC_SYNC_FACTORS.iter().take(SIC_ROUNDS) {
+        let candidates = coarse_sync::<Ft2>(
+            AudioSource::Real(&residual),
+            freq_min,
+            freq_max,
+            sync_min * factor,
+            None,
+            max_cand,
+            RxGrid::real(DECODE_RATE as f32),
+        );
+        if candidates.is_empty() {
+            break;
         }
+        let fft_cache = build_fft_cache(&residual, &FT2_DOWNSAMPLE);
+        let mut new: Vec<DecodeResult> =
+            candidates.par_iter().filter_map(|c| process_candidate(c, &fft_cache)).collect();
+
+        // Two candidates a few hertz apart routinely resolve to the same
+        // transmission, and already-decoded transmissions reappear in a later
+        // round's residual (subtraction is a model, not a perfect
+        // cancellation). Keep each message once: within a round the copy with
+        // the cleaner sync, across rounds the first round's.
+        new.sort_by(|a, b| b.sync_score.total_cmp(&a.sync_score));
+        let mut fresh: Vec<DecodeResult> = Vec::new();
+        for r in new {
+            if all.iter().any(|k| k.info == r.info) || fresh.iter().any(|k| k.info == r.info) {
+                continue;
+            }
+            fresh.push(r);
+        }
+        if fresh.is_empty() {
+            break;
+        }
+        for r in &fresh {
+            let Ok(bits): Result<[u8; 77], _> = r.message77().try_into() else { continue };
+            let tones = crate::ft2::encode::message_to_tones(&bits);
+            let refined =
+                refine_freq(&residual, &tones, r.freq_hz, r.dt_sec, &FT2_SUBTRACT, 1.0, 0.1);
+            subtract_tones_lpf(
+                &mut residual,
+                &tones,
+                refined,
+                r.dt_sec,
+                &FT2_SUBTRACT,
+                SIC_LPF_HALF,
+                false,
+            );
+        }
+        all.extend(fresh);
     }
-    kept.sort_by(|a, b| a.freq_hz.total_cmp(&b.freq_hz));
-    kept
+
+    all.sort_by(|a, b| a.freq_hz.total_cmp(&b.freq_hz));
+    all
 }
 
 /// One coarse candidate through refine → LLR → BP → OSD. `None` when nothing
@@ -346,6 +415,35 @@ mod tests {
             .collect();
         assert!(texts.iter().any(|t| t == "CQ OE1ABC JN88"), "{texts:?}");
         assert!(texts.iter().any(|t| t == "CQ IU8LMC JN70"), "{texts:?}");
+    }
+
+    /// A weak FT2 signal buried under a strong one at the same audio offset
+    /// must still decode. This is what the SIC rounds exist for: the strong
+    /// signal's 167 Hz occupied bandwidth covers the weak one, and only
+    /// subtraction of the strong decode exposes it in the residual. Without
+    /// the rounds, single-pass reports the strong signal alone.
+    #[test]
+    fn a_masked_signal_is_recovered_by_subtraction() {
+        let strong = pack77("CQ", "OE1ABC", "JN88").expect("pack");
+        let weak = pack77("CQ", "IU8LMC", "JN70").expect("pack");
+        let mut slot = vec![0i16; (Ft2::T_SLOT_S * 12_000.0) as usize];
+        let at = (Ft2::TX_START_OFFSET_S * 12_000.0) as usize;
+        for (msg, amp) in [(&strong, 18_000i16), (&weak, 1_800i16)] {
+            let burst = tones_to_i16(&message_to_tones(msg), 1500.0, amp);
+            for (i, &s) in burst.iter().enumerate() {
+                if at + i < slot.len() {
+                    slot[at + i] = slot[at + i].saturating_add(s);
+                }
+            }
+        }
+        let got = decode_slot(&slot, 200.0, 3000.0, 1.0, 100);
+        let texts: Vec<String> = got
+            .iter()
+            .filter_map(|r| <[u8; 77]>::try_from(r.message77()).ok())
+            .filter_map(|b| unpack77(&b))
+            .collect();
+        assert!(texts.iter().any(|t| t == "CQ OE1ABC JN88"), "{texts:?}");
+        assert!(texts.iter().any(|t| t == "CQ IU8LMC JN70"), "weak signal lost: {texts:?}");
     }
 
     /// Noise alone must not produce messages; CRC-14 is the only thing

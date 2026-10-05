@@ -265,6 +265,15 @@ pub(crate) struct Latest {
     /// attaches after the decoder locked would otherwise show an empty panel
     /// in front of a perfectly good decode.
     pub drm: Option<sdroxide_types::DrmStatus>,
+    /// What the HD Radio decoder has made of the broadcast currently tuned.
+    /// Replayed on connect for the same reason as `drm`, its neighbour in the
+    /// same position: sync and multiplex facts are standing conditions, not
+    /// events.
+    pub hd: Option<sdroxide_types::HdRadioStatus>,
+    /// The station's saved profile names, announced at engine start and after
+    /// every change, and replayed on connect for the same reason as
+    /// `memories`: a client that attaches later would otherwise offer nothing.
+    pub profiles: Vec<String>,
 }
 
 /// Everything the routes are served out of: the station's radios and the
@@ -1070,6 +1079,10 @@ fn handle_event(shared: &Shared, ev: RadioEvent) {
             }
             RadioEvent::Ft8QsoLogged(r) => Some(ServerMsg::Ft8QsoLogged(r)),
             RadioEvent::WsprSpots(s) => Some(ServerMsg::WsprSpots(s)),
+            // No propagation-map observation, unlike WSPR's: a PI4 message
+            // carries no grid square, so there is nowhere on the map to
+            // place a reception.
+            RadioEvent::Pi4Spots(s) => Some(ServerMsg::Pi4Spots(s)),
             RadioEvent::Rds(d) => {
                 // Cached without the group log: that part is a delta, and
                 // replaying one batch of it to a client that joined later would
@@ -1083,6 +1096,10 @@ fn handle_event(shared: &Shared, ev: RadioEvent) {
             RadioEvent::Drm(d) => {
                 latest.drm = Some(d.clone());
                 Some(ServerMsg::Drm(d))
+            }
+            RadioEvent::HdRadio(h) => {
+                latest.hd = Some(h.clone());
+                Some(ServerMsg::Hd(h))
             }
             RadioEvent::SkimmerSpots(s) => Some(ServerMsg::SkimmerSpots(s)),
             RadioEvent::IsmReports(r) => {
@@ -1109,6 +1126,9 @@ fn handle_event(shared: &Shared, ev: RadioEvent) {
             // own hardware locally, so there is no `ServerMsg` variant for
             // this yet — see `RadioEvent::Qo100Status`'s own doc.
             RadioEvent::Qo100Status(_) => None,
+            // Native-only for the same reason as QO-100 above — the live HFDL
+            // decode log is engine-internal, bridged nowhere yet.
+            RadioEvent::HfdlStatus(_) => None,
             RadioEvent::SstvLine { image_id, y, rgb } => {
                 Some(ServerMsg::SstvLine { image_id, y, rgb })
             }
@@ -1222,6 +1242,10 @@ fn handle_event(shared: &Shared, ev: RadioEvent) {
             // client's, and it is only ever asked for from the machine the
             // credentials live on. Same treatment as `RadioEvent::Notice`.
             RadioEvent::LoginTest(_) => None,
+            RadioEvent::Profiles(p) => {
+                latest.profiles = p.clone();
+                Some(ServerMsg::Profiles(p))
+            }
         }
     };
     // The satellite half of the station config also drives this machine's own
@@ -1234,8 +1258,17 @@ fn handle_event(shared: &Shared, ev: RadioEvent) {
     }
     if let Some(msg) = msg {
         if let Some(s) = shared.session.lock().unwrap().as_ref() {
-            if s.reliable.try_send(msg).is_err() {
-                warn!("reliable lane full; dropping message");
+            if let Err(e) = s.reliable.try_send(msg) {
+                // Name what was dropped. A client that falls behind sheds a
+                // burst of these in well under a second, and the consequence
+                // is not the same for every kind: a state or meter update is
+                // re-sent on the next tick and the client catches up by
+                // itself, while a notice, a decoded line or a spot exists
+                // once and is simply gone. Without the discriminant in the
+                // log there is no way to tell those two apart afterwards
+                // (issue #443).
+                let dropped = e.into_inner();
+                warn!("reliable lane full; dropping {}", msg_kind(&dropped));
             }
         }
     }
@@ -1245,6 +1278,36 @@ fn handle_event(shared: &Shared, ev: RadioEvent) {
     if renamed && let Some(station) = shared.station.upgrade() {
         station.announce_roster();
     }
+}
+
+/// The variant name of a [`ServerMsg`], for a log line that has to say what was
+/// lost. `Debug` already spells it and everything up to the first `{`, `(` or
+/// space is the discriminant, so nothing here can drift from the enum.
+///
+/// Formatted into a sink that gives up at that first delimiter rather than
+/// into a `String`: some of these messages are a whole `RadioState` or a
+/// spectrum frame, and rendering kilobytes of it to read the first word would
+/// make the drop path expensive exactly when the process is already behind.
+fn msg_kind(msg: &ServerMsg) -> String {
+    use std::fmt::Write as _;
+    struct FirstWord(String);
+    impl std::fmt::Write for FirstWord {
+        fn write_str(&mut self, s: &str) -> std::fmt::Result {
+            match s.find([' ', '{', '(']) {
+                Some(i) => {
+                    self.0.push_str(&s[..i]);
+                    Err(std::fmt::Error) // stop formatting: the name is complete
+                }
+                None => {
+                    self.0.push_str(s);
+                    Ok(())
+                }
+            }
+        }
+    }
+    let mut w = FirstWord(String::new());
+    let _ = write!(w, "{msg:?}");
+    if w.0.is_empty() { "message".to_string() } else { w.0 }
 }
 
 /// What a radio's *interface* contributes to its name — empty when it has not

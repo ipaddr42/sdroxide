@@ -31,7 +31,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use crossbeam_channel::{Receiver, Sender, TryRecvError};
-use sdroxide_types::{RelayConfig, RelayStatus};
+use sdroxide_types::{Band, RelayConfig, RelayRole, RelayStatus};
 
 use crate::frame::{self, ChannelMask};
 use crate::trace::{self, Trace};
@@ -112,8 +112,24 @@ pub struct Sequencer {
     sense_on_air: bool,
     /// When the OR of the two last changed.
     edge: Instant,
-    /// Logical: which contacts are in their transmit state.
+    /// Logical: which contacts are in their transmit state. For a
+    /// `RelayRole::BandDecoder` contact that means "following its TX word",
+    /// not "closed" — see [`Sequencer::want`].
     asserted: ChannelMask,
+    /// The `RelayRole::BandDecoder` contacts.
+    decoder: ChannelMask,
+    /// The band table, each row's words already clipped to `decoder` by
+    /// `RelayConfig::band_mask` — so no band, however its row was edited, can
+    /// move a contact that has another job.
+    band_words: Vec<(Band, ChannelMask, ChannelMask)>,
+    /// The band the receiver is on, and the band the keying radio will
+    /// transmit on. `None` until told.
+    rx_band: Option<Band>,
+    tx_band: Option<Band>,
+    /// A transmit band that arrived while a band-decoder contact was
+    /// following the TX word, held back until that over and its hold are
+    /// done — see [`Sequencer::set_tx_band`].
+    tx_band_pending: Option<Band>,
     /// Physical: what the transport last accepted. `None` is "unknown", which
     /// is the starting state and what a failure resets it to.
     applied: Option<ChannelMask>,
@@ -133,6 +149,11 @@ impl Sequencer {
             sense_on_air: false,
             edge: now,
             asserted: 0,
+            decoder: 0,
+            band_words: Vec::new(),
+            rx_band: None,
+            tx_band: None,
+            tx_band_pending: None,
             applied: None,
             test: None,
             failures: 0,
@@ -148,6 +169,7 @@ impl Sequencer {
         self.slots.clear();
         self.managed = 0;
         self.inverted = 0;
+        self.decoder = 0;
         for ch in cfg.active_channels() {
             let bit = frame::bit(ch.index);
             if bit == 0 {
@@ -156,6 +178,12 @@ impl Sequencer {
             self.managed |= bit;
             if !ch.active_high {
                 self.inverted |= bit;
+            }
+            // A band-decoder contact still gets a slot: the slot decides
+            // when it swaps its RX word for its TX word, which is an on-air
+            // edge like any other.
+            if ch.role == RelayRole::BandDecoder {
+                self.decoder |= bit;
             }
             let lead = u64::from(cfg.lead_for(ch)).min(max_lead);
             self.slots.push(Slot {
@@ -166,6 +194,11 @@ impl Sequencer {
         }
         // A contact that is no longer managed is not ours to hold.
         self.asserted &= self.managed;
+        self.band_words = cfg
+            .band_table
+            .iter()
+            .map(|r| (r.band, cfg.band_mask(r.band, false), cfg.band_mask(r.band, true)))
+            .collect();
     }
 
     /// Adopt a new configuration. The hardware is written in full afterwards —
@@ -202,7 +235,55 @@ impl Sequencer {
         }
         if self.on_air() != was {
             self.edge = now;
+            // A transmit band held back from the last over is safe to take
+            // now: the engine's key-down waits the full lead after this edge
+            // before any RF, which is the lead the TX word is ramped in on.
+            // Not on the sense line's edge — that transmitter is already
+            // radiating.
+            if self.on_air() && source == Source::Engine {
+                self.take_pending_tx_band();
+            }
         }
+    }
+
+    /// The band the receiver is on. Only ever moves the band-decoder contacts
+    /// that are following their RX word, so it is safe at any moment,
+    /// including mid-over.
+    pub fn set_rx_band(&mut self, band: Band) {
+        self.rx_band = Some(band);
+    }
+
+    /// The band the next (or current) over transmits on.
+    ///
+    /// Taken at once only off the air with no band-decoder contact following
+    /// its TX word. Otherwise it waits: changing the TX word under a contact
+    /// that is following it — or that is about to, part-way through a
+    /// key-down's lead — is switching a filter with RF on it, or racing it,
+    /// which is what this whole subsystem exists to prevent. A retune
+    /// mid-over therefore takes effect after that over's hold, or at the next
+    /// key-down edge, whose lead covers it. The keying radio's own band is
+    /// always sent *before* its key-down, so it is never the one held back.
+    pub fn set_tx_band(&mut self, band: Band) {
+        self.tx_band_pending = Some(band);
+        if !self.on_air() && self.asserted & self.decoder == 0 {
+            self.take_pending_tx_band();
+        }
+    }
+
+    fn take_pending_tx_band(&mut self) {
+        if let Some(b) = self.tx_band_pending.take() {
+            self.tx_band = Some(b);
+        }
+    }
+
+    /// A band's RX or TX word, zero for a band nobody has told us or the
+    /// table has no row for.
+    fn band_word(&self, band: Option<Band>, tx: bool) -> ChannelMask {
+        let Some(band) = band else { return 0 };
+        self.band_words
+            .iter()
+            .find(|(b, _, _)| *b == band)
+            .map_or(0, |&(_, rx_w, tx_w)| if tx { tx_w } else { rx_w })
     }
 
     /// Drop everything immediately, with no hold: for a key-down that was
@@ -214,6 +295,7 @@ impl Sequencer {
         self.asserted = 0;
         self.test = None;
         self.edge = now;
+        self.take_pending_tx_band();
     }
 
     /// Close one contact for [`TEST_PULSE`], so an operator can hear the relay
@@ -255,12 +337,25 @@ impl Sequencer {
                     self.asserted &= !s.bit;
                 }
             }
+            if self.asserted & self.decoder == 0 {
+                self.take_pending_tx_band();
+            }
         }
     }
 
     /// The physical mask the hardware should be holding.
+    ///
+    /// An ordinary contact is closed while its slot is asserted. A
+    /// band-decoder contact is never "closed by the over": its slot only
+    /// chooses which word it follows — the transmit band's TX word while
+    /// asserted, the receive band's RX word otherwise.
     pub fn want(&self) -> ChannelMask {
-        let logical = self.asserted | self.test.map(|(b, _)| b).unwrap_or(0);
+        let d = self.decoder;
+        let on_air_words = self.asserted & self.band_word(self.tx_band, true);
+        let receive_words = !self.asserted & self.band_word(self.rx_band, false);
+        let logical = (self.asserted & !d)
+            | (d & (on_air_words | receive_words))
+            | self.test.map(|(b, _)| b).unwrap_or(0);
         (logical ^ self.inverted) & self.managed
     }
 
@@ -334,6 +429,10 @@ pub enum Ctrl {
     Abort,
     /// Pulse one contact, for checking the wiring.
     Test(u8),
+    /// The band the receiver is on — see [`Sequencer::set_rx_band`].
+    RxBand(Band),
+    /// The band the keying radio transmits on — see [`Sequencer::set_tx_band`].
+    TxBand(Band),
     Shutdown,
 }
 
@@ -384,6 +483,18 @@ impl RelayHandle {
     pub fn set_config(&self, cfg: RelayConfig) {
         self.lead_ms.store(u64::from(cfg.max_lead_ms()), Ordering::Relaxed);
         let _ = self.tx.send(Ctrl::Config(Box::new(cfg)));
+    }
+
+    /// See [`Sequencer::set_rx_band`]. The worker resolves it against its own
+    /// configuration's band table, never against the caller's copy.
+    pub fn set_rx_band(&self, band: Band) {
+        let _ = self.tx.send(Ctrl::RxBand(band));
+    }
+
+    /// See [`Sequencer::set_tx_band`]. Sent ahead of [`Self::key`] on the same
+    /// channel, so the worker always has the band before the edge.
+    pub fn set_tx_band(&self, band: Band) {
+        let _ = self.tx.send(Ctrl::TxBand(band));
     }
 
     pub fn test(&self, channel: u8) {
@@ -653,6 +764,14 @@ fn apply_ctrl(
             let ok = seq.test(ch, Instant::now());
             trace.note(format!("test pulse on channel {ch}"), if ok { "ok" } else { "refused" });
         }
+        Ctrl::RxBand(band) => {
+            seq.set_rx_band(band);
+            trace.note("band decoder", format!("receive on {band:?}"));
+        }
+        Ctrl::TxBand(band) => {
+            seq.set_tx_band(band);
+            trace.note("band decoder", format!("transmit on {band:?}"));
+        }
         Ctrl::Shutdown => return false,
     }
     true
@@ -661,7 +780,7 @@ fn apply_ctrl(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sdroxide_types::{RelayChannel, RelayLink, RelayRole};
+    use sdroxide_types::{RelayBandRow, RelayChannel, RelayLink, RelayRole};
 
     fn ms(n: u64) -> Duration {
         Duration::from_millis(n)
@@ -931,5 +1050,230 @@ mod tests {
         let t1 = t0 + ms(100);
         s.set_source(Source::Engine, false, t1);
         assert_eq!(s.next_change(t1), Some(t1 + ms(5)), "the amplifier drops first");
+    }
+
+    /// Contact 1 a 20 m band-pass filter, in circuit both ways. Contact 2 a
+    /// 20 m transmit-only LPF, the case that most needs sequencing. Contact 3
+    /// a 40 m band-pass filter wired active-low. Contact 4 an amplifier.
+    /// Leads 10, 20, 10, 5 — so the LPF closes first and the amplifier last.
+    fn band_decoder_cfg() -> RelayConfig {
+        RelayConfig {
+            link: RelayLink::Gpio,
+            channels: vec![
+                RelayChannel {
+                    index: 1,
+                    role: RelayRole::BandDecoder,
+                    active_high: true,
+                    lead_ms: 10,
+                    hold_ms: 20,
+                    ..RelayChannel::default()
+                },
+                RelayChannel {
+                    index: 2,
+                    role: RelayRole::BandDecoder,
+                    active_high: true,
+                    lead_ms: 20,
+                    hold_ms: 30,
+                    ..RelayChannel::default()
+                },
+                RelayChannel {
+                    index: 3,
+                    role: RelayRole::BandDecoder,
+                    active_high: false,
+                    lead_ms: 10,
+                    hold_ms: 20,
+                    ..RelayChannel::default()
+                },
+                RelayChannel {
+                    index: 4,
+                    role: RelayRole::Amplifier,
+                    active_high: true,
+                    lead_ms: 5,
+                    hold_ms: 0,
+                    ..RelayChannel::default()
+                },
+            ],
+            band_table: vec![
+                RelayBandRow { band: Band::M20, rx_mask: 0b001, tx_mask: 0b011 },
+                RelayBandRow { band: Band::M40, rx_mask: 0b100, tx_mask: 0b100 },
+            ],
+            ..RelayConfig::default()
+        }
+    }
+
+    /// Physical: contact 3 is active-low, so its bit reads inverted.
+    const INV: ChannelMask = 0b0100;
+
+    /// Receiving, the band picks the RX word and it applies at once — a retune
+    /// is not an on-air edge and has nothing to wait for.
+    #[test]
+    fn a_receive_band_applies_at_once() {
+        let t0 = Instant::now();
+        let mut s = Sequencer::new(&band_decoder_cfg(), t0);
+        assert_eq!(s.due(t0), Some(INV), "no band told yet: nothing asserted");
+        s.on_ack(INV);
+        s.set_rx_band(Band::M20);
+        assert_eq!(s.due(t0), Some(0b0001 ^ INV));
+        s.on_ack(0b0001 ^ INV);
+        s.set_rx_band(Band::M40);
+        assert_eq!(s.due(t0), Some(0b0100 ^ INV), "20 m filter out, 40 m filter in");
+    }
+
+    /// The claim that matters most: a transmit-only LPF must be in circuit
+    /// *before* RF, on its own lead, and out only after its hold — never
+    /// switched at the moment the transmitter is already putting power into it.
+    #[test]
+    fn a_transmit_only_word_rides_the_on_air_ramp() {
+        let t0 = Instant::now();
+        let cfg = band_decoder_cfg();
+        let mut s = Sequencer::new(&cfg, t0);
+        s.set_rx_band(Band::M20);
+        s.set_tx_band(Band::M20);
+        settle(&mut s, t0);
+        assert_eq!(s.want(), 0b0001 ^ INV, "receiving: only the band-pass filter");
+
+        // Key-down. RF may appear at t0 + max lead (20 ms).
+        assert_eq!(cfg.max_lead_ms(), 20, "the LPF's lead counts toward the wait");
+        s.set_source(Source::Engine, true, t0);
+        settle(&mut s, t0);
+        assert_eq!(s.want(), 0b0011 ^ INV, "the LPF is in at the edge, 20 ms ahead of RF");
+        settle(&mut s, t0 + ms(15));
+        assert_eq!(s.want(), 0b1011 ^ INV, "then the amplifier, on its own 5 ms lead");
+
+        // Key-up at t1. The amplifier drops at once; the LPF stays for 30 ms.
+        let t1 = t0 + ms(100);
+        s.set_source(Source::Engine, false, t1);
+        settle(&mut s, t1);
+        assert_eq!(s.want(), 0b0011 ^ INV, "amplifier out, the LPF still in");
+        settle(&mut s, t1 + ms(29));
+        assert_eq!(s.want(), 0b0011 ^ INV, "not before its hold");
+        settle(&mut s, t1 + ms(30));
+        assert_eq!(s.want(), 0b0001 ^ INV, "and back to the receive word after it");
+    }
+
+    /// A split across bands: receiving on 40 m, transmitting on 20 m. Every
+    /// band-decoder contact changes at key-down, so every one of them has to
+    /// be on the ramp — not only the ones whose row differs.
+    #[test]
+    fn a_cross_band_split_switches_before_rf_not_with_it() {
+        let t0 = Instant::now();
+        let mut s = Sequencer::new(&band_decoder_cfg(), t0);
+        s.set_rx_band(Band::M40);
+        s.set_tx_band(Band::M20);
+        settle(&mut s, t0);
+        assert_eq!(s.want(), 0b0100 ^ INV);
+
+        s.set_source(Source::Engine, true, t0);
+        // By RF (t0 + 20 ms) every decoder contact is on the 20 m TX word.
+        settle(&mut s, t0 + ms(20));
+        assert_eq!(s.want(), 0b1011 ^ INV);
+    }
+
+    /// Retuning the transmitter mid-over must not move a filter that is
+    /// carrying RF. The new band waits for the over and its hold to finish.
+    #[test]
+    fn a_transmit_band_change_mid_over_waits_for_the_hold() {
+        let t0 = Instant::now();
+        let mut s = Sequencer::new(&band_decoder_cfg(), t0);
+        s.set_rx_band(Band::M20);
+        s.set_tx_band(Band::M20);
+        s.set_source(Source::Engine, true, t0);
+        settle(&mut s, t0 + ms(20));
+        assert_eq!(s.want(), 0b1011 ^ INV);
+
+        s.set_tx_band(Band::M40);
+        settle(&mut s, t0 + ms(50));
+        assert_eq!(s.want(), 0b1011 ^ INV, "still the 20 m TX word under RF");
+
+        let t1 = t0 + ms(100);
+        s.set_source(Source::Engine, false, t1);
+        settle(&mut s, t1 + ms(30));
+        assert_eq!(s.want(), 0b0001 ^ INV, "receiving again on 20 m");
+
+        // The next over transmits on 40 m.
+        let t2 = t1 + ms(200);
+        s.set_source(Source::Engine, true, t2);
+        settle(&mut s, t2 + ms(20));
+        assert_eq!(s.want(), 0b1000, "40 m filter (active-low, so its bit clears) and the PA");
+    }
+
+    /// A transmit band that arrives inside the previous over's hold is taken
+    /// at the next key-down edge, whose lead the engine then waits out.
+    #[test]
+    fn a_re_key_inside_the_hold_takes_the_new_transmit_band() {
+        let t0 = Instant::now();
+        let mut s = Sequencer::new(&band_decoder_cfg(), t0);
+        s.set_rx_band(Band::M20);
+        s.set_tx_band(Band::M20);
+        s.set_source(Source::Engine, true, t0);
+        settle(&mut s, t0 + ms(20));
+        let t1 = t0 + ms(100);
+        s.set_source(Source::Engine, false, t1);
+        settle(&mut s, t1 + ms(5));
+        s.set_tx_band(Band::M40);
+        assert_eq!(s.want(), 0b0011 ^ INV, "inside the hold: still the old TX word");
+        s.set_source(Source::Engine, true, t1 + ms(10));
+        settle(&mut s, t1 + ms(30));
+        assert_eq!(s.want(), 0b1000);
+    }
+
+    /// A transmit band that reaches the worker after the key-down edge — from
+    /// a radio that is not the one keying — must not be taken mid-lead, even
+    /// though no contact has moved yet.
+    #[test]
+    fn a_transmit_band_after_the_edge_waits_for_the_over() {
+        let t0 = Instant::now();
+        let mut s = Sequencer::new(&band_decoder_cfg(), t0);
+        s.set_rx_band(Band::M20);
+        s.set_tx_band(Band::M20);
+        s.set_source(Source::Engine, true, t0);
+        s.set_tx_band(Band::M40);
+        settle(&mut s, t0 + ms(20));
+        assert_eq!(s.want(), 0b1011 ^ INV, "this over is still 20 m");
+    }
+
+    /// The safety property the table's clipping exists for: a row whose bits
+    /// happen to line up with an amplifier's contact cannot key it.
+    #[test]
+    fn a_band_row_cannot_move_a_contact_with_another_job() {
+        let mut cfg = band_decoder_cfg();
+        cfg.band_table.push(RelayBandRow { band: Band::M15, rx_mask: 0b1000, tx_mask: 0b1000 });
+        let t0 = Instant::now();
+        let mut s = Sequencer::new(&cfg, t0);
+        s.set_rx_band(Band::M15);
+        settle(&mut s, t0);
+        assert_eq!(s.want(), INV, "the amplifier bit leaked through");
+    }
+
+    /// An abort drops the TX word at once, like everything else — no RF ever
+    /// appeared.
+    #[test]
+    fn an_abort_puts_the_receive_word_straight_back() {
+        let t0 = Instant::now();
+        let mut s = Sequencer::new(&band_decoder_cfg(), t0);
+        s.set_rx_band(Band::M20);
+        s.set_tx_band(Band::M20);
+        s.set_source(Source::Engine, true, t0);
+        settle(&mut s, t0);
+        assert_eq!(s.want(), 0b0011 ^ INV);
+        s.abort(t0 + ms(1));
+        settle(&mut s, t0 + ms(1));
+        assert_eq!(s.want(), 0b0001 ^ INV);
+    }
+
+    /// A band-decoder channel dropped from the configuration is no longer
+    /// ours to hold, exactly as an on-air-driven one is not.
+    #[test]
+    fn a_band_decoder_channel_removed_from_config_is_forgotten() {
+        let t0 = Instant::now();
+        let mut s = Sequencer::new(&band_decoder_cfg(), t0);
+        s.set_rx_band(Band::M20);
+        settle(&mut s, t0);
+        assert_eq!(s.want(), 0b0001 ^ INV);
+
+        let mut narrowed = band_decoder_cfg();
+        narrowed.channels.retain(|c| c.index != 1);
+        s.set_config(&narrowed);
+        assert_eq!(s.want(), INV, "contact 1 left the configuration and is no longer held");
     }
 }

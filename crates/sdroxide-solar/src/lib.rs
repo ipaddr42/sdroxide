@@ -26,6 +26,7 @@ pub mod helio;
 pub mod imagery;
 pub mod impact;
 pub mod indices;
+pub mod meteor;
 pub mod planets;
 pub mod satellites;
 pub mod satfreq;
@@ -40,7 +41,10 @@ pub use aurora::{AuroraOval, HemisphericPower, KpPoint};
 pub use clouds::{Band, CloudField, ConvCell};
 pub use data::{SolarData, Source, SourceStatus};
 pub use donki::{CmeAnalysis, CmeEvent, FlareEvent};
-pub use ephem::{AU, EARTH_R, MOON_R, SUN_R, SunFrame, is_daylight_at, solar_elevation_deg};
+pub use ephem::{
+    AU, EARTH_R, MOON_R, NIGHT_MAX_ALPHA, SUN_R, SunFrame, is_daylight_at, night_shade,
+    night_shade_rgba, solar_elevation_deg,
+};
 #[cfg(not(target_arch = "wasm32"))]
 pub use feed::{FeedCmd, RawUpdate, SolarFeed, band_conditions_cached};
 pub use imagery::{SdoChannel, SunImage};
@@ -49,6 +53,7 @@ pub use indices::{
     BandConditions, BandRating, GeomagneticIndex, HfBandCondition, MufEstimate, SolarFlux,
     SpaceWeather, VhfCondition, XrayLevel,
 };
+pub use meteor::{ActiveShower, SHOWERS, Shower, active_at, radiant_altaz};
 pub use planets::{Moon, Planet, Surface};
 pub use satellites::{Observation, Pass, PassSearch, SatState, Satellite};
 pub use satfreq::{Passband, SatFreqs, SatLink};

@@ -302,18 +302,25 @@ pub fn mode_to_tci(mode: Mode) -> &'static str {
         Mode::Cw => "cw",
         // TCI has no DRM modulation; AM is the nearest, for the same
         // reason as the hamlib mapping.
-        Mode::Am | Mode::Drm => "am",
+        Mode::Am | Mode::Drm | Mode::Acars => "am",
         Mode::Sam => "sam",
         // RIFP centres on the dial and swings ±4 kHz, and VHF packet and
         // VHF SSTV frequency-modulate it too: FM, not a sideband.
         Mode::Nfm | Mode::Rifp | Mode::Packet | Mode::Aprs | Mode::SstvFm | Mode::RttyFm => "nfm",
         // ExpertSDR has no ADS-B mode either; wide FM is the nearest thing a
         // client can be told without inventing a name it would reject.
-        Mode::Wfm | Mode::Adsb | Mode::Vdl2 | Mode::Ais => "wfm",
+        Mode::Wfm | Mode::Adsb | Mode::Vdl2 | Mode::Ais | Mode::Hfdl | Mode::HdRadio => "wfm",
         Mode::Digu
         | Mode::Ft8
         | Mode::Js8
         | Mode::Wspr
+        | Mode::Pi4
+        | Mode::Msk144
+        | Mode::Jt65
+        | Mode::Jt9
+        | Mode::Fst4
+        | Mode::Q65
+        | Mode::Fsk441
         | Mode::Ft4
         | Mode::Ft2
         | Mode::Psk

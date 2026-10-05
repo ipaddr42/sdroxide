@@ -15,6 +15,7 @@
 
 use std::fs::File;
 use std::io::{BufWriter, Write};
+use std::panic::AssertUnwindSafe;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -26,7 +27,7 @@ use shine_rs::encoder::{
     ShineConfig, ShineMpeg, ShineWave, shine_close, shine_encode_buffer, shine_flush,
     shine_initialise, shine_samples_per_pass,
 };
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 use sdroxide_dsp::{MonoResampler, StereoResampler};
 
@@ -67,13 +68,41 @@ impl RecordingChannels {
     }
 }
 
+/// How many times the encoder may be rebuilt around a panic before the
+/// recording is given up on.
+///
+/// A handful, not one: a single bad frame is a bug in the encoder and worth
+/// riding out, while a panic on every frame is a recording that is never going
+/// to produce anything and a thread that would otherwise spin rebuilding an
+/// encoder forever.
+const MAX_ENCODER_RESTARTS: u32 = 8;
+
 /// A running recording. Feed it through the paired [`Producer`] (held by the
 /// mixer); drop-finalize by calling [`Recorder::stop`].
 pub struct Recorder {
     stop: Arc<AtomicBool>,
     join: Option<JoinHandle<()>>,
+    /// Set when the encoder panicked and could not be brought back, so the
+    /// recording has stopped short of where the operator thinks it has. Read
+    /// by [`Recorder::failure`].
+    failed: Arc<AtomicBool>,
+    /// Set when the encoder panicked *and was restarted* — the file is intact
+    /// either side of a short gap. Cleared by [`Recorder::failure`] once
+    /// reported, so one glitch is mentioned once.
+    glitched: Arc<AtomicBool>,
     /// The file being written (absolute path).
     pub path: PathBuf,
+}
+
+/// What [`Recorder::failure`] has to report.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecorderFault {
+    /// The encoder panicked and came back; the file continues after a gap of a
+    /// few tens of milliseconds.
+    Glitch,
+    /// The encoder could not be brought back. Nothing more is being written
+    /// and the file ends where it ends.
+    Dead,
 }
 
 impl Recorder {
@@ -91,14 +120,38 @@ impl Recorder {
         let cap = (in_rate as usize).max(MP3_RATE as usize) * 4 * channels.count();
         let (prod, cons) = RingBuffer::<f32>::new(cap);
         let stop = Arc::new(AtomicBool::new(false));
+        let failed = Arc::new(AtomicBool::new(false));
+        let glitched = Arc::new(AtomicBool::new(false));
+        let health = Health { failed: failed.clone(), glitched: glitched.clone() };
         let stop_worker = stop.clone();
         let path_worker = path.clone();
         let join = std::thread::Builder::new()
             .name("mp3-recorder".into())
-            .spawn(move || encode_loop(cons, file, in_rate, channels, stop_worker, path_worker))
+            .spawn(move || {
+                encode_loop(cons, file, in_rate, channels, stop_worker, path_worker, health)
+            })
             .expect("spawn recorder thread");
         info!(path = %path.display(), "recording started");
-        Ok((Recorder { stop, join: Some(join), path }, prod))
+        Ok((Recorder { stop, join: Some(join), failed, glitched, path }, prod))
+    }
+
+    /// Anything that has gone wrong in the encoder since this was last asked,
+    /// so a caller can tell the operator rather than leaving them to find a
+    /// truncated file afterwards (issue #443).
+    ///
+    /// A recording is the one part of the program whose failure is completely
+    /// invisible while it happens: the audio keeps playing, the button stays
+    /// lit, and the only sign is a file that stops early. Polled rather than
+    /// pushed because the worker is a plain thread with no channel back, and
+    /// because a glitch is worth mentioning once rather than every tick.
+    ///
+    /// [`RecorderFault::Dead`] latches — it is the state of the recording, not
+    /// an event — while [`RecorderFault::Glitch`] is taken and cleared.
+    pub fn failure(&self) -> Option<RecorderFault> {
+        if self.failed.load(Ordering::Relaxed) {
+            return Some(RecorderFault::Dead);
+        }
+        self.glitched.swap(false, Ordering::Relaxed).then_some(RecorderFault::Glitch)
     }
 
     /// Stop recording: signal the worker, wait for it to flush and close the
@@ -112,6 +165,29 @@ impl Recorder {
     }
 }
 
+/// The two flags [`Recorder::failure`] reads, as the worker sees them.
+struct Health {
+    failed: Arc<AtomicBool>,
+    glitched: Arc<AtomicBool>,
+}
+
+/// The recorder thread: run an encode session, and if the encoder panics,
+/// build a fresh one and carry on appending to the same file.
+///
+/// An MP3 file is a sequence of self-contained frames, so a new encoder's
+/// output appended to a half-written file plays: what is lost is the audio
+/// that was in flight, a few tens of milliseconds, and the listener hears a
+/// click. That is a far better answer than what used to happen — the thread
+/// died, the panic went to stderr, the recording stopped, and nothing on the
+/// client said so, so the operator found out when they played the file back
+/// (issue #443).
+///
+/// The panic that prompted this was an integer underflow inside `shine-rs`
+/// 0.1.3 (`labs(i32::MIN)` wrapping, then indexing a lookup table with the
+/// result), fixed upstream in 0.1.4, which this crate now requires. The
+/// supervision stays regardless: the encoder is the one piece of this path
+/// that is not sdroxide's code, and a recording that stops silently is worse
+/// than one with a click in it.
 fn encode_loop(
     mut cons: Consumer<f32>,
     file: File,
@@ -119,6 +195,57 @@ fn encode_loop(
     channels: RecordingChannels,
     stop: Arc<AtomicBool>,
     path: PathBuf,
+    health: Health,
+) {
+    let mut file = BufWriter::new(file);
+    let mut restarts = 0u32;
+    loop {
+        // `AssertUnwindSafe` because the state that crosses this boundary is
+        // the writer and the ring — a `BufWriter` that may be missing its last
+        // frame, and a consumer that has had samples taken out of it. Both are
+        // exactly as valid after a panic as before one; nothing here holds an
+        // invariant a half-finished encode could break. The encoder itself is
+        // built inside and thrown away with the panic.
+        let finished = std::panic::catch_unwind(AssertUnwindSafe(|| {
+            encode_session(&mut cons, &mut file, in_rate, channels, &stop, &path)
+        }));
+        match finished {
+            Ok(()) => break,
+            Err(_) => {
+                restarts += 1;
+                if stop.load(Ordering::Relaxed) || restarts > MAX_ENCODER_RESTARTS {
+                    health.failed.store(true, Ordering::Relaxed);
+                    error!(
+                        path = %path.display(),
+                        restarts,
+                        "the MP3 encoder panicked and could not be restarted; this recording \
+                         ends here"
+                    );
+                    break;
+                }
+                health.glitched.store(true, Ordering::Relaxed);
+                warn!(
+                    path = %path.display(),
+                    restarts,
+                    "the MP3 encoder panicked; rebuilding it and carrying on — the recording \
+                     has a short gap at this point"
+                );
+            }
+        }
+    }
+    let _ = file.flush();
+}
+
+/// One encode session: build an encoder, drain and encode until asked to stop,
+/// then write the tail. Returns normally only on a clean stop — a panic in the
+/// encoder unwinds out of here and [`encode_loop`] catches it.
+fn encode_session(
+    cons: &mut Consumer<f32>,
+    file: &mut BufWriter<File>,
+    in_rate: f64,
+    channels: RecordingChannels,
+    stop: &AtomicBool,
+    path: &std::path::Path,
 ) {
     let ch = channels.count();
     let cfg = ShineConfig {
@@ -140,7 +267,6 @@ fn encode_loop(
     };
     let spp = shine_samples_per_pass(&enc) as usize; // samples per channel per frame
 
-    let mut file = BufWriter::new(file);
     // Exactly one of these is live, matching `ch`; `None` when the rates
     // already match (see `StereoResampler`/`MonoResampler::new`).
     let mut stereo_rs = (ch == 2).then(|| StereoResampler::new(in_rate, MP3_RATE as f64)).flatten();
@@ -178,15 +304,7 @@ fn encode_loop(
             (None, None) => pending.extend_from_slice(&drained),
         }
         while pending.len() >= spp * ch {
-            encode_frame(
-                &mut file,
-                &mut enc,
-                &pending[..spp * ch],
-                ch,
-                &mut pcm_l,
-                &mut pcm_r,
-                &path,
-            );
+            encode_frame(file, &mut enc, &pending[..spp * ch], ch, &mut pcm_l, &mut pcm_r, path);
             pending.drain(..spp * ch);
         }
     }
@@ -194,7 +312,7 @@ fn encode_loop(
     // Final partial frame (zero-padded) so no tail is dropped, then flush.
     if !pending.is_empty() {
         pending.resize(spp * ch, 0.0);
-        encode_frame(&mut file, &mut enc, &pending[..spp * ch], ch, &mut pcm_l, &mut pcm_r, &path);
+        encode_frame(file, &mut enc, &pending[..spp * ch], ch, &mut pcm_l, &mut pcm_r, path);
     }
     let (tail, n) = shine_flush(&mut enc);
     if n > 0 {
@@ -298,5 +416,66 @@ mod tests {
         assert!(bytes.len() > 1_000, "mp3 suspiciously small: {} bytes", bytes.len());
         assert_eq!(bytes[0], 0xFF, "no MP3 frame sync");
         assert_eq!(bytes[1] & 0xE0, 0xE0, "no MP3 frame sync in byte 1");
+    }
+
+    /// Full scale, both rails, for a second — the input that used to reach the
+    /// underflow in `shine-rs` 0.1.3 (`labs(i32::MIN)` wrapping negative and
+    /// then indexing a 10000-entry table with it), which killed the recorder
+    /// thread and stopped the recording without a word to anyone (issue #443).
+    ///
+    /// A square wave rather than a sine: it is the signal that drives the MDCT
+    /// coefficients hardest, and the whole point is to stand on the rails
+    /// rather than approach them.
+    #[test]
+    fn a_recording_at_full_scale_neither_panics_nor_reports_a_fault() {
+        let path =
+            std::env::temp_dir().join(format!("sdroxide-rec-test-rail-{}.mp3", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let (rec, mut prod) = Recorder::start(path.clone(), 48_000.0, RecordingChannels::Stereo)
+            .expect("start recorder");
+        for i in 0..48_000u32 {
+            // A 1 kHz square at exactly ±1.0, and the other ear its inverse so
+            // the joint-stereo path sees the widest difference there is.
+            let hi = (i / 24) % 2 == 0;
+            let l = if hi { 1.0 } else { -1.0 };
+            for sample in [l, -l] {
+                while prod.push(sample).is_err() {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+            }
+        }
+        std::thread::sleep(Duration::from_millis(200));
+        assert_eq!(rec.failure(), None, "the encoder fell over on full-scale audio");
+        rec.stop();
+
+        let bytes = std::fs::read(&path).expect("read mp3");
+        let _ = std::fs::remove_file(&path);
+        assert!(bytes.len() > 2_000, "mp3 suspiciously small: {} bytes", bytes.len());
+        assert_eq!(bytes[0], 0xFF, "no MP3 frame sync");
+    }
+
+    /// `failure()`'s two answers behave differently on purpose: a glitch is an
+    /// event and is reported once, a dead encoder is a *state* and keeps being
+    /// reported, because the recording really is over.
+    #[test]
+    fn a_glitch_is_reported_once_and_a_dead_encoder_keeps_being_reported() {
+        let path = std::env::temp_dir()
+            .join(format!("sdroxide-rec-test-health-{}.mp3", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let (rec, prod) = Recorder::start(path.clone(), 48_000.0, RecordingChannels::Mono)
+            .expect("start recorder");
+        assert_eq!(rec.failure(), None);
+
+        rec.glitched.store(true, Ordering::Relaxed);
+        assert_eq!(rec.failure(), Some(RecorderFault::Glitch));
+        assert_eq!(rec.failure(), None, "a glitch is mentioned once, not every tick");
+
+        rec.failed.store(true, Ordering::Relaxed);
+        assert_eq!(rec.failure(), Some(RecorderFault::Dead));
+        assert_eq!(rec.failure(), Some(RecorderFault::Dead), "still not recording");
+
+        drop(prod);
+        rec.stop();
+        let _ = std::fs::remove_file(&path);
     }
 }

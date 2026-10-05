@@ -98,9 +98,43 @@
         if (micStarting || micReady || !ctx) return;
         micStarting = true;
         try {
+            // Raw capture, explicitly. A browser defaults all three of these
+            // ON, because its idea of a microphone is a conference call: the
+            // echo canceller removes whatever the page is also playing, the
+            // noise suppressor removes anything that does not look like
+            // speech, and the gain control rides the level.
+            //
+            // Every one of them is wrong on a transmitter. A transmitter must
+            // send what the microphone heard -- the suppressor alone will gate
+            // a CW note or a digital tone to nothing, since neither looks like
+            // speech to it. The echo canceller is worse still: this page plays
+            // receive audio through the same AudioContext, so the band becomes
+            // the far-end reference and the operator's voice becomes the thing
+            // it is built to subtract, which is a microphone that reads open
+            // and transmits silence (issue #493; receive audio is also held
+            // off for the length of an over now, see `RemoteController`).
+            //
+            // Plain values rather than `exact`: these are preferences, and a
+            // device that cannot turn its processing off should still open.
             const stream = await navigator.mediaDevices.getUserMedia({
-                audio: { sampleRate: 48000, channelCount: 1 },
+                audio: {
+                    channelCount: 1,
+                    echoCancellation: false,
+                    noiseSuppression: false,
+                    autoGainControl: false,
+                },
             });
+            // What the browser actually gave us, named in the log so a report
+            // of a silent transmitter does not need a second round trip.
+            const track = stream.getAudioTracks()[0];
+            const got = (track && track.getSettings) ? track.getSettings() : {};
+            console.log(
+                "sdroxide audio: microphone", (track && track.label) || "(unnamed)",
+                "rate", got.sampleRate || "(context)",
+                "channels", got.channelCount || 1,
+                "aec", got.echoCancellation, "ns", got.noiseSuppression,
+                "agc", got.autoGainControl
+            );
             const src = ctx.createMediaStreamSource(stream);
             const capture = new AudioWorkletNode(ctx, "mic-capture");
             capture.port.onmessage = (ev) => {
@@ -109,6 +143,13 @@
                 while (micChunks.length > 400) micChunks.shift();
             };
             src.connect(capture);
+            // A Web Audio node is only rendered if it has a path through to the
+            // destination, and MicCapture is driven entirely by `process()` —
+            // so with no onward connection it was never scheduled, its
+            // `postMessage` never fired, and the mic fed nothing while logging
+            // "mic ready". The processor writes no output, so this path carries
+            // silence and cannot feed back.
+            capture.connect(ctx.destination);
             micReady = true;
             console.log("sdroxide audio: mic ready");
         } catch (e) {

@@ -14,7 +14,7 @@ use std::net::Ipv4Addr;
 use std::time::{Duration, Instant};
 
 use sdroxide_dsp::{Decimator, PureSignal};
-use sdroxide_hpsdr::{HpsdrBoard, HpsdrRx, LNA_GAIN_ELEMENT, TX_RATE_HZ};
+use sdroxide_hpsdr::{HpsdrBoard, HpsdrRx, LNA_GAIN_ELEMENT};
 use sdroxide_radio::{Complex32, ControlUpdate, IqSource, Result};
 
 use crate::device_registry::{DeviceKey, SharedDevice, registry};
@@ -49,6 +49,10 @@ pub struct HpsdrSource {
     /// The connection's sample rate, kept here so a released source still
     /// answers `IqSource::sample_rate` — see that method.
     rate: f64,
+    /// The rate this board drains transmit I/Q at: 48 kHz on Protocol 1,
+    /// 192 kHz on Protocol 2. Kept beside `rate` for the same reason, and
+    /// never assumed to equal it or to be a constant (issue #440).
+    tx_rate: f64,
     center: f64,
     /// See [`sdroxide_types::HpsdrConfig::ppm`].
     ppm: f64,
@@ -66,9 +70,9 @@ pub struct HpsdrSource {
     /// The predistortion loop, present exactly when the operator has asked for
     /// it on the radio that owns the transmitter.
     puresignal: Option<PureSignal>,
-    /// Brings the board's receive rate down to the 48 kHz the transmit stream
+    /// Brings the board's receive rate down to the rate the transmit stream
     /// runs at, so the two can be compared sample for sample. `None` when the
-    /// board is already at 48 kHz.
+    /// two already match, or when the receiver is the slower of the two.
     ps_decim: Option<Decimator>,
     /// Where the transmitter is this over, for the offset the feedback has to
     /// be spun back by. Zero while receiving.
@@ -146,28 +150,61 @@ impl HpsdrSource {
         // The predistortion loop, on the radio that owns the transmitter and
         // nowhere else: a second DDC has no transmitter to linearise.
         let rate = board.sample_rate_hz();
+        // The transmit rate is the board's, not a constant: Protocol 1 drains
+        // its EP2 frames at 48 kHz and Protocol 2 its DUC at 192 kHz (issue
+        // #440). Everything that lines the two streams up has to use this one.
+        let tx_rate = board.tx_rate_hz();
         let puresignal = (cfg.puresignal && cfg.ddc == 0)
-            .then(|| PureSignal::new(usize::from(cfg.ps_bins), cfg.ps_rate, TX_RATE_HZ as f64));
-        // The receive stream is faster than the transmit one on every rate but
-        // the lowest, and the loop compares the two sample for sample, so the
-        // feedback is brought down to the transmitter's rate before it is
-        // handed over. Every Protocol 1 and Protocol 2 rate is a power of two
-        // times 48 kHz, which is exactly what this decimator does.
+            .then(|| PureSignal::new(usize::from(cfg.ps_bins), cfg.ps_rate, tx_rate));
+        // The loop compares the transmit stream and the feedback sample for
+        // sample, so the receiver is brought down to the transmitter's rate
+        // first. Every HPSDR receive rate is a power of two times 48 kHz, so
+        // where the receiver is the faster of the two a plain decimator does
+        // it. On Protocol 2 it often is not: a board receiving at 48, 96 or
+        // 192 kHz runs *slower* than its own 192 kHz DUC, and there is nothing
+        // to decimate — the loop needs the receiver at or above the transmit
+        // rate, so it is refused rather than fed a mismatched stream that
+        // would never align.
         let ps_decim = puresignal.as_ref().and_then(|_| {
-            let factor = (rate / f64::from(TX_RATE_HZ)).round() as u32;
+            let factor = (rate / tx_rate).round() as u32;
             (factor > 1).then(|| Decimator::new(factor))
         });
+        let ps_rate_too_low = puresignal.is_some() && rate < tx_rate - 0.5;
+        if ps_rate_too_low {
+            tracing::warn!(
+                "HPSDR: PureSignal is on, but this radio receives at {rate:.0} Hz and transmits \
+                 at {tx_rate:.0} Hz — the feedback is slower than the transmission it has to be \
+                 compared against, so the loop cannot align and the transmitter is left \
+                 uncorrected. Raise the sample rate to {tx_rate:.0} Hz or above."
+            );
+        }
         if puresignal.is_some() {
+            // Where the sample has to arrive depends on the board. Sending the
+            // operator of a Hermes, an ANAN or a Red Pitaya after a
+            // Hermes-Lite 2's IO board gives them nowhere to look.
+            let wiring = if board.has_io_board() {
+                "on a Hermes-Lite 2 that is the IO board's PureSignal input, with the IO board's                  receive input set to match"
+            } else {
+                "this board has no IO board to switch it in, so the coupler and its attenuator                  have to reach a receive input the T/R switch does not take away on transmit —                  an ANAN's RX port, or an external relay that switches the coupler into the                  receive input for the length of the over"
+            };
             tracing::info!(
-                "HPSDR: PureSignal is on — the receiver is the feedback path, so a coupled \
-                 sample of the transmitter has to reach it during the over (on a Hermes-Lite 2 \
-                 that is the IO board's PureSignal input). {} table steps, feedback decimated \
-                 by {}. Until the loop locks the transmitter is left exactly as it would have \
-                 been.",
+                "HPSDR: PureSignal is on — this receiver, the first one, is the feedback path, \
+                 so a coupled sample of the transmitter has to reach it during the over \
+                 ({wiring}). A second receiver is never read as the feedback: a coupler wired \
+                 to RX2/ADC2 cannot lock the loop however the board's own firmware routes it \
+                 (issue #510). {} table steps, feedback decimated by {}. Until the loop locks \
+                 the transmitter is left exactly as it would have been.",
                 cfg.ps_bins,
                 ps_decim.as_ref().map_or(1, |d| d.factor())
             );
-            if cfg.io_rx_input != sdroxide_types::HpsdrIoRxInput::IoBoardPureSignal {
+            // Only on a board that can have an IO board. The setting this
+            // names is a Hermes-Lite 2 accessory's, and it is not even offered
+            // on a Hermes or an ANAN — telling one of those that its IO board
+            // is set wrong sends the operator after a board they do not own
+            // (issue #518).
+            if board.has_io_board()
+                && cfg.io_rx_input != sdroxide_types::HpsdrIoRxInput::IoBoardPureSignal
+            {
                 tracing::warn!(
                     "HPSDR: PureSignal is on but the IO board's receive input is set to \"{}\" \
                      — unless you have wired the transmit sample in some other way, the T/R \
@@ -182,7 +219,7 @@ impl HpsdrSource {
         // nothing on J9 is deaf there, so the choice is not put on the panel of
         // an HL2 that has never used it.
         let io_rx_input = (board.protocol() == 1
-            && board.has_lna_gain()
+            && board.has_io_board()
             && cfg.ddc == 0
             && cfg.io_rx_input != sdroxide_types::HpsdrIoRxInput::Radio)
             .then_some(cfg.io_rx_input);
@@ -193,6 +230,7 @@ impl HpsdrSource {
             rx_scratch: Vec::new(),
             tx_scratch: Vec::new(),
             ptt: false,
+            tx_rate,
             label,
             rx: Some(rx),
             board: Some(board),
@@ -295,19 +333,21 @@ impl HpsdrSource {
         // difference puts it in the receiver's span. It is known exactly, so
         // this is arithmetic rather than a search.
         let offset = self.ps_tx_hz - self.center;
-        if offset.abs() > f64::from(TX_RATE_HZ) * 0.45 {
+        let tx_rate = self.tx_rate;
+        if offset.abs() > tx_rate * 0.45 {
             if !self.ps_warned_offset {
                 self.ps_warned_offset = true;
                 tracing::warn!(
                     "HPSDR: transmitting {:.1} kHz from where the receiver is tuned, which is \
-                     outside the 48 kHz the feedback is compared over — PureSignal will not \
+                     outside the {:.0} kHz the feedback is compared over — PureSignal will not \
                      correct this over",
-                    offset / 1e3
+                    offset / 1e3,
+                    tx_rate / 1e3
                 );
             }
             return;
         }
-        ps.feed_back(fb, offset, f64::from(TX_RATE_HZ));
+        ps.feed_back(fb, offset, tx_rate);
         if self.ps_log_at.elapsed() >= PS_LOG_INTERVAL {
             self.ps_log_at = Instant::now();
             if ps.locked() {
@@ -417,12 +457,30 @@ impl IqSource for HpsdrSource {
         self.rx.as_ref()?.pa_temp_c()
     }
 
+    fn tx_telemetry(&mut self) -> Option<sdroxide_types::TxTelemetry> {
+        let swr = self.rx.as_ref()?.swr()?;
+        Some(sdroxide_types::TxTelemetry { fwd_w: None, swr: Some(swr), alc: None, po: None })
+    }
+
     /// The board's own ADC-overflow flag — see [`IqSource::adc_overload`]. It
     /// is the one thing that can tell an operator a direct-sampling front end
     /// is in trouble, because a narrow DDC out of a converter being hammered by
     /// something outside it looks perfectly clean.
     fn adc_overload(&mut self) -> Option<bool> {
         self.rx.as_ref()?.adc_overload()
+    }
+
+    /// What the predistortion loop is doing, for the operator rather than for
+    /// the log (issue #441). Only the radio that owns the transmitter runs one,
+    /// so every other DDC's tab answers `None` and shows nothing.
+    fn puresignal(&mut self) -> Option<sdroxide_types::PsMeter> {
+        let ps = self.puresignal.as_ref()?;
+        Some(sdroxide_types::PsMeter {
+            locked: ps.locked(),
+            correction_db: ps.correction_db(),
+            score: ps.score(),
+            frozen: ps.frozen(),
+        })
     }
 
     /// The board's front-end LNA gain. On a Hermes-Lite 2 this is the only
@@ -527,7 +585,7 @@ impl IqSource for HpsdrSource {
             Some(rx) => {
                 Ok(rx.tx_begin(sdroxide_types::HpsdrConfig::apply_ppm(center_hz, self.ppm)))
             }
-            None => Ok(sdroxide_hpsdr::TX_RATE_HZ as f64),
+            None => Ok(self.tx_rate),
         }
     }
 

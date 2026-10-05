@@ -376,6 +376,26 @@ impl Js8Controller {
             .map(Self::single)
     }
 
+    /// The CQ someone asked for by typing it.
+    ///
+    /// Like the heartbeat, a CQ is a *compound* frame — callsign and grid — and
+    /// not a directed command, so once the panel's CQ chip became a way to fill
+    /// the compose box rather than a command of its own, a typed `"CQ"` would
+    /// otherwise put the two literal letters on the air (issue #472).
+    fn cq_for(&self, text: &str) -> Option<Js8Payload> {
+        let t = text.trim().to_ascii_uppercase();
+        let body = t.strip_prefix("@ALLCALL").map(str::trim).unwrap_or(t.as_str());
+        if body != "CQ" {
+            return None;
+        }
+        let call = self.my_call();
+        if call.is_empty() {
+            return None;
+        }
+        let grid = self.cfg.my_grid.to_ascii_uppercase();
+        Compound::cq(&call, (!grid.is_empty()).then_some(grid.as_str()), 0).pack().map(Self::single)
+    }
+
     /// The directed frame a message opens with, and how much text it ate.
     ///
     /// Anything addressed to a callsign gets one: `"KN4CRD SNR?"` because JS8
@@ -1094,12 +1114,20 @@ impl DigiEngine for Js8Controller {
 
     /// Queue a message.
     ///
-    /// `"HB"` becomes a heartbeat, one self-contained frame. Everything else
-    /// goes through [`Js8Controller::frames_for_text`]: a directed command when
-    /// the message opens with one, then text for whatever follows.
+    /// `"HB"` becomes a heartbeat, one self-contained frame, and `"CQ"` a CQ
+    /// with this station's callsign and grid. Everything else goes through
+    /// [`Js8Controller::frames_for_text`]: a directed command when the message
+    /// opens with one, then text for whatever follows.
     fn send_text(&mut self, text: String) {
         if text.trim().is_empty() {
             self.abort_tx();
+            return;
+        }
+        // Both are compound frames rather than text, and both are how the
+        // panel's chips reach the air now that they compose instead of
+        // transmit (issue #472).
+        if let Some(p) = self.cq_for(&text) {
+            self.queue_frames(vec![p]);
             return;
         }
         if let Some(p) = self.heartbeat_for(&text) {
@@ -1134,6 +1162,7 @@ impl DigiEngine for Js8Controller {
             tx_even: false,
             transmitting: self.keyed,
             tx_watchdog: false,
+            tx_refused: None,
             transcript: Vec::new(),
             config: self.cfg.clone(),
             text_rx: String::new(),
@@ -1143,6 +1172,7 @@ impl DigiEngine for Js8Controller {
             rade: None,
             packet: None,
             navtex: None,
+            acars: None,
             aprs: None,
             js8: Some(Js8Status {
                 speed: self.speed,
@@ -1159,6 +1189,7 @@ impl DigiEngine for Js8Controller {
             clock_offset_s: self.clock.offset_s(),
             cw: None,
             wspr: None,
+            pi4: None,
             qso: None,
         }
     }
@@ -1575,6 +1606,23 @@ mod tests {
             assert_eq!(hb.call, "N0JDS", "{typed:?}");
             assert!(!hb.is_cq(), "{typed:?} came out as a CQ");
             assert_eq!(hb.grid().as_deref(), Some("FN42"), "{typed:?}");
+        }
+    }
+
+    /// The same for a CQ: there is no ` CQ` command either, so once the panel's
+    /// CQ chip composes instead of transmitting, a typed "CQ" would go out as
+    /// the two literal letters without this (issue #472).
+    #[test]
+    fn a_typed_cq_becomes_a_cq_frame() {
+        let mut c = Js8Controller::new(cfg(), 48_000.0);
+        for typed in ["@ALLCALL CQ", "CQ", "cq"] {
+            c.send_text(typed.into());
+            assert_eq!(c.tx_frames.len(), 1, "{typed:?}");
+            let cq =
+                Compound::unpack(&c.tx_frames[0].payload).unwrap_or_else(|| panic!("{typed:?}"));
+            assert_eq!(cq.call, "N0JDS", "{typed:?}");
+            assert!(cq.is_cq(), "{typed:?} did not come out as a CQ");
+            assert_eq!(cq.grid().as_deref(), Some("FN42"), "{typed:?}");
         }
     }
 

@@ -159,6 +159,7 @@ impl WefaxController {
             tx_even: false,
             transmitting: false,
             tx_watchdog: false,
+            tx_refused: None,
             transcript: Vec::<TranscriptLine>::new(),
             config: self.cfg.clone(),
             text_rx: String::new(),
@@ -168,6 +169,7 @@ impl WefaxController {
             rade: None,
             packet: None,
             navtex: None,
+            acars: None,
             aprs: None,
             js8: None,
             atchat: None,
@@ -176,6 +178,7 @@ impl WefaxController {
             clock_offset_s: None,
             cw: None,
             wspr: None,
+            pi4: None,
             qso: None,
         }
     }
@@ -311,6 +314,14 @@ impl DigiEngine for WefaxController {
 
     fn wefax_nudge(&mut self, pixels: i32) {
         self.rx.nudge_phase(pixels);
+        // Correct what has already arrived as well, so the chart the operator
+        // is looking at — and the PNG it becomes — moves as one picture rather
+        // than only from the nudge onwards (issue #439).
+        let w = self.width as usize;
+        if w > 0 {
+            let h = self.image.len() / w;
+            sdroxide_types::shift_fax_rows(&mut self.image, w, h, pixels);
+        }
         self.status_dirty = true;
     }
 }

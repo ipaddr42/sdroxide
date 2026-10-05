@@ -165,10 +165,17 @@ pub enum Backend {
     /// and a machine without it enumerates nothing and opening explains what
     /// to install. Appended last, for the same reason as `SmartSdr` above.
     Fobos,
+    /// A radio with no control port at all — a handheld, a walkie, a toy, a
+    /// USB dongle rig: receive comes in from one of the computer's sound
+    /// cards, transmit goes out another, and keying is the radio's own VOX
+    /// firing on the audio it hears at its mic line. Same audio machinery as a
+    /// demod-audio CAT rig, minus the serial. Appended last, for the same
+    /// reason as `SmartSdr` above.
+    UsbAudio,
 }
 
 impl Backend {
-    pub const ALL: [Backend; 22] = [
+    pub const ALL: [Backend; 23] = [
         Backend::Auto,
         Backend::Soapy,
         Backend::Cat,
@@ -191,6 +198,7 @@ impl Backend {
         Backend::Lime,
         Backend::HydraSdr,
         Backend::Fobos,
+        Backend::UsbAudio,
     ];
     pub fn label(self) -> &'static str {
         match self {
@@ -216,6 +224,7 @@ impl Backend {
             Backend::Lime => "LimeSDR + LimeRFE (LimeSuite)",
             Backend::HydraSdr => "HydraSDR RFOne (USB)",
             Backend::Fobos => "RigExpert Fobos SDR (USB)",
+            Backend::UsbAudio => "USB audio radio (sound card)",
             Backend::None => "Not configured",
         }
     }
@@ -407,10 +416,38 @@ pub enum CatFamily {
     /// Appended after [`CatFamily::QrpLabs`] for the reason [`CatFamily::Flrig`]
     /// gives.
     RsHfiq,
+    /// The (tr)uSDX — DL2MAN/PE1NNZ's pocket QRP transceiver, and the open
+    /// uSDX firmware it grew from.
+    ///
+    /// A fourth Kenwood dialect: the radio emulates a TS-480 and answers
+    /// `ID;` with `020`, but the subset is thin — dial, mode, PTT, RIT/XIT,
+    /// VOX and AF gain, and nothing else. No S-meter, no SWR, no power control,
+    /// no VFO B, no split, no keyer: every one of those reads earns a `?;`.
+    /// Driving it as a Kenwood is therefore not merely imprecise but noisy, so
+    /// it gets a profile that asks only what this firmware answers.
+    ///
+    /// What makes it a family rather than a Kenwood note is the audio. There is
+    /// **no sound card**: receive audio and transmit audio are 8-bit streams
+    /// carried *inside the CAT serial link*, switched on with the firmware's
+    /// own `UA` command. That framing — audio bytes running until a `;`, then a
+    /// CAT frame, then a `US` that resumes the stream — is unlike anything else
+    /// on this link, and no other family's driver could be asked to carry it.
+    ///
+    /// Two hardware facts shape the driver and are asserted rather than
+    /// configured. Opening the port may reset the radio (the CH340's DTR is
+    /// wired to it on the common board), and toggling DTR resets it again — so
+    /// DTR is pinned high for the whole session and offered as nothing at all.
+    /// And the radio ignores CAT while it is transmitting, so the poll must
+    /// stand down for the length of an over; a frame written into the stream
+    /// there is a splice in the transmitted audio, not a reading.
+    ///
+    /// Appended after [`CatFamily::RsHfiq`] for the reason [`CatFamily::Flrig`]
+    /// gives.
+    TrUsdx,
 }
 
 impl CatFamily {
-    pub const ALL: [CatFamily; 10] = [
+    pub const ALL: [CatFamily; 11] = [
         CatFamily::Xiegu,
         CatFamily::Icom,
         CatFamily::Yaesu,
@@ -419,6 +456,7 @@ impl CatFamily {
         CatFamily::Elad,
         CatFamily::QrpLabs,
         CatFamily::RsHfiq,
+        CatFamily::TrUsdx,
         CatFamily::Rigctld,
         CatFamily::Flrig,
     ];
@@ -438,6 +476,7 @@ impl CatFamily {
             CatFamily::Elad => "ELAD",
             CatFamily::QrpLabs => "QRP Labs",
             CatFamily::RsHfiq => "RS-HFIQ",
+            CatFamily::TrUsdx => "(tr)uSDX",
             CatFamily::Rigctld => "Hamlib rigctld (network)",
             CatFamily::Flrig => "flrig (network)",
         }
@@ -896,6 +935,45 @@ impl Default for SerialConfig {
     }
 }
 
+/// How a (tr)uSDX's audio reaches sdroxide.
+///
+/// The radio has no sound card of its own and two ways to be listened to, and
+/// which one is right is a fact about the operator's shack rather than about
+/// the radio: one is a single USB cable, the other a sound card on the 3.5 mm
+/// jack. So it is a setting, and this is it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum TrUsdxAudio {
+    /// Receive and transmit audio carried *inside* the CAT serial link as the
+    /// firmware's own 8-bit stream — one USB cable and nothing else.
+    ///
+    /// The catch is the firmware: it cannot take a CAT command while its stream
+    /// is running, so this mode sends no polls, and the radio's own dial and
+    /// mode are not followed.
+    #[default]
+    OneCable,
+    /// Audio from an external USB sound card wired to the radio's 3.5 mm
+    /// speaker/mic jack. Control still goes over the serial port, and the rig
+    /// is polled and behaves as any other CAT rig.
+    SoundCard,
+}
+
+impl TrUsdxAudio {
+    pub const ALL: [TrUsdxAudio; 2] = [TrUsdxAudio::OneCable, TrUsdxAudio::SoundCard];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            TrUsdxAudio::OneCable => "One cable (audio in the CAT stream)",
+            TrUsdxAudio::SoundCard => "USB sound card (3.5 mm jack)",
+        }
+    }
+
+    /// Whether this mode carries the audio in the CAT link, which the serial
+    /// thread and the source both branch on.
+    pub fn streams_audio(self) -> bool {
+        self == TrUsdxAudio::OneCable
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct CatConfig {
@@ -1082,6 +1160,10 @@ pub struct CatConfig {
     /// there it also puts the scope into centre mode so it follows the dial.
     #[serde(default)]
     pub scope_span: IcomScopeSpan,
+    /// How a (tr)uSDX's audio reaches this end — see [`TrUsdxAudio`]. Ignored
+    /// by every other family, which have no such choice to make.
+    #[serde(default)]
+    pub trusdx_audio: TrUsdxAudio,
 }
 
 /// The slowest CI-V link the scope sweeps fit down. A sweep is ~500 bytes of
@@ -1140,6 +1222,27 @@ pub const QMX_IQ_RATE_HZ: u32 = 48_000;
 /// selecting the family fills this in and `sdroxide_cat::spawn` pins it
 /// (issue #383).
 pub const RS_HFIQ_CAT_BAUD: u32 = 57_600;
+
+/// The rate a (tr)uSDX sends receive audio at, over its CAT link's own `US`
+/// stream, in samples per second.
+///
+/// The published figures disagree — DL2MAN's page says 7825, community drivers
+/// use 7820, and the firmware's own comment says 4812 — so this is the one
+/// number here that was *measured* rather than read: on the bench radio
+/// (firmware 2.x, CH340 board) 93 761 bytes arrived in 12.002 s, or 7812.3 B/s.
+/// The firmware computes the rate from a timer, so 7812.5 is the nominal value
+/// and the small deficit is the host's own read jitter.
+///
+/// The exact figure matters less than it looks: the samples are resampled to
+/// the engine's rate on the way in, and a rate off by a fraction of a percent
+/// is a fraction of a percent of pitch, not a broken link. It matters at all
+/// because the resampler needs a number, and the wrong one drifts.
+pub const TRUSDX_RX_RATE_HZ: u32 = 7812;
+
+/// The rate a (tr)uSDX takes transmit audio at, over the same link. Unlike the
+/// receive side the firmware gives this one plainly ("11520 Hz"), and the host
+/// paces the bytes out at it — the radio does not clock them.
+pub const TRUSDX_TX_RATE_HZ: u32 = 11_520;
 
 /// Whether a rig's I/Q is corrected unless the operator says otherwise. On:
 /// see [`CatConfig::iq_correction`].
@@ -1205,6 +1308,7 @@ impl Default for CatConfig {
             audio_bw_hz: 4000.0,
             scope: false,
             scope_span: IcomScopeSpan::default(),
+            trusdx_audio: TrUsdxAudio::default(),
         }
     }
 }
@@ -3557,26 +3661,38 @@ impl LimeDevice {
     /// enumeration on a machine with one plugged in offers a "Lime" device
     /// that is nothing of the kind. Opening it would flood the log with
     /// transfer errors and hand back a receiver that hears nothing.
-    pub const KNOWN_BOARDS: [&'static str; 8] = [
+    pub const KNOWN_BOARDS: [&'static str; 6] = [
         "LimeSDR-USB",
         "LimeSDR-Mini",
-        "LimeSDR-Mini_v2",
         "LimeNET-Micro",
         "LimeSDR-PCIe",
         "LimeSDR-QPCIe",
         "LimeSDR-Core",
-        "LimeSDR_Core",
     ];
+
+    /// One board name reduced to the spelling the allow-list is written in.
+    ///
+    /// LimeSuite punctuates the same board three ways — `LimeSDR-Mini`,
+    /// `LimeSDR_Core`, and, from 23.11, a bare space in `LimeSDR Mini` — so the
+    /// separator carries no meaning and is folded to one character before
+    /// anything is compared. Issue #508: a Mini on LimeSuite 23.11 enumerates
+    /// as `LimeSDR Mini, media=USB 3, module=FT601, …`, which the hyphenated
+    /// allow-list rejected as "not a Lime board", and the backend then reported
+    /// no LimeSDR present at all.
+    fn canonical_name(name: &str) -> String {
+        name.trim().to_ascii_lowercase().replace([' ', '_'], "-")
+    }
 
     /// Whether a device string names a board this backend recognises.
     ///
     /// Matched on a prefix and case-folded, because LimeSuite spells the same
     /// board differently across versions (`LimeSDR-USB` and `LimeSDR-USB_SP`
     /// are the same family) and the trailing variant is not worth a new entry
-    /// every time one appears.
+    /// every time one appears. `LimeSDR-Mini_v2` is covered by the `LimeSDR-Mini`
+    /// prefix for that reason, and needs no entry of its own.
     pub fn name_is_known(name: &str) -> bool {
-        let name = name.trim().to_ascii_lowercase();
-        Self::KNOWN_BOARDS.iter().any(|b| name.starts_with(&b.to_ascii_lowercase()))
+        let name = Self::canonical_name(name);
+        Self::KNOWN_BOARDS.iter().any(|b| name.starts_with(&Self::canonical_name(b)))
     }
 
     /// Whether `want` selects this board. Empty selects the first one found;
@@ -3621,8 +3737,11 @@ impl LimeDevice {
     /// `RX2_W`), one everywhere else. The Mini has a single chain; the
     /// LimeNET-Micro's LMS7002M has two but only one is wired to a connector.
     pub fn rx_channels(&self) -> usize {
-        let name = self.name.trim().to_ascii_lowercase();
-        let two = ["limesdr-usb", "limesdr-pcie", "limesdr-qpcie", "limesdr-core", "limesdr_core"];
+        // Through the same fold as the allow-list: a board spelled with a space
+        // is the same board, and reporting a `LimeSDR USB` as single-chain
+        // would hide its second front end from the picker.
+        let name = Self::canonical_name(&self.name);
+        let two = ["limesdr-usb", "limesdr-pcie", "limesdr-qpcie", "limesdr-core"];
         if two.iter().any(|b| name.starts_with(b)) { 2 } else { 1 }
     }
 
@@ -4169,6 +4288,34 @@ impl LimeConfig {
     /// [`Self::rate_note`].
     pub const SAMPLE_RATES: [f64; 9] =
         [1.0e6, 2.0e6, 2.5e6, 5.0e6, 10.0e6, 15.36e6, 20.0e6, 30.72e6, 40.0e6];
+
+    /// The lower rates a LimeSDR **Mini** also offers, and the reason they exist.
+    ///
+    /// The Mini's FT601 USB link cannot sustain 1 Msps on transmit — it
+    /// underruns, which is issue #609. Soapy runs the Mini at 100–750 ksps and
+    /// SDRconsole only transmits at 750 ksps for the same reason. These are the
+    /// rates that clear it, offered on the Mini only: the USB boards have no
+    /// need for them and the extra entries would only clutter their combo. The
+    /// full list follows, since the Mini still receives at those rates.
+    pub const MINI_SAMPLE_RATES: [f64; 13] = [
+        100_000.0, 250_000.0, 500_000.0, 750_000.0, 1.0e6, 2.0e6, 2.5e6, 5.0e6, 10.0e6, 15.36e6,
+        20.0e6, 30.72e6, 40.0e6,
+    ];
+
+    /// The rates the settings combo should offer for a board called `name`.
+    ///
+    /// The Mini gets [`Self::MINI_SAMPLE_RATES`]; every other board gets
+    /// [`Self::SAMPLE_RATES`]. Matched on the same folded name as
+    /// [`LimeDevice::rx_channels`], so a board spelled with a space or an
+    /// underscore is still recognised.
+    pub fn rates_for(name: &str) -> &'static [f64] {
+        let folded = name.trim().to_ascii_lowercase().replace([' ', '_'], "-");
+        if folded.starts_with("limesdr-mini") {
+            &Self::MINI_SAMPLE_RATES
+        } else {
+            &Self::SAMPLE_RATES
+        }
+    }
 
     /// What to say beside a rate in the combo, when there is something to say.
     ///
@@ -7274,6 +7421,18 @@ pub struct RadioConfig {
     /// exactly right: no row means no trim, and the radio transmits at the
     /// operator's Drive setting on every band as it always did.
     pub tx_drive_trim: Vec<BandDriveTrim>,
+    /// A hard ceiling on transmit drive that the operator sets once for this
+    /// radio, as a `0..1` fraction of full drive, or `None` for none. Appended
+    /// after `tx_drive_trim`, for the same reason as every field above it: the
+    /// layout is positional, so a new block goes on the end and nowhere else,
+    /// and `RadioConfig` rides `ServerMsg::RadioConfig` and
+    /// `Command::SetRadioConfig` whole (issue #504).
+    ///
+    /// `None` in a configuration written before this existed and `None` by
+    /// default, because a ceiling nobody asked for is a radio that quietly
+    /// refuses to make its rated power. See [`Self::tx_drive_ceiling`] for what
+    /// it is for and why it is not the band table.
+    pub tx_drive_max: Option<f32>,
 }
 
 impl RadioConfig {
@@ -7316,6 +7475,33 @@ impl RadioConfig {
         }
         let band = Band::containing(tx_dial_hz);
         self.tx_drive_trim.iter().find(|t| t.band == band).map(BandDriveTrim::db).unwrap_or(0.0)
+    }
+
+    /// The operator's own ceiling on transmit drive, held to `0..1`, or `None`
+    /// where they have set none (issue #504).
+    ///
+    /// Distinct from [`Self::drive_trim_db`], and the distinction is the whole
+    /// point of having both. The band table is a *calibration*: it trims the
+    /// Drive setting so one number means one output power across the bands, and
+    /// a calibrated band can still be driven to the top of the slider. This is
+    /// a *limit*: a number the Drive and TUNE controls cannot be taken past,
+    /// whatever the slider says and whatever the calibration does to it.
+    ///
+    /// What it is for is a transmitter whose full-scale baseband is far past
+    /// what its amplifier can take. On an HPSDR set the protocol's own drive
+    /// register is pinned at full scale and the I/Q amplitude *is* the drive,
+    /// so the top of the slider is the transmitter wide open: an ANAN-7000DLE
+    /// makes about 50 W at 15% and well over 200 W out of 100 W-rated finals a
+    /// little above that, with nothing between a slip of the mouse and a
+    /// destroyed PA. A ceiling set once puts the usable range back under the
+    /// whole travel of the control.
+    ///
+    /// A zero or a NaN in a hand-edited `radio.json` reads as no ceiling rather
+    /// than as a radio that cannot transmit: a configuration file is not a
+    /// sensible place to discover you have muted your own transmitter, and the
+    /// operator who wants no output turns the Drive control down.
+    pub fn tx_drive_ceiling(&self) -> Option<f32> {
+        self.tx_drive_max.filter(|c| c.is_finite() && *c > 0.0).map(|c| c.min(1.0))
     }
 
     /// The converter offset in force at `dial_hz`, read-only.
@@ -7472,13 +7658,16 @@ mod tests {
     /// disappears from the dialog instead of failing to build.
     #[test]
     fn every_cat_family_is_offered_and_labelled() {
-        assert_eq!(CatFamily::ALL.len(), 10);
+        assert_eq!(CatFamily::ALL.len(), 11);
         for f in CatFamily::ALL {
             assert!(!f.label().is_empty(), "{f:?}");
         }
         assert!(CatFamily::ALL.contains(&CatFamily::Elad));
         assert!(CatFamily::ALL.contains(&CatFamily::QrpLabs));
         assert!(CatFamily::ALL.contains(&CatFamily::RsHfiq));
+        assert!(CatFamily::ALL.contains(&CatFamily::TrUsdx));
+        // A (tr)uSDX serves its own serial port over USB, like a QMX.
+        assert!(!CatFamily::TrUsdx.is_network());
         // An RS-HFIQ's control link is a serial port on the board itself
         // (issue #383).
         assert!(!CatFamily::RsHfiq.is_network());
@@ -8579,6 +8768,35 @@ mod tests {
         assert_eq!(chains("LimeSDR-PCIe, media=PCIe"), 2);
         assert_eq!(chains("LimeSDR-Mini_v2, media=USB 3.0"), 1);
         assert_eq!(chains("LimeNET-Micro, media=USB 2.0"), 1);
+        // Spelled with a space, the way LimeSuite 23.11 writes it.
+        assert_eq!(chains("LimeSDR USB, media=USB 3.0"), 2);
+        assert_eq!(chains("LimeSDR Mini, media=USB 3"), 1);
+    }
+
+    /// However LimeSuite punctuates the board, it is the same board.
+    ///
+    /// Issue #508: the reported enumeration, verbatim from `LimeUtil --find` on
+    /// LimeSuite 23.11. The allow-list was hyphenated and matched on a prefix,
+    /// so a space-spelled Mini fell through to "not a Lime board, ignored" and
+    /// `LMS_Open` then said no LimeSDR was plugged in at all.
+    #[test]
+    fn a_board_is_known_however_its_name_is_punctuated() {
+        let known = |info: &str| LimeDevice::name_is_known(&LimeDevice::parse(info).name);
+        assert!(known("LimeSDR Mini, media=USB 3, module=FT601, serial=1D424CAEE0153C, index=0"));
+        assert!(known("LimeSDR-Mini, media=USB 3.0"));
+        assert!(known("LimeSDR-Mini_v2, media=USB 3.0"));
+        assert!(known("LimeSDR Mini v2, media=USB 3.0"));
+        assert!(known("LimeSDR-USB_SP, media=USB 3.0"));
+        assert!(known("LimeSDR_Core, media=PCIe"));
+        assert!(known("LimeNET Micro, media=USB 2.0"));
+
+        // And the reason the list is an allow-list: the bare Cypress FX3 id an
+        // unprogrammed RX-888 presents must still be turned away, whatever the
+        // fold does to the separators.
+        assert!(!known("Cypress USB BootLoader, media=USB 3.0"));
+        assert!(!known("Generic FX3, media=USB 3.0"));
+        assert!(!known("LimeRFE, media=USB"));
+        assert!(!known(""));
     }
 
     /// Which RX-888 panadapter widths the tuner's IF can actually fill.
@@ -8607,5 +8825,23 @@ mod tests {
         // below the tuner's own floor.
         assert_eq!(Rx888Config::vhf_crossover_hz(CLOCK), 64_800_000.0);
         assert_eq!(Rx888Config::vhf_crossover_hz(32_400_000.0), 24_000_000.0);
+    }
+
+    #[test]
+    fn the_mini_gets_lower_rates_because_its_usb_link_underruns() {
+        // Issue #609: the Mini's FT601 cannot sustain 1 Msps on transmit, so it
+        // gets a list that starts at 100 ksps. Every other board keeps the full
+        // list — the lower rates would only clutter their combo.
+        assert_eq!(LimeConfig::rates_for("LimeSDR-Mini"), &LimeConfig::MINI_SAMPLE_RATES);
+        assert_eq!(LimeConfig::rates_for("LimeSDR-Mini_v2"), &LimeConfig::MINI_SAMPLE_RATES);
+        // LimeSuite 23.11 spells the same board with a bare space.
+        assert_eq!(LimeConfig::rates_for("LimeSDR Mini"), &LimeConfig::MINI_SAMPLE_RATES);
+        // The low rates are added, not substituted: the Mini still receives wide.
+        assert!(LimeConfig::MINI_SAMPLE_RATES.ends_with(&LimeConfig::SAMPLE_RATES));
+        assert_eq!(LimeConfig::rates_for("LimeSDR-USB"), &LimeConfig::SAMPLE_RATES);
+        assert_eq!(LimeConfig::rates_for("LimeSDR-PCIe"), &LimeConfig::SAMPLE_RATES);
+        assert_eq!(LimeConfig::rates_for("LimeNET-Micro"), &LimeConfig::SAMPLE_RATES);
+        // An unknown board gets the safe full list rather than an empty one.
+        assert_eq!(LimeConfig::rates_for(""), &LimeConfig::SAMPLE_RATES);
     }
 }

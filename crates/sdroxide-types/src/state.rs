@@ -564,6 +564,23 @@ pub struct RadioState {
     /// position.
     #[serde(default)]
     pub rx_antenna: bool,
+    /// Why HD Radio cannot be decoded at this station, or `None` when it can.
+    ///
+    /// The decoder is `libnrsc5`, loaded at run time from the machine the
+    /// engine runs on rather than built in (issue #488), so whether the mode
+    /// works is that machine's answer — which is why it travels here, for a
+    /// remote client to grey the mode out and say why, rather than being
+    /// worked out wherever the UI happens to be. The sentence is written to be
+    /// shown as it is. Appended last: postcard numbers fields by position.
+    #[serde(default)]
+    pub hd_radio_unavailable: Option<String>,
+    /// The HFDL ground-network decoder: whether it runs, and which channel it
+    /// listens on. Live status (level, decode log) is [`crate::HfdlStatus`],
+    /// sent separately like [`crate::Qo100Status`] — this field is settings,
+    /// sent whole on every change like [`Self::qo100`]. Appended last:
+    /// postcard numbers fields by position.
+    #[serde(default)]
+    pub hfdl: crate::HfdlSettings,
 }
 
 impl Default for RadioState {
@@ -610,11 +627,25 @@ impl Default for RadioState {
             vdl2: crate::Vdl2Settings::default(),
             ais: crate::AisSettings::default(),
             rx_antenna: false,
+            // Available until the engine says otherwise: it is the one that
+            // knows, and it says so in the first state it sends.
+            hd_radio_unavailable: None,
+            hfdl: crate::HfdlSettings::default(),
         }
     }
 }
 
 impl RadioState {
+    /// Why `mode` cannot be used at this station, or `None` when it can — the
+    /// sentence a greyed-out mode shows. Only HD Radio can be missing today:
+    /// see [`Self::hd_radio_unavailable`].
+    pub fn mode_unavailable(&self, mode: Mode) -> Option<&str> {
+        match mode {
+            Mode::HdRadio => self.hd_radio_unavailable.as_deref(),
+            _ => None,
+        }
+    }
+
     /// Frequency of the currently active VFO.
     pub fn active_freq_hz(&self) -> f64 {
         match self.active_vfo {

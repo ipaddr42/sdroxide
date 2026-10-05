@@ -193,6 +193,61 @@ impl PropHeat {
     }
 }
 
+/// Cells across the whole world in the grey-line overlay. 1° is finer than the
+/// terminator's own blur — the twilight band is 16° wide — and the texture's
+/// LINEAR filtering smooths the edges between cells.
+const NIGHT_SHADE_W: usize = 360;
+const NIGHT_SHADE_H: usize = 180;
+
+/// The grey-line overlay for the flat maps: where the Sun is up, where it is
+/// down, and the twilight between.
+///
+/// One equirectangular texture, rebuilt only when the minute changes. The
+/// terminator moves about 0.25° of longitude a minute, a quarter of a cell, so
+/// a per-frame rebuild would upload pixels that differ by nothing. It is
+/// geography rather than data: drawn whether or not the propagation heat is on,
+/// and independent of it.
+#[derive(Default)]
+pub struct NightShade {
+    tex: Option<eframe::egui::TextureHandle>,
+    built_minute: Option<i64>,
+}
+
+impl NightShade {
+    /// The terminator texture for this instant, rebuilt at most once a minute.
+    pub fn texture(&mut self, ctx: &eframe::egui::Context, unix: i64) -> eframe::egui::TextureId {
+        let minute = unix.div_euclid(60);
+        if self.built_minute != Some(minute) || self.tex.is_none() {
+            let (w, h) = (NIGHT_SHADE_W, NIGHT_SHADE_H);
+            let rgba = sdroxide_solar::night_shade_rgba(w, h, minute * 60);
+            let px: Vec<eframe::egui::Color32> = rgba
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|&[r, g, b, a]| eframe::egui::Color32::from_rgba_unmultiplied(r, g, b, a))
+                .collect();
+            let img = eframe::egui::ColorImage {
+                size: [w, h],
+                pixels: px,
+                source_size: eframe::egui::vec2(w as f32, h as f32),
+            };
+            match self.tex.as_mut() {
+                // LINEAR is what keeps the 1° cells from showing as banding.
+                Some(t) => t.set(img, eframe::egui::TextureOptions::LINEAR),
+                None => {
+                    self.tex = Some(ctx.load_texture(
+                        "map-night",
+                        img,
+                        eframe::egui::TextureOptions::LINEAR,
+                    ))
+                }
+            }
+            self.built_minute = Some(minute);
+        }
+        self.tex.as_ref().map(|t| t.id()).expect("the texture was just built")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

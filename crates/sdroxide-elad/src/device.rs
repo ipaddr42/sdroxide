@@ -18,8 +18,9 @@ use sdroxide_types::EladConfig;
 
 use crate::error::{Error, Result};
 use crate::protocol::{
-    CAT_FRAME_LEN, Calibration, DuoSub, FRONT_END_ATTENUATOR, FRONT_END_FILTER, Model, Request,
-    STATUS_CAT_BUSY, eeprom, eeprom_f32, eeprom_i32, s2_front_end_code, tune_request, tuning_word,
+    CAT_FRAME_LEN, Calibration, DuoSub, DuoTuning, FRONT_END_ATTENUATOR, FRONT_END_FILTER, Model,
+    Request, STATUS_CAT_BUSY, TUNE_READ_LEN, decode_tune_read, eeprom, eeprom_f32, eeprom_i32,
+    s2_front_end_code, tune_request, tuning_word,
 };
 use crate::trace::Trace;
 use crate::usb::UsbDev;
@@ -366,6 +367,30 @@ impl Device {
             DuoSub::CatWrite.index(),
             &buf,
         )
+    }
+
+    /// What the radio says it is tuned to, or `None` on anything but a DUO.
+    ///
+    /// The FDM-DUO's receive window rides on its VFO, so the front-panel knob
+    /// moves the samples out from under us. With a CAT serial port there is a
+    /// report to read; with only the streaming cable there was nothing, and the
+    /// frequency axis quietly went stale by however far the operator turned —
+    /// the samples stayed good and every label on them was wrong. This is the
+    /// answer to that, on the interface the samples are already arriving on.
+    pub fn read_tuned(&self) -> Result<Option<DuoTuning>> {
+        if self.model != Model::Duo {
+            return Ok(None);
+        }
+        // Polled, so only a failure is traced — see `UsbDev::control_in_polled`.
+        // The stream thread notes the first answer itself.
+        let reply = self.usb.control_in_polled(
+            Request::DuoGateway,
+            "read tune",
+            0,
+            DuoSub::TuneRead.index(),
+            TUNE_READ_LEN,
+        )?;
+        Ok(decode_tune_read(&reply))
     }
 
     /// Block until the radio's CAT buffer has finished the previous command.

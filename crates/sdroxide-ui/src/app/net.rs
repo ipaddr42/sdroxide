@@ -229,6 +229,12 @@ impl SdroxideApp {
     /// sense of has to cost the import, not the application. Nothing touches
     /// the log until the parse has returned, so a failed one leaves it as it
     /// was.
+    ///
+    /// That backstop is native only. The browser build aborts on a panic, so
+    /// there is nothing for `catch_unwind` to catch and a parser panic takes
+    /// the page down with it — which is why the parser's own tests feed it
+    /// damaged documents (`adif_import_survives_a_truncated_document` and
+    /// `adif_import_survives_tags_that_are_not_tags`).
     pub(in crate::app) fn poll_adif_import(&mut self) {
         let loaded = self.adif_import_inbox.lock().ok().and_then(|mut g| g.take());
         let Some(loaded) = loaded else { return };
@@ -243,8 +249,9 @@ impl SdroxideApp {
             }
         };
         let text = loaded.text;
-        let parsed = catch_unwind(AssertUnwindSafe(|| sdroxide_types::adif_to_qso_log(&text)));
-        let Ok(records) = parsed else {
+        let parsed =
+            catch_unwind(AssertUnwindSafe(|| sdroxide_types::adif_to_qso_log_counting_swl(&text)));
+        let Ok((records, swl)) = parsed else {
             self.push_net_log("ADIF import failed: the file could not be parsed".to_string());
             return;
         };
@@ -288,8 +295,14 @@ impl SdroxideApp {
             Some(enc) => format!(" (not Unicode; read as {enc})"),
             None => String::new(),
         };
+        // A file of received reports — the decode list's own ADIF export —
+        // adds nothing, and saying why beats reporting an empty import.
+        let reports = match swl {
+            0 => String::new(),
+            n => format!(", {n} received reports (SWL) left out"),
+        };
         self.push_net_log(format!(
-            "ADIF import: {added} added, {skipped} duplicates skipped{assumed}"
+            "ADIF import: {added} added, {skipped} duplicates skipped{reports}{assumed}"
         ));
     }
 
@@ -301,6 +314,8 @@ impl SdroxideApp {
     /// Under [`catch_unwind`] for the reason the ADIF import is: this is the
     /// frame loop handing an operator-supplied file to a parser, and a file it
     /// cannot make sense of has to cost the import rather than the application.
+    /// Native only, as there: in the browser the parser must simply not panic
+    /// (`a_damaged_file_never_panics`).
     pub(in crate::app) fn poll_chirp_import(&mut self, cmds: &mut Vec<Command>) {
         let loaded = self.chirp_import_inbox.lock().ok().and_then(|mut g| g.take());
         let Some(loaded) = loaded else { return };

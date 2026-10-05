@@ -240,8 +240,6 @@ impl FontSize {
 /// control strip wrapped over three rows.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum LayoutMode {
-    #[default]
-    Auto,
     Desktop,
     Tablet,
     Phone,
@@ -254,6 +252,18 @@ pub enum LayoutMode {
     /// serialised into `config.toml` and inserting a variant would rename
     /// everyone else's.
     Small,
+    /// Picks one from the viewport size — the default, and where serde sends a
+    /// value this build has never heard of.
+    ///
+    /// Declared last for the same reason as [`FontSize::Medium`]: the catch-all
+    /// must be final. Without `#[serde(other)]` a `config.toml` written by a
+    /// build with a later layout — `Small` was the last one added — fails the
+    /// **whole** file, and `Settings::load` quarantines it: the radio, audio,
+    /// speech and alerts settings go with the one unknown value. Degrading to
+    /// `Auto` costs a layout, not a configuration.
+    #[default]
+    #[serde(other)]
+    Auto,
 }
 
 impl LayoutMode {
@@ -287,6 +297,37 @@ pub enum UiTheme {
     AmberPhosphor,
     TealOrange,
     Rainbow,
+    /// The Nordic palette: polar-night navy grounds, snow-storm text, frost
+    /// cyan accents and a purple chrome. Already a dark theme — NordDark is
+    /// its near-black echo.
+    Nord,
+    /// The same accents as [`UiTheme::Nord`] on near-black grounds, so the
+    /// panels sit almost in the page behind them.
+    NordDark,
+    /// The warm Gruvbox palette: parchment text on near-black browns, blue and
+    /// aqua accents, and the iconic bright-orange chrome.
+    Gruvbox,
+    /// The Everforest palette: green-tinged deep blues, soft cream text, and
+    /// mossy accent hues.
+    Everforest,
+    /// Ethan Schoonover's Solarized dark: teal, blue and magenta accents on
+    /// the deep blue-grey base03/base02 grounds.
+    SolarizedDark,
+    /// Solarized on paper: the same accents carried down until they read as
+    /// text on the pale base3 ground.
+    Solarized,
+    /// The Dracula palette: graphite mantles, mint-bright cyan, soft magenta
+    /// chrome.
+    Dracula,
+    /// Catppuccin Mocha, the dark flavour: a deep indigo base, sky-blue and
+    /// mauve accents.
+    CatppuccinMocha,
+    /// Catppuccin Latte, the light flavour: a cream base with teal and blue
+    /// accents taken down to where they read as text on it.
+    CatppuccinLatte,
+    /// A near-monochrome light theme: white panels, graphite lines and a
+    /// single restrained blue accent — the modern development-tool look.
+    ModernMinimalist,
     /// White panels, near-black ink, dark saturated accents — the one theme
     /// that inverts the ground. The instruments (panadapter, S-meter, map,
     /// solar globe) keep their dark glass: a waterfall has no bright-ground
@@ -307,7 +348,7 @@ pub enum UiTheme {
 }
 
 impl UiTheme {
-    pub const ALL: [UiTheme; 7] = [
+    pub const ALL: [UiTheme; 17] = [
         UiTheme::Default,
         UiTheme::Light,
         UiTheme::HighContrast,
@@ -315,6 +356,16 @@ impl UiTheme {
         UiTheme::AmberPhosphor,
         UiTheme::TealOrange,
         UiTheme::Rainbow,
+        UiTheme::Nord,
+        UiTheme::NordDark,
+        UiTheme::Gruvbox,
+        UiTheme::Everforest,
+        UiTheme::SolarizedDark,
+        UiTheme::Solarized,
+        UiTheme::Dracula,
+        UiTheme::CatppuccinMocha,
+        UiTheme::CatppuccinLatte,
+        UiTheme::ModernMinimalist,
     ];
 
     pub fn label(self) -> &'static str {
@@ -326,13 +377,17 @@ impl UiTheme {
             UiTheme::AmberPhosphor => "Amber phosphor",
             UiTheme::TealOrange => "Teal / orange",
             UiTheme::Rainbow => "Rainbow",
+            UiTheme::Nord => "Nord",
+            UiTheme::NordDark => "Nord dark",
+            UiTheme::Gruvbox => "Gruvbox",
+            UiTheme::Everforest => "Everforest",
+            UiTheme::SolarizedDark => "Solarized dark",
+            UiTheme::Solarized => "Solarized",
+            UiTheme::Dracula => "Dracula",
+            UiTheme::CatppuccinMocha => "Catppuccin mocha",
+            UiTheme::CatppuccinLatte => "Catppuccin latte",
+            UiTheme::ModernMinimalist => "Modern minimalist",
         }
-    }
-
-    /// True where the chrome sits on a bright ground, so anything that has to
-    /// pick an ink or a shade by hand knows which way round the world is.
-    pub fn is_light(self) -> bool {
-        matches!(self, UiTheme::Light)
     }
 }
 
@@ -437,6 +492,22 @@ impl SmeterStyle {
     }
 }
 
+/// Where the solar-system 3D window was: its inner size and, where the platform
+/// reports one, its outer position — both in egui points.
+///
+/// Kept so opening it — the first time after a restart, or again after it was
+/// closed — puts it back where the operator left it rather than at the built-in
+/// size. `pos` is `None` on Wayland, which gives a client no absolute window
+/// position; the size still comes back and the compositor places the window.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct Solar3dWindow {
+    /// Inner (drawing-area) size in points.
+    pub size: [f32; 2],
+    /// Outer (top-left, including decorations) position in points.
+    #[serde(default)]
+    pub pos: Option<[f32; 2]>,
+}
+
 /// User display preferences. All have defaults so a missing `[ui]` table loads.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -471,6 +542,17 @@ pub struct UiSettings {
     /// between sessions: an operator working one band works one channel
     /// spacing.
     pub tune_step_hz: f64,
+    /// Make a press of the step row land on the step's own grid — the next
+    /// multiple of the step in the direction pressed — instead of moving the
+    /// dial by exactly the step. A dial already on the grid moves by the step,
+    /// so only the first press from an untidy frequency differs.
+    ///
+    /// Off by default, and deliberately so: the step buttons move by exactly
+    /// the step, and a press that lands somewhere else is a second, invisible
+    /// edit — see `tune_step_row`. On, it is the touch-screen habit of tidying a
+    /// dial left anywhere before working down a band (issue #422). Only
+    /// meaningful with [`Self::tune_step_buttons`].
+    pub tune_step_round_first: bool,
     /// Whether the waterfall's history is drawn through a smoothing filter.
     ///
     /// On — the default, and what it has always done — each screen pixel is
@@ -602,6 +684,13 @@ pub struct UiSettings {
     /// operator's. The 3D globe is untouched — its cities are night-side lights
     /// rather than markers, and nothing is written across a contact there.
     pub map_cities: bool,
+    /// Where the solar-system 3D window last was — see [`Solar3dWindow`].
+    ///
+    /// Here rather than in the operator's view state because window geometry is
+    /// a property of this screen, not of the radio, and a remote client keeps
+    /// its own.
+    #[serde(default)]
+    pub solar3d_window: Option<Solar3dWindow>,
 }
 
 /// Default for [`UiSettings::spot_colors`] — every kind on its stock tint.
@@ -674,6 +763,7 @@ impl Default for UiSettings {
             // 1 kHz: the round step the operators who asked for this tune in,
             // on a band where the stations sit 3 kHz apart.
             tune_step_hz: 1_000.0,
+            tune_step_round_first: false,
             spectrum_detail: SpectrumDetail::Auto,
             spectrum_gradient: true,
             gradient_top: [64, 0, 0],   // dark red
@@ -700,6 +790,7 @@ impl Default for UiSettings {
             decode_cq_only: false,
             decode_new_only: false,
             map_cities: true,
+            solar3d_window: None,
         }
     }
 }
@@ -858,5 +949,30 @@ mod tune_step_tests {
             ui.tune_step_hz = hz;
             assert_eq!(ui.tune_step_label(), want);
         }
+    }
+}
+
+#[cfg(test)]
+mod serde_tests {
+    use super::*;
+
+    /// A layout value this build has never heard of costs that field, not the
+    /// whole `config.toml`. `Settings::load` quarantines the entire file on a
+    /// parse error, so before `#[serde(other)]` a config written by a build
+    /// that knew a later `LayoutMode` took the radio, audio and speech settings
+    /// down with the one unknown value (issue #469).
+    #[test]
+    fn an_unknown_layout_degrades_to_auto() {
+        let m: LayoutMode = serde_json::from_str("\"Holographic\"").unwrap();
+        assert_eq!(m, LayoutMode::Auto);
+        // The known ones still name themselves.
+        let d: LayoutMode = serde_json::from_str("\"Desktop\"").unwrap();
+        assert_eq!(d, LayoutMode::Desktop);
+        let s: LayoutMode = serde_json::from_str("\"Small\"").unwrap();
+        assert_eq!(s, LayoutMode::Small);
+        // And `ALL` — the picker's list — is unaffected by the declaration
+        // order: it is written out, not derived.
+        assert!(LayoutMode::ALL.contains(&LayoutMode::Auto));
+        assert_eq!(LayoutMode::ALL.len(), 5);
     }
 }

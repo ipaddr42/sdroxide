@@ -14,10 +14,12 @@
 //! - [`js8`], [`fsq`] — the two keyboard modes with their own message model
 //! - [`sstv`], [`wefax`], [`rf_paint`] — the image modes
 //! - [`wspr`] — the propagation beacon: receptions and the beacon's own cycle
+//! - [`pi4`] — the PI4 propagation beacon: receptions and the one-minute cycle
 //! - [`rade`] — FreeDV / RADE digital voice
 //! - [`setup`] — the digimode setup window the panels share
 //! - [`widgets`] — the row and station-card widgets several panels draw
 
+mod acars;
 pub(in crate::app) mod adsb;
 pub(in crate::app) mod ais;
 pub(in crate::app) mod aprs;
@@ -26,8 +28,10 @@ pub(in crate::app) mod cw;
 pub(in crate::app) mod decodes;
 pub(in crate::app) mod fsq;
 pub(in crate::app) mod js8;
+pub(in crate::app) mod macros;
 mod navtex;
 pub(in crate::app) mod packet;
+pub(in crate::app) mod pi4;
 pub(in crate::app) mod rade;
 pub(in crate::app) mod rf_paint;
 pub(in crate::app) mod setup;
@@ -38,10 +42,10 @@ pub(in crate::app) mod wefax;
 pub(in crate::app) mod widgets;
 pub(in crate::app) mod wspr;
 
-use eframe::egui::{self, RichText};
-use sdroxide_types::{Band, Command, Mode};
+use eframe::egui::{self, Color32, RichText};
+use sdroxide_types::{Band, Command, DigiStatus, Mode};
 
-use crate::app::SdroxideApp;
+use crate::app::{SdroxideApp, tx_gated};
 
 /// The waterfall's tab. Always last, and every mode has one: on a phone the
 /// panadapter is a view of its own rather than a strip above the panel, because
@@ -63,6 +67,9 @@ pub(in crate::app) fn panel_panes(mode: Mode) -> &'static [&'static str] {
         // is its own pane rather than sharing one, so a narrow screen can show
         // it whole instead of squeezing it under something else.
         Mode::Wspr => &["SPOTS", "MAP", "STATUS"],
+        // No MAP pane, unlike WSPR's: a PI4 message carries no grid square,
+        // so there is no path to place on a map.
+        Mode::Pi4 => &["SPOTS", "STATUS"],
         Mode::Fsq => &["HEARD", "TRAFFIC"],
         Mode::Sstv | Mode::SstvFm | Mode::Rifp => &["RECEIVE", "SEND"],
         // MONITOR is every frame heard on the channel, TERMINAL is the
@@ -87,12 +94,119 @@ pub(in crate::app) fn panel_panes(mode: Mode) -> &'static [&'static str] {
         // Two, for the reason ADS-B has two: a safety broadcast nobody answers,
         // and the only two questions about it are what is out there and where.
         Mode::Ais => &["VESSELS", "CHART"],
+        // Two, for the reason ADS-B has two: the decode log and the aircraft
+        // the network has located, which move independently.
+        Mode::Hfdl => &["DECODES", "MAP"],
         Mode::Wefax => &["CHART", "SAVED"],
         Mode::Navtex => &["MESSAGES", "READING"],
         Mode::RfPaint => &["TEXT", "IMAGE"],
+        // The decode list alone: the QSO pane is FT8's sequencer, which a
+        // receive-only MSK144 build has nothing to put in.
+        Mode::Msk144 => &["DECODES"],
+        // The decode list alone: the QSO pane is FT8's sequencer, which a
+        // receive-only JT65/JT9 build has nothing to put in.
+        Mode::Jt65 | Mode::Jt9 => &["DECODES"],
+        // The decode list alone: the QSO pane is FT8's sequencer, which a
+        // receive-only FST4 build has nothing to put in.
+        Mode::Fst4 => &["DECODES"],
+        // The decode list alone: the QSO pane is FT8's sequencer, which a
+        // receive-only Q65 build has nothing to put in.
+        Mode::Q65 => &["DECODES"],
+        // The decode list alone: the QSO pane is FT8's sequencer, and FSK441
+        // keys from its own message box rather than a slot sequencer.
+        Mode::Fsk441 => &["DECODES"],
         // The keyboard modes and RADE are one column already: receive above,
         // what you are sending below it.
         _ => &["PANEL"],
+    }
+}
+
+/// Which propagation source a mode's own decodes are filed under, or `None`
+/// for a mode whose decodes are not evidence of an ionospheric path.
+///
+/// Every slotted HF mode's decodes are observations of a path; which mode they
+/// came from only changes the decode floor they are measured against, so each
+/// keeps its own source. Meteor scatter and moonbounce are not skip at all,
+/// and a meteor ping or an echo off the Moon filed here would paint a band as
+/// open that is not.
+pub(in crate::app) fn prop_source_for(mode: Mode) -> Option<sdroxide_types::PropSource> {
+    match mode {
+        Mode::Ft8 => Some(sdroxide_types::PropSource::Ft8),
+        Mode::Ft4 => Some(sdroxide_types::PropSource::Ft4),
+        Mode::Ft2 => Some(sdroxide_types::PropSource::Ft2),
+        Mode::Js8 => Some(sdroxide_types::PropSource::Js8),
+        _ => None,
+    }
+}
+
+/// A **SAVE** chip for a log a panel holds outside [`sdroxide_types::DigiStatus`]
+/// — HFDL, VDL2, WSPR, PI4 and the skimmer. `text` is built only on click, so a
+/// long log costs nothing until the operator asks for it (issue #533).
+pub(in crate::app) fn save_text_chip(
+    ui: &mut egui::Ui,
+    ready: bool,
+    name: &str,
+    hover: &str,
+    text: impl FnOnce() -> String,
+) {
+    let resp = save_chip(ui, ready, hover);
+    if resp.clicked() {
+        crate::download::save(name, text().as_bytes());
+    }
+}
+
+/// The **SAVE** chip itself, drawn the same wherever it appears; the two
+/// callers differ only in what they do when it is clicked. One place, so the
+/// chip cannot drift between a panel that holds its log in `DigiStatus` and one
+/// that holds it beside the status (issue #533).
+fn save_chip(ui: &mut egui::Ui, ready: bool, hover: &str) -> egui::Response {
+    let resp = crate::chrome::chip_accent_enabled(
+        ui,
+        ready,
+        false,
+        " SAVE ",
+        Some(10.5),
+        crate::theme::CYAN(),
+        crate::theme::INK_ON_CYAN(),
+    );
+    if ready {
+        resp.on_hover_text(hover)
+    } else {
+        resp.on_disabled_hover_text("Nothing decoded to save")
+    }
+}
+
+/// [`SdroxideApp::clear_rx_chip_enabled`] for a header row drawn by a free
+/// function, which has the commands but not the app.
+pub(in crate::app) fn clear_rx_chip_at(ui: &mut egui::Ui, cmds: &mut Vec<Command>, enabled: bool) {
+    let resp = crate::chrome::chip_accent_enabled(
+        ui,
+        enabled,
+        false,
+        " CLEAR RX ",
+        Some(10.5),
+        crate::theme::CYAN(),
+        crate::theme::INK_ON_CYAN(),
+    );
+    let resp = if enabled {
+        resp.on_hover_text("Empty the receive window. Nothing that is on the air stops.")
+    } else {
+        resp.on_disabled_hover_text("Nothing received to clear")
+    };
+    if resp.clicked() {
+        cmds.push(Command::DigiClearRx);
+    }
+}
+
+/// [`SdroxideApp::save_rx_chip`] for a header row drawn by a free function:
+/// `status` is the app's `digi_status`.
+pub(in crate::app) fn save_rx_chip_for(ui: &mut egui::Ui, status: Option<&DigiStatus>) {
+    let ready = status.is_some_and(crate::app::save_text::digi_has_log);
+    let resp = save_chip(ui, ready, "Save what this panel has decoded to a file");
+    if resp.clicked()
+        && let Some((name, text)) = status.and_then(crate::app::save_text::digi_log)
+    {
+        crate::download::save(&name, text.as_bytes());
     }
 }
 
@@ -123,18 +237,10 @@ impl SdroxideApp {
         if !my_grid.trim().is_empty() {
             self.prop.set_home(&my_grid);
 
-            // Every slotted mode's decodes are observations of a path; which
-            // mode they came from only changes the decode floor they are
-            // measured against.
-            let mode = self.state.rx[0].mode;
-            let src = match mode {
-                Mode::Ft8 => Some(sdroxide_types::PropSource::Ft8),
-                Mode::Ft4 => Some(sdroxide_types::PropSource::Ft4),
-                Mode::Ft2 => Some(sdroxide_types::PropSource::Ft2),
-                Mode::Js8 => Some(sdroxide_types::PropSource::Js8),
-                _ => None,
-            };
-            if let Some(src) = src {
+            // The rolling decode list again. Each batch was folded as it
+            // arrived (see `frame.rs`); the store keys what it has seen, so
+            // this adds only what a source switched on since then had missed.
+            if let Some(src) = prop_source_for(self.state.rx[0].mode) {
                 let decodes = std::mem::take(&mut self.digi_decodes);
                 self.prop.observe_decodes(&decodes, src, dial_hz, &my_grid, now);
                 self.digi_decodes = decodes;
@@ -166,6 +272,17 @@ impl SdroxideApp {
         self.prop_heat.texture(ctx, &field, heat_mode, band, u32::MAX).map(|t| t.id())
     }
 
+    /// The grey-line overlay for the flat map, when it is switched on — night
+    /// and twilight from the same Sun the band-conditions table is taken at.
+    /// `None` when the operator has it off; the texture itself is rebuilt at
+    /// most once a minute (see [`crate::prop_map::NightShade`]).
+    pub(in crate::app) fn night_texture(
+        &mut self,
+        ctx: &egui::Context,
+    ) -> Option<eframe::egui::TextureId> {
+        self.view.map_night.then(|| self.night_shade.texture(ctx, crate::time::now_unix()))
+    }
+
     /// The chip row that turns the flat map's propagation heat on and picks
     /// what it shows. Drawn just above the map by every panel that has one.
     pub(in crate::app) fn prop_map_controls(&mut self, ui: &mut egui::Ui) {
@@ -185,6 +302,18 @@ impl SdroxideApp {
                  switched on under Settings → Spots — what the world's skimmers are \
                  hearing, which covers the bands this radio is not on.",
             );
+            // The grey line, independent of the heat — it stays useful with PROP
+            // off, so it sits above the early return.
+            if crate::chrome::chip(ui, self.view.map_night, RichText::new("NIGHT").size(9.5))
+                .on_hover_text(
+                    "Shade where the Sun is down, and the twilight between, so the grey line \
+                     shows on the map. Low bands go long and high bands close on the night side \
+                     of it, and the terminator itself is where the DX is.",
+                )
+                .clicked()
+            {
+                self.view.map_night = !self.view.map_night;
+            }
             if !on {
                 return;
             }
@@ -512,6 +641,8 @@ impl SdroxideApp {
         // the panel prints the band from it, so a hopping beacon's multi-band
         // list is right as it stands.
         self.wspr_spots.clear();
+        // Same reasoning as the WSPR list just above.
+        self.pi4_spots.clear();
         // The read-along stream anchors on the buffer it was last reading; a
         // new mode fills that buffer with something unrelated, and without a
         // re-anchor the first snapshot after the change would be read out from
@@ -541,6 +672,7 @@ impl SdroxideApp {
     /// purpose.
     pub(in crate::app) fn clear_digi_band_rx(&mut self) {
         self.digi_decodes.clear();
+        self.digi_decode_dials.clear();
         self.digi_stations = Default::default();
         self.digi_preview = None;
         // The Hell raster is a continuous strip with no frame boundary, so
@@ -695,12 +827,31 @@ impl SdroxideApp {
     /// box's CLEAR — one throws away what was received, the other stops what is
     /// being sent, and confusing the two mid-over is expensive.
     pub(in crate::app) fn clear_rx_chip(&self, ui: &mut egui::Ui, cmds: &mut Vec<Command>) {
-        if crate::chrome::chip(ui, false, RichText::new(" CLEAR RX ").size(10.5))
-            .on_hover_text("Empty the receive window. Nothing that is on the air stops.")
-            .clicked()
-        {
-            cmds.push(Command::DigiClearRx);
-        }
+        self.clear_rx_chip_enabled(ui, cmds, true);
+    }
+
+    /// [`Self::clear_rx_chip`], but greyed out when there is nothing to clear.
+    ///
+    /// JS8's composer disables it on an empty conversation (issue #473); the
+    /// other panels have no cheap "is there anything" test and keep it live.
+    pub(in crate::app) fn clear_rx_chip_enabled(
+        &self,
+        ui: &mut egui::Ui,
+        cmds: &mut Vec<Command>,
+        enabled: bool,
+    ) {
+        clear_rx_chip_at(ui, cmds, enabled);
+    }
+
+    /// A **SAVE** chip that writes the current mode's decoded log to a file.
+    ///
+    /// Beside [`Self::clear_rx_chip`] everywhere that is used, because the two
+    /// are a panel's "keep it" and "bin it". What is written is
+    /// [`crate::app::save_text::digi_log`]'s answer for the mode, so a mode with
+    /// nothing decoded yet greys the chip rather than opening an empty file
+    /// (issue #533).
+    pub(in crate::app) fn save_rx_chip(&self, ui: &mut egui::Ui) {
+        save_rx_chip_for(ui, self.digi_status.as_ref());
     }
 
     /// Commit the transmit box: hand the whole buffer over and start the over.
@@ -974,8 +1125,141 @@ impl SdroxideApp {
                     .map_or(sdroxide_types::Js8Speed::default(), |j| j.speed)
                     .slot_timing(),
             ),
+            // FST4's clock is its period, which is a config field the mode
+            // cannot see — the same shape as JS8's speed, answered from the
+            // editor config the panel just wrote.
+            Mode::Fst4 => Some(self.digi_cfg_edit.fst4_period.slot_timing()),
+            // Q65's clock is its sub-mode, which is a config field the mode
+            // cannot see — the same shape as JS8's speed, answered from the
+            // editor config the panel just wrote.
+            Mode::Q65 => Some(self.digi_cfg_edit.q65_mode.slot_timing()),
+            // FSK441's clock is its period, which is a config field the mode
+            // cannot see — the same shape as JS8's speed, answered from the
+            // editor config the panel just wrote.
+            Mode::Fsk441 => Some(self.digi_cfg_edit.fsk441_period.slot_timing()),
             _ => mode.slot_timing(),
         }
+    }
+
+    /// The FSK441 panel: the period chip row, the slot clock, the decode list
+    /// and the transmit row.
+    ///
+    /// An FSK441 decode is an ordinary [`sdroxide_types::Decode`], so the list
+    /// is the one the FT8 modes share — but with no QSO controls, since a
+    /// meteor-scatter exchange this build does not sequence has no station to
+    /// answer and nothing to queue.
+    pub(in crate::app) fn fsk441_panel(&mut self, ui: &mut egui::Ui, cmds: &mut Vec<Command>) {
+        // FSK441's T/R period is the one thing about it an operator chooses,
+        // and it decides the slot length the ping search runs over — so it gets
+        // a chip row, exactly as JS8's speed does.
+        ui.horizontal_wrapped(|ui| {
+            ui.label(RichText::new("FSK441").size(11.0).strong().color(crate::theme::CYAN()));
+            ui.label(RichText::new("period").size(10.0).weak());
+            for p in sdroxide_types::Fsk441Period::ALL {
+                let on = self.digi_cfg_edit.fsk441_period == p;
+                if crate::chrome::chip(ui, on, RichText::new(p.label()).size(10.5))
+                    .on_hover_text(format!("{}-second T/R period", p.label()))
+                    .clicked()
+                    && !on
+                {
+                    self.digi_cfg_edit.fsk441_period = p;
+                    if self.digi_cfg_seeded {
+                        cmds.push(Command::SetDigiConfig(self.digi_cfg_edit.clone()));
+                    }
+                }
+            }
+        });
+        ui.add_space(4.0);
+        self.slot_progress(ui);
+        ui.add_space(4.0);
+        // The decode list's scroll area takes every point it is given, so the
+        // transmit row is laid out first, up from the bottom edge, and the list
+        // gets what is left above it — as `qso_area` does for FT8's controls.
+        ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
+            self.fsk441_tx_row(ui, cmds);
+            ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
+                self.decode_list(ui, cmds);
+            });
+        });
+    }
+
+    /// FSK441's transmit row, under its decode list.
+    ///
+    /// The mode keeps the decode list — a meteor ping lands there and the
+    /// operator wants to read it — so transmit is a single line beneath it:
+    /// the message, a key, and CQ. The message loops for as long as the key is
+    /// held, which is how FSK441 is worked on the air.
+    ///
+    /// Called inside a bottom-up layout, so the rows are added bottom first.
+    fn fsk441_tx_row(&mut self, ui: &mut egui::Ui, cmds: &mut Vec<Command>) {
+        let tx_on = self.digi_status.as_ref().is_some_and(|s| s.transmitting);
+        // Armed with an empty box: the key was refused, and saying so is the
+        // difference between "nothing happened" and "there is nothing to send".
+        let refused = self.digi_status.as_ref().and_then(|s| s.tx_refused.clone());
+        let tx_ok = self.tx_capable();
+        ui.label(
+            RichText::new(
+                "The message repeats for as long as transmit is held — a meteor catches \
+                 whatever part of it is passing.",
+            )
+            .size(9.5)
+            .color(crate::theme::CYAN_DIM()),
+        );
+        ui.horizontal_wrapped(|ui| {
+            ui.label(RichText::new("TX").size(10.5).strong().color(crate::theme::CYAN()));
+            let field = ui.add(
+                egui::TextEdit::singleline(&mut self.text_tx)
+                    .desired_width(260.0)
+                    .hint_text("W1ABC W9XYZ FN42"),
+            );
+            if field.changed() {
+                cmds.push(Command::DigiTxText(self.text_tx.clone()));
+            }
+            let label = if tx_on { "  TX ON  " } else { "   TX   " };
+            if tx_gated(ui, tx_ok, |ui| {
+                crate::chrome::chip_accent(
+                    ui,
+                    tx_on,
+                    RichText::new(label).size(13.0).strong(),
+                    crate::theme::ALERT(),
+                    Color32::WHITE,
+                )
+            })
+            .clicked()
+            {
+                // The box may not have been committed yet; hand the current text
+                // over on the key, or the over starts with nothing to send.
+                cmds.push(Command::DigiTxText(self.text_tx.clone()));
+                cmds.push(Command::DigiTxActive(!tx_on));
+            }
+            if tx_gated(ui, tx_ok, |ui| {
+                crate::chrome::chip_accent(
+                    ui,
+                    false,
+                    RichText::new(" CALL CQ ").size(12.0).strong(),
+                    crate::theme::GREEN(),
+                    crate::theme::INK_ON_CYAN(),
+                )
+            })
+            .clicked()
+            {
+                let call = if self.digi_cfg_edit.my_call.is_empty() {
+                    "NOCALL".into()
+                } else {
+                    self.digi_cfg_edit.my_call.clone()
+                };
+                let cq = format!("CQ CQ CQ DE {call} {call} {call} PSE K");
+                cmds.push(Command::DigiAbortTx);
+                self.text_tx = cq.clone();
+                cmds.push(Command::DigiTxText(cq));
+                cmds.push(Command::DigiTxActive(true));
+            }
+        });
+        if let Some(why) = refused {
+            ui.label(RichText::new(why).size(10.0).color(crate::theme::ALERT()));
+        }
+        ui.separator();
+        ui.add_space(4.0);
     }
 
     /// The slot length of the current mode, in seconds.
@@ -1029,11 +1313,174 @@ impl SdroxideApp {
             }
         ));
     }
+
+    /// The MSK144 panel: the slot clock and the decode list, and nothing else.
+    ///
+    /// An MSK144 decode is an ordinary [`sdroxide_types::Decode`], so the list
+    /// is the one the FT8 modes share. What is missing is the QSO area — a
+    /// meteor-scatter exchange is a timed handshake this build does not
+    /// sequence (it is receive-only), so the sequencer, the transmit pane and
+    /// the call queue have nothing to drive.
+    pub(in crate::app) fn msk144_panel(&mut self, ui: &mut egui::Ui, cmds: &mut Vec<Command>) {
+        self.slot_progress(ui);
+        ui.add_space(4.0);
+        self.decode_list(ui, cmds);
+    }
+
+    /// The JT65/JT9 panel: the slot clock and the decode list, and nothing
+    /// else.
+    ///
+    /// A JT decode is an ordinary [`sdroxide_types::Decode`], so the list is
+    /// the one the FT8 modes share. What is missing is the QSO area — a JT
+    /// exchange is a minutes-long handshake this build does not sequence (it
+    /// is receive-only), so the sequencer, the transmit pane and the call
+    /// queue have nothing to drive.
+    pub(in crate::app) fn jt_panel(&mut self, ui: &mut egui::Ui, cmds: &mut Vec<Command>) {
+        self.slot_progress(ui);
+        ui.add_space(4.0);
+        self.decode_list(ui, cmds);
+    }
+
+    /// The FST4 panel: the period chip row, the slot clock and the decode
+    /// list, and nothing else.
+    ///
+    /// FST4's T/R period is the one thing about it an operator chooses, and it
+    /// decides both the slot length and the decode — so it gets a chip row,
+    /// exactly as JS8's speed does. The slot bar below reads from the chosen
+    /// period. An FST4 decode is an ordinary [`sdroxide_types::Decode`], so
+    /// the list is the one the FT8 modes share; what is missing is the QSO
+    /// area, because this build does not sequence an FST4 exchange.
+    pub(in crate::app) fn fst4_panel(&mut self, ui: &mut egui::Ui, cmds: &mut Vec<Command>) {
+        ui.horizontal_wrapped(|ui| {
+            ui.label(RichText::new("FST4").size(11.0).strong().color(crate::theme::CYAN()));
+            ui.label(RichText::new("period").size(10.0).weak());
+            for p in sdroxide_types::Fst4Period::ALL {
+                let on = self.digi_cfg_edit.fst4_period == p;
+                if crate::chrome::chip(ui, on, RichText::new(p.label()).size(10.5))
+                    .on_hover_text(format!("{}-second T/R period", p.label()))
+                    .clicked()
+                    && !on
+                {
+                    self.digi_cfg_edit.fst4_period = p;
+                    if self.digi_cfg_seeded {
+                        cmds.push(Command::SetDigiConfig(self.digi_cfg_edit.clone()));
+                    }
+                }
+            }
+        });
+        ui.add_space(4.0);
+        self.slot_progress(ui);
+        ui.add_space(4.0);
+        self.decode_list(ui, cmds);
+    }
+
+    /// The Q65 panel: the sub-mode chip row, the slot clock and the decode
+    /// list, and nothing else.
+    ///
+    /// Q65's sub-mode is the one thing about it an operator chooses, and it
+    /// fixes the period, the tone spacing and the decode — so it gets a chip
+    /// row, exactly as FST4's period does. The slot bar below reads from the
+    /// chosen sub-mode. A Q65 decode is an ordinary
+    /// [`sdroxide_types::Decode`], so the list is the one the FT8 modes share;
+    /// what is missing is the QSO area, because this build does not sequence a
+    /// Q65 exchange.
+    pub(in crate::app) fn q65_panel(&mut self, ui: &mut egui::Ui, cmds: &mut Vec<Command>) {
+        ui.horizontal_wrapped(|ui| {
+            ui.label(RichText::new("Q65").size(11.0).strong().color(crate::theme::CYAN()));
+            ui.label(RichText::new("sub-mode").size(10.0).weak());
+            for m in sdroxide_types::Q65Mode::ALL {
+                let on = self.digi_cfg_edit.q65_mode == m;
+                if crate::chrome::chip(ui, on, RichText::new(m.label()).size(10.5))
+                    .on_hover_text(format!(
+                        "{:.0}-second T/R period, {:.1} s burst",
+                        m.slot_s(),
+                        m.burst_s()
+                    ))
+                    .clicked()
+                    && !on
+                {
+                    self.digi_cfg_edit.q65_mode = m;
+                    if self.digi_cfg_seeded {
+                        cmds.push(Command::SetDigiConfig(self.digi_cfg_edit.clone()));
+                    }
+                }
+            }
+        });
+        ui.add_space(4.0);
+        self.slot_progress(ui);
+        ui.add_space(4.0);
+        self.decode_list(ui, cmds);
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The header rows that carry SAVE, on the narrowest phones in their
+    /// widest state — a busy channel, bad frames, a repaired/lost count — stay
+    /// on the screen: a row too long for one line takes a second rather than
+    /// pushing its last chips off the edge. Those were packet's ⚙ SETUP,
+    /// NAVTEX's REV and ACARS's SAVE itself, where no finger can reach them.
+    #[test]
+    fn the_save_rows_stay_on_a_phone_screen() {
+        use sdroxide_types::{AcarsStatus, DigiConfig, NavtexStatus, PacketBaud, PacketStatus};
+        let tier = crate::layout::Tier::Phone;
+        let acars = AcarsStatus { level: 1.0, frames: 123_456, bad: 9_999, ..Default::default() };
+        let navtex =
+            NavtexStatus { in_sync: false, repaired: 9_999, lost: 999, ..Default::default() };
+        let packet = PacketStatus {
+            baud: PacketBaud::Vhf1200,
+            dcd: true,
+            bad_frames: 99_999,
+            ..Default::default()
+        };
+        let mut status = DigiStatus::idle(DigiConfig::default());
+        status.text_rx = "something to save".into();
+        let mut off_screen = Vec::new();
+        for w in [360.0f32, 393.0] {
+            let ctx = egui::Context::default();
+            crate::theme::apply(&ctx);
+            crate::layout::set_tier(&ctx, tier);
+            crate::theme::apply_metrics(&ctx, tier);
+            let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(w, 800.0));
+            let mut rows: Vec<(&str, egui::Rect)> = Vec::new();
+            let mut cmds = Vec::new();
+            ctx.run_ui(egui::RawInput { screen_rect: Some(screen), ..Default::default() }, |ui| {
+                let s = Some(&status);
+                let r = ui.scope(|ui| acars::acars_header(ui, &acars, s, &mut cmds));
+                rows.push(("ACARS", r.response.rect));
+                let r = ui.scope(|ui| navtex::navtex_list_header(ui, &navtex, s, true));
+                rows.push(("NAVTEX", r.response.rect));
+                let r =
+                    ui.scope(|ui| packet::packet_monitor_header(ui, &packet, s, true, &mut cmds));
+                rows.push(("packet", r.response.rect));
+            })
+            .drop_without_applying_deltas();
+            for (name, r) in rows {
+                if r.right() > w + 0.5 {
+                    off_screen
+                        .push(format!("{w} pt phone: the {name} header runs to {}", r.right()));
+                }
+            }
+        }
+        assert!(off_screen.is_empty(), "{off_screen:#?}");
+    }
+
+    /// This station's decodes are filed under their own mode — FT4 is not
+    /// FT8, and filing it as FT8 counted it twice — and meteor scatter and
+    /// moonbounce not at all: a ping or an echo is not a band that is open.
+    #[test]
+    fn own_decodes_file_under_their_own_mode_and_never_meteor_or_moon() {
+        use sdroxide_types::PropSource;
+        assert_eq!(prop_source_for(Mode::Ft8), Some(PropSource::Ft8));
+        assert_eq!(prop_source_for(Mode::Ft4), Some(PropSource::Ft4));
+        assert_eq!(prop_source_for(Mode::Ft2), Some(PropSource::Ft2));
+        assert_eq!(prop_source_for(Mode::Js8), Some(PropSource::Js8));
+        for m in [Mode::Msk144, Mode::Fsk441, Mode::Jt65, Mode::Q65] {
+            assert_eq!(prop_source_for(m), None, "{m:?}");
+        }
+    }
 
     /// The waterfall is the tab one past the mode's own panes — that is how
     /// `App::ui` tells "show the panadapter" from "show the panel", so a mode

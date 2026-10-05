@@ -59,7 +59,9 @@ const COLUMNS: &[&str] = &[
 /// *modulation*, not the traffic.
 fn mode_name(m: Mode) -> &'static str {
     match m {
-        Mode::Wfm => "WFM",
+        // HD Radio is the digital sidecar of a broadcast FM station, and a
+        // handheld with the channel stored hears that station in WFM.
+        Mode::Wfm | Mode::HdRadio => "WFM",
         Mode::Am | Mode::Sam => "AM",
         Mode::Lsb | Mode::Digl => "LSB",
         Mode::Cw => "CW",
@@ -467,6 +469,12 @@ Location,Name,Frequency,Duplex,Offset,Tone,rToneFreq,cToneFreq,DtcsCode,DtcsPola
 
     /// What sdroxide writes, CHIRP's reader — and this one — must be able to
     /// read back unchanged.
+    /// HD Radio is stored as the FM broadcast it rides on, not as a sideband.
+    #[test]
+    fn an_hd_radio_channel_exports_as_broadcast_fm() {
+        assert_eq!(mode_name(Mode::HdRadio), "WFM");
+    }
+
     #[test]
     fn the_writer_and_the_reader_agree() {
         let (before, _) = chirp_csv_to_memories(SAMPLE);
@@ -476,6 +484,31 @@ Location,Name,Frequency,Duplex,Offset,Tone,rToneFreq,cToneFreq,DtcsCode,DtcsPola
         for (a, b) in after.iter().zip(&before) {
             assert_eq!((a.name.as_str(), a.freq_hz, a.mode), (b.name.as_str(), b.freq_hz, b.mode));
             assert_eq!(a.repeater, b.repeater, "{}", a.name);
+        }
+    }
+
+    /// The parser has to survive whatever file it is handed, not merely report
+    /// it: the native import catches a panic and costs only the import, but in
+    /// the browser a panic aborts the whole page, so there the parser itself is
+    /// the only guard. Every prefix of a real export — a line cut anywhere,
+    /// inside a quote or a number — and a handful of files that are not CHIRP
+    /// at all.
+    #[test]
+    fn a_damaged_file_never_panics() {
+        for end in 0..=SAMPLE.len() {
+            if SAMPLE.is_char_boundary(end) {
+                let _ = chirp_csv_to_memories(&SAMPLE[..end]);
+            }
+        }
+        for junk in [
+            "Name,Frequency\n\"unterminated,145.5\n",
+            "Name,Frequency,Duplex,Offset\nX,1e308,+,1e308\n",
+            "Name,Frequency,Duplex,Offset\nX,-145.5,-,-99999999999\n",
+            "Name,Frequency,Tone,rToneFreq,DtcsCode\nX,145.5,DTCS,NaN,99999999999999999999\n",
+            "Frequency\n,,,,,,,,,,,,\n\"\"\"\n",
+            "\u{feff}Name,Frequency\nÄ€\u{0},145.5\n",
+        ] {
+            let _ = chirp_csv_to_memories(junk);
         }
     }
 }

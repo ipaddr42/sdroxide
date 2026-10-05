@@ -193,6 +193,14 @@ pub struct QsoMachine {
     /// whatever the sequencer had planned, then the exchange carries on from
     /// where it was.
     manual: Option<String>,
+    /// A **sign-off** step the operator picked by hand — RR73 or 73, from the
+    /// Tx buttons — while the exchange was still short of it. The whole point of
+    /// picking it is to *close the contact now* rather than wait for the DX to
+    /// send the report that would earn the sign-off naturally, and the DX
+    /// repeating that report must not drag us back to R+report: they are asking
+    /// for the message we have decided not to send. Held until the contact ends
+    /// or the operator picks something else.
+    manual_signoff: Option<QsoStep>,
     /// Callsigns, and the DXCC entities they were in, worked this session —
     /// what makes one answer to our CQ worth more than another.
     worked_calls: std::collections::HashSet<String>,
@@ -240,6 +248,7 @@ impl QsoMachine {
             resend: false,
             logged: false,
             manual: None,
+            manual_signoff: None,
             worked_calls: std::collections::HashSet::new(),
             worked_entities: std::collections::HashSet::new(),
             progress_utc: 0,
@@ -381,6 +390,7 @@ impl QsoMachine {
         self.resend = false;
         self.logged = false;
         self.manual = None;
+        self.manual_signoff = None;
         self.operator_acted();
         self.step = QsoStep::CallingCq;
     }
@@ -398,6 +408,11 @@ impl QsoMachine {
             return true;
         }
         self.manual = None;
+        // A sign-off picked by hand is a *decision to close the contact*: the
+        // DX repeating the report that was not answered must not move us back
+        // to answering it. Any other pick releases that hold — the operator is
+        // steering the exchange again rather than ending it.
+        self.manual_signoff = matches!(step, QsoStep::TxRr73 | QsoStep::Tx73).then_some(step);
         self.operator_acted();
         self.step = step;
         true
@@ -439,6 +454,7 @@ impl QsoMachine {
         self.resend = false;
         self.logged = false;
         self.manual = None;
+        self.manual_signoff = None;
         self.operator_acted();
         // Working them now settles whatever the queue had them down for.
         self.queue.retain(|q| !q.call.eq_ignore_ascii_case(&from));
@@ -484,6 +500,7 @@ impl QsoMachine {
     pub fn stop(&mut self) {
         self.step = QsoStep::Idle;
         self.manual = None;
+        self.manual_signoff = None;
     }
 
     /// Hard reset.
@@ -491,6 +508,7 @@ impl QsoMachine {
         self.step = QsoStep::Idle;
         self.dx = None;
         self.manual = None;
+        self.manual_signoff = None;
         self.logged = false;
         self.watchdog = false;
     }
@@ -528,6 +546,7 @@ impl QsoMachine {
         if limit > 0 && !self.watchdog && self.wants_tx() && now_utc - self.progress_utc >= limit {
             self.watchdog = true;
             self.manual = None;
+            self.manual_signoff = None;
             self.step = QsoStep::Idle;
             self.transcript.push(TranscriptLine::note(format!(
                 "transmit watchdog: {} minutes with no progress",
@@ -854,6 +873,15 @@ impl QsoMachine {
             self.set_rcvd(*r);
         }
         self.set_exch_rcvd(payload);
+        // The operator picked the sign-off by hand to close a QSO that was
+        // dragging on. What the DX sends next is exactly the message we have
+        // decided not to answer — a report, or the R+report we already sent —
+        // and `reply_step` would read it as "we owe R+report" and put us back
+        // there, every slot. Their report is still recorded above; the exchange
+        // simply does not move until the sign-off has gone out.
+        if self.manual_signoff.is_some() {
+            return false;
+        }
         let prev = self.step;
         match payload {
             // Free text, a bare call, anything the packer mangled: it says
@@ -974,6 +1002,10 @@ impl QsoMachine {
         }
         self.logged = true;
         self.step = QsoStep::Confirming;
+        // The contact is closed, so the sign-off hold has done its job: leaving
+        // it set would refuse to answer anything for the *next* contact the
+        // operator opens with the same DX still on the machine.
+        self.manual_signoff = None;
         self.deadline_utc = now_utc + CONFIRM_S;
         self.resend = false;
     }
@@ -1204,6 +1236,7 @@ impl QsoMachine {
             tx_even: self.tx_even,
             transmitting,
             tx_watchdog: self.watchdog,
+            tx_refused: None,
             transcript: self.transcript.clone(),
             config: self.cfg.clone(),
             // FT8/FT4 don't use the continuous keyboard-text fields.
@@ -1214,6 +1247,7 @@ impl QsoMachine {
             rade: None,
             packet: None,
             navtex: None,
+            acars: None,
             aprs: None,
             js8: None,
             atchat: None,
@@ -1222,6 +1256,7 @@ impl QsoMachine {
             clock_offset_s: None,
             cw: None,
             wspr: None,
+            pi4: None,
             qso: self.dx.as_ref().map(|d| sdroxide_types::QsoLive {
                 started_utc: d.started_utc,
                 rpt_sent: d.rpt_sent,
@@ -1676,6 +1711,45 @@ mod tests {
         // Calling CQ needs no DX.
         assert!(q.set_step(QsoStep::CallingCq));
         assert_eq!(q.plan_tx().as_deref(), Some("CQ AB1CD FN42"));
+    }
+
+    /// Picking **RR73** or **73** mid-exchange closes the contact *now* — the
+    /// operator's way out of a QSO that is dragging on. The DX repeating the
+    /// report we have decided not to answer must not drag us back to R+report:
+    /// that is the whole reason the sign-off was picked by hand.
+    #[test]
+    fn a_hand_picked_sign_off_survives_the_dx_repeating_their_report() {
+        let mut q = QsoMachine::new(Mode::Ft8, cfg());
+        q.start_qso("W9XYZ".into(), Some("EM48".into()), -10, false, 100);
+        q.on_rx(&[decode("AB1CD W9XYZ -13")], 115);
+        assert_eq!(q.step(), QsoStep::TxRReport, "settled into R+report");
+        // The operator has had enough and picks 73 to close it.
+        assert!(q.set_step(QsoStep::Tx73));
+        // The DX sends their report again while we are about to send 73 — the
+        // exact message that used to put us back on TxRReport.
+        q.on_rx(&[decode("AB1CD W9XYZ -13")], 130);
+        assert_eq!(q.step(), QsoStep::Tx73, "the sign-off the operator picked still stands");
+        assert_eq!(q.plan_tx().as_deref(), Some("W9XYZ AB1CD 73"));
+        // Sending it logs the contact and ends the exchange as usual.
+        q.note_tx_sent(145);
+        assert_eq!(q.step(), QsoStep::Confirming);
+        assert!(q.take_completed().is_some());
+    }
+
+    /// The hold is released by picking any other step: steering the exchange
+    /// again is not the same as ending it.
+    #[test]
+    fn picking_another_step_releases_the_sign_off_hold() {
+        let mut q = QsoMachine::new(Mode::Ft8, cfg());
+        q.start_qso("W9XYZ".into(), Some("EM48".into()), -10, false, 100);
+        q.on_rx(&[decode("AB1CD W9XYZ -13")], 115);
+        q.set_step(QsoStep::Tx73);
+        // Back to answering them: their next message moves us as it always did.
+        // An RR73 is one that *moves* the step — a report would leave us on
+        // R+report held or not, and prove nothing.
+        q.set_step(QsoStep::TxRReport);
+        q.on_rx(&[decode("AB1CD W9XYZ RR73")], 130);
+        assert_eq!(q.step(), QsoStep::Tx73, "the released hold let their RR73 move the exchange");
     }
 
     #[test]

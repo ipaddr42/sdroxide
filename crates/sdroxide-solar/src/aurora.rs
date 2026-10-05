@@ -317,6 +317,21 @@ pub fn upcoming(points: &[KpPoint], now: i64, horizon_s: i64) -> impl Iterator<I
     points.iter().filter(move |p| p.unix + 10_800 > now && p.unix <= now + horizon_s)
 }
 
+/// The observed bins covering the last `horizon_s` seconds, oldest first.
+///
+/// The other half of the series the same product carries: `upcoming` is what
+/// is predicted, this is what was measured, and a trend chart needs both. Only
+/// observed bins are returned — the forecast half is [`upcoming`]'s — so the
+/// two never overlap in the middle.
+pub fn recent(points: &[KpPoint], now: i64, horizon_s: i64) -> impl Iterator<Item = &KpPoint> {
+    // The bin containing `now` has not finished, so it belongs to the forecast
+    // half ([`upcoming`]); requiring the bin to have *ended* is what keeps the
+    // two from both showing it.
+    points.iter().filter(move |p| {
+        !p.predicted && p.unix + 10_800 <= now && p.unix + 10_800 > now - horizon_s
+    })
+}
+
 /// The worst bin in the next `horizon_s` seconds.
 pub fn peak_forecast(points: &[KpPoint], now: i64, horizon_s: i64) -> Option<&KpPoint> {
     upcoming(points, now, horizon_s).max_by(|a, b| a.kp.total_cmp(&b.kp))
@@ -523,6 +538,24 @@ mod tests {
         // Nothing ahead is not an error.
         assert_eq!(peak_forecast(&points, 2_000_000, 24 * 3600), None);
         assert_eq!(peak_forecast(&[], now, 24 * 3600), None);
+    }
+
+    #[test]
+    fn recent_returns_observed_history_oldest_first() {
+        let points = [
+            KpPoint { unix: 1_000_000, kp: 2.0, predicted: false },
+            KpPoint { unix: 1_010_800, kp: 3.0, predicted: false },
+            KpPoint { unix: 1_021_600, kp: 4.0, predicted: false },
+            KpPoint { unix: 1_032_400, kp: 5.0, predicted: true },
+        ];
+        let now = 1_025_000;
+        let seen: Vec<i64> = recent(&points, now, 24 * 3600).map(|p| p.unix).collect();
+        // The in-progress bin (1_021_600) belongs to `upcoming`, not here; the
+        // predicted bin is never history.
+        assert_eq!(seen, vec![1_000_000, 1_010_800]);
+        // The two halves meet without overlapping: no bin in both.
+        let ahead: Vec<i64> = upcoming(&points, now, 24 * 3600).map(|p| p.unix).collect();
+        assert!(seen.iter().all(|u| !ahead.contains(u)), "a bin is in both halves");
     }
 
     #[test]

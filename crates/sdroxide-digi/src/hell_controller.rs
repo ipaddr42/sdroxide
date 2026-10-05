@@ -135,6 +135,7 @@ impl HellController {
             tx_even: false,
             transmitting: self.keyed,
             tx_watchdog: false,
+            tx_refused: None,
             transcript: Vec::<TranscriptLine>::new(),
             config: self.cfg.clone(),
             // Deliberately empty: Hell is read by eye, not decoded.
@@ -145,6 +146,7 @@ impl HellController {
             rade: None,
             packet: None,
             navtex: None,
+            acars: None,
             aprs: None,
             js8: None,
             atchat: None,
@@ -153,6 +155,7 @@ impl HellController {
             clock_offset_s: None,
             cw: None,
             wspr: None,
+            pi4: None,
             qso: None,
         }
     }

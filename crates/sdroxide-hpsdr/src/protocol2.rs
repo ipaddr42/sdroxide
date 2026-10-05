@@ -1,10 +1,34 @@
 //! OpenHPSDR Protocol 2 ("new protocol") wire format: constants and pure
 //! packet builders/parsers.
 //!
-//! Byte offsets follow the g0orx/rustyHPSDR reference and the N4MTT
-//! "openhpsdr-e" Wireshark dissector. They are cross-checked but should be
-//! verified field-by-field against the TAPR Protocol 2 documentation before
-//! trusting on-air behavior; see the notes on individual builders.
+//! Byte offsets originally came from the g0orx/rustyHPSDR reference and the
+//! N4MTT "openhpsdr-e" Wireshark dissector. Every field in this file was then
+//! audited against `dl1ycf/pihpsdr` — `src/new_protocol.c` and `src/alex.h` for
+//! what the host writes, and `src/newhpsdrsim.c`, which is the *radio* side and
+//! therefore says what each byte is read back as. That is the reference to
+//! reach for: it is more precise than the PDF spec and it is what the boards
+//! are tested against.
+//!
+//! What the audit found, all of it silent — well-formed packets a board
+//! accepts and acts on wrongly, never an error:
+//!
+//! - The transmit stream is fed at **192 kHz**, not Protocol 1's 48 kHz
+//!   ([`crate::TX_RATE_HZ_P2`], issue #440). Starving it four to one leaves a
+//!   carrier untouched and chops speech to pieces.
+//! - The open-collector byte is **1401**, not 1400 ([`HP_OC`], issue #438).
+//!   1400 is a real neighbouring field, so the word was accepted and switched
+//!   nothing.
+//! - The **Alex control words** (1428/1432) were never sent, so a board with an
+//!   internal filter chain was told to release every relay — no transmit path,
+//!   no antenna, no filter. See [`alex_words`].
+//! - The two-ADC boards were recognised by a name **no board ever reports**, so
+//!   a Saturn or ANAN-7000 was told in its General packet that it had one Alex
+//!   chain.
+//! - The DUC command declared **zero DACs** ([`duc_command_packet`]).
+//!
+//! Cross-checked but still not hardware-verified here: the DDC frequency
+//! stride, the Alex bit assignments, and everything the notes on individual
+//! builders call out.
 
 use std::net::{IpAddr, SocketAddr, UdpSocket};
 use std::sync::Arc;
@@ -155,9 +179,22 @@ pub fn ddc_command_packet(seq: u32, rate_khz: u16, ddcs: &[u8]) -> [u8; DDC_COMM
 }
 
 /// Build the DUC command packet (dest port 1026). Minimal linear-SSB config.
+///
+/// Byte 4 is the number of DACs the host is driving, and it is **one**. It used
+/// to be left at zero, which declares a transmitter that does not exist; the
+/// boards this crate has met transmit anyway, but piHPSDR and rustyHPSDR both
+/// state it and a firmware that believes the field has no reason to.
+///
+/// Bytes 14..=16 are the DUC sample rate (kHz, big-endian) and the sample
+/// width in bits. They stay zero on purpose: the reference implementations
+/// leave them zero too, with piHPSDR's source noting that they *should* be 192
+/// and 24 — the gateware fixes both, and the field is vestigial. That is also
+/// the one place in Protocol 2 where 192 kHz is written down; the rate itself
+/// is not optional, and [`crate::TX_RATE_HZ_P2`] is where it is honoured.
 pub fn duc_command_packet(seq: u32) -> [u8; DUC_COMMAND_LEN] {
     let mut b = [0u8; DUC_COMMAND_LEN];
     put_u32_be(&mut b, 0, seq);
+    b[4] = 1; // one DAC
     b[5] = 0x00; // mode flags (no CW/keyer)
     b[50] = 0x00; // mic config
     b[51] = 0x00; // line-in / DUC gain
@@ -169,10 +206,204 @@ pub fn duc_command_packet(seq: u32) -> [u8; DUC_COMMAND_LEN] {
 ///
 /// Same convention as Protocol 1's C2 (`protocol1::config_cc`): the seven
 /// outputs occupy bits 7..1 with bit 0 unused, so the word is written shifted
-/// up by one. Offset and shift are from piHPSDR's `new_protocol.c`, which
-/// writes `band->OCtx`/`OCrx << 1` here, and from the N4MTT dissector; like
-/// every other offset in this file they are **not** hardware-verified.
-const HP_OC: usize = 1400;
+/// up by one. The offset is piHPSDR's `new_protocol.c`
+/// (`high_priority_buffer_to_radio[1401] = band->OCtx/OCrx << 1`), which
+/// deskHPSDR and hpsdr-rs both match; **1401, confirmed on air** by an
+/// Odyssey 2 (issue #438).
+///
+/// It used to say 1400, which is [`HP_OC_ANAN7000`] — a byte the boards that
+/// read it use for something else entirely. The word went out on every
+/// high-priority packet and the real open-collector field stayed zero, so a
+/// Protocol 2 station's filter board, antenna relays and band decoder never
+/// switched and nothing anywhere reported an error. That is the failure mode
+/// of an off-by-one into a *defined* neighbouring field: it is silent.
+const HP_OC: usize = 1401;
+
+/// The byte before [`HP_OC`]: on an ANAN-7000 / G2 (Saturn) it carries the
+/// XVTR-out relay (bit 0) and the built-in speaker-amplifier mute (bit 1), and
+/// on every other board it is reserved. sdroxide drives neither, so it stays
+/// zero — named here only so the next reader can see at a glance that 1400 is
+/// a real field and not spare room, which is why writing the OC word into it
+/// switched nothing instead of failing.
+#[allow(dead_code)]
+const HP_OC_ANAN7000: usize = 1400;
+
+/// The two 32-bit Alex control words in the high-priority packet, and the bytes
+/// they occupy. `alex0` drives the first filter chain (and the transmitter's
+/// relays), `alex1` the second — which only an ANAN-7000/8000 or ANAN-G2 has.
+///
+/// Both are big-endian, and `alex1` sits *before* `alex0` in the packet. That
+/// is not a mistake in the layout: it is the layout.
+const HP_ALEX1: usize = 1428;
+const HP_ALEX0: usize = 1432;
+
+/// Alex control bits, from piHPSDR's `alex.h`. Only the ones this crate can
+/// decide from a frequency and a key state are here; the antenna-jack routing
+/// (EXT1/EXT2/XVTR-in), the board's own step attenuators and the PureSignal
+/// feedback tap all need settings the HPSDR backend does not yet carry.
+mod alex {
+    /// Route the transmitter to ANT1. Always one of ANT1/2/3, never none: a
+    /// board that is told nothing routes its transmitter nowhere.
+    pub const TX_ANTENNA_1: u32 = 0x0100_0000; // bit 24
+    /// The T/R relay itself.
+    pub const TX_RELAY: u32 = 0x0800_0000; // bit 27
+
+    // Transmit low-pass filters, by band.
+    pub const LPF_30_20: u32 = 0x0010_0000; // bit 20
+    pub const LPF_60_40: u32 = 0x0020_0000; // bit 21
+    pub const LPF_80: u32 = 0x0040_0000; // bit 22
+    pub const LPF_160: u32 = 0x0080_0000; // bit 23
+    pub const LPF_6_BYPASS: u32 = 0x2000_0000; // bit 29
+    pub const LPF_12_10: u32 = 0x4000_0000; // bit 30
+    pub const LPF_17_15: u32 = 0x8000_0000; // bit 31
+
+    // Receive high-pass filters (ANAN-100/200-class first ADC).
+    pub const HPF_13MHZ: u32 = 0x0000_0002; // bit 1
+    pub const HPF_20MHZ: u32 = 0x0000_0004; // bit 2
+    pub const PREAMP_6M: u32 = 0x0000_0008; // bit 3: 35 MHz HPF + LNA
+    pub const HPF_9_5MHZ: u32 = 0x0000_0010; // bit 4
+    pub const HPF_6_5MHZ: u32 = 0x0000_0020; // bit 5
+    pub const HPF_1_5MHZ: u32 = 0x0000_0040; // bit 6
+    pub const HPF_BYPASS: u32 = 0x0000_1000; // bit 12
+
+    // Receive band-pass filters (ANAN-7000/8000 and ANAN-G2), valid in both
+    // words. Same bit numbers as the high-pass set above, different filters —
+    // which is exactly why the board class has to be known before either is
+    // written.
+    pub const BPF_20_15: u32 = 0x0000_0002; // bit 1: 11.0–22.0 MHz
+    pub const BPF_12_10: u32 = 0x0000_0004; // bit 2: 22.0–35.6 MHz
+    pub const BPF_6_PRE: u32 = 0x0000_0008; // bit 3: above 35.6 MHz, with preamp
+    pub const BPF_40_30: u32 = 0x0000_0010; // bit 4: 5.5–10.9 MHz
+    pub const BPF_80_60: u32 = 0x0000_0020; // bit 5: 2.1–5.4 MHz
+    pub const BPF_160: u32 = 0x0000_0040; // bit 6: 1.5–2.0 MHz
+    pub const BPF_BYPASS: u32 = 0x0000_1000; // bit 12
+
+    /// Ground the second ADC's input while transmitting (`alex1` only).
+    pub const RX2_GND_ON_TX: u32 = 0x0000_0100; // bit 8
+}
+
+/// Which internal filter chain a board carries, which decides what the Alex
+/// words mean — the receive bits are laid out one way on an ANAN-100/200 and
+/// another on an ANAN-7000/8000, using the same bit numbers for different
+/// filters.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum AlexClass {
+    /// ANAN-100/200 and everything else: one chain, receive high-pass filters,
+    /// and a receive path that runs through the *transmit* low-pass filters —
+    /// so while receiving, those follow the receive frequency.
+    Classic,
+    /// ANAN-7000/8000 (Orion 2) and ANAN-G2 (Saturn): two chains, receive
+    /// band-pass filters, and a receive path that bypasses the transmit
+    /// low-pass filters.
+    Orion2,
+}
+
+/// The transmit low-pass filter for `hz`.
+fn lpf_bit(hz: f64) -> u32 {
+    match hz {
+        h if h > 35_600_000.0 => alex::LPF_6_BYPASS,
+        h if h > 24_000_000.0 => alex::LPF_12_10,
+        h if h > 16_500_000.0 => alex::LPF_17_15,
+        h if h > 8_000_000.0 => alex::LPF_30_20,
+        h if h > 5_000_000.0 => alex::LPF_60_40,
+        h if h > 2_500_000.0 => alex::LPF_80,
+        _ => alex::LPF_160,
+    }
+}
+
+/// The receive high-pass filter for `hz` on an ANAN-100/200-class board.
+fn hpf_bit(hz: f64) -> u32 {
+    match hz {
+        h if h < 1_800_000.0 => alex::HPF_BYPASS,
+        h if h < 6_500_000.0 => alex::HPF_1_5MHZ,
+        h if h < 9_500_000.0 => alex::HPF_6_5MHZ,
+        h if h < 13_000_000.0 => alex::HPF_9_5MHZ,
+        h if h < 20_000_000.0 => alex::HPF_13MHZ,
+        h if h < 50_000_000.0 => alex::HPF_20MHZ,
+        _ => alex::PREAMP_6M,
+    }
+}
+
+/// The receive band-pass filter for `hz` on an ANAN-7000/8000 or ANAN-G2.
+/// `0.0` means "nothing to receive on this chain", which is the bypass.
+fn bpf_bit(hz: f64) -> u32 {
+    match hz {
+        h if h < 1_500_000.0 => alex::BPF_BYPASS,
+        h if h < 2_100_000.0 => alex::BPF_160,
+        h if h < 5_500_000.0 => alex::BPF_80_60,
+        h if h < 11_000_000.0 => alex::BPF_40_30,
+        h if h < 22_000_000.0 => alex::BPF_20_15,
+        h if h < 35_000_000.0 => alex::BPF_12_10,
+        _ => alex::BPF_6_PRE,
+    }
+}
+
+/// The two Alex control words for a board of `class` receiving on `rx_hz`,
+/// transmitting on `tx_hz`, keyed or not.
+///
+/// **Both frequencies are the radio's own**, never the operator's dial: this
+/// switches filters and relays *inside* the radio, so with a transverter in
+/// front it is the 28 MHz I.F. that has to be filtered, not the 144 MHz on the
+/// air. That is the opposite of the open-collector word next door, which drives
+/// an external decoder and does follow the dial (issue #278) — two fields, one
+/// packet, and deliberately different answers.
+///
+/// Protocol 2 has no equivalent of Protocol 1's "let the gateware pick the
+/// filters" mode: on Protocol 2 the host states them or they are not stated,
+/// and an all-zero word is a board with every relay released — no transmit
+/// path, no antenna, no filter. sdroxide sent exactly that until this audit.
+///
+/// The "Jan 2023 protocol update" is why `alex1` carries the transmit bits even
+/// while receiving: the upper half of `alex1` is the *would-be transmit* state,
+/// which the firmware needs in advance of the key-down it may have to service
+/// itself.
+///
+/// Not hardware-verified — there is no ANAN here. The bits and the band edges
+/// are piHPSDR's `new_protocol.c` and `alex.h`, transcribed.
+pub fn alex_words(class: AlexClass, rx_hz: f64, tx_hz: f64, ptt: bool) -> (u32, u32) {
+    let mut alex0 = 0u32;
+    let mut alex1 = 0u32;
+
+    // The T/R relay: asserted in `alex0` for the over itself, and standing in
+    // `alex1` so the firmware knows where a transmission would go.
+    if ptt {
+        alex0 |= alex::TX_RELAY;
+    }
+    alex1 |= alex::TX_RELAY;
+
+    // Receive filters. On the two-chain boards the second chain has no receiver
+    // of its own here — sdroxide drives one ADC — so it is bypassed, and
+    // grounded for the length of an over.
+    match class {
+        AlexClass::Classic => alex0 |= hpf_bit(rx_hz),
+        AlexClass::Orion2 => {
+            alex0 |= bpf_bit(rx_hz);
+            alex1 |= alex::BPF_BYPASS;
+            if ptt {
+                alex1 |= alex::RX2_GND_ON_TX;
+            }
+        }
+    }
+
+    // Transmit low-pass filters. `alex1` always follows the transmit frequency.
+    // `alex0` follows it too while keyed; while receiving it follows the
+    // *receive* frequency on a classic board, because there the received signal
+    // comes back through these same filters — set them for the transmitter and
+    // a receiver on another band goes deaf.
+    alex1 |= lpf_bit(tx_hz);
+    alex0 |= match class {
+        AlexClass::Classic if !ptt => lpf_bit(rx_hz),
+        _ => lpf_bit(tx_hz),
+    };
+
+    // ANT1. There is no antenna selection in the HPSDR backend yet, and "none"
+    // is not a safe default: a board told no antenna routes the transmitter
+    // nowhere. ANT1 is the jack every board in the family has.
+    alex0 |= alex::TX_ANTENNA_1;
+    alex1 |= alex::TX_ANTENNA_1;
+
+    (alex0, alex1)
+}
 
 /// Build the High-Priority command packet (dest port 1027): the run bit, RX/TX
 /// NCO frequencies, PTT/MOX, drive level (0..=255) and the open-collector
@@ -180,9 +411,9 @@ const HP_OC: usize = 1400;
 ///
 /// Offsets: DDC-*n* RX NCO @ `buf[9 + 4n .. 13 + 4n]` (the spec's frequency
 /// table, 4 bytes per DDC), TX DUC0 NCO @ `buf[329..333]`, drive @ `buf[345]`,
-/// open collectors @ `buf[1400]` (see [`HP_OC`]), run/MOX flags @ `buf[4]` —
-/// canonical P2 values; DDC0's offset is hardware-verified, the stride is per
-/// the TAPR layout.
+/// open collectors @ `buf[1401]` (see [`HP_OC`]), run/MOX flags @ `buf[4]` —
+/// canonical P2 values; DDC0's offset and the OC byte are hardware-verified,
+/// the DDC stride is per the TAPR layout.
 ///
 /// `run` is bit 0 of byte 4 and is the *only* thing that starts and stops the
 /// radio's streams. Sending this packet with it clear is how a session ends —
@@ -197,6 +428,11 @@ const HP_OC: usize = 1400;
 /// (bit 0 = output 1), and is zero on a station that has configured no filter
 /// board — which is what every Protocol 2 radio sent before issue #296,
 /// because nothing on this path wrote the byte at all.
+///
+/// `alex` is the pair from [`alex_words`]: the board's *internal* filter chain
+/// and T/R relay, which is a different thing from `oc` and follows a different
+/// frequency. Bytes 1442 and 1443 — the two ADCs' step attenuators — stay zero,
+/// which is no attenuation; nothing in this backend commands them yet.
 pub fn high_priority_packet(
     seq: u32,
     rx_phases: &[u32; MAX_DDCS as usize],
@@ -205,6 +441,7 @@ pub fn high_priority_packet(
     ptt: bool,
     drive: u8,
     oc: u8,
+    alex: (u32, u32),
 ) -> [u8; HIGH_PRIORITY_LEN] {
     let mut b = [0u8; HIGH_PRIORITY_LEN];
     put_u32_be(&mut b, 0, seq);
@@ -215,6 +452,8 @@ pub fn high_priority_packet(
     put_u32_be(&mut b, 329, tx_phase); // DUC0 TX NCO
     b[345] = drive; // TX drive level 0..255
     b[HP_OC] = (oc & 0x7F) << 1; // open-collector outputs 1..7
+    put_u32_be(&mut b, HP_ALEX1, alex.1); // second filter chain — before the first
+    put_u32_be(&mut b, HP_ALEX0, alex.0);
     b
 }
 
@@ -309,9 +548,16 @@ pub(crate) fn run(ctx: ThreadCtx) {
         band_dial: None,
         last_kick: None,
         kick_logged: false,
-        // The two-ADC boards drive a second Alex chain; the rest have one.
-        // Same test piHPSDR makes, and it is a board fact, not a setting.
-        alex_both: matches!(ctx.board.as_str(), "Saturn" | "Orion2"),
+        // The two-ADC boards drive a second Alex chain and lay their filter
+        // bits out differently; the rest have one chain. A board fact, not a
+        // setting — and one that has to be asked of the *display* name
+        // discovery built, which is why this is a helper and not a match on
+        // two short strings that no board ever answers to.
+        alex_class: if crate::net::board_is_orion2_class(&ctx.board) {
+            AlexClass::Orion2
+        } else {
+            AlexClass::Classic
+        },
     };
     t.run();
 }
@@ -366,8 +612,9 @@ struct P2Thread {
     /// The starved-DDC watchdog's rate limit and one-shot log flag.
     last_kick: Option<Instant>,
     kick_logged: bool,
-    /// Whether this board has the second Alex/filter chain (Orion2, Saturn).
-    alex_both: bool,
+    /// Which internal filter chain this board carries — how many the General
+    /// packet enables, and what the Alex control bits mean.
+    alex_class: AlexClass,
 }
 
 impl P2Thread {
@@ -390,13 +637,19 @@ impl P2Thread {
         let tx = phase_word(self.tx_freq, CLOCK_HZ);
         let drive = if self.ptt { TX_DRIVE } else { 0 };
         let oc = self.oc_word();
-        let pkt = high_priority_packet(seq, &phases, tx, run, self.ptt, drive, oc);
+        // The board's own filter chain, which follows the radio's frequency
+        // rather than the dial the open-collector word follows — see
+        // `alex_words`.
+        let alex = alex_words(self.alex_class, self.alex_rx_hz(), self.tx_freq, self.ptt);
+        let pkt = high_priority_packet(seq, &phases, tx, run, self.ptt, drive, oc, alex);
         tracing::trace!(
             "HPSDR P2: high-priority seq {seq}: run {run}, {} DDC NCO(s), TX phase 0x{tx:08X} \
-             ({:.0} Hz), MOX {}, drive {drive}, OC 0x{oc:02X}",
+             ({:.0} Hz), MOX {}, drive {drive}, OC 0x{oc:02X}, Alex 0x{:08X}/0x{:08X}",
             self.slots.len(),
             self.tx_freq,
-            self.ptt
+            self.ptt,
+            alex.0,
+            alex.1
         );
         let _ = self.socket.send_to(&pkt, self.dest(port::HIGH_PRIORITY));
     }
@@ -510,8 +763,25 @@ impl P2Thread {
 
     fn send_general(&mut self) {
         let seq = next_seq(&mut self.seq.general);
-        let pkt = general_packet(seq, self.alex_both);
+        let pkt = general_packet(seq, self.alex_class == AlexClass::Orion2);
         let _ = self.socket.send_to(&pkt, self.dest(port::GENERAL));
+    }
+
+    /// Where the board's own receive filters have to be set for: DDC 0's NCO,
+    /// because DDC 0 is the receiver that owns the transmitter and the front
+    /// end. Falls back to the lowest attached DDC so a panadapter-only tab
+    /// still gets a filter, and to the transmit frequency when nothing is
+    /// attached at all.
+    ///
+    /// The radio's frequency, never the dial: these filters are inside the
+    /// radio (see [`alex_words`]).
+    fn alex_rx_hz(&self) -> f64 {
+        match self.slots.get(&0) {
+            Some(s) => s.freq_hz,
+            None => {
+                self.slots.iter().min_by_key(|(d, _)| **d).map_or(self.tx_freq, |(_, s)| s.freq_hz)
+            }
+        }
     }
 
     fn run(&mut self) {
@@ -870,7 +1140,7 @@ mod tests {
         phases[0] = rx0;
         phases[1] = rx1;
         let tx = phase_word(7_100_000.0, CLOCK_HZ);
-        let b = high_priority_packet(0, &phases, tx, true, true, 200, 0);
+        let b = high_priority_packet(0, &phases, tx, true, true, 200, 0, (0, 0));
         assert_eq!(b[4] & 0x02, 0x02, "MOX bit set");
         // The DDC frequency table: 4 bytes per DDC from offset 9.
         assert_eq!(u32::from_be_bytes([b[9], b[10], b[11], b[12]]), rx0);
@@ -892,14 +1162,21 @@ mod tests {
     fn the_open_collector_word_lands_in_the_high_priority_packet() {
         let phases = [0u32; MAX_DDCS as usize];
         // Outputs 1, 3 and 7.
-        let b = high_priority_packet(0, &phases, 0, true, false, 0, 0b100_0101);
+        let b = high_priority_packet(0, &phases, 0, true, false, 0, 0b100_0101, (0, 0));
         assert_eq!(b[HP_OC], 0b1000_1010, "outputs 1, 3 and 7, shifted off bit 0");
-        assert_eq!(HP_OC, 1400);
+        // The offset itself is the bug of issue #438: 1400 is the ANAN-7000's
+        // XVTR-out/speaker-mute byte, so an OC word written there was accepted
+        // and switched nothing.
+        assert_eq!(HP_OC, 1401);
+        assert_eq!(b[HP_OC_ANAN7000], 0, "byte 1400 is a different field and stays untouched");
         // Nothing else in the packet moved with it.
         assert_eq!(b[345], 0);
-        assert!(b[1401..].iter().all(|&x| x == 0), "nothing written past the OC byte");
+        assert!(
+            b[HP_OC + 1..HP_ALEX1].iter().all(|&x| x == 0),
+            "nothing written between the OC byte and the Alex words"
+        );
         // There is no eighth output: bit 7 of the word cannot reach the wire.
-        let b = high_priority_packet(0, &phases, 0, true, false, 0, 0xFF);
+        let b = high_priority_packet(0, &phases, 0, true, false, 0, 0xFF, (0, 0));
         assert_eq!(b[HP_OC], 0xFE);
     }
 
@@ -932,13 +1209,83 @@ mod tests {
     #[test]
     fn the_run_bit_lives_in_the_high_priority_packet() {
         let phases = [0u32; MAX_DDCS as usize];
-        let running = high_priority_packet(0, &phases, 0, true, false, 0, 0);
+        let running = high_priority_packet(0, &phases, 0, true, false, 0, 0, (0, 0));
         assert_eq!(running[4] & 0x01, 0x01, "run");
         assert_eq!(running[4] & 0x02, 0x00, "not keyed");
-        let stopped = high_priority_packet(1, &phases, 0, false, false, 0, 0);
+        let stopped = high_priority_packet(1, &phases, 0, false, false, 0, 0, (0, 0));
         assert_eq!(stopped[4], 0x00, "a stop is the run bit cleared, and nothing else");
         // MOX rides beside it either way.
-        assert_eq!(high_priority_packet(2, &phases, 0, true, true, 0, 0)[4], 0x03);
+        assert_eq!(high_priority_packet(2, &phases, 0, true, true, 0, 0, (0, 0))[4], 0x03);
+    }
+
+    /// The board's own filter chain and T/R relay, which Protocol 2 never sent
+    /// at all: an all-zero Alex word is every relay released — no transmit
+    /// path, no antenna, no filter — and that is what went out on every
+    /// high-priority packet.
+    #[test]
+    fn the_alex_words_land_in_the_high_priority_packet() {
+        let phases = [0u32; MAX_DDCS as usize];
+        let alex = alex_words(AlexClass::Classic, 14_074_000.0, 14_074_000.0, false);
+        let b = high_priority_packet(0, &phases, 0, true, false, 0, 0, alex);
+        // alex1 comes *first* in the packet; that is the layout, not a slip.
+        assert_eq!(u32::from_be_bytes([b[1428], b[1429], b[1430], b[1431]]), alex.1);
+        assert_eq!(u32::from_be_bytes([b[1432], b[1433], b[1434], b[1435]]), alex.0);
+        assert_eq!(HP_ALEX1, 1428);
+        assert_eq!(HP_ALEX0, 1432);
+        // The step attenuators are the two bytes after them and stay at zero.
+        assert_eq!((b[1442], b[1443]), (0, 0), "no attenuation commanded");
+    }
+
+    /// The transmit relay, the antenna and the filters the two words carry.
+    #[test]
+    fn alex_words_switch_the_transmitter_and_the_band() {
+        // Receiving on 20 m on an ANAN-100-class board: no T/R relay in alex0,
+        // but alex1 stands ready with it (the "Jan 2023" rule).
+        let (a0, a1) = alex_words(AlexClass::Classic, 14_074_000.0, 14_074_000.0, false);
+        assert_eq!(a0 & alex::TX_RELAY, 0, "not keyed: no T/R relay");
+        assert_eq!(a1 & alex::TX_RELAY, alex::TX_RELAY, "alex1 always carries it");
+        // An antenna is always routed: "none" would transmit into nothing.
+        assert_eq!(a0 & alex::TX_ANTENNA_1, alex::TX_ANTENNA_1);
+        assert_eq!(a1 & alex::TX_ANTENNA_1, alex::TX_ANTENNA_1);
+        // 20 m: the 13 MHz high-pass and the 30/20 low-pass.
+        assert_eq!(a0 & alex::HPF_13MHZ, alex::HPF_13MHZ);
+        assert_eq!(a0 & alex::LPF_30_20, alex::LPF_30_20);
+
+        // Keyed, still 20 m: the relay closes.
+        let (a0, _) = alex_words(AlexClass::Classic, 14_074_000.0, 14_074_000.0, true);
+        assert_eq!(a0 & alex::TX_RELAY, alex::TX_RELAY);
+
+        // On a classic board the receive signal comes back through the
+        // transmit low-pass filters, so while receiving they follow the
+        // *receive* frequency — a split across two bands would otherwise go
+        // deaf. Keyed, they follow the transmitter.
+        let (rx, _) = alex_words(AlexClass::Classic, 3_573_000.0, 28_074_000.0, false);
+        assert_eq!(rx & alex::LPF_80, alex::LPF_80, "receiving on 80 m");
+        let (tx, tx1) = alex_words(AlexClass::Classic, 3_573_000.0, 28_074_000.0, true);
+        assert_eq!(tx & alex::LPF_12_10, alex::LPF_12_10, "transmitting on 10 m");
+        assert_eq!(tx1 & alex::LPF_12_10, alex::LPF_12_10, "alex1 always the transmitter's");
+
+        // An ANAN-7000 has band-pass filters instead, and its receive path does
+        // not run through the transmit low-pass filters — so those follow the
+        // transmitter even while receiving.
+        let (a0, a1) = alex_words(AlexClass::Orion2, 3_573_000.0, 28_074_000.0, false);
+        assert_eq!(a0 & alex::BPF_80_60, alex::BPF_80_60, "80 m band-pass");
+        assert_eq!(a0 & alex::LPF_12_10, alex::LPF_12_10, "low-pass follows the transmitter");
+        assert_eq!(a1 & alex::BPF_BYPASS, alex::BPF_BYPASS, "no second receiver here");
+        assert_eq!(a1 & alex::RX2_GND_ON_TX, 0, "not keyed");
+        let (_, a1) = alex_words(AlexClass::Orion2, 3_573_000.0, 28_074_000.0, true);
+        assert_eq!(a1 & alex::RX2_GND_ON_TX, alex::RX2_GND_ON_TX, "second ADC grounded on TX");
+    }
+
+    /// A transmitter the host never declared. Issue-free on the boards met so
+    /// far, but zero DACs is not what either reference sends.
+    #[test]
+    fn the_duc_command_declares_one_dac() {
+        let b = duc_command_packet(3);
+        assert_eq!(u32::from_be_bytes([b[0], b[1], b[2], b[3]]), 3);
+        assert_eq!(b[4], 1, "one DAC");
+        // The vestigial rate/width fields stay zero, as in both references.
+        assert_eq!((b[14], b[15], b[16]), (0, 0, 0));
     }
 
     #[test]

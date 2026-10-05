@@ -119,7 +119,7 @@ pub fn to_hamlib_mode(m: Mode) -> &'static str {
         // the carrier is on the dial and the channel is about as wide.
         // It is also how the signal would reach an outboard decoder — off
         // a receiver set to AM.
-        Mode::Am | Mode::Drm => "AM",
+        Mode::Am | Mode::Drm | Mode::Acars => "AM",
         Mode::Sam => "SAM",
         Mode::Nfm => "FM",
         // RIFP, VHF packet and VHF SSTV are data on an FM carrier, not on a
@@ -127,7 +127,7 @@ pub fn to_hamlib_mode(m: Mode) -> &'static str {
         Mode::Rifp | Mode::Packet | Mode::Aprs | Mode::SstvFm | Mode::RttyFm => "PKTFM",
         // No rig has an ADS-B mode; a remote hamlib client asking is told the
         // widest FM there is, which is at least the right kind of receiver.
-        Mode::Wfm | Mode::Adsb | Mode::Vdl2 | Mode::Ais => "WFM",
+        Mode::Wfm | Mode::Adsb | Mode::Vdl2 | Mode::Ais | Mode::Hfdl | Mode::HdRadio => "WFM",
         Mode::Digu => "PKTUSB",
         Mode::Digl => "PKTLSB",
         Mode::Dsb => "DSB",
@@ -140,6 +140,13 @@ pub fn to_hamlib_mode(m: Mode) -> &'static str {
         Mode::Ft8
         | Mode::Js8
         | Mode::Wspr
+        | Mode::Pi4
+        | Mode::Msk144
+        | Mode::Jt65
+        | Mode::Jt9
+        | Mode::Fst4
+        | Mode::Q65
+        | Mode::Fsk441
         | Mode::Ft4
         | Mode::Ft2
         | Mode::Psk

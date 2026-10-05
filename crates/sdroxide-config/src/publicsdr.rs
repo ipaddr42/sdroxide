@@ -7,10 +7,10 @@
 //! parses into something plausible, so a captive portal's login page never
 //! overwrites a good list.
 //!
-//! Both directories are fetched at once, on two threads, because they are
+//! Every directory is fetched at once, one thread each, because they are
 //! independent and because this is called from the probe worker — whose caller
-//! gives up after twenty seconds. One slow source must not cost the other its
-//! answer.
+//! gives up after twenty seconds. One slow source must not cost the others
+//! their answer.
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -30,6 +30,15 @@ const SPYSERVER_URL: &str = "https://airspy.com/directory/status.json";
 /// why it arrives as JavaScript rather than as JSON.
 const KIWISDR_URL: &str = "http://rx.linkfanel.net/kiwisdr_com.js";
 
+/// `sdr-list.xyz`'s own API — the directory of PhantomSDR-Plus, UberSDR,
+/// NovaSDR and VertexSDR receivers (issue #482). A plain JSON array, and the
+/// only one of the three that was built to be read by a program.
+///
+/// The path comes from the site's own front end (`/api/v1/receivers`), which is
+/// where `/api-docs` points; the docs page itself is rendered in the browser
+/// and says nothing to a fetch.
+const SDR_LIST_URL: &str = "https://sdr-list.xyz/api/v1/receivers";
+
 /// How long a fetched list is served without going back to the network.
 ///
 /// The only field that moves faster than this is the user count, and a count
@@ -39,9 +48,10 @@ const TTL_S: i64 = 15 * 60;
 
 /// Fewest entries a download must yield to be believed.
 ///
-/// Both directories carry hundreds. Anything in single figures is a truncated
-/// transfer or an error page that happened to parse, and the cached copy is
-/// better than that. Same reasoning as `MIN_SCHEDULE_ROWS`.
+/// Airspy's and the Kiwi listing carry hundreds; sdr-list.xyz carried 71 when
+/// this was written. Anything in single figures is a truncated transfer or an
+/// error page that happened to parse, and the cached copy is better than that.
+/// Same reasoning as `MIN_SCHEDULE_ROWS`.
 const MIN_ENTRIES: usize = 20;
 
 /// The KiwiSDR listing was 907 KB when this was written and grows with the
@@ -76,7 +86,7 @@ struct Source {
     parse: fn(&str) -> Result<Vec<PublicSdrEntry>, String>,
 }
 
-const SOURCES: [Source; 2] = [
+const SOURCES: [Source; 3] = [
     Source {
         network: PublicSdrNetwork::SpyServer,
         url: SPYSERVER_URL,
@@ -89,9 +99,15 @@ const SOURCES: [Source; 2] = [
         file: "kiwisdr.json",
         parse: publicsdr::parse_kiwisdr_directory,
     },
+    Source {
+        network: PublicSdrNetwork::SdrList,
+        url: SDR_LIST_URL,
+        file: "sdrlist.json",
+        parse: publicsdr::parse_sdr_list_directory,
+    },
 ];
 
-/// Both directories, from cache when it is fresh enough and from the network
+/// Every directory, from cache when it is fresh enough and from the network
 /// otherwise.
 ///
 /// Blocking — the caller is the probe worker, which exists for exactly this.

@@ -48,10 +48,13 @@
 //! minutes, so a shorter one would blank most of a harbour between two
 //! perfectly good reports.
 
-use eframe::egui::{Align2, Color32, FontId, Pos2, Sense, Stroke, Ui, pos2, vec2};
+use eframe::egui::{
+    Align2, Color32, FontId, Margin, Pos2, Rect, RichText, Sense, Stroke, Ui, pos2, vec2,
+};
 use sdroxide_types::{AisKind, AisSettings, AisVessel};
 
 use crate::theme;
+use crate::widgets::map_labels::{self, MapLabel};
 use crate::widgets::worldmap::{MapView, alpha, draw_base, interact, wrap180};
 
 /// Below this height the map is not worth drawing.
@@ -79,15 +82,13 @@ const PAD: f64 = 1.25;
 /// Per-frame ease toward the auto-fit.
 const EASE: f64 = 0.06;
 
-/// Above this many targets on screen, only the selected and hovered ones keep
-/// their label. A busy approach channel is a wall of names with a chart
-/// somewhere underneath it.
-const LABEL_LIMIT: usize = 30;
-
 /// One nautical mile in degrees of latitude. A minute of arc, by definition —
 /// which is what makes converting knots into map degrees exact rather than
 /// approximate.
 const NM_PER_DEG_LAT: f64 = 60.0;
+
+/// The on-chart zoom buttons step by this factor per click.
+const ZOOM_STEP: f64 = 0.7;
 
 /// The map's own state, owned by the panel so the view survives across frames.
 #[derive(Default)]
@@ -248,6 +249,23 @@ fn symbol(
     }
 }
 
+/// How hard a vessel's name fights for room on a crowded chart: lower wins.
+///
+/// The order is what a port watch would read first — a distress call, then a
+/// SOLAS ship, then any other craft (a Class B yacht, a SAR aircraft, a
+/// lifeboat — by kind, so one tied up in a marina counts), then the marks.
+fn label_rank(v: &AisVessel) -> u8 {
+    if v.is_alarm() {
+        0
+    } else if v.kind == AisKind::ClassA {
+        1
+    } else if v.kind.is_underway() {
+        2
+    } else {
+        3
+    }
+}
+
 /// Draw the map. Returns the vessel clicked this frame, if any.
 pub fn show(
     ui: &mut Ui,
@@ -352,24 +370,13 @@ pub fn show(
         }
     }
 
-    let on_screen = live
-        .iter()
-        .filter(|v| v.lat.zip(v.lon).is_some_and(|(la, lo)| rect.contains(project(la, lo))))
-        .count();
-    let label_all = on_screen <= LABEL_LIMIT;
     let font = FontId::monospace(9.0);
-
-    let draw = |v: &AisVessel, top: bool| {
-        let Some((lat, lon)) = v.lat.zip(v.lon) else { return };
-        let c = project(lat, lon);
-        if !rect.contains(c) && !top {
-            return;
-        }
-        let selected = state.selected == Some(v.mmsi);
-        // A distress beacon and the row the operator picked get the same
-        // attention colour, because both mean "look here" and a chart with two
-        // of those is a chart with none.
-        let tint = if v.is_alarm() || selected {
+    let selected_mmsi = state.selected;
+    // A distress beacon and the row the operator picked get the same attention
+    // colour, because both mean "look here" and a chart with two of those is a
+    // chart with none.
+    let tint_for = |v: &AisVessel, top: bool| -> Color32 {
+        if v.is_alarm() || selected_mmsi == Some(v.mmsi) {
             map.dx
         } else if top {
             map.hover
@@ -380,49 +387,77 @@ pub fn show(
             // stations — is dimmer, so a busy marina does not out-shout the
             // traffic in the channel next to it.
             alpha(map.station, 175.0)
-        };
+        }
+    };
 
+    // ── symbols, under the names ──
+    // The hovered one last, so it sits over its neighbours.
+    let draw_symbol = |v: &AisVessel, top: bool| {
+        let Some((lat, lon)) = v.lat.zip(v.lon) else { return };
+        let c = project(lat, lon);
+        if !rect.contains(c) && !top {
+            return;
+        }
+        let tint = tint_for(v, top);
         // The vector, under the symbol: where it is now matters more than where
         // it will be.
         if let Some((la, lo)) = vector(v, cfg.vector_minutes) {
             p.line_segment([c, project(la, lo)], (1.2, alpha(tint, 185.0)));
         }
-
-        let r = if top || selected { HULL_R + 1.0 } else { HULL_R };
+        let r = if top || selected_mmsi == Some(v.mmsi) { HULL_R + 1.0 } else { HULL_R };
         symbol(&p, c, v.kind, v.icon_deg(), r, tint, map.sea);
-
-        // The label, up and to the right, with a tick joining it to the symbol
-        // so a crowded picture still says which label belongs to which.
-        if label_all || top || selected {
-            let anchor = c + vec2(r + 3.0, -(r + 2.0));
-            p.line_segment([c + vec2(r * 0.6, -r * 0.6), anchor], (1.0, alpha(tint, 110.0)));
-            // The speed only where there is one to have. A buoy labelled
-            // "--- kt" is two characters of information and a line of noise on
-            // a chart that may carry a hundred of them.
-            let mut lines = vec![v.label()];
-            if let Some(kt) = v.sog_kt.filter(|_| v.kind.is_underway()) {
-                lines.push(format!("{kt:.1} kt"));
-            }
-            for (k, line) in lines.iter().enumerate() {
-                p.text(
-                    anchor + vec2(2.0, -((lines.len() - 1 - k) as f32) * 10.0 - 5.0),
-                    Align2::LEFT_CENTER,
-                    line,
-                    font.clone(),
-                    alpha(tint, if k == 0 { 240.0 } else { 185.0 }),
-                );
-            }
-        }
     };
-
     for (i, v) in live.iter().enumerate() {
         if hover != Some(i) {
-            draw(v, false);
+            draw_symbol(v, false);
         }
     }
     if let Some(i) = hover {
-        draw(live[i], true);
+        draw_symbol(live[i], true);
     }
+
+    // ── the names ──
+    // The selected, the hovered and a distress call always; the rest by how
+    // much they matter — a SOLAS ship, then any other craft, then the marks —
+    // each only where its name misses the ones already placed. A busy approach
+    // channel then keeps the names that say the most, rather than losing every
+    // one of them at once the moment a few dozen vessels are in view (#408).
+    let mut labels = Vec::new();
+    for (i, v) in live.iter().enumerate() {
+        let Some((lat, lon)) = v.lat.zip(v.lon) else { continue };
+        let c = project(lat, lon);
+        // Only where the symbol is on the chart: a name for one off it would be
+        // a name and a tick pointing at nothing, at the chart's edge.
+        if !rect.contains(c) {
+            continue;
+        }
+        let top = hover == Some(i);
+        let selected = selected_mmsi == Some(v.mmsi);
+        let tint = tint_for(v, top);
+        // The speed only where there is one to have. A buoy labelled "--- kt"
+        // is two characters of information and a line of noise on a chart that
+        // may carry a hundred of them.
+        let mut lines = vec![(v.label(), alpha(tint, 240.0))];
+        if let Some(kt) = v.sog_kt.filter(|_| v.kind.is_underway()) {
+            lines.push((format!("{kt:.1} kt"), alpha(tint, 185.0)));
+        }
+        labels.push(MapLabel {
+            at: c,
+            r: if top || selected { HULL_R + 1.0 } else { HULL_R },
+            tick_from: 0.6,
+            tick: alpha(tint, 110.0),
+            lines,
+            must: top || selected || v.is_alarm(),
+            rank: label_rank(v),
+            key: v.mmsi,
+        });
+    }
+    // Our own mark is drawn over the names, so they keep off it.
+    let marks: Vec<Rect> = home
+        .map(|(lat, lon)| Rect::from_center_size(project(lat, lon), vec2(16.0, 16.0)))
+        .into_iter()
+        .collect();
+    map_labels::draw(&p, rect, &font, labels, &marks);
 
     // ── us ──
     if let Some((lat, lon)) = home {
@@ -501,6 +536,72 @@ pub fn show(
             alpha(Color32::WHITE, 110.0),
         );
     }
+
+    // ── the on-chart zoom controls ──
+    //
+    // The wheel, trackpad pinch, drag and double-click already work, but none
+    // of them announce themselves: a chart that fits a few hundred ships is
+    // assumed to show all there is until someone happens to try the wheel, and
+    // a remote or touch viewer may have no wheel to find. Three small buttons
+    // make the zoom explicit, and the scale note at the other corner says what
+    // the view is actually showing now — so “I cannot zoom in” stops being a
+    // silent failure.
+    //
+    // Anchored on the top-right corner and laid out from the right, so the row
+    // grows into the chart whatever the chips measure — they are wider on a
+    // touch screen, and a fixed box sized for a desktop pushed FIT off the edge
+    // of the map there. A child `Ui` rather than a scope, so the controls float
+    // over the chart without moving the parent's cursor.
+    let inset = Rect::from_min_max(
+        pos2(rect.left() + 4.0, rect.top() + 4.0),
+        pos2(rect.right() - 4.0, rect.bottom() - 4.0),
+    );
+    let mut ctrl_ui = ui.new_child(
+        eframe::egui::UiBuilder::new()
+            .max_rect(inset)
+            .layout(eframe::egui::Layout::right_to_left(eframe::egui::Align::Min)),
+    );
+    eframe::egui::Frame::NONE
+        .fill(alpha(theme::BG_DEEP(), 200.0))
+        .inner_margin(Margin::symmetric(3, 1))
+        .show(&mut ctrl_ui, |ui| {
+            ui.horizontal(|ui| {
+                if crate::chrome::chip(ui, false, RichText::new("\u{2212}").size(12.0))
+                    .on_hover_text("Zoom out — the wheel or a pinch do this too")
+                    .clicked()
+                {
+                    view.zoom_about(1.0 / ZOOM_STEP, 0.5, 0.5, aspect);
+                    view.manual = true;
+                    crate::repaint::animate(ui.ctx());
+                }
+                if crate::chrome::chip(ui, false, RichText::new("+").size(12.0))
+                    .on_hover_text("Zoom in about the middle of the chart")
+                    .clicked()
+                {
+                    view.zoom_about(ZOOM_STEP, 0.5, 0.5, aspect);
+                    view.manual = true;
+                    crate::repaint::animate(ui.ctx());
+                }
+                if crate::chrome::chip(ui, false, RichText::new("FIT").size(10.0))
+                    .on_hover_text("Frame everything being tracked again — a double-click does too")
+                    .clicked()
+                {
+                    view.manual = false;
+                    crate::repaint::animate(ui.ctx());
+                }
+            });
+        });
+    // The scale note: what the current view actually spans. Worth saying on a
+    // chart that looks fully zoomed in when it is still half an ocean.
+    let cos = clat.to_radians().cos().abs().max(0.01);
+    let km = lon_span * 111.32 * cos;
+    p.text(
+        rect.left_bottom() + vec2(6.0, -4.0),
+        Align2::LEFT_BOTTOM,
+        format!("{lon_span:.2}° · ~{km:.0} km across"),
+        FontId::proportional(9.0),
+        alpha(Color32::WHITE, 110.0),
+    );
     clicked
 }
 

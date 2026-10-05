@@ -505,6 +505,18 @@ impl IqSource for LimeSource {
         self.handle.sample_rate()
     }
 
+    /// What the predistortion loop on the second chain is doing, for the
+    /// operator rather than for the log (issue #441).
+    fn puresignal(&mut self) -> Option<sdroxide_types::PsMeter> {
+        let ps = self.puresignal.as_ref()?;
+        Some(sdroxide_types::PsMeter {
+            locked: ps.locked(),
+            correction_db: ps.correction_db(),
+            score: ps.score(),
+            frozen: ps.frozen(),
+        })
+    }
+
     fn center_hz(&self) -> f64 {
         self.center
     }

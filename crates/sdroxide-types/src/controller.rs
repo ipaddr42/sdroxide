@@ -296,6 +296,11 @@ pub enum RadioEvent {
     /// A whole snapshot, emitted a few times a second while anything moves —
     /// the sync lights and the scrolling text both change on their own.
     Drm(crate::DrmStatus),
+    /// What the HD Radio decoder has made of the broadcast on the main
+    /// receiver. A whole snapshot, emitted a few times a second while anything
+    /// moves — the sync lights, the sideband MER and the station text all
+    /// change on their own.
+    HdRadio(crate::HdRadioStatus),
     /// Every aircraft the ADS-B decoder is still tracking, plus what the
     /// demodulator is seeing, re-sent whole a couple of times a second
     /// (issue #160).
@@ -321,6 +326,17 @@ pub enum RadioEvent {
     /// `IsmStatus` has one — not done yet, since every station this shipped
     /// for runs its own hardware locally.
     Qo100Status(crate::Qo100Status),
+    /// What the HFDL (ARINC 635) channel decoder has made of the tuned
+    /// channel: burst level, how many bursts carried recognized events, and
+    /// the rolling decode log (ground-station squitters, aircraft position
+    /// reports, ACARS traffic). Sent whenever it changes, the same convention
+    /// [`RadioEvent::Qo100Status`] follows — settings travel separately, in
+    /// [`crate::RadioState::hfdl`].
+    ///
+    /// Native-engine only for now, like [`RadioEvent::Qo100Status`]: bridging
+    /// this to a remote/WASM client would mean a matching variant in
+    /// `sdroxide_proto::ServerMsg` — not done yet.
+    HfdlStatus(crate::HfdlStatus),
     /// Everything the VDL Mode 2 decoder has: the message log, the station
     /// table, and what every channel of the plan is doing. A whole snapshot, a
     /// couple of times a second.
@@ -357,6 +373,22 @@ pub enum RadioEvent {
     ///
     /// Appended last, for the usual reason.
     AisStatus(Box<crate::AisStatus>),
+    /// The names of the station's saved profiles, after a save, an apply or a
+    /// delete (issue #197). The engine owns the store; the screen only needs
+    /// the list to offer, so the payload is names — the profiles themselves
+    /// live with everything else the radio remembers.
+    ///
+    /// Crosses the wire as `sdroxide_proto::ServerMsg::Profiles`, and the
+    /// server keeps the last one to replay to a client that connects later.
+    ///
+    /// Appended last, for the usual reason.
+    Profiles(Vec<String>),
+    /// What a PI4 slot decoded — the same shape of thing
+    /// [`RadioEvent::WsprSpots`] is, for the same reason: a beacon reception
+    /// is a measurement, not a message addressed to anyone.
+    ///
+    /// Appended last, for the usual reason.
+    Pi4Spots(Vec<crate::Pi4Spot>),
 }
 
 /// Snapshot of the frontend's switchable sound devices (native clients).

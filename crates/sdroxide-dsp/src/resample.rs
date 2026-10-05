@@ -84,9 +84,15 @@ impl StereoResampler {
 
 /// Complex-valued resampler: I/Q as a 2-channel interleaved stream so both
 /// components share exact timing.
+///
+/// This one runs at I/Q rates — the HD Radio decoder's is three quarters of a
+/// million samples a second — so it does not allocate per chunk: output goes
+/// into a buffer kept between calls, and the consumed input is shifted out of
+/// `pending` once per call rather than once per chunk.
 pub struct ComplexResampler {
     inner: Async<f32>,
     pending: Vec<f32>, // interleaved re,im
+    produced: Vec<f32>,
 }
 
 impl ComplexResampler {
@@ -104,7 +110,8 @@ impl ComplexResampler {
             FixedAsync::Input,
         )
         .expect("resampler construction");
-        Some(ComplexResampler { inner, pending: Vec::new() })
+        let produced = vec![0.0; inner.output_frames_max() * 2];
+        Some(ComplexResampler { inner, pending: Vec::new(), produced })
     }
 
     pub fn push(&mut self, input: &[Complex32], out: &mut Vec<Complex32>) {
@@ -113,13 +120,53 @@ impl ComplexResampler {
             self.pending.push(z.re);
             self.pending.push(z.im);
         }
-        while self.pending.len() >= CHUNK * 2 {
+        let mut consumed = 0;
+        while self.pending.len() - consumed >= CHUNK * 2 {
             let adapter =
-                InterleavedSlice::new(&self.pending[..CHUNK * 2], 2, CHUNK).expect("adapter");
-            let produced = self.inner.process(&adapter, None).expect("resample");
-            let data = produced.take_data();
-            out.extend(data.chunks_exact(2).map(|p| Complex32::new(p[0], p[1])));
-            self.pending.drain(..CHUNK * 2);
+                InterleavedSlice::new(&self.pending[consumed..consumed + CHUNK * 2], 2, CHUNK)
+                    .expect("adapter");
+            let frames = self.produced.len() / 2;
+            let mut into =
+                InterleavedSlice::new_mut(&mut self.produced, 2, frames).expect("adapter");
+            let (_, written) =
+                self.inner.process_into_buffer(&adapter, &mut into, None).expect("resample");
+            out.extend(
+                self.produced[..written * 2].chunks_exact(2).map(|p| Complex32::new(p[0], p[1])),
+            );
+            consumed += CHUNK * 2;
         }
+        self.pending.drain(..consumed);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// How the input is split across calls changes nothing about the output:
+    /// the chunks carried over in `pending`, and the ones consumed in the middle
+    /// of a call, have to be the same ones either way.
+    #[test]
+    fn a_complex_stream_resamples_the_same_whatever_the_block_size() {
+        let input: Vec<Complex32> = (0..20_000)
+            .map(|n| {
+                let t = n as f32 * 0.013;
+                Complex32::new(t.cos(), (t * 1.7).sin())
+            })
+            .collect();
+        let mut whole = ComplexResampler::new(1_000_000.0, 744_187.5).unwrap();
+        let mut once = Vec::new();
+        whole.push(&input, &mut once);
+
+        let mut split = ComplexResampler::new(1_000_000.0, 744_187.5).unwrap();
+        let mut pieces = Vec::new();
+        for block in input.chunks(333) {
+            split.push(block, &mut pieces);
+        }
+        assert!(!once.is_empty());
+        assert_eq!(once, pieces);
+        // 19 whole chunks of 1024 in 20 000 samples, each at the rate ratio.
+        let expected = (19.0 * 1024.0 * 744_187.5 / 1_000_000.0) as usize;
+        assert!(once.len().abs_diff(expected) <= 19, "{} vs {expected}", once.len());
     }
 }

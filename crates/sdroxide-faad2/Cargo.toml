@@ -1,0 +1,19 @@
+[package]
+name = "sdroxide-faad2"
+version.workspace = true
+edition.workspace = true
+# faad2 (`vendor/faad2`, knik0/faad2 at 2.11.2) is GPL-2.0-or-later, which
+# sits inside the workspace's GPL-3.0-or-later. Built stock, with nothing
+# patched: the HD Radio decoder's HDC-capable faad2 lives inside the libnrsc5 it
+# loads at run time, not here (issue #488).
+license.workspace = true
+# The one faad2 in the binary. Cargo refuses two packages with the same `links`,
+# which is the guarantee wanted here: two archives would collide on every
+# `NeAACDec*` symbol.
+links = "faad2"
+
+# Native-only: builds vendored C. Must never be a dependency of any
+# wasm-targeted crate.
+
+[build-dependencies]
+cc = "1"

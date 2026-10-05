@@ -35,6 +35,7 @@ use eframe::egui::{Align2, Color32, FontId, Rect, Sense, Ui, pos2, vec2};
 use sdroxide_types::{AdsbAircraft, AdsbSettings};
 
 use crate::theme;
+use crate::widgets::map_labels::{self, MapLabel};
 use crate::widgets::worldmap::{MapView, alpha, draw_base, interact, wrap180};
 
 /// Below this height the map is not worth drawing.
@@ -55,11 +56,6 @@ const PAD: f64 = 1.25;
 
 /// Per-frame ease toward the auto-fit.
 const EASE: f64 = 0.06;
-
-/// Above this many targets on screen, only the selected and hovered ones keep
-/// their data block. Three lines of text per aircraft over a busy sector is a
-/// wall of text with a map somewhere underneath it.
-const LABEL_LIMIT: usize = 25;
 
 /// One nautical mile in degrees of latitude. A minute of arc, by definition —
 /// which is what makes converting a speed in knots into map degrees exact
@@ -146,6 +142,20 @@ fn leader(ac: &AdsbAircraft, minutes: f32) -> Vec<(f64, f64)> {
         hdg += turn;
     }
     out
+}
+
+/// How hard an aircraft's data block fights for room on a busy map: lower wins.
+///
+/// An emergency first, then anything flying, then anything on the ground — an
+/// apron of parked aircraft must not crowd the approach off the picture.
+fn block_rank(a: &AdsbAircraft) -> u8 {
+    if a.emergency.is_some() {
+        0
+    } else if !a.on_ground {
+        1
+    } else {
+        2
+    }
 }
 
 /// Draw the map. Returns the aircraft clicked this frame, if any.
@@ -252,29 +262,27 @@ pub fn show(
         }
     }
 
-    let on_screen = live
-        .iter()
-        .filter(|a| a.lat.zip(a.lon).is_some_and(|(la, lo)| rect.contains(project(la, lo))))
-        .count();
-    let label_all = on_screen <= LABEL_LIMIT;
     let font = FontId::monospace(9.0);
-
-    let draw = |i: usize, a: &AdsbAircraft, top: bool| {
-        let Some((lat, lon)) = a.lat.zip(a.lon) else { return };
-        let c = project(lat, lon);
-        if !rect.contains(c) && !top {
-            return;
-        }
-        let selected = state.selected == Some(a.icao);
-        let tint = if a.emergency.is_some() {
-            map.dx
-        } else if selected {
+    let selected_icao = state.selected;
+    let tint_for = |a: &AdsbAircraft, top: bool| -> Color32 {
+        if a.emergency.is_some() || selected_icao == Some(a.icao) {
             map.dx
         } else if top {
             map.hover
         } else {
             map.station
-        };
+        }
+    };
+
+    // ── targets, under the data blocks ──
+    // The hovered one last, so it sits over its neighbours.
+    let draw_target = |a: &AdsbAircraft, top: bool| {
+        let Some((lat, lon)) = a.lat.zip(a.lon) else { return };
+        let c = project(lat, lon);
+        if !rect.contains(c) && !top {
+            return;
+        }
+        let tint = tint_for(a, top);
 
         // The leader, under the symbol: where it is now matters more than where
         // it will be.
@@ -287,7 +295,7 @@ pub fn show(
         }
 
         // The target: a square, hollow, the same size at every zoom.
-        let r = if top || selected { TARGET_R + 1.0 } else { TARGET_R };
+        let r = if top || selected_icao == Some(a.icao) { TARGET_R + 1.0 } else { TARGET_R };
         // A halo so it stays readable over the dotted land.
         p.circle_filled(c, r + 2.0, alpha(map.sea, 170.0));
         p.rect_stroke(
@@ -301,34 +309,54 @@ pub fn show(
         if a.on_ground {
             p.circle_filled(c, 1.4, tint);
         }
-
-        // The data block, up and to the right, with a tick joining it to the
-        // target so a crowded picture still says which block belongs to which.
-        if label_all || top || selected {
-            let anchor = c + vec2(r + 3.0, -(r + 2.0));
-            p.line_segment([c + vec2(r * 0.7, -r * 0.7), anchor], (1.0, alpha(tint, 110.0)));
-            let lines = [a.label(), a.fmt_altitude(), a.fmt_speed()];
-            for (k, line) in lines.iter().enumerate() {
-                p.text(
-                    anchor + vec2(2.0, -((2 - k) as f32) * 10.0 - 5.0),
-                    Align2::LEFT_CENTER,
-                    line,
-                    font.clone(),
-                    alpha(tint, if k == 0 { 240.0 } else { 190.0 }),
-                );
-            }
-        }
-        let _ = i;
     };
-
     for (i, a) in live.iter().enumerate() {
         if hover != Some(i) {
-            draw(i, a, false);
+            draw_target(a, false);
         }
     }
     if let Some(i) = hover {
-        draw(i, live[i], true);
+        draw_target(live[i], true);
     }
+
+    // ── the data blocks ──
+    // The selected, the hovered and an emergency always; the rest by how much
+    // they matter — what is flying, then what is on the ground — each only
+    // where its block misses the symbols and the blocks already placed. A busy
+    // sector then keeps the blocks it has room for, rather than losing every
+    // one of them at once the moment a couple of dozen aircraft are in view,
+    // which is how the AIS chart's names went missing (#408).
+    let mut labels = Vec::new();
+    for (i, a) in live.iter().enumerate() {
+        let Some((lat, lon)) = a.lat.zip(a.lon) else { continue };
+        let c = project(lat, lon);
+        if !rect.contains(c) {
+            continue;
+        }
+        let top = hover == Some(i);
+        let selected = selected_icao == Some(a.icao);
+        let tint = tint_for(a, top);
+        labels.push(MapLabel {
+            at: c,
+            r: if top || selected { TARGET_R + 1.0 } else { TARGET_R },
+            tick_from: 0.7,
+            tick: alpha(tint, 110.0),
+            lines: vec![
+                (a.label(), alpha(tint, 240.0)),
+                (a.fmt_altitude(), alpha(tint, 190.0)),
+                (a.fmt_speed(), alpha(tint, 190.0)),
+            ],
+            must: top || selected || a.emergency.is_some(),
+            rank: block_rank(a),
+            key: a.icao,
+        });
+    }
+    // Our own mark is drawn over the blocks, so they keep off it.
+    let marks: Vec<Rect> = home
+        .map(|(lat, lon)| Rect::from_center_size(project(lat, lon), vec2(16.0, 16.0)))
+        .into_iter()
+        .collect();
+    map_labels::draw(&p, rect, &font, labels, &marks);
 
     // ── us ──
     if let Some((lat, lon)) = home {
@@ -394,6 +422,19 @@ mod tests {
         a.track_deg = Some(track);
         a.turn_rate_deg_s = turn;
         a
+    }
+
+    /// On a busy map the blocks that give way first are those of aircraft on
+    /// the ground, and an emergency gives way to nothing.
+    #[test]
+    fn a_parked_aircraft_gives_way_to_one_flying() {
+        let mut parked = flying(0.0, 0.0, 0.0);
+        parked.on_ground = true;
+        let airborne = flying(250.0, 0.0, 0.0);
+        let mut mayday = flying(250.0, 0.0, 0.0);
+        mayday.emergency = Some("7700 general emergency".into());
+        assert!(block_rank(&mayday) < block_rank(&airborne));
+        assert!(block_rank(&airborne) < block_rank(&parked));
     }
 
     /// The leader's length is the distance covered in the vector time, in

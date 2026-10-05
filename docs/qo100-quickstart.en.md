@@ -4,7 +4,7 @@ A task-oriented walkthrough for getting an **ADALM-Pluto** + **Ku-band LNB**
 station onto the QO-100 (Es'hail-2) geostationary transponder with sdroxide. It
 covers the one-time station setup, locking onto the bird, and the QO-100
 beacon-sync tab. For the reference detail behind each control, see
-[`USER_MANUAL.md`](USER_MANUAL.md) §2.21 (QO-100 beacon plugin) and §6.2.7
+[`USER_MANUAL.md`](USER_MANUAL.md) §2.22 (QO-100 beacon plugin) and §6.2.7
 (PlutoSDR).
 
 The 10 GHz downlink comes down through the LNB; the 2.4 GHz uplink leaves the

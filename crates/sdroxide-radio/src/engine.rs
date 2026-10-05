@@ -17,19 +17,22 @@ use sdroxide_adsb::{AdsbAction, AdsbController};
 use sdroxide_ais::{AisAction, AisController};
 use sdroxide_config::BandStacks;
 use sdroxide_digi::{
-    AprsController, AtChatController, CwController, DigiAction, DigiController, DigiEngine,
-    FsqController, HellController, Js8Controller, NavtexController, PacketController,
-    RadeController, RfPaintController, RifpController, SstvController, TextModemController,
-    WefaxController, WsprController,
+    AcarsController, AprsController, AtChatController, CwController, DigiAction, DigiController,
+    DigiEngine, Fsk441Controller, FsqController, Fst4Controller, HellController, Js8Controller,
+    JtController, Msk144Controller, NavtexController, PacketController, Pi4Controller,
+    Q65Controller, RadeController, RfPaintController, RifpController, SstvController,
+    TextModemController, WefaxController, WsprController,
 };
 use sdroxide_drm::DrmDemod;
 use sdroxide_dsp::{
     AdcMeter, Agc, AutoNotch, Binaural, Cessb, DcBlock, Ddc, Decimator, DeepFilterNr, Demodulator,
-    Duc, Modulator, MonoResampler, Nco, NeuralNr, NoiseBlanker, ParametricEq, SpecBleachNr,
-    SpectralNr, SpectrumAnalyzer, StereoResampler, SubToneGen, ToneBurst, channel_target,
-    make_demod, make_modulator,
+    Duc, Modulator, MonoResampler, Nco, NeuralNr, NoiseBlanker, Nr2, ParametricEq, SpecBleachNr,
+    SpectralNr, SpectrumAnalyzer, StereoResampler, SubToneGen, ToneBurst, channel_target_at,
+    hd_radio_is_am, make_demod, make_modulator,
 };
+use sdroxide_hfdl::HfdlController;
 use sdroxide_ism::{IsmAction, IsmController};
+use sdroxide_nrsc5::{HdDemod, Mode as HdMode};
 use sdroxide_qo100::Qo100Controller;
 use sdroxide_rigctld::{RigState, RigctldController};
 use sdroxide_skimmer::{SkimmerAction, SkimmerController};
@@ -42,7 +45,7 @@ use sdroxide_types::{
 };
 use sdroxide_vdl2::{Vdl2Action, Vdl2Controller};
 
-use crate::recorder::{Recorder, RecordingChannels};
+use crate::recorder::{Recorder, RecorderFault, RecordingChannels};
 use crate::voice::VoiceKeyer;
 use crate::{Complex32, ControlUpdate, IqSource};
 
@@ -453,6 +456,17 @@ const DRM_INTERVAL: Duration = Duration::from_millis(250);
 /// anything past a couple of kHz is a different transmission, not drift.
 const DRM_RETUNE_HZ: f64 = 2_000.0;
 
+/// How often the HD Radio status is polled. Faster than RDS, like DRM: the
+/// sync and the sideband MER are what an operator watches while tuning one in,
+/// and a half-second lag on those reads as a decoder that is not working.
+const HD_RADIO_INTERVAL: Duration = Duration::from_millis(250);
+
+/// How far the dial has to move before the HD Radio decoder is told to
+/// re-acquire. A commercial FM channel is 200 kHz wide and stations are spaced
+/// at least that far apart on the band, so half of one is comfortably inside
+/// "the same station" and anything past it is somebody else.
+const HD_RADIO_RETUNE_HZ: f64 = 100_000.0;
+
 /// How far the dial has to move before the RDS decoder is told to forget the
 /// station.
 ///
@@ -687,7 +701,8 @@ fn dfnr_available(slot: &mut Option<Box<DeepFilterNr>>, failed: &mut bool) -> bo
 ///
 /// Noise reduction and the auto-notch disqualify it: every NR engine carries a
 /// latency — a frame for `SpectralNr`, an RNNoise frame for `NeuralNr`, a
-/// DeepFilterNet hop, three quarters of a 20 ms frame for `SpecBleachNr` — and
+/// DeepFilterNet hop, three quarters of a 20 ms frame for `SpecBleachNr`,
+/// three quarters of NR2's 43 ms one — and
 /// all of them would run on the sum only. An 8–10 ms delay on one side of
 /// `L = M±S` is three cycles of phase error at 1 kHz — the matrix would collapse
 /// into a comb filter with a randomly wandering image. They are HF speech tools
@@ -759,6 +774,10 @@ struct RxChain {
     ddc: Ddc,
     demod: Option<Box<dyn Demodulator>>,
     mode: Mode,
+    /// Where the dial was when the chain was last (re)built. HD Radio is the
+    /// one mode whose channel rate depends on it — the FM hybrid or HD on AM
+    /// (issue #489) — so the value is kept to notice a change and rebuild.
+    dial_hz: f64,
     agc: Agc,
     resampler: Option<MonoResampler>,
     out_rate: f64,
@@ -786,6 +805,7 @@ struct RxChain {
     nr: SpectralNr,
     /// The libspecbleach port — the other classical engine.
     sbnr: SpecBleachNr,
+    nr2: Nr2,
     /// Neural (RNNoise) noise reduction.
     nnr: NeuralNr,
     /// DeepFilterNet3. Built on first use: it unpacks an 8 MB model, which is
@@ -816,12 +836,13 @@ struct RxChain {
 }
 
 impl RxChain {
-    fn new(in_rate: f64, rx: &RxState, out_rate: f64) -> Self {
+    fn new(in_rate: f64, rx: &RxState, out_rate: f64, dial_hz: f64) -> Self {
         let mut chain = RxChain {
             in_rate,
-            ddc: Ddc::new(in_rate, channel_target(rx.mode)),
+            ddc: Ddc::new(in_rate, channel_target_at(rx.mode, dial_hz)),
             demod: None,
             mode: rx.mode,
+            dial_hz,
             agc: Agc::new(48_000.0),
             resampler: None,
             out_rate,
@@ -836,6 +857,7 @@ impl RxChain {
             notch_on: false,
             nr: SpectralNr::new(),
             sbnr: SpecBleachNr::new(),
+            nr2: Nr2::new(),
             nnr: NeuralNr::new(),
             dfnr: None,
             dfnr_failed: false,
@@ -851,7 +873,7 @@ impl RxChain {
             rec_buf: Vec::new(),
             rec_buf_r: Vec::new(),
         };
-        chain.build_for_mode(rx);
+        chain.build_for_mode(rx, dial_hz);
         chain
     }
 
@@ -872,30 +894,38 @@ impl RxChain {
 
     /// (Re)build demod/AGC/resampler for the mode in `rx`, and the DDC if
     /// the channel target changed. Keeps the NCO offset.
-    fn build_for_mode(&mut self, rx: &RxState) {
+    fn build_for_mode(&mut self, rx: &RxState, dial_hz: f64) {
         self.mode = rx.mode;
-        let target = channel_target(rx.mode);
+        self.dial_hz = dial_hz;
+        let target = channel_target_at(rx.mode, dial_hz);
         if (self.ddc.out_rate() - target).abs() / target > 0.5 || self.ddc.out_rate() < target {
             self.ddc = Ddc::new(self.in_rate, target);
             self.ddc.set_offset_hz(self.offset_hz);
         }
         // Release the old demodulator before building the new one. For most
-        // modes that is housekeeping; for DRM it is the difference between one
-        // Dream receiver and two, because assigning over `self.demod` would
-        // construct the replacement first and only then drop what was there.
-        // Two of them briefly coexisting is a lot of vendored C++ running
-        // twice on two threads for no reason, and `set_rx_mode` does not
-        // early-return when the mode has not actually changed — so a rig
+        // modes that is housekeeping; for DRM and HD Radio it is the difference
+        // between one decoder and two, because assigning over `self.demod`
+        // would construct the replacement first and only then drop what was
+        // there. Two of either briefly coexisting is a lot of vendored C
+        // running twice on two threads for no reason, and `set_rx_mode` does
+        // not early-return when the mode has not actually changed — so a rig
         // reporting its mode back can trigger it at any moment.
         self.demod = None;
-        // Every mode but this one comes from `make_demod`. DRM's decoder links
-        // a vendored C++ receiver, which `sdroxide-dsp` cannot depend on and
-        // still build for the browser, so it is constructed here instead — see
-        // `Demodulator::take_drm`.
-        self.demod = if rx.mode == Mode::Drm {
-            Some(Box::new(DrmDemod::new(self.ddc.out_rate())) as Box<dyn Demodulator>)
-        } else {
-            make_demod(rx.mode, self.ddc.out_rate())
+        // Every mode but these two comes from `make_demod`. Their decoders are
+        // C libraries — DRM's linked in, HD Radio's loaded at run time — which
+        // `sdroxide-dsp` cannot depend on and still build for the browser, so
+        // they are constructed here instead — see `Demodulator::take_drm` and
+        // `Demodulator::take_hd_radio`.
+        self.demod = match rx.mode {
+            Mode::Drm => Some(Box::new(DrmDemod::new(self.ddc.out_rate())) as Box<dyn Demodulator>),
+            Mode::HdRadio => {
+                // HD Radio is two decoders on two channel rates, and which one
+                // is wanted is a property of the dial: the FM hybrid or HD on
+                // AM (issue #489).
+                let hd = if hd_radio_is_am(dial_hz) { HdMode::Am } else { HdMode::Fm };
+                Some(Box::new(HdDemod::new(self.ddc.out_rate(), hd)) as Box<dyn Demodulator>)
+            }
+            _ => make_demod(rx.mode, self.ddc.out_rate()),
         };
         if let Some(d) = self.demod.as_mut() {
             d.set_filter(rx.filter_lo, rx.filter_hi);
@@ -1044,6 +1074,13 @@ impl RxChain {
                     let (db, whiten) = now.spec_params();
                     self.sbnr.set_params(db, whiten);
                 }
+                Some(NrEngine::Nr2) => {
+                    if switched {
+                        self.nr2.reset();
+                    }
+                    let (over, floor) = now.nr2_params();
+                    self.nr2.set_params(over, floor);
+                }
                 Some(NrEngine::Spectral) => {
                     if switched {
                         self.nr.reset();
@@ -1081,6 +1118,10 @@ impl RxChain {
                 Some(NrEngine::SpecBleach) => {
                     self.sbnr.set_rate(fs);
                     self.sbnr.process(&mut self.audio_buf);
+                }
+                Some(NrEngine::Nr2) => {
+                    self.nr2.set_rate(fs);
+                    self.nr2.process(&mut self.audio_buf);
                 }
                 Some(NrEngine::Spectral) => self.nr.process(&mut self.audio_buf),
                 None => {}
@@ -1247,6 +1288,26 @@ impl RxChain {
     fn set_drm_constellation(&mut self, channel: Option<sdroxide_types::DrmChannel>) {
         if let Some(d) = self.demod.as_mut() {
             d.set_drm_constellation(channel);
+        }
+    }
+
+    /// What the HD Radio decoder has made of the broadcast since the last poll,
+    /// or `None` when nothing has moved. Only HD Radio ever answers.
+    fn take_hd_radio(&mut self) -> Option<sdroxide_types::HdRadioStatus> {
+        self.demod.as_mut().and_then(|d| d.take_hd_radio())
+    }
+
+    /// Re-acquire, for the same reason as [`RxChain::reset_rds`].
+    fn reset_hd_radio(&mut self) {
+        if let Some(d) = self.demod.as_mut() {
+            d.reset_hd_radio();
+        }
+    }
+
+    /// Decode a different programme of the HD Radio multiplex, 0-based.
+    fn set_hd_program(&mut self, program: u8) {
+        if let Some(d) = self.demod.as_mut() {
+            d.set_hd_program(program);
         }
     }
 }
@@ -1612,6 +1673,11 @@ struct TxChain {
 
 /// 10 ms of TX audio per iteration.
 const TX_AUDIO_BLOCK: usize = 480;
+/// Cap on the queued CW sidetone monitor, in samples — a second at 48 kHz.
+/// Bounds the queue if the speaker path stalls; the operator's own sending is
+/// at most a character or two ahead of what is playing.
+const CW_MONITOR_CAP: usize = 48_000;
+
 /// The loudest a microphone may be over a whole voice over and still count as
 /// silent — about 60 dB below full scale, which is quieter than the noise floor
 /// of any sound card anyone transmits through.
@@ -2362,6 +2428,11 @@ struct Engine {
     /// back to the store. Empty on the overwhelming majority of stations, which
     /// is what makes [`Self::refresh_drive_trim`] free there.
     drive_trim: Vec<sdroxide_types::BandDriveTrim>,
+    /// The operator's own hard ceiling on transmit drive, as a `0..1` fraction,
+    /// or `None` for none — held here for the same reason as `drive_trim`: it
+    /// is read on every transmitted block. See
+    /// [`sdroxide_types::RadioConfig::tx_drive_ceiling`] (issue #504).
+    tx_drive_max: Option<f32>,
     /// The operator's fixed receive-audio trim, in dB — the other part of
     /// `radio.json` the engine keeps a copy of, and for the same reason as
     /// `drive_trim`: the mixer that applies it is rebuilt whenever the sound
@@ -2438,6 +2509,7 @@ struct Engine {
     audio_notch_on: bool,
     audio_nr: SpectralNr,
     audio_sbnr: SpecBleachNr,
+    audio_nr2: Nr2,
     audio_nnr: NeuralNr,
     audio_dfnr: Option<Box<DeepFilterNr>>,
     audio_dfnr_failed: bool,
@@ -2495,6 +2567,27 @@ struct Engine {
     voice_prev_rate: f64,
     /// The monitored block handed to whichever speaker path is in use.
     voice_prev_out: Vec<f32>,
+    /// CW sidetone monitor: the keyed tone copied for the local speakers, at
+    /// the digi TX rate (48 kHz), resampled to the output rate and drained as
+    /// the speaker path asks. Empty unless CW is sending with the monitor on
+    /// (`DigiConfig::cw_sidetone`), so it costs nothing on any other mode.
+    cw_monitor_q: Vec<f32>,
+    cw_monitor_rs: Option<MonoResampler>,
+    cw_monitor_rate: f64,
+    /// Resampled and waiting for the speaker, drained from the front a block at
+    /// a time. Separate from `cw_monitor_q` because the two ends do not deal in
+    /// the same samples: the transmit loop pushes 10 ms of 48 kHz, the speaker
+    /// path asks for whatever its own block is at its own rate, and a resampler
+    /// hands back a ragged count either way. Holding the remainder here is what
+    /// makes a dit survive a block boundary — thrown away instead, the tone is
+    /// cut wherever the two cadences disagree, which is a click in the middle
+    /// of an element rather than a shorter one.
+    cw_monitor_ready: std::collections::VecDeque<f32>,
+    cw_monitor_out: Vec<f32>,
+    /// One-shot diagnostic: warned once that the monitor queue is filling
+    /// faster than the speaker drains it (device unhooked or wedged). Cleared
+    /// again when a drain does serve audio.
+    cw_monitor_warned: bool,
     /// When the current keyer over was requested, so one that never reached the
     /// air (the transmit rails refused, a digital-voice burst was aborted)
     /// releases the keyer instead of leaving it stuck "transmitting".
@@ -2651,6 +2744,21 @@ struct Engine {
     /// `RadioConfig::converter_offset_hz` since the tracker was switched on.
     /// Only live while `state.qo100.auto_apply` is set.
     qo100_auto: Qo100Auto,
+    /// HFDL (ARINC 635) channel decoder: a 24 kS/s downconversion centred on
+    /// the operator's chosen channel plus a worker-thread demodulator, present
+    /// only while the decoder is enabled. Same fixed-frequency shape as the
+    /// QO-100 beacon lane — retuning it is always just re-seating the mixer —
+    /// see `sync_hfdl_window`.
+    hfdl_ddc: Option<Ddc>,
+    hfdl: Option<HfdlController>,
+    hfdl_buf: Vec<Complex32>,
+    /// The stream rate `hfdl_ddc` was built to decimate — the same reason
+    /// `qo100_in_rate` exists.
+    hfdl_in_rate: f64,
+    /// The last HFDL setting the operator chose, held in step with
+    /// `state.hfdl` for symmetry with `qo100_cfg`. Nothing reads it back yet,
+    /// and it is not persisted — the same convention `qo100_cfg` follows.
+    hfdl_cfg: sdroxide_types::HfdlSettings,
     /// Open capture file for `--record-iq`, and the interleaving scratch it is
     /// written from.
     iq_rec: Option<std::io::BufWriter<std::fs::File>>,
@@ -2693,6 +2801,8 @@ struct Engine {
     rds_dial_hz: f64,
     /// The same, for the DRM decoder — see [`DRM_RETUNE_HZ`].
     drm_dial_hz: f64,
+    /// The same, for the HD Radio decoder — see [`HD_RADIO_RETUNE_HZ`].
+    hd_dial_hz: f64,
     /// WSJT-X UDP broadcast: decodes, status and logged QSOs sent out for
     /// GridTracker, JTAlert, N1MM+ and Log4OM. Present while enabled.
     wsjtx: Option<sdroxide_wsjtx::WsjtxUdp>,
@@ -2881,11 +2991,30 @@ struct Engine {
     relay_pending: bool,
     /// Whether the lead cap has already been complained about this session.
     relay_lead_capped: bool,
+    /// The receive and transmit dials, and the bands they were in, last told
+    /// to the T/R switch's band decoder (issue #442) — see
+    /// [`Engine::tell_tr_switch_bands`]. The dials are kept so an unmoved one
+    /// costs a comparison per tick rather than a band-plan lookup.
+    relay_bands_told: Option<(f64, f64, sdroxide_types::Band, sdroxide_types::Band)>,
     /// What was last written to `session.json`, so the periodic check only
     /// touches the disk when the operator has actually moved. `None` when this
     /// engine does not remember its session (see
     /// [`EngineConfig::remember_session`]).
     session: Option<sdroxide_config::Session>,
+    /// The station's named profiles (issue #197): the operator's saveable
+    /// working setups, held here so an apply is a memory read rather than
+    /// one whenever a radio's dial is clicked.
+    profiles: Vec<sdroxide_config::Profile>,
+    /// The operator's per-mode settings overrides (`modeprofiles.json`): what
+    /// AGC, squelch, noise reduction and the rest were changed to while a mode
+    /// was selected, laid over [`sdroxide_types::Mode::default_profile`] and
+    /// applied again the next time that mode comes up. See
+    /// [`sdroxide_types::ModeProfile`].
+    mode_profiles: sdroxide_types::ModeProfiles,
+    /// Whether [`Self::mode_profiles`] has changes the file has not seen yet.
+    /// Flushed on the session tick, like the digi config, because a dragged
+    /// slider is a change per frame and none of them is worth a write.
+    mode_profiles_dirty: bool,
     /// The antenna ports the operator wants, RX and TX: the command line's
     /// choice, else the remembered session's, else whatever they last picked in
     /// the UI. Re-applied whenever a front end is (re)opened, because a
@@ -3491,6 +3620,10 @@ fn engine_thread(
     // Published so every UI attached to this engine — including a remote one
     // started by somebody else — can warn about it.
     state.oob_tx = !engine_cfg.tx_ham_only;
+    // Whether this machine has an nrsc5 to decode HD Radio with. Asked here, on
+    // the machine the decoder would run on, so a remote client greys the mode
+    // out for the station's reason rather than its own.
+    state.hd_radio_unavailable = sdroxide_nrsc5::unavailable_reason().map(str::to_string);
     // Seeded here, next to the other config-derived state, so the very first
     // broadcast carries the real guard settings and no client ever renders the
     // 0.0 that `TxState::default()` would give it.
@@ -3569,6 +3702,24 @@ fn engine_thread(
             }
             state.band = Band::containing(hz);
         }
+        // ...and HFDL, whose channel is chosen in its panel rather than by the
+        // dial: there is a plan of assigned frequencies, so the mode brings the
+        // dial onto the chosen one and the panadapter shows the signal the lane
+        // is decoding. The lane follows its own frequency, so this is a view,
+        // not the tuning.
+        if mode.is_hfdl() {
+            let hz = state.hfdl.frequency_hz;
+            info!(
+                from = state.active_freq_hz(),
+                to = hz,
+                "HFDL channel selected; tuning the dial there"
+            );
+            match state.active_vfo {
+                Vfo::A => state.vfo_a_hz = hz,
+                Vfo::B => state.vfo_b_hz = hz,
+            }
+            state.band = Band::containing(hz);
+        }
     }
     let skim_cfg = sdroxide_config::load_skimmer_config();
     state.skimmer = if audio_mode {
@@ -3620,7 +3771,16 @@ fn engine_thread(
     // further down: the remembered decimation decides what rate the analyzer
     // and the receiver chain are built at, and building them at the device rate
     // first would mean tearing them down again before the first block.
-    let session = engine_cfg.remember_session.then(|| engine_cfg.store.load_session());
+    //
+    // Whether it came off the disk is held apart from the session itself. An
+    // engine that remembers gets a default session when there is no file —
+    // which is what keeps it remembering from its first change — but only a
+    // *restored* one's levels are recorded as its mode's own values at startup;
+    // see the profile block below.
+    let restored =
+        engine_cfg.remember_session.then(|| engine_cfg.store.load_session_if_present()).flatten();
+    let session_restored = restored.is_some();
+    let session = engine_cfg.remember_session.then(|| restored.unwrap_or_default());
     // Held separately from what this front end can carry: a start on a stand-in
     // (a radio switched off, a rig that isn't there yet) must not be the thing
     // that forgets it — see `Engine::want_decimation`.
@@ -3650,7 +3810,12 @@ fn engine_thread(
             (None, Some(StereoMixer::new(audio.producer)), audio.out_rate, rs)
         }
         Some(audio) => {
-            let chain = RxChain::new(state.sample_rate, &state.rx[0], audio.out_rate);
+            let chain = RxChain::new(
+                state.sample_rate,
+                &state.rx[0],
+                audio.out_rate,
+                state.active_freq_hz(),
+            );
             info!(channel_rate = chain.ddc.out_rate(), out_rate = audio.out_rate, "audio chain up");
             (Some(chain), Some(StereoMixer::new(audio.producer)), audio.out_rate, None)
         }
@@ -3664,6 +3829,15 @@ fn engine_thread(
     // never taken in it; the list is the part that goes.
     scan_cfg.forget_stale_skips();
     let stacks = sdroxide_config::load_bandstacks();
+    let profiles = sdroxide_config::load_profiles();
+    // Like the session, the per-mode overrides are only read and written by an
+    // engine that was asked to remember its settings. A test or a one-shot
+    // engine must not pick up the operator's file — or leave one behind.
+    let mut mode_profiles = if engine_cfg.remember_session {
+        engine_cfg.store.load_mode_profiles()
+    } else {
+        sdroxide_types::ModeProfiles::default()
+    };
     let digi_config = sdroxide_config::load_digi_config();
     // Only the per-band drive calibration is kept out of `radio.json` — the
     // engine deliberately does not hold that file (see
@@ -3676,6 +3850,7 @@ fn engine_thread(
     let _ = event_tx.send(RadioEvent::Memories(memories.clone()));
     let _ = event_tx.send(RadioEvent::MemoryFolders(mem_folders.clone()));
     let _ = event_tx.send(RadioEvent::Scanner(scan_cfg.clone()));
+    let _ = event_tx.send(RadioEvent::Profiles(profiles.iter().map(|p| p.name.clone()).collect()));
     // Surface any warning captured while opening the source (e.g. radio audio
     // device unavailable / mono card chosen for IQ) so the UI can show it
     // instead of an unexplained "waiting for spectrum" — together with any
@@ -3734,6 +3909,46 @@ fn engine_thread(
         // a transmit frequency.
         state.repeater = s.repeater.clamped();
         state.recording_mono = s.recording_mono;
+    }
+    // Every receiver starts on its mode's settings: the mode's defaults with
+    // this station's overrides laid over them.
+    //
+    // A restored session's levels are what the operator left its mode on, so
+    // they are first recorded as that mode's own values, and the profile then
+    // lays them back on the receiver. Standing on the receiver alone they
+    // would last only until the mode was next left — a station upgrading to a
+    // build with per-mode settings starts with an empty `modeprofiles.json`,
+    // and its saved AGC, squelch, noise reduction, binaural and RX gain would
+    // be gone the first time it changed mode and came back. Laid over the
+    // profile rather than instead of it, because the session does not carry
+    // everything: auto-notch, AGC max gain, WFM stereo and the whole sub
+    // receiver come from the profile alone, and an override for one of them
+    // has to be back after a restart too.
+    //
+    // Recorded against the mode the session was left in, which is not always
+    // the one the receiver starts in: `--mode` can pick another, and that is a
+    // mode change like any other.
+    //
+    // A first run, or an engine told not to remember, has no session to
+    // record: the profile alone, which is the mode's defaults.
+    let mut mode_profiles_dirty = false;
+    if let Some(s) = session.as_ref().filter(|_| session_restored) {
+        let left_on = sdroxide_types::ModeProfile {
+            agc: Some(s.agc),
+            manual_gain_db: Some(s.rx_gain_db),
+            squelch_db: Some(s.squelch_db),
+            noise_reduction: Some(s.noise_reduction),
+            binaural: Some(s.binaural),
+            ..Default::default()
+        };
+        let before = mode_profiles.overrides(s.mode);
+        let mut over = left_on.over(before.unwrap_or_default());
+        over.trim_against(&s.mode.default_profile());
+        mode_profiles.set(s.mode, over);
+        mode_profiles_dirty = mode_profiles.overrides(s.mode) != before;
+    }
+    for rx in &mut state.rx {
+        mode_profiles.effective(rx.mode).apply_to(rx);
     }
     // The command line outranks the remembered session, exactly as it does for
     // the dial and the mode.
@@ -3797,6 +4012,7 @@ fn engine_thread(
         tx_freq_told: None,
         drive_trim_db: 0.0,
         drive_trim: radio_cfg.tx_drive_trim.clone(),
+        tx_drive_max: radio_cfg.tx_drive_ceiling(),
         rx_af_gain_db: radio_cfg.rx_audio_gain_db,
         tx_center_hz: 0.0,
         tx_ham_only: engine_cfg.tx_ham_only,
@@ -3837,6 +4053,7 @@ fn engine_thread(
         audio_notch_on: false,
         audio_nr: SpectralNr::new(),
         audio_sbnr: SpecBleachNr::new(),
+        audio_nr2: Nr2::new(),
         audio_nnr: NeuralNr::new(),
         audio_dfnr: None,
         audio_dfnr_failed: false,
@@ -3856,6 +4073,12 @@ fn engine_thread(
         voice_prev_rs: None,
         voice_prev_rate: 0.0,
         voice_prev_out: Vec::new(),
+        cw_monitor_q: Vec::new(),
+        cw_monitor_ready: std::collections::VecDeque::new(),
+        cw_monitor_rs: None,
+        cw_monitor_rate: 0.0,
+        cw_monitor_out: Vec::new(),
+        cw_monitor_warned: false,
         voice_started: None,
         voice_tick: None,
         tx_pace: None,
@@ -3904,6 +4127,12 @@ fn engine_thread(
         // `sync_qo100`'s doc for why this one is not read back from disk.
         qo100_cfg: sdroxide_types::Qo100Settings::default(),
         qo100_auto: Qo100Auto::default(),
+        hfdl_ddc: None,
+        hfdl: None,
+        hfdl_buf: Vec::new(),
+        hfdl_in_rate: 0.0,
+        // Session-scoped only, for the same reason as `qo100_cfg`.
+        hfdl_cfg: sdroxide_types::HfdlSettings::default(),
         iq_rec,
         iq_rec_buf: Vec::new(),
         iq_wav: None,
@@ -3922,6 +4151,7 @@ fn engine_thread(
         last_s_dbm: -127.0,
         rds_dial_hz: 0.0,
         drm_dial_hz: 0.0,
+        hd_dial_hz: 0.0,
         tci_srv: None,
         tci_cfg: TciServerConfig::default(),
         tci_srv_err: None,
@@ -3982,6 +4212,7 @@ fn engine_thread(
         relay_last_status: None,
         relay_pending: false,
         relay_lead_capped: false,
+        relay_bands_told: None,
         rotator: None,
         rot_last_status: None,
         next_rot_emit: Instant::now(),
@@ -3991,6 +4222,9 @@ fn engine_thread(
         want_gains,
         want_decimation,
         store: engine_cfg.store,
+        profiles,
+        mode_profiles,
+        mode_profiles_dirty,
         instance: engine_cfg.instance,
         primary: engine_cfg.primary,
         tx_gate: engine_cfg.tx_gate,
@@ -4029,6 +4263,7 @@ fn engine_thread(
         engine.sync_vdl2(); // ...and the datalink lane, likewise
         engine.sync_ais(); // ...and the shipping lane, likewise
         engine.sync_qo100(); // a no-op today: `qo100_cfg` starts disabled and is never loaded
+        engine.sync_hfdl(); // a no-op today: `hfdl_cfg` starts disabled too
     }
     // Start any enabled network spot feeds from the persisted config. The
     // operator identity comes from the digi config — one identity for the whole
@@ -4174,6 +4409,7 @@ fn engine_thread(
     let mut lane_sweeps: u64 = 0;
     let mut next_rds = Instant::now();
     let mut next_drm = Instant::now();
+    let mut next_hd = Instant::now();
     let mut next_session = Instant::now() + SESSION_SAVE_INTERVAL;
 
     // The band-dependent gain ranges, once, before anything is published: the
@@ -4265,6 +4501,7 @@ fn engine_thread(
         engine.poll_vdl2();
         engine.poll_ais();
         engine.poll_qo100();
+        engine.poll_hfdl();
         engine.poll_scanner();
         engine.poll_tci_server();
         engine.poll_rigctld();
@@ -4477,6 +4714,11 @@ fn engine_thread(
         }
         if now >= next_meters {
             next_meters = now + METER_INTERVAL;
+            // A recording that has stopped writing, or stumbled and carried
+            // on. Nothing else in the program fails this quietly — the audio
+            // plays on, the button stays lit, and the only evidence is a file
+            // that ends early (issue #443).
+            engine.report_recorder_faults();
             // How much of the disk the I/Q capture has taken, for the readout
             // beside the button. At 2.4 Msps this climbs by 19 MB a second and
             // an operator wants to see that before the disk fills.
@@ -4501,6 +4743,11 @@ fn engine_thread(
             // side's view of the samples that arrived, and on a direct-sampling
             // radio the two answer different questions (issue #362).
             let adc_overload = engine.source.adc_overload();
+            // The predistortion loop, where the radio runs one. Also read once
+            // for both branches: whether it locked is asked mostly *after* the
+            // over, and a reading that vanished at unkey would hide the answer
+            // (issue #441).
+            let puresignal = engine.source.puresignal();
             let meters = if engine.tx_active || engine.rig_tx {
                 // CAT/TCI rigs report real forward power / SWR; HackRF and other
                 // IQ sources have no such sensor and leave both `None` (the meter
@@ -4632,6 +4879,7 @@ fn engine_thread(
                     // Transmitting: the receiver is stood down and whatever the
                     // chain last measured belongs to a moment that has passed.
                     passband_dbfs: f32::NEG_INFINITY,
+                    puresignal,
                 })
             } else {
                 // Not transmitting: both SWR counters belong to an over, so they
@@ -4663,6 +4911,7 @@ fn engine_thread(
                     stereo,
                     tone,
                     passband_dbfs,
+                    puresignal,
                 })
             };
             if let Some(m) = meters {
@@ -4687,10 +4936,17 @@ fn engine_thread(
                 let _ = engine.event_tx.send(RadioEvent::Drm(drm));
             }
         }
+        if now >= next_hd {
+            next_hd = now + HD_RADIO_INTERVAL;
+            if let Some(hd) = engine.main.as_mut().and_then(|c| c.take_hd_radio()) {
+                let _ = engine.event_tx.send(RadioEvent::HdRadio(hd));
+            }
+        }
         if now >= next_session {
             next_session = now + SESSION_SAVE_INTERVAL;
             engine.save_session();
             engine.flush_digi_config();
+            engine.flush_mode_profiles();
         }
     }
 }
@@ -4761,6 +5017,11 @@ impl Drop for Engine {
         // And the transmit-audio rail, for the same reason: an operator who
         // trims their level and quits has set it, not been trying it out.
         self.flush_digi_config();
+        // And the per-mode settings, on every way out and not only a clean one:
+        // a front end that drops its connection takes the engine down with a
+        // change since the last session tick still unwritten, while the session
+        // saved just above already describes it.
+        self.flush_mode_profiles();
         // Finalize any in-progress recording so the MP3 file is closed cleanly
         // when the engine thread exits (all controllers gone / fatal error).
         if let Some(rec) = self.recorder.take() {
@@ -5118,6 +5379,16 @@ impl Engine {
                 c.on_rx_iq(&self.qo100_buf);
             }
         }
+        // ...and the HFDL channel decoder from a 24 kS/s lane centred on the
+        // operator's chosen channel. One channel per lane — HFDL stations are
+        // spread across the band, not clustered, so a window holds one.
+        if let Some(ddc) = self.hfdl_ddc.as_mut() {
+            self.hfdl_buf.clear();
+            ddc.process(iq, &mut self.hfdl_buf);
+            if let Some(c) = self.hfdl.as_ref() {
+                c.on_rx_iq(&self.hfdl_buf);
+            }
+        }
         // Feed TCI clients: the same clean tap the digital decoders use (so
         // muting or turning down sdroxide can't silence somebody's decoder),
         // resampled to the 48 kHz TCI mandates.
@@ -5371,6 +5642,13 @@ impl Engine {
                     let (db, whiten) = nr_level.spec_params();
                     self.audio_sbnr.set_params(db, whiten);
                 }
+                Some(NrEngine::Nr2) => {
+                    if switched {
+                        self.audio_nr2.reset();
+                    }
+                    let (over, floor) = nr_level.nr2_params();
+                    self.audio_nr2.set_params(over, floor);
+                }
                 Some(NrEngine::Spectral) => {
                     if switched {
                         self.audio_nr.reset();
@@ -5404,6 +5682,10 @@ impl Engine {
                 Some(NrEngine::SpecBleach) => {
                     self.audio_sbnr.set_rate(fs);
                     self.audio_sbnr.process(&mut self.audio_re);
+                }
+                Some(NrEngine::Nr2) => {
+                    self.audio_nr2.set_rate(fs);
+                    self.audio_nr2.process(&mut self.audio_re);
                 }
                 Some(NrEngine::Spectral) => self.audio_nr.process(&mut self.audio_re),
                 None => {}
@@ -5463,6 +5745,17 @@ impl Engine {
             self.audio_play_rec.clear();
             if want_rec {
                 self.audio_play_rec.extend_from_slice(&self.voice_play);
+            }
+        } else if self.take_cw_monitor(self.audio_out_rate, block) {
+            // The keyed CW sidetone takes the speakers, so an MCW operator
+            // hears what they are sending even though the tone went out to the
+            // rig and not to a monitor. Silence between elements, exactly as a
+            // sidetone is.
+            self.audio_play.clear();
+            self.audio_play.extend_from_slice(&self.cw_monitor_out);
+            self.audio_play_rec.clear();
+            if want_rec {
+                self.audio_play_rec.extend_from_slice(&self.cw_monitor_out);
             }
         } else if self.mutes_analog_audio() {
             self.audio_play.fill(0.0);
@@ -5595,6 +5888,7 @@ impl Engine {
                 self.sync_vdl2_window();
                 self.sync_ais_window();
                 self.sync_qo100_window();
+                self.sync_hfdl_window();
                 self.update_tuning();
                 let _ = self.event_tx.send(RadioEvent::State(self.state.clone()));
             }
@@ -5697,8 +5991,17 @@ impl Engine {
                 // Non-digital: follow the operator's rig, but only when the
                 // underlying rig class actually changed (ignore USB↔DIGU echoes).
                 if !same_class {
+                    // A mode chosen on the radio is a mode chosen: it gets that
+                    // mode's settings exactly as the mode buttons here would,
+                    // or an operator who works the rig's own controls would
+                    // carry one mode's AGC and noise reduction into the next.
+                    let profile =
+                        (self.state.rx[0].mode != m).then(|| self.mode_profiles.effective(m));
                     let r = &mut self.state.rx[0];
                     r.mode = m;
+                    if let Some(profile) = profile {
+                        profile.apply_to(r);
+                    }
                     (r.filter_lo, r.filter_hi) = m.default_filter();
                     let snapshot = *r;
                     // Rebuild the demodulator for the new mode. Sideband is
@@ -5706,8 +6009,9 @@ impl Engine {
                     // without this the internal demod (e.g. TCI wideband-IQ RX)
                     // keeps the old sideband while state/UI already show the new
                     // mode — the LSB-shows-but-demodulates-USB desync.
+                    let dial = self.state.rx_freq_hz();
                     if let Some(c) = self.chain_mut(RxId::Main) {
-                        c.build_for_mode(&snapshot);
+                        c.build_for_mode(&snapshot, dial);
                     }
                     self.update_display_center(); // sideband flip changes the window
                     self.sync_digi_mode();
@@ -5844,6 +6148,10 @@ impl Engine {
         // centre — its one target frequency never moves, so re-seating the
         // mixer is all a retune ever needs.
         self.sync_qo100_window();
+        // The HFDL window is the same fixed-frequency shape as the QO-100 one:
+        // the operator's chosen channel never moves with the band, so a retune
+        // is just re-seating the mixer.
+        self.sync_hfdl_window();
         // Re-seat the DDCs on the new centre. Without this the main receiver
         // keeps the offset it had against the old one, which is exactly how a
         // rig-initiated retune ends up demodulating somewhere the readout does
@@ -5856,6 +6164,10 @@ impl Engine {
     /// name nobody, and our own callsign is not something we heard.
     fn psk_report_decodes(&self, decodes: &[sdroxide_types::Decode], dial_hz: f64) {
         for d in decodes {
+            // Free text names nobody, whatever its first words look like.
+            if d.free_text {
+                continue;
+            }
             let Some(call) = d.from.as_deref().filter(|c| !c.is_empty()) else { continue };
             self.psk_report_heard(
                 call,
@@ -6069,15 +6381,17 @@ impl Engine {
             de_grid: s.config.my_grid.clone(),
             dx_grid: s.dx_grid.clone().unwrap_or_default(),
             tx_watchdog: s.tx_watchdog,
-            // JS8's period is a runtime setting rather than implied by the
-            // mode, so it has to come from the status rather than a constant.
+            // The WSJT-X UDP Status message carries the period as whole
+            // seconds, so FT4's 7.5 goes out as 7 and FT2's 3.75 as 3. JS8's
+            // speed and the FST4, Q65 and FSK441 periods are settings rather
+            // than implied by the mode, so those come from the status; every
+            // other slotted mode states its own.
             tr_period_s: match s.mode {
-                sdroxide_types::Mode::Ft4 => 7,
-                // The WSJT-X UDP Status message carries the period as whole
-                // seconds, so FT4's 7.5 goes out as 7 and FT2's 3.75 as 3.
-                sdroxide_types::Mode::Ft2 => 3,
                 sdroxide_types::Mode::Js8 => s.js8.as_ref().map_or(15, |j| j.speed.slot_s() as u32),
-                _ => 15,
+                sdroxide_types::Mode::Fst4 => s.config.fst4_period.slot_s() as u32,
+                sdroxide_types::Mode::Q65 => s.config.q65_mode.slot_s() as u32,
+                sdroxide_types::Mode::Fsk441 => s.config.fsk441_period.slot_s() as u32,
+                mode => mode.slot_timing().map_or(15, |t| t.slot_s as u32),
             },
             tx_message: s.tx_pending_msg.clone().unwrap_or_default(),
         });
@@ -6172,6 +6486,12 @@ impl Engine {
                     self.spots.wspr_report(&spots, dial, self.digi_config.wspr_tx_percent);
                     let _ = self.event_tx.send(RadioEvent::WsprSpots(spots));
                 }
+                // No reporting-network upload, unlike WSPR's: there is no
+                // PI4 equivalent of WSPRnet to report to, so this only ever
+                // reaches the UI.
+                DigiAction::Pi4Spots(spots) => {
+                    let _ = self.event_tx.send(RadioEvent::Pi4Spots(spots));
+                }
                 DigiAction::SetDial(hz) => self.wspr_hop(hz),
                 DigiAction::Heard { call, grid, audio_hz, snr_db, slot_utc } => {
                     self.psk_report_heard(&call, &grid, audio_hz, snr_db, slot_utc, dial);
@@ -6183,6 +6503,12 @@ impl Engine {
                     // `freq_hz` is only of interest to the log line.
                     debug!(%call, snr_db, freq_hz, "RADE callsign decoded");
                     self.spots.reporter_rx_report(call, snr_db.round().clamp(-128.0, 127.0) as i32);
+                }
+                DigiAction::RadePresence { snr_db } => {
+                    // In sync with an unidentified station: say we are hearing
+                    // *something*, so the far end can see it is being heard
+                    // before either of us knows the other's callsign.
+                    self.spots.reporter_rx_presence(snr_db.round().clamp(-128.0, 127.0) as i32);
                 }
                 DigiAction::KeyTx => {
                     // Key up via the normal PTT path so the safety rails apply.
@@ -6370,6 +6696,11 @@ impl Engine {
             // a framing of its own — and nothing further down would notice it
             // had been handed a maritime safety broadcast.
             Box::new(NavtexController::new(self.digi_config.clone(), tap_rate))
+        } else if mode == Mode::Acars {
+            // The same shape of thing as NAVTEX: the framing is its own and
+            // nothing further down would notice it had been handed an airline
+            // datalink rather than a radio amateur's text.
+            Box::new(AcarsController::new(self.digi_config.clone(), tap_rate))
         } else if mode.is_rifp() {
             Box::new(RifpController::new(self.digi_config.clone(), tap_rate))
         } else if mode.is_aprs() {
@@ -6424,6 +6755,37 @@ impl Engine {
             // would be quieter still: WSPR is 4-FSK in the same passband, so an
             // FT8 decoder handed its audio finds nothing and says nothing.
             Box::new(WsprController::new(self.digi_config.clone(), tap_rate))
+        } else if mode.is_pi4() {
+            // Ahead of the fall-through for the same reason `is_wspr` is:
+            // PI4 is 4-FSK too, just wider and faster, so an FT8 decoder
+            // handed its audio would sit there finding nothing.
+            Box::new(Pi4Controller::new(self.digi_config.clone(), tap_rate))
+        } else if mode == Mode::Msk144 {
+            // And again: MSK144 is its own protocol, and its decoder hunts the
+            // whole slot for a meteor burst rather than reading a frame at a
+            // fixed offset, which the FT8 controller has no concept of.
+            Box::new(Msk144Controller::new(self.digi_config.clone(), tap_rate))
+        } else if matches!(mode, Mode::Jt65 | Mode::Jt9) {
+            // Ahead of the fall-through, which is FT8's: JT65/JT9 are a different
+            // 60-second protocol with no 77-bit message and no QSO sequencer, so
+            // an FT8 decoder handed their audio would decode nothing and say
+            // nothing. Their own controller holds the slot and shows decodes.
+            Box::new(JtController::new(mode, self.digi_config.clone(), tap_rate))
+        } else if mode == Mode::Fst4 {
+            // The same shape again, and ahead of the fall-through for the same
+            // reason: FST4 is its own slow protocol whose period is a setting,
+            // which the FT8 controller has no concept of.
+            Box::new(Fst4Controller::new(self.digi_config.clone(), tap_rate))
+        } else if mode == Mode::Q65 {
+            // And again: Q65 is its own slow protocol whose sub-mode fixes both
+            // the period and the tone spacing, neither of which the FT8
+            // controller has a concept of.
+            Box::new(Q65Controller::new(self.digi_config.clone(), tap_rate))
+        } else if mode == Mode::Fsk441 {
+            // FSK441 is its own meteor-scatter protocol and its own decoder —
+            // mfsk-core has none — and its slot is a period setting, so the
+            // FT8 fall-through has neither its protocol nor its clock.
+            Box::new(Fsk441Controller::new(self.digi_config.clone(), tap_rate))
         } else {
             Box::new(DigiController::new(mode, self.digi_config.clone(), tap_rate))
         }
@@ -6525,8 +6887,15 @@ impl Engine {
     /// sideband and keyed sidetone lands a pitch above the VFO exactly as it
     /// does on an SDR.
     fn rig_cw_offset_hz(&self) -> f64 {
+        self.rig_cw_offset_hz_in(self.state.rx[0].mode)
+    }
+
+    /// [`Self::rig_cw_offset_hz`] for a receiver in `mode` — for the moment a
+    /// VFO switch needs the offset of the mode it is about to put the receiver
+    /// in, before it has.
+    fn rig_cw_offset_hz_in(&self, mode: Mode) -> f64 {
         if self.audio_mode
-            || self.state.rx[0].mode != Mode::Cw
+            || mode != Mode::Cw
             || !self.source.center_is_dial()
             || !self.source.cw_iq_on_vfo()
             || self.source.cw_audio_keyed()
@@ -7538,6 +7907,28 @@ impl Engine {
                 if vfo == self.state.active_vfo {
                     self.state.band = Band::containing(hz);
                     self.follow_dial();
+                    // In HFDL the dial and the panel's channel are two controls
+                    // for one thing, and the operator turns the dial. Carry it
+                    // into the channel so the lane follows the signal they have
+                    // tuned to, rather than sitting on the last chip pressed —
+                    // which left a station heard clearly on 8 843 kHz decoding
+                    // silence at the 21 931 default (reported on #497). The
+                    // panel's chips still work: they send a dial move too, and
+                    // this makes the two agree from either side.
+                    if self.state.rx[0].mode.is_hfdl()
+                        && (self.state.hfdl.frequency_hz - hz).abs() >= 0.5
+                    {
+                        self.state.hfdl.frequency_hz = hz;
+                        if let Some(c) = self.hfdl.as_ref() {
+                            c.set_config(self.state.hfdl);
+                        }
+                        // Re-seat the lane's mixer now rather than waiting for
+                        // the next centre change: `follow_dial` only moves the
+                        // hardware once the dial leaves the span, so a retune
+                        // inside it would otherwise leave the DDC on the old
+                        // channel.
+                        self.sync_hfdl_window();
+                    }
                 }
                 self.update_tuning();
             }
@@ -7575,6 +7966,27 @@ impl Engine {
                 // (issues #286 and #404).
                 self.shelve_vfo_state();
                 self.state.active_vfo = v;
+                // A rig with its own pair of VFOs is told which one is being
+                // worked, so its display and its A/B button agree with ours.
+                // Sent before anything else about the switch: recalling a VFO
+                // left in another mode commands the mode and retunes for it,
+                // and every one of those sent ahead of the selection lands on
+                // the VFO being left — overwriting the radio's other dial with
+                // this one's. The frequency travels with the selection because
+                // a rig that selects a VFO holding a stale number puts its
+                // receiver there until the dial lands. A no-op on every front
+                // end without a second VFO, which is nearly all of them.
+                //
+                // The *rig's* number, not the dial: in CW a radio that keys its
+                // own transmitter sits a sidetone above it, exactly as
+                // `follow_dial` sends it. Passing the bare dial here puts the
+                // radio one pitch low, and since the reply is read back and
+                // believed, the dial then walks down by one pitch on every
+                // switch. The receiver is not in this VFO's mode yet, so the
+                // offset is taken for the mode it is about to be put in.
+                let mode = self.vfo_memory[v.index()].mode;
+                let rig_hz = self.state.active_freq_hz() + self.rig_cw_offset_hz_in(mode);
+                self.source.select_vfo(v, rig_hz);
                 self.recall_vfo_mode();
                 self.recall_vfo_antenna();
                 self.state.band = Band::containing(self.state.active_freq_hz());
@@ -7612,6 +8024,8 @@ impl Engine {
             }
             SetSplit(on) => self.state.split = on,
             SetCenter(hz) => {
+                // Never onto the VFO itself: see `guarded_center`.
+                let hz = self.guarded_center(hz);
                 // Asking for the centre the front end is already on costs a
                 // hardware retune, a skimmer restart and a waterfall remap for
                 // nothing — and a panadapter pan held against the end of a
@@ -7689,12 +8103,14 @@ impl Engine {
                     c.agc.set_manual_gain_db(manual_db);
                     c.agc.set_mode(agc);
                 }
+                self.remember_mode_setting(rx, |p| p.agc = Some(agc));
             }
             SetAgcMaxGain { rx, db } => {
                 self.state.rx[rx.index()].agc_max_gain_db = db;
                 if let Some(c) = self.chain_mut(rx) {
                     c.agc.set_max_gain_db(db);
                 }
+                self.remember_mode_setting(rx, |p| p.agc_max_gain_db = Some(db));
             }
             SetManualGain { rx, db } => {
                 let db = db.clamp(0.0, sdroxide_types::MAX_MANUAL_GAIN_DB);
@@ -7702,10 +8118,14 @@ impl Engine {
                 if let Some(c) = self.chain_mut(rx) {
                     c.agc.set_manual_gain_db(db);
                 }
+                self.remember_mode_setting(rx, |p| p.manual_gain_db = Some(db));
             }
             SetVolume { rx, v } => self.state.rx[rx.index()].volume = v.clamp(0.0, 1.0),
             SetMute { rx, muted } => self.state.rx[rx.index()].muted = muted,
-            SetSquelch { rx, db } => self.state.rx[rx.index()].squelch_db = db,
+            SetSquelch { rx, db } => {
+                self.state.rx[rx.index()].squelch_db = db;
+                self.remember_mode_setting(rx, |p| p.squelch_db = Some(db));
+            }
             // The rig's own squelch, on a front end that has one. Held in the
             // state either way so the rail keeps its position on a source that
             // is not listening, and passed straight down — the radio is what
@@ -7733,10 +8153,45 @@ impl Engine {
                     level
                 };
                 self.state.rx[rx.index()].noise_reduction = level;
+                self.remember_mode_setting(rx, |p| p.noise_reduction = Some(level));
             }
-            SetAutoNotch { rx, on } => self.state.rx[rx.index()].auto_notch = on,
-            SetWfmStereo { rx, on } => self.state.rx[rx.index()].wfm_stereo = on,
-            SetBinaural { rx, on } => self.state.rx[rx.index()].binaural = on,
+            SetAutoNotch { rx, on } => {
+                self.state.rx[rx.index()].auto_notch = on;
+                self.remember_mode_setting(rx, |p| p.auto_notch = Some(on));
+            }
+            SetWfmStereo { rx, on } => {
+                self.state.rx[rx.index()].wfm_stereo = on;
+                self.remember_mode_setting(rx, |p| p.wfm_stereo = Some(on));
+            }
+            SetBinaural { rx, on } => {
+                self.state.rx[rx.index()].binaural = on;
+                self.remember_mode_setting(rx, |p| p.binaural = Some(on));
+            }
+            // Forget the operator's per-mode values and put the mode's own
+            // defaults back on anything sitting in one of the modes cleared.
+            ResetModeDefaults { mode } => {
+                match mode {
+                    Some(m) => self.mode_profiles.clear(m),
+                    None => self.mode_profiles.clear_all(),
+                }
+                self.mode_profiles_dirty = self.session.is_some();
+                self.flush_mode_profiles();
+                for rx in [RxId::Main, RxId::Sub] {
+                    let live = self.state.rx[rx.index()].mode;
+                    if mode.is_some_and(|m| m != live) {
+                        continue;
+                    }
+                    let profile = self.mode_profiles.effective(live);
+                    let r = &mut self.state.rx[rx.index()];
+                    profile.apply_to(r);
+                    let (agc, max_gain, manual) = (r.agc, r.agc_max_gain_db, r.manual_gain_db);
+                    if let Some(c) = self.chain_mut(rx) {
+                        c.agc.set_mode(agc);
+                        c.agc.set_max_gain_db(max_gain);
+                        c.agc.set_manual_gain_db(manual);
+                    }
+                }
+            }
             // Main receiver only, like the status it answers: the DRM panel
             // shows the broadcast being listened to.
             SetDrmService { service } => {
@@ -7747,6 +8202,11 @@ impl Engine {
             SetDrmConstellation { channel } => {
                 if let Some(c) = self.main.as_mut() {
                     c.set_drm_constellation(channel);
+                }
+            }
+            SetHdProgram { program } => {
+                if let Some(c) = self.main.as_mut() {
+                    c.set_hd_program(program);
                 }
             }
             SetToneSquelch { rx, tone } => self.state.rx[rx.index()].tone_sql = tone,
@@ -7807,6 +8267,7 @@ impl Engine {
                         self.state.sample_rate,
                         &self.state.rx[1],
                         self.audio_out_rate,
+                        self.state.sub_rx_hz,
                     ));
                 } else if !on {
                     self.sub = None;
@@ -8552,6 +9013,16 @@ impl Engine {
                     }
                 }
             }
+            CwStraight(on) => {
+                if let Some(d) = self.digi.as_mut() {
+                    d.set_straight(on);
+                }
+            }
+            CwKey(down) => {
+                if let Some(d) = self.digi.as_mut() {
+                    d.key_down(down);
+                }
+            }
             SstvSetMode(mode) => {
                 if let Some(d) = self.digi.as_mut() {
                     d.set_sstv_mode(mode);
@@ -8712,6 +9183,18 @@ impl Engine {
                 self.qo100_cfg = cfg;
                 self.sync_qo100();
                 if let Some(c) = self.qo100.as_ref() {
+                    c.set_config(cfg);
+                }
+            }
+
+            SetHfdlConfig(cfg) => {
+                self.state.hfdl = cfg;
+                // Session-scoped only, for the same reason as `qo100_cfg`
+                // (above): holding it in step keeps a source swap's behaviour
+                // predictable, and there is nothing worth persisting yet.
+                self.hfdl_cfg = cfg;
+                self.sync_hfdl();
+                if let Some(c) = self.hfdl.as_ref() {
                     c.set_config(cfg);
                 }
             }
@@ -9157,6 +9640,9 @@ impl Engine {
                 // else, and the band stack, the band buttons and the transmit
                 // lockout all key off `state.band`.
                 self.state.band = Band::containing(self.state.active_freq_hz());
+                // So does the band decoder, which only looks again when a dial
+                // moves (issue #442).
+                self.relay_bands_told = None;
                 self.emit_station_config();
             }
             SetCessb(db) => {
@@ -9203,6 +9689,7 @@ impl Engine {
                 // Same reason as `SetRegion`: the dial has not moved but the
                 // band under it may have.
                 self.state.band = Band::containing(self.state.active_freq_hz());
+                self.relay_bands_told = None;
                 self.emit_station_config();
                 // Whatever the loader had to say — a row it dropped, a file it
                 // could not read — reaches the operator who asked for the
@@ -9234,6 +9721,24 @@ impl Engine {
                 // the radio running the configuration on disk, and the trim
                 // is corrected on the next reload either way.
                 self.drive_trim = cfg.tx_drive_trim.clone();
+                // And the ceiling beside it, live rather than at the next
+                // reopen: the operator setting one is very likely doing it
+                // because the radio is making too much power *now*.
+                let ceiling = cfg.tx_drive_ceiling();
+                if ceiling != self.tx_drive_max {
+                    match ceiling {
+                        Some(c) => info!(
+                            "TX drive ceiling set to {:.0}% — the Drive and TUNE controls \
+                             cannot be taken past it",
+                            c * 100.0
+                        ),
+                        None => info!(
+                            "TX drive ceiling removed — the Drive and TUNE controls now reach \
+                             full drive"
+                        ),
+                    }
+                }
+                self.tx_drive_max = ceiling;
                 let tx_hz = self.tx_freq_told.unwrap_or_else(|| self.state.tx_freq_hz());
                 self.refresh_drive_trim(tx_hz);
                 // The receive trim is the other half of that: live rather than
@@ -9264,6 +9769,79 @@ impl Engine {
             // changed is the front end, which announces itself.
             ReopenSource => {
                 self.reopen_source();
+                return;
+            }
+
+            // ── Station profiles (issue #197) ──────────────────────────
+            //
+            // The station's named working setups — dials, VFOs, mode and
+            // filters, gains and drive, the digital identity, and the band
+            // stacks. The hardware is deliberately not part of it.
+            ProfileSave(name) => {
+                let name = name.trim().to_string();
+                if name.is_empty() {
+                    return;
+                }
+                // Another radio in the station may have saved or deleted one
+                // since this engine last looked; catch up before rewriting the
+                // file from our own copy, or their change is lost.
+                self.poll_shared_stores();
+                let snapshot = sdroxide_config::Profile {
+                    name: name.clone(),
+                    session: self.current_session(),
+                    digi: self.digi_config.clone(),
+                    stacks: self.stacks.clone(),
+                };
+                match self.profiles.iter().position(|p| p.name.eq_ignore_ascii_case(&name)) {
+                    Some(i) => self.profiles[i] = snapshot,
+                    None => self.profiles.push(snapshot),
+                }
+                if let Err(e) = sdroxide_config::save_profiles(&self.profiles) {
+                    warn!("saving profiles: {e}");
+                    self.notice(&format!("Could not save your profiles: {e}"));
+                }
+                self.mark_shared_store_write();
+                self.emit_profile_names();
+                self.notice(&format!("Profile \u{201c}{name}\u{201d} saved."));
+                return;
+            }
+
+            ProfileApply(name) => {
+                // A profile moves the dial, the mode and the transmit setup
+                // under whatever is on the air, so it waits for the over — by
+                // any route: keyed at the radio, or a message the rig's own
+                // keyer is sending, as well as our own key.
+                if self.on_air() || self.state.tx.ptt {
+                    self.notice("Wait for the transmission to finish before putting a profile on.");
+                    return;
+                }
+                let Some(profile) =
+                    self.profiles.iter().find(|p| p.name.eq_ignore_ascii_case(&name)).cloned()
+                else {
+                    self.notice(&format!("Profile \u{201c}{name}\u{201d} does not exist."));
+                    return;
+                };
+                self.apply_profile(&profile);
+                self.emit_profile_names();
+                self.notice(&format!("Profile \u{201c}{name}\u{201d} applied."));
+                return;
+            }
+
+            ProfileDelete(name) => {
+                self.poll_shared_stores();
+                let before = self.profiles.len();
+                self.profiles.retain(|p| !p.name.eq_ignore_ascii_case(&name));
+                if self.profiles.len() == before {
+                    self.notice(&format!("Profile \u{201c}{name}\u{201d} does not exist."));
+                    return;
+                }
+                if let Err(e) = sdroxide_config::save_profiles(&self.profiles) {
+                    warn!("saving profiles: {e}");
+                    self.notice(&format!("Could not save your profiles: {e}"));
+                }
+                self.mark_shared_store_write();
+                self.emit_profile_names();
+                self.notice(&format!("Profile \u{201c}{name}\u{201d} deleted."));
                 return;
             }
         }
@@ -9378,6 +9956,32 @@ impl Engine {
         self.state.iq_recording = false;
         self.state.iq_recording_file = None;
         self.state.iq_recording_mb = 0;
+    }
+
+    /// Tell the operator when the MP3 encoder has stumbled, and take the
+    /// recording down when it cannot be brought back.
+    ///
+    /// A dead recorder leaves `state.recording` lit and the mixer feeding a
+    /// ring nobody drains, so the button would go on claiming a recording that
+    /// stopped minutes ago. It is torn down here for the same reason the
+    /// operator is told: the honest state is "not recording".
+    fn report_recorder_faults(&mut self) {
+        let Some(fault) = self.recorder.as_ref().and_then(|r| r.failure()) else { return };
+        match fault {
+            RecorderFault::Glitch => {
+                let _ = self.event_tx.send(RadioEvent::Notice(Some(
+                    "Recording: the MP3 encoder hiccuped — there is a short gap in the file".into(),
+                )));
+            }
+            RecorderFault::Dead => {
+                let file = self.state.recording_file.clone().unwrap_or_default();
+                self.stop_recording();
+                let _ = self.event_tx.send(RadioEvent::Notice(Some(format!(
+                    "Recording stopped: the MP3 encoder failed. {file} holds what was captured \
+                     up to that point."
+                ))));
+            }
+        }
     }
 
     /// Stop and finalize any active recording.
@@ -9815,6 +10419,75 @@ impl Engine {
         let _ = self.event_tx.send(RadioEvent::Qo100Status(status));
     }
 
+    /// Whether the HFDL worker should be running at all.
+    fn hfdl_wanted(&self) -> bool {
+        self.state.hfdl.enabled
+    }
+
+    /// Construct or tear down the HFDL channel decoder, mirroring
+    /// [`Self::sync_qo100`]'s shape: a fixed-frequency lane that follows the
+    /// radio only through its mixer offset. The lane is a 24 kS/s
+    /// downconversion centred on [`HfdlSettings::frequency_hz`] — the rate the
+    /// decoder chain was validated against (see `sdroxide_hfdl`), and wide
+    /// enough to hold the whole 2.8 kHz USB channel with margin.
+    fn sync_hfdl(&mut self) {
+        // Wideband-only, for the same reason as the QO-100 lane: a CAT rig on
+        // a sound card hands over demodulated audio, not IQ to mix a
+        // downconverter from.
+        if self.audio_mode {
+            self.state.hfdl.enabled = false;
+        }
+        match (self.hfdl_wanted(), self.hfdl.is_some()) {
+            (true, false) => {
+                let mut ddc = Ddc::new(self.state.sample_rate, sdroxide_types::HFDL_LANE_RATE_HZ);
+                ddc.set_offset_hz(self.state.hfdl.frequency_hz - self.state.center_hz);
+                let out_rate = ddc.out_rate();
+                self.hfdl = Some(HfdlController::new(out_rate, self.state.hfdl));
+                self.hfdl_ddc = Some(ddc);
+                self.hfdl_in_rate = self.state.sample_rate;
+                info!(rate = out_rate, "HFDL decoder started");
+            }
+            (false, true) => {
+                self.hfdl = None;
+                self.hfdl_ddc = None;
+                self.hfdl_buf.clear();
+                info!("HFDL decoder stopped");
+            }
+            (true, true) => self.sync_hfdl_window(),
+            _ => {}
+        }
+    }
+
+    /// Re-seat the HFDL downconverter's mixer after a retune, and rebuild it
+    /// outright if the sample rate feeding it has changed — a `Ddc` bakes its
+    /// input rate and its decimation chain in at construction. The target rate
+    /// is fixed, so a retune never resizes the lane; it only moves the mixer.
+    fn sync_hfdl_window(&mut self) {
+        if self.hfdl_ddc.is_none() {
+            return;
+        }
+        let rebuild = (self.state.sample_rate - self.hfdl_in_rate).abs() >= 1.0;
+        if rebuild {
+            let mut ddc = Ddc::new(self.state.sample_rate, sdroxide_types::HFDL_LANE_RATE_HZ);
+            ddc.set_offset_hz(self.state.hfdl.frequency_hz - self.state.center_hz);
+            let out_rate = ddc.out_rate();
+            self.hfdl_ddc = Some(ddc);
+            self.hfdl_in_rate = self.state.sample_rate;
+            self.hfdl = Some(HfdlController::new(out_rate, self.state.hfdl));
+            info!(rate = out_rate, "HFDL window rebuilt");
+            return;
+        }
+        let Some(ddc) = self.hfdl_ddc.as_mut() else { return };
+        ddc.set_offset_hz(self.state.hfdl.frequency_hz - self.state.center_hz);
+    }
+
+    /// Drain the HFDL decoder's latest status and forward it.
+    fn poll_hfdl(&mut self) {
+        let Some(c) = self.hfdl.as_ref() else { return };
+        let Some(status) = c.poll() else { return };
+        let _ = self.event_tx.send(RadioEvent::HfdlStatus(status));
+    }
+
     /// One pass of the tracker's closed loop: decide whether this estimate is
     /// clean and steady enough to write into the converter offset, and if so
     /// do it. Deadband + rate-limit + a two-cycle agreement check keep it
@@ -10168,12 +10841,17 @@ impl Engine {
 
     /// The rate the VDL2 window asks its down-converter for.
     ///
+    /// Derived from the device rate rather than a fixed figure, because a
+    /// down-converter rounds to the nearest whole decimation and a fixed target
+    /// lands under the plan on some front ends — a 768 kSPS Airspy HF+ among
+    /// them (issue #548). See [`sdroxide_vdl2::plan::window_target_rate_for`].
+    ///
     /// Capped at what the front end delivers, because a window is a decimation
     /// of that stream and not a second tuner. A receiver too narrow to hold even
     /// one channel therefore lands on its own rate, `sync_vdl2` refuses to
     /// start, and the panel says why.
     fn vdl2_target_rate_hz(&self) -> f64 {
-        sdroxide_vdl2::plan::WINDOW_TARGET_RATE_HZ.min(self.state.sample_rate)
+        sdroxide_vdl2::plan::window_target_rate_for(self.state.sample_rate)
     }
 
     /// Where the window sits: over the channel plan where the span reaches it,
@@ -11563,6 +12241,10 @@ impl Engine {
     /// Capped, because an operator who types 500 ms should get a switch that
     /// works and not a radio that stutters.
     fn lead_tr_switch(&mut self) {
+        // The dial may have moved since the last tick — a split set in the
+        // same batch of commands as the key-down — and the band decoder's TX
+        // word has to be this over's.
+        self.tell_tr_switch_bands();
         let Some(hub) = self.tr_switch.as_ref() else { return };
         let wait = hub.key(self.instance);
         if wait.is_zero() {
@@ -11591,6 +12273,9 @@ impl Engine {
     /// comparison — see [`crate::TrSwitch::publish`].
     fn poll_tr_switch(&mut self) {
         let Some(hub) = self.tr_switch.clone() else { return };
+        // Before `publish`, which may be the key-down for an over this engine
+        // did not drive, and brings this radio's transmit band with it.
+        self.tell_tr_switch_bands();
         hub.publish(self.instance, self.on_air());
 
         // A transmitter out in the shack keyed itself, and the sense line saw
@@ -11616,6 +12301,34 @@ impl Engine {
                 let _ = self.event_tx.send(RadioEvent::RelayStatus(Box::new(st)));
             }
         }
+    }
+
+    /// Tell the T/R switch's band decoder (issue #442) which bands this
+    /// radio's dials are in: every engine its transmit band, since whichever
+    /// radio keys brings its own; the primary its receive band too, since the
+    /// bank belongs to the station and not to any one receiver.
+    ///
+    /// Bands only. Which word a contact follows, and when it swaps its RX
+    /// word for its TX word, is the relay worker's decision, made from the
+    /// station-wide on-air state inside the same lead and hold as every other
+    /// contact — never here, where it would arrive after the key-down's lead
+    /// had already been served.
+    fn tell_tr_switch_bands(&mut self) {
+        let Some(hub) = self.tr_switch.as_ref() else { return };
+        let (rx_hz, tx_hz) = (self.state.rx_freq_hz(), self.tx_target_hz());
+        let told = self.relay_bands_told;
+        if matches!(told, Some((r, t, _, _)) if r == rx_hz && t == tx_hz) {
+            return;
+        }
+        let rx = sdroxide_types::Band::containing(rx_hz);
+        let tx = sdroxide_types::Band::containing(tx_hz);
+        if self.primary && told.map(|t| t.2) != Some(rx) {
+            hub.set_rx_band(rx);
+        }
+        if told.map(|t| t.3) != Some(tx) {
+            hub.set_tx_band(self.instance, tx);
+        }
+        self.relay_bands_told = Some((rx_hz, tx_hz, rx, tx));
     }
 
     fn emit_relay_status(&mut self) {
@@ -11646,6 +12359,10 @@ impl Engine {
         self.follow_rig_tx(on);
         // Straight through to the switch rather than waiting for the next tick.
         // The whole value of hearing about this early is spending none of it.
+        // The bands first, as `poll_tr_switch` does: a rig that retuned and
+        // keyed in the same batch of updates would otherwise bring the old
+        // band into the over, and a band arriving mid-over waits for its end.
+        self.tell_tr_switch_bands();
         if let Some(hub) = self.tr_switch.as_ref() {
             hub.publish(self.instance, self.on_air());
         }
@@ -11974,9 +12691,10 @@ impl Engine {
         if rx != RxId::Main || self.state.rx[0].mode == mode {
             return None;
         }
-        // `is_slotted` is FT8/FT4/FT2/JS8. WSPR is slotted too and is kept out
-        // of that predicate for reasons of its own (see its docs), but it is a
-        // one-frequency-per-band mode by exactly the same argument.
+        // `is_slotted` is the modes whose decodes are `Decode`s (see its
+        // docs). WSPR is slotted too and is kept out of that predicate for
+        // reasons of its own, but it is a one-frequency-per-band mode by
+        // exactly the same argument.
         if !(mode.is_slotted() || mode.is_wspr()) {
             return None;
         }
@@ -12142,6 +12860,41 @@ impl Engine {
         }
     }
 
+    /// Remember a per-mode settings change the operator just made.
+    ///
+    /// The value goes into the override for the receiver's *current* mode, and
+    /// is then trimmed against that mode's defaults: a setting put back where
+    /// the mode starts is forgotten rather than stored as a preference, which
+    /// is also what makes an override with nothing left in it removable.
+    ///
+    /// Written out on the session tick rather than on the change. These are a
+    /// handful of bytes and the operator makes them one at a time, except when
+    /// a slider is being dragged — a change per frame, none of which is worth a
+    /// write. An engine started without `remember_session` (a test, a one-shot)
+    /// keeps them for the run and writes nothing.
+    fn remember_mode_setting(
+        &mut self,
+        rx: RxId,
+        update: impl FnOnce(&mut sdroxide_types::ModeProfile),
+    ) {
+        let mode = self.state.rx[rx.index()].mode;
+        let default = mode.default_profile();
+        let mut over = self.mode_profiles.overrides(mode).unwrap_or_default();
+        update(&mut over);
+        over.trim_against(&default);
+        self.mode_profiles.set(mode, over);
+        self.mode_profiles_dirty = self.session.is_some();
+    }
+
+    fn flush_mode_profiles(&mut self) {
+        if !std::mem::take(&mut self.mode_profiles_dirty) {
+            return;
+        }
+        if let Err(e) = self.store.save_mode_profiles(&self.mode_profiles) {
+            warn!("saving the per-mode settings (modeprofiles.json): {e}");
+        }
+    }
+
     fn set_rx_mode(&mut self, rx: RxId, mode: Mode) {
         // APRS is a channel, not a band, and which channel is a property of
         // the operator's region: 144.800 in Region 1, 144.390 in the Americas,
@@ -12260,13 +13013,24 @@ impl Engine {
             RxId::Main => self.state.rx_freq_hz(),
             RxId::Sub => self.state.sub_rx_hz,
         };
+        // The profile to lay on, decided before the borrow below. Only on a real
+        // change: `set_rx_mode` also runs when the mode stays what it was — a
+        // band-stack recall or a memory in the same mode, a client re-sending
+        // the mode it read — and a profile re-applied then would overwrite the
+        // tweak the operator just made. A mode the rig reports goes through
+        // `apply_control`, which applies the profile on the same terms.
+        let profile =
+            (self.state.rx[rx.index()].mode != mode).then(|| self.mode_profiles.effective(mode));
         let r = &mut self.state.rx[rx.index()];
         r.mode = mode;
+        if let Some(profile) = profile {
+            profile.apply_to(r);
+        }
         let (lo, hi) = mode.default_filter_at(dial);
         (r.filter_lo, r.filter_hi) = (lo, hi);
         let snapshot = *r;
         if let Some(c) = self.chain_mut(rx) {
-            c.build_for_mode(&snapshot);
+            c.build_for_mode(&snapshot, dial);
         }
         // A CAT rig: command its mode (subject to the mode policy) and, since
         // the sideband flips which half of the audio band is RF, re-center.
@@ -13426,28 +14190,45 @@ impl Engine {
     /// intermediate frequencies is worth a file write.
     fn save_session(&mut self) {
         let Some(saved) = self.session.as_ref() else { return };
-        // What the hardware reports, not what was asked for, and dropped when it
+        let mut now = self.current_session();
+        // What the hardware reports, not what was asked for, and kept when it
         // is empty: a front end with no antenna to choose (a CAT rig, a file)
         // must not erase the port a real radio was left on.
-        // Both dials and which one was in use, so a station left listening on
-        // B — or split, with the other VFO on the DX's transmit frequency —
-        // comes back set up the way it was rather than with B collapsed onto A.
-        let now = sdroxide_config::Session {
+        now.antenna_rx = chosen(&self.state.antenna_rx).or_else(|| saved.antenna_rx.clone());
+        now.antenna_tx = chosen(&self.state.antenna_tx).or_else(|| saved.antenna_tx.clone());
+        if now == *saved {
+            return;
+        }
+        match self.store.save_session(&now) {
+            Ok(()) => self.session = Some(now),
+            // Don't latch the new value on failure, so the next tick retries.
+            Err(e) => warn!("saving the session (dial + mode + antennas + levels): {e}"),
+        }
+    }
+
+    /// The session this engine's present state describes — both dials and
+    /// which one was in use, the modes and filters, the levels, the gains and
+    /// the antennas, exactly as the operator left them.
+    ///
+    /// The raw standing state, with nothing merged in from a previously saved
+    /// session. `save_session` adds the antenna fallback for a front end that
+    /// cannot report its ports; a profile snapshot wants the plain truth.
+    fn current_session(&self) -> sdroxide_config::Session {
+        sdroxide_config::Session {
             freq_hz: self.state.vfo_a_hz,
             vfo_b_hz: Some(self.state.vfo_b_hz),
             active_vfo: self.state.active_vfo,
             mode: self.state.rx[0].mode,
             // The shelf is only current for the VFO that is *not* in use, so
             // the live mode is written into the active slot on the way past
-            // rather than shelved here — `save_session` is called from a timer
-            // and from `Drop`, and neither is a VFO change.
+            // rather than shelved here.
             vfo_modes: Some({
                 let mut m = [self.vfo_memory[0].mode, self.vfo_memory[1].mode];
                 m[self.state.active_vfo.index()] = self.state.rx[0].mode;
                 m
             }),
-            antenna_rx: chosen(&self.state.antenna_rx).or_else(|| saved.antenna_rx.clone()),
-            antenna_tx: chosen(&self.state.antenna_tx).or_else(|| saved.antenna_tx.clone()),
+            antenna_rx: chosen(&self.state.antenna_rx),
+            antenna_tx: chosen(&self.state.antenna_tx),
             volume: self.state.rx[0].volume,
             muted: self.state.rx[0].muted,
             rx_gain_db: self.state.rx[0].manual_gain_db,
@@ -13460,23 +14241,21 @@ impl Engine {
             squelch_db: self.state.rx[0].squelch_db,
             noise_reduction: self.state.rx[0].noise_reduction,
             binaural: self.state.rx[0].binaural,
-            // The standing choice again, not what the front end of the moment
-            // could do with it: a session written while the radio was switched
-            // off would otherwise put 1 on disk and lose it for good.
+            // The standing choice, not what the front end of the moment could
+            // do with it: a session written while the radio was switched off
+            // would otherwise put 1 on disk and lose it for good.
             decimation: self.want_decimation,
             repeater: self.state.repeater,
             // What the operator asked for rather than what the device currently
             // reports, for the antennas' reason again: a front end with no gain
             // to set — a CAT rig, a file — must not erase the stages a real
-            // receiver was left on, and a driver that moves a gain by itself
-            // (an AGC riding the IF) is not the operator changing their mind.
+            // receiver was left on.
             gains: self.want_gains.0.clone(),
             tx_gains: self.want_gains.1.clone(),
             recording_mono: self.state.recording_mono,
             band_antenna: self.band_antenna.clone(),
             // The shelf again, with the live socket written into the active
-            // slot on the way past for the same reason the modes are: the shelf
-            // is only current for the VFO that is *not* in use.
+            // slot on the way past for the same reason the modes are.
             vfo_antennas: Some({
                 let mut a = [
                     (self.vfo_memory[0].antenna_rx.clone(), self.vfo_memory[0].antenna_tx.clone()),
@@ -13486,15 +14265,169 @@ impl Engine {
                     (chosen(&self.state.antenna_rx), chosen(&self.state.antenna_tx));
                 a
             }),
+        }
+    }
+
+    /// Announce the station's profile list. The screen only ever needs the
+    /// names to offer; the profiles themselves stay with everything else the
+    /// radio remembers (issue #197).
+    fn emit_profile_names(&self) {
+        let names = self.profiles.iter().map(|p| p.name.clone()).collect();
+        let _ = self.event_tx.send(RadioEvent::Profiles(names));
+    }
+
+    /// Put the station back onto a saved profile (issue #197): the dials,
+    /// VFOs, mode and filters, the levels and gains and antennas, the digital
+    /// identity and templates, and the band stacks. What a profile scoped out
+    /// — the backend, the audio devices, the converters — is untouched: the
+    /// apply works through the same paths a band change or a session restore
+    /// do, so the front end is retuned rather than reopened.
+    fn apply_profile(&mut self, profile: &sdroxide_config::Profile) {
+        // The band stacks go wholesale: this way of working the station
+        // brought its own setup for each band with it, and switching back
+        // should put them back too.
+        self.stacks = profile.stacks.clone();
+        if let Err(e) = sdroxide_config::save_bandstacks(&self.stacks) {
+            warn!("saving band stacks: {e}");
+        }
+        let s = &profile.session;
+
+        // The active VFO retunes through the same path a band click does —
+        // dial, band, mode and filters together. The band-stack memory it is
+        // recalled against is the profile's own, carried in wholesale above,
+        // so the filter offsets come from how this way of working the station
+        // heard that band.
+        //
+        // The session's `freq_hz` is VFO A's dial whatever is active (see
+        // `current_session`), so the *active* dial is `vfo_b_hz` when B was the
+        // one in use — reading `freq_hz` there put a profile saved on B onto A's
+        // frequency.
+        let active_hz = match s.active_vfo {
+            sdroxide_types::Vfo::A => s.freq_hz,
+            sdroxide_types::Vfo::B => s.vfo_b_hz.unwrap_or(s.freq_hz),
         };
-        if now == *saved {
-            return;
+        let mode = s.vfo_modes.map(|m| m[s.active_vfo.index()]).unwrap_or(s.mode);
+        if s.active_vfo != self.state.active_vfo {
+            self.state.active_vfo = s.active_vfo;
+            // A rig with its own pair of VFOs is told which one is now being
+            // worked, and before the retune below, for `SelectVfo`'s reasons:
+            // a retune sent ahead of the selection lands on the VFO being left
+            // and overwrites the radio's other dial. The rig's number, in the
+            // mode the profile puts it in, as there. The inactive shelf needs
+            // no shelving here — it is set whole from the profile below.
+            let rig_hz = active_hz + self.rig_cw_offset_hz_in(mode);
+            self.source.select_vfo(s.active_vfo, rig_hz);
         }
-        match self.store.save_session(&now) {
-            Ok(()) => self.session = Some(now),
-            // Don't latch the new value on failure, so the next tick retries.
-            Err(e) => warn!("saving the session (dial + mode + antennas + levels): {e}"),
+        let band = Band::containing(active_hz);
+        let (filter_lo, filter_hi) = self
+            .stacks
+            .get(&band)
+            .and_then(|st| st.first())
+            .map(|e| (e.filter_lo, e.filter_hi))
+            .unwrap_or_else(|| mode.default_filter_at(active_hz));
+        self.apply_entry(BandStackEntry { freq_hz: active_hz, mode, filter_lo, filter_hi });
+
+        // The inactive VFO has no dial of its own to retune; it is placed
+        // exactly as it was left — the other dial, the mode and the socket
+        // from the session, and the mode's default filter at that dial, the
+        // same way startup seeds the shelf.
+        let idle = 1 - s.active_vfo.index();
+        let other_freq = match s.active_vfo {
+            sdroxide_types::Vfo::A => s.vfo_b_hz.unwrap_or(s.freq_hz),
+            sdroxide_types::Vfo::B => s.freq_hz,
+        };
+        match s.active_vfo {
+            sdroxide_types::Vfo::A => self.state.vfo_b_hz = other_freq,
+            sdroxide_types::Vfo::B => self.state.vfo_a_hz = other_freq,
         }
+        if let Some(modes) = s.vfo_modes {
+            self.vfo_memory[idle].mode = modes[idle];
+            let (lo, hi) = modes[idle].default_filter_at(other_freq);
+            (self.vfo_memory[idle].filter_lo, self.vfo_memory[idle].filter_hi) = (lo, hi);
+        }
+        if let Some(ants) = s.vfo_antennas.clone() {
+            (self.vfo_memory[idle].antenna_rx, self.vfo_memory[idle].antenna_tx) =
+                ants[idle].clone();
+        }
+
+        // The receiver and transmitter levels, exactly as a session restore
+        // sets them.
+        self.state.rx[0].volume = s.volume;
+        self.state.rx[0].muted = s.muted;
+        self.state.rx[0].manual_gain_db = s.rx_gain_db;
+        self.state.rx[0].agc = s.agc;
+        self.state.rx[0].squelch_db = s.squelch_db;
+        self.state.rx[0].noise_reduction = s.noise_reduction;
+        self.state.rx[0].binaural = s.binaural;
+        self.state.tx.drive = s.drive;
+        self.state.tx.tune_drive = s.tune_drive;
+        self.state.tx.mic_gain = s.mic_gain;
+        self.state.tx.cessb_db = s.cessb_db.clamp(0.0, sdroxide_types::CESSB_MAX_DB);
+        self.state.tx.eq = s.tx_eq.clamped();
+        self.state.repeater = s.repeater.clamped();
+        // The per-mode ones among those levels are now what this mode is being
+        // worked with, so they are its own values from here on — the same thing
+        // a restored session gets at startup. Left on the receiver alone they
+        // would be replaced by the mode's old values the first time the
+        // operator changed mode and came back.
+        let r = self.state.rx[0];
+        self.remember_mode_setting(RxId::Main, |p| {
+            p.agc = Some(r.agc);
+            p.manual_gain_db = Some(r.manual_gain_db);
+            p.squelch_db = Some(r.squelch_db);
+            p.noise_reduction = Some(r.noise_reduction);
+            p.binaural = Some(r.binaural);
+        });
+
+        // The hardware preferences travel with the profile: the antenna port
+        // and the gain stages, applied through the same paths an antenna CLI
+        // or a session restore would take, so the preference lands on a device
+        // that offers it and is ignored by one that does not.
+        self.want_antenna = (s.antenna_rx.clone(), s.antenna_tx.clone());
+        self.band_antenna = s.band_antenna.clone();
+        self.restore_antennas();
+        self.follow_band_antenna(self.state.band);
+        self.want_gains = (s.gains.clone(), s.tx_gains.clone());
+        self.restore_gains();
+
+        // The digital identity and the message templates. The engine-owned
+        // fields (the per-band TX offset, the per-mode levels, the contest
+        // serial) stay as the engine has them — they follow the band and the
+        // mode the profile just moved to, not the profile.
+        let digi = keep_engine_owned(profile.digi.clone(), &self.digi_config);
+        self.digi_config = digi.clone();
+        if let Some(d) = self.digi.as_mut() {
+            d.set_config(digi);
+        }
+        if self.state.rx[0].mode == sdroxide_types::Mode::Cw {
+            self.source.set_cw_wpm(self.digi_config.cw_wpm);
+        }
+        self.sync_cw_filter();
+        self.sync_cw_dial();
+        if let Err(e) = sdroxide_config::save_digi_config(&self.digi_config) {
+            warn!("saving digi config: {e}");
+        }
+        self.digi_dirty = false;
+        self.mark_shared_store_write();
+        self.spots.set_operator(&self.digi_config.my_call, &self.report_grid());
+        self.sync_adsb_home();
+        self.emit_digi_status();
+
+        // The radio now describes where the profile left it; the remembered
+        // session is replaced so the periodic check compares against what is
+        // really running rather than against a stale remembered pre-apply
+        // value and "corrects" the radio back. Only on an engine that
+        // remembers a session at all: one started without `remember_session`
+        // must not write `session.json` here any more than it does on its
+        // timer.
+        if self.session.is_some() {
+            let now = self.current_session();
+            if let Err(e) = self.store.save_session(&now) {
+                warn!("saving the session after applying a profile: {e}");
+            }
+            self.session = Some(now);
+        }
+        let _ = self.event_tx.send(RadioEvent::State(self.state.clone()));
     }
 
     /// Write the memory list out, and say so on screen if it could not be
@@ -13568,6 +14501,14 @@ impl Engine {
             let _ = self.event_tx.send(RadioEvent::MemoryFolders(self.mem_folders.clone()));
         }
         self.stacks = sdroxide_config::load_bandstacks();
+        // The profiles are station-shared too: another radio in the station
+        // saving or deleting one rewrites the file, and this engine's copy is
+        // stale until it is told.
+        let profiles = sdroxide_config::load_profiles();
+        if profiles != self.profiles {
+            self.profiles = profiles;
+            self.emit_profile_names();
+        }
         let digi_config = sdroxide_config::load_digi_config();
         if digi_config != self.digi_config {
             // The same fan-out a SetDigiConfig does, minus the save: the other
@@ -13640,8 +14581,12 @@ impl Engine {
         self.stop_recording();
         match audio {
             Some(a) => {
-                self.main =
-                    Some(RxChain::new(self.state.sample_rate, &self.state.rx[0], a.out_rate));
+                self.main = Some(RxChain::new(
+                    self.state.sample_rate,
+                    &self.state.rx[0],
+                    a.out_rate,
+                    self.state.rx_freq_hz(),
+                ));
                 let mut mixer = StereoMixer::new(a.producer);
                 // A swap mid-announcement must not come back at full volume.
                 mixer.set_duck(self.speech_duck);
@@ -13650,10 +14595,14 @@ impl Engine {
                 mixer.set_trim_db(self.rx_af_gain_db);
                 self.mixer = Some(mixer);
                 self.audio_out_rate = a.out_rate;
-                self.sub = self
-                    .state
-                    .sub_rx_enabled
-                    .then(|| RxChain::new(self.state.sample_rate, &self.state.rx[1], a.out_rate));
+                self.sub = self.state.sub_rx_enabled.then(|| {
+                    RxChain::new(
+                        self.state.sample_rate,
+                        &self.state.rx[1],
+                        a.out_rate,
+                        self.state.sub_rx_hz,
+                    )
+                });
                 self.sync_audio_tap();
                 info!(out_rate = a.out_rate, "audio output swapped");
             }
@@ -13719,10 +14668,19 @@ impl Engine {
             self.analyzer_view_span(),
         );
         if self.mixer.is_some() {
-            self.main =
-                Some(RxChain::new(self.state.sample_rate, &self.state.rx[0], self.audio_out_rate));
+            self.main = Some(RxChain::new(
+                self.state.sample_rate,
+                &self.state.rx[0],
+                self.audio_out_rate,
+                self.state.rx_freq_hz(),
+            ));
             self.sub = self.state.sub_rx_enabled.then(|| {
-                RxChain::new(self.state.sample_rate, &self.state.rx[1], self.audio_out_rate)
+                RxChain::new(
+                    self.state.sample_rate,
+                    &self.state.rx[1],
+                    self.audio_out_rate,
+                    self.state.sub_rx_hz,
+                )
             });
         }
         // The digital-mode controller and its high-resolution waterfall are fed
@@ -14118,6 +15076,7 @@ impl Engine {
                     self.state.sample_rate,
                     &self.state.rx[0],
                     self.audio_out_rate,
+                    self.state.rx_freq_hz(),
                 ));
                 self.audio_resampler = None;
             }
@@ -14146,6 +15105,7 @@ impl Engine {
             self.sync_vdl2();
             self.sync_ais();
             self.sync_qo100();
+            self.sync_hfdl();
         }
         // Re-derive the TCI streams at the new device rate and push a fresh
         // state burst, so connected clients follow the swap.
@@ -14245,6 +15205,21 @@ impl Engine {
                 c.reset_drm();
             }
         }
+        if (dial - self.hd_dial_hz).abs() > HD_RADIO_RETUNE_HZ {
+            // HD Radio's two variants are different decoders on different
+            // channel rates, and which is wanted is a property of the band the
+            // dial landed in — so a move between them is a rebuild of the
+            // chain, not a restart of the decoder (issue #489).
+            let variant_changed = hd_radio_is_am(self.hd_dial_hz) != hd_radio_is_am(dial);
+            self.hd_dial_hz = dial;
+            let rx = self.state.rx[0];
+            if let Some(c) = self.main.as_mut() {
+                c.reset_hd_radio();
+                if variant_changed && rx.mode == Mode::HdRadio {
+                    c.build_for_mode(&rx, dial);
+                }
+            }
+        }
         if let Some(c) = self.main.as_mut() {
             c.set_offset_hz(main_offset);
         }
@@ -14262,6 +15237,18 @@ impl Engine {
         self.sync_skim_window();
     }
 
+    /// Where a key-down would transmit: the dial's transmit frequency, or
+    /// under a satellite lock the transponder's uplink for the dial — the
+    /// mapping the key-down itself uses. Everything that switches hardware by
+    /// band ahead of the over reads this, so a V/U or QO-100 station has its
+    /// filters on the uplink's band rather than the downlink's.
+    fn tx_target_hz(&self) -> f64 {
+        match self.sat_lock.as_ref().and_then(|l| l.cfg.uplink) {
+            Some(u) => u.uplink_for(self.state.active_freq_hz()) + self.state.xit.effective_hz(),
+            None => self.state.tx_freq_hz(),
+        }
+    }
+
     /// Tell the source where we would transmit, for the band-switching hardware
     /// that has to know before the operator keys (see
     /// [`IqSource::set_tx_freq_hz`]).
@@ -14273,10 +15260,7 @@ impl Engine {
     /// instrumenting them all is a list that would silently fall out of date.
     /// Deriving it costs one comparison per iteration.
     fn push_tx_freq(&mut self) {
-        let hz = match self.sat_lock.as_ref().and_then(|l| l.cfg.uplink) {
-            Some(u) => u.uplink_for(self.state.active_freq_hz()) + self.state.xit.effective_hz(),
-            None => self.state.tx_freq_hz(),
-        };
+        let hz = self.tx_target_hz();
         if self.tx_freq_told != Some(hz) {
             self.tx_freq_told = Some(hz);
             self.source.set_tx_freq_hz(hz);
@@ -14402,8 +15386,8 @@ impl Engine {
     }
 
     /// The drive actually used: the operator's setting, calibrated for the band
-    /// it is going out on and then held under whatever ceiling the converter in
-    /// front of the radio imposes.
+    /// it is going out on and then held under whatever ceiling is in force —
+    /// the transverter in front of the radio, the operator's own, or both.
     ///
     /// Both corrections in one place, in that order, because they answer
     /// different questions and only one of them is a limit. The band trim is a
@@ -14412,7 +15396,9 @@ impl Engine {
     /// them (issue #295). The ceiling is a hard limit and therefore last: a
     /// transverter's I.F. input takes milliwatts, and the drive that is right
     /// for the radio's own bands destroys it, so no calibration may lift the
-    /// drive back over it (issue #278).
+    /// drive back over it (issue #278). A ceiling the operator set for the
+    /// radio itself binds the same way and for the same reason (issue #504);
+    /// see [`Self::under_ceiling`].
     ///
     /// Neither moves the operator's slider. The number they set for HF is still
     /// there when the dial leaves the transverter's band, and the trim is a
@@ -14421,8 +15407,25 @@ impl Engine {
         self.under_ceiling(want * self.drive_trim()).clamp(0.0, 1.0)
     }
 
+    /// Hold `want` under every ceiling in force — the station's and the
+    /// operator's — whichever is lower.
+    ///
+    /// Two of them, and they answer different questions. The source's is the
+    /// *station's*: a transverter's I.F. input takes milliwatts and the box in
+    /// front of the radio is the one that knows (issue #278). The operator's is
+    /// a figure they set once for this radio, for a transmitter whose full
+    /// scale is past what its own amplifier can take — an HPSDR set pins the
+    /// protocol's drive register at full and modulates the I/Q amplitude
+    /// instead, so the top of the slider is an ANAN's finals wide open (issue
+    /// #504). Neither is a calibration and neither moves the slider: they are
+    /// limits, and the lower of the two is the one that binds.
     fn under_ceiling(&self, want: f32) -> f32 {
-        match self.source.tx_drive_ceiling() {
+        let ceiling = match (self.source.tx_drive_ceiling(), self.tx_drive_max) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (Some(c), None) | (None, Some(c)) => Some(c),
+            (None, None) => None,
+        };
+        match ceiling {
             Some(c) => want.min(c.clamp(0.0, 1.0)),
             None => want,
         }
@@ -15021,6 +16024,88 @@ impl Engine {
         self.emit_voice_status();
     }
 
+    /// Drain the queued CW sidetone into `cw_monitor_out`, resampling from the
+    /// 48 kHz it is generated at to the speaker's rate. Returns false when
+    /// nothing is waiting, so the caller leaves the received audio alone.
+    ///
+    /// Whatever the resampler hands back beyond this block stays in
+    /// `cw_monitor_ready` for the next one. The transmit loop and the speaker
+    /// path do not run in step — different block sizes, different rates, and a
+    /// resampler that returns a ragged count — so a drain that kept only one
+    /// block's worth would cut the tone wherever the two cadences disagreed,
+    /// once per block, in the middle of an element. It is also what
+    /// [`CW_MONITOR_CAP`] is for: a cap on a queue nothing ever carried over
+    /// would be a cap on nothing.
+    fn take_cw_monitor(&mut self, out_rate: f64, n: usize) -> bool {
+        if n == 0 || (self.cw_monitor_q.is_empty() && self.cw_monitor_ready.is_empty()) {
+            return false;
+        }
+        if (out_rate - self.cw_monitor_rate).abs() > 0.01 {
+            self.cw_monitor_rate = out_rate;
+            self.cw_monitor_rs = MonoResampler::new(TX_MONITOR_RATE, out_rate);
+            // The old rate's tail would play at the wrong speed.
+            self.cw_monitor_ready.clear();
+        }
+        queue_cw_monitor(
+            self.cw_monitor_rs.as_mut(),
+            &mut self.cw_monitor_q,
+            &mut self.cw_monitor_ready,
+        );
+        let rx0 = &self.state.rx[0];
+        // The operator's own volume control, as for any other audio.
+        let vol = if rx0.muted { 0.0 } else { rx0.volume };
+        self.cw_monitor_warned = false;
+        drain_cw_monitor(&mut self.cw_monitor_ready, &mut self.cw_monitor_out, n, vol);
+        true
+    }
+
+    /// Whether the receiver keeps being read — and so the queued CW monitor
+    /// drained — while the transmitter is keyed. That is only ever true of a
+    /// full-duplex I/Q source: [`Self::poll`] skips the receiver read inside a
+    /// TX over unless `caps.full_duplex` and the audio is not already
+    /// demodulated (`!audio_mode`), so every sound-card and half-duplex path
+    /// spends the over deaf. Where this is false the sidetone is played live
+    /// from the TX loop instead of queued — see [`Self::play_cw_sidetone`].
+    fn cw_monitor_drained_during_tx(&self) -> bool {
+        self.caps.full_duplex && !self.audio_mode
+    }
+
+    /// Play one block of CW sidetone to the speakers, live from the transmit
+    /// loop. The queue normally serves it on the receiver-driven speaker path;
+    /// where the receiver is not read during TX (see
+    /// [`Self::cw_monitor_drained_during_tx`]) the tone would otherwise pile
+    /// into `cw_monitor_q` and then burst out as a single short beep when the
+    /// over ends — exactly what an MCW operator hears as "the sidetone took a
+    /// few seconds, then a blip". Fed the same 48 kHz samples that go to the
+    /// radio (post the modem's own level), resampled to the speaker's rate and
+    /// scaled by the receiver's own volume, as the queued path scales them.
+    fn play_cw_sidetone(&mut self, audio: &[f32]) {
+        if self.cw_monitor_drained_during_tx()
+            || !self.digi_config.cw_sidetone
+            || self.digi.as_ref().is_none_or(|d| d.mode() != Mode::Cw)
+        {
+            return;
+        }
+        if (self.audio_out_rate - self.cw_monitor_rate).abs() > 0.01 {
+            self.cw_monitor_rate = self.audio_out_rate;
+            self.cw_monitor_rs = MonoResampler::new(TX_MONITOR_RATE, self.audio_out_rate);
+        }
+        let mut ready = Vec::new();
+        match self.cw_monitor_rs.as_mut() {
+            Some(rs) => rs.push(audio, &mut ready),
+            None => ready.extend_from_slice(audio),
+        }
+        let rx0 = &self.state.rx[0];
+        let vol = if rx0.muted { 0.0 } else { rx0.volume };
+        let mono: Vec<f32> =
+            if vol != 1.0 { ready.iter().map(|s| s * vol).collect() } else { ready };
+        let want_rec = self.recorder.is_some();
+        let rec: Vec<f32> = if want_rec { mono.clone() } else { Vec::new() };
+        if let Some(mixer) = self.mixer.as_mut() {
+            mixer.push(&mono, None, &rec, None);
+        }
+    }
+
     /// Feed a recording from the microphone, and end a keyer over once its
     /// message has played out. Called once per engine iteration.
     fn poll_voice(&mut self) {
@@ -15251,6 +16336,41 @@ impl Engine {
         if (gain - 1.0).abs() > f32::EPSILON {
             for a in out.iter_mut() {
                 *a = (*a * gain).clamp(-1.0, 1.0);
+            }
+        }
+        // CW: keep a copy of the keyed sidetone for the local speakers, so a
+        // `Sound card (MCW)` operator hears what they are sending. The samples
+        // are the same ones going to the radio, at 48 kHz; the speaker path
+        // drains them at its own rate (see `take_cw_monitor`). Only while
+        // transmitting, so the queue is empty on every other mode and between
+        // overs.
+        //
+        // Gated on the engine actually sending CW — `DigiEngine::mode()` — and
+        // not on what the rig happens to be reporting: MCW commands the digi
+        // sideband, so the radio's mode can read as something else while the
+        // keyer is the one producing this audio (and the CW controller is only
+        // ever built for `Mode::Cw`), and the sidetone must follow the thing
+        // being sent, not the rig's echo of it.
+        //
+        // ...and queued only where the queue gets drained. The speaker path
+        // that drains it runs off the receiver, and the main loop does not read
+        // the receiver during TX except on a full-duplex I/Q source; everywhere
+        // else the tone is played block-by-block from the TX loop instead
+        // (`play_cw_sidetone`), so nothing is left to spoil and burst later.
+        if self.digi_config.cw_sidetone
+            && self.cw_monitor_drained_during_tx()
+            && self.digi.as_ref().is_some_and(|d| d.mode() == Mode::Cw)
+        {
+            let room = CW_MONITOR_CAP.saturating_sub(self.cw_monitor_q.len());
+            if room > 0 {
+                self.cw_monitor_q.extend_from_slice(&out[..room.min(out.len())]);
+            } else if !self.cw_monitor_warned {
+                self.cw_monitor_warned = true;
+                warn!(
+                    "CW sidetone monitor: queue full and undrained ({}) — is the speaker \
+                     output serving audio?",
+                    self.cw_monitor_q.len()
+                );
             }
         }
         done
@@ -15584,6 +16704,11 @@ impl Engine {
         // needs the engine itself.
         let mut audio = [0.0f32; TX_AUDIO_BLOCK];
         let done = self.fill_digi_tx_block(&mut audio);
+        // Where the receiver is read during the over this block is queued for
+        // the speaker path in `fill_digi_tx_block`; where it is not (a
+        // half-duplex or sound-card rig is deaf while keyed) it is played here
+        // instead, or the sidetone would sit unplayed until PTT drops.
+        self.play_cw_sidetone(&audio);
         if let Some(mixer) = self.mixer.as_mut() {
             mixer.push_tx(&audio);
         }
@@ -15675,6 +16800,12 @@ impl Engine {
             // audio and not the power register (issue #131). `tx_peak` is what
             // divides it back out, inside `fill_digi_tx_block`.
             digi_done = self.fill_digi_tx_block(&mut audio);
+            // As in `tx_block_digi`: on a rig that cannot hear itself keyed the
+            // sidetone is played from here, because the queue's speaker path
+            // only runs on received audio and the receiver is not read during
+            // the over. Where it is read, `fill_digi_tx_block` queued the block
+            // instead and this finds the digi already spoken for.
+            self.play_cw_sidetone(&audio);
         } else if self.state.tx.tune {
             // An audio-modulated rig (CAT/TCI) needs a tone to produce a carrier;
             // silence would key up with no output. On a rig with its own power
@@ -15933,8 +17064,67 @@ impl Engine {
         if offset <= 0.0 {
             return 0.0;
         }
+        // FM HD Radio needs no guard, and sized from its channel the guard did
+        // harm. That channel is nrsc5's 744 kHz sample rate, so on an RSPdx at
+        // 2 Msps the guard came to 400 kHz and CTR left the dial a fifth of the
+        // window below centre. What it protects is not there: the digital
+        // carriers sit at +/-129 to +/-198 kHz, and the middle of the channel is
+        // the analog FM, which nrsc5 does not decode from — so the DC spike on
+        // the carrier lands in the part nobody reads. Measured on an RSPdx
+        // against CITE-FM 107.3 and WVPS 107.9: MER 12.3/12.2 and 14.1/14.0 dB
+        // with the LO clear of the signal, 12.4/12.3 and 14.1/14.0 with it on
+        // the carrier, CBER 0 throughout, and the two sidebands kept matching,
+        // which a zero-IF image mirroring one onto the other would have broken.
+        //
+        // Exempted here rather than in `guarded_center`, because
+        // `keep_vfo_in_span` reads the same guard on every pass and would
+        // otherwise retune the LO straight back off the carrier. HD on AM keeps
+        // its guard: the innermost digital carriers there sit within a few kHz
+        // of the carrier, under the analog audio.
+        if self.state.rx[0].mode == Mode::HdRadio && !hd_radio_is_am(self.state.rx_freq_hz()) {
+            return 0.0;
+        }
         let channel = self.main.as_ref().map(|c| c.channel_rate()).unwrap_or(48_000.0);
         (channel * 0.6).min(offset * 0.8)
+    }
+
+    /// A hardware centre the caller asked for, moved out of the active VFO's
+    /// guard band if it landed inside it.
+    ///
+    /// The panadapter's CTR keeps the window centred on the dial, and asks for
+    /// the centre by [`Command::SetCenter`] when the view reaches the edge of
+    /// the span. Taken literally that puts the hardware LO *on* the VFO, which
+    /// is the one place [`Self::lo_guard_hz`] exists to keep it away from: a
+    /// zero-IF front end has a DC spike at its LO, and the carrier-centred
+    /// modes have passbands that contain DC — AM's is +/-5 kHz — so the spike
+    /// lands in the demodulated channel and beats against the carrier. SSB and
+    /// CW never showed it because their passbands start a few hundred hertz up
+    /// and filter it away.
+    ///
+    /// So the request is honoured up to the guard and no further. The view
+    /// stays as near centred as the front end allows, and the operator keeps
+    /// the audio. Pushed to whichever side the request came from, so a window
+    /// panning up does not jump back down past the dial.
+    fn guarded_center(&self, want: f64) -> f64 {
+        let guard = self.lo_guard_hz();
+        if guard <= 0.0 {
+            return want;
+        }
+        let vfo = self.state.rx_freq_hz();
+        let d = want - vfo;
+        if d.abs() >= guard {
+            return want;
+        }
+        // Above by preference: that is where `retune_for_vfo` puts the LO, and
+        // at the top of a tuning range the mirror is the fallback there too.
+        let (first, second) =
+            if d < 0.0 { (vfo - guard, vfo + guard) } else { (vfo + guard, vfo - guard) };
+        for cand in [first, second] {
+            if self.can_tune(cand) {
+                return cand;
+            }
+        }
+        want
     }
 
     /// Put the hardware where this VFO wants it: on the VFO for a front end with
@@ -16011,6 +17201,7 @@ impl Engine {
                 self.sync_vdl2_window();
                 self.sync_ais_window();
                 self.sync_qo100_window();
+                self.sync_hfdl_window();
                 true
             }
             Err(e) => {
@@ -16076,6 +17267,49 @@ fn describe_ranges(ranges: &[(f64, f64)]) -> String {
 /// The underlying rig mode class a `Mode` commands over CAT/TCI (USB/LSB/CW/
 /// AM/FM). Digital/data modes ride on a sideband, so a rig reporting that plain
 /// sideband must not be mistaken for the operator leaving the digital mode.
+/// Resample everything the transmit loop has left in `pending` to the speaker's
+/// rate and put it on the back of `ready`, capped at [`CW_MONITOR_CAP`].
+///
+/// The cap is for a speaker path that has stopped serving audio at all (device
+/// unhooked or wedged): the oldest goes rather than the queue growing without
+/// bound, because the operator's own sending is only ever a character or two
+/// ahead of what is playing and an older backlog than that is of no use to
+/// anyone.
+fn queue_cw_monitor(
+    rs: Option<&mut MonoResampler>,
+    pending: &mut Vec<f32>,
+    ready: &mut std::collections::VecDeque<f32>,
+) {
+    if pending.is_empty() {
+        return;
+    }
+    let mut out = Vec::new();
+    match rs {
+        Some(rs) => rs.push(pending, &mut out),
+        None => out.extend_from_slice(pending),
+    }
+    pending.clear();
+    ready.extend(out);
+    while ready.len() > CW_MONITOR_CAP {
+        ready.pop_front();
+    }
+}
+
+/// Take one speaker block off the front of `ready`, at the operator's volume,
+/// padded to `n` with silence. What is left stays for the next block: see
+/// [`Engine::take_cw_monitor`].
+fn drain_cw_monitor(
+    ready: &mut std::collections::VecDeque<f32>,
+    out: &mut Vec<f32>,
+    n: usize,
+    vol: f32,
+) {
+    out.clear();
+    let take = ready.len().min(n);
+    out.extend(ready.drain(..take).map(|s| s * vol));
+    out.resize(n, 0.0);
+}
+
 fn rig_mode_class(m: Mode) -> u8 {
     match m {
         Mode::Lsb | Mode::Digl => 0,
@@ -16086,6 +17320,12 @@ fn rig_mode_class(m: Mode) -> u8 {
         | Mode::Ft2
         | Mode::Js8
         | Mode::Wspr
+        | Mode::Pi4
+        | Mode::Msk144
+        | Mode::Jt65
+        | Mode::Jt9
+        | Mode::Fst4
+        | Mode::Q65
         | Mode::Psk
         | Mode::Rtty
         | Mode::Sstv
@@ -16099,10 +17339,11 @@ fn rig_mode_class(m: Mode) -> u8 {
         | Mode::Rade
         | Mode::PacketHf
         | Mode::AtChat
+        | Mode::Fsk441
         | Mode::Spec => 1,
         // DRM sits on the dial in a channel about as wide as AM's, and a
         // rig has no DRM setting to report back — see `to_hamlib_mode`.
-        Mode::Am | Mode::Sam | Mode::Dsb | Mode::Isb | Mode::Drm => 2,
+        Mode::Am | Mode::Sam | Mode::Dsb | Mode::Isb | Mode::Drm | Mode::Acars => 2,
         Mode::Cw => 3,
         // RIFP, VHF packet, APRS, VHF SSTV and VHF RTTY are data on an FM
         // carrier, so a rig reporting plain FM is still where we left it.
@@ -16118,7 +17359,9 @@ fn rig_mode_class(m: Mode) -> u8 {
         // operator having left the mode.
         | Mode::Adsb
         | Mode::Vdl2
-        | Mode::Ais => 5,
+        | Mode::Ais
+        | Mode::Hfdl
+        | Mode::HdRadio => 5,
     }
 }
 
@@ -16549,7 +17792,7 @@ mod stereo_tests {
         let out_rate = 48_000.0;
         let mut rx = RxState::with_mode(Mode::Wfm);
         rx.volume = 1.0;
-        let mut chain = RxChain::new(dev_rate, &rx, out_rate);
+        let mut chain = RxChain::new(dev_rate, &rx, out_rate, 98_000_000.0);
 
         let iq = wfm_stereo_iq(dev_rate, 6.0);
         let (mut left, mut right) = (Vec::new(), Vec::new());
@@ -16600,7 +17843,7 @@ mod stereo_tests {
         let dev_rate = 1_536_000.0;
         let mut rx = RxState::with_mode(Mode::Wfm);
         rx.volume = 1.0;
-        let mut chain = RxChain::new(dev_rate, &rx, 48_000.0);
+        let mut chain = RxChain::new(dev_rate, &rx, 48_000.0, 98_000_000.0);
         let iq = wfm_stereo_iq(dev_rate, 3.0);
         for block in iq.chunks(16_384) {
             let _ = chain.run(block, &rx, false);
@@ -16628,7 +17871,7 @@ mod stereo_tests {
         let dev_rate = 1_536_000.0;
         let mut rx = RxState::with_mode(Mode::Usb);
         rx.volume = 1.0;
-        let mut chain = RxChain::new(dev_rate, &rx, 48_000.0);
+        let mut chain = RxChain::new(dev_rate, &rx, 48_000.0, 14_200_000.0);
         // Broadband noise is the honest input here: it is what NR is pointed at.
         let mut seed = 0x5EEDu64;
         let iq: Vec<Complex32> = (0..16_384 * 8)
@@ -18222,5 +19465,81 @@ mod tci_pace_tests {
         }
         p.rekey();
         assert_eq!(p.request(0, 0, true), Some((TCI_TX_LEAD + TX_AUDIO_BLOCK) as u32));
+    }
+}
+
+#[cfg(test)]
+mod cw_monitor_tests {
+    use super::*;
+    use std::collections::VecDeque;
+
+    /// The sidetone survives block boundaries.
+    ///
+    /// The transmit loop pushes 10 ms of 48 kHz at a time and the speaker asks
+    /// for its own block at its own rate; the two counts do not match, and the
+    /// first cut of this kept one block and threw the rest away. That is not a
+    /// shorter tone — it is a gap punched in the middle of every element, once
+    /// per block, which an operator hears as a rattle rather than a dit.
+    #[test]
+    fn the_queue_carries_the_remainder_between_blocks() {
+        let mut pending = Vec::new();
+        let mut ready: VecDeque<f32> = VecDeque::new();
+        let mut out = Vec::new();
+        // No resampler: the speaker is already at the transmit rate, so what
+        // goes in is exactly what must come out and the arithmetic is the
+        // property rather than the resampler's.
+        let mut served = Vec::new();
+        for block in 0..8 {
+            pending.extend((0..480).map(|i| (block * 480 + i) as f32));
+            queue_cw_monitor(None, &mut pending, &mut ready);
+            // A speaker block that does *not* divide the transmit block.
+            drain_cw_monitor(&mut ready, &mut out, 128, 1.0);
+            served.extend_from_slice(&out);
+        }
+        // Everything the speaker was given, in order, is a prefix of what was
+        // keyed — nothing dropped, nothing reordered.
+        let asked: Vec<f32> = (0..served.len()).map(|i| i as f32).collect();
+        assert_eq!(served, asked, "the monitor lost or reordered samples");
+        // ...and the rest is still queued rather than gone.
+        assert_eq!(ready.len(), 8 * 480 - served.len());
+    }
+
+    /// A block longer than the queue is padded with silence, so the speaker
+    /// stays paced rather than being handed a short buffer.
+    #[test]
+    fn a_short_queue_is_padded_not_shortened() {
+        let mut ready: VecDeque<f32> = VecDeque::from(vec![1.0, 1.0, 1.0]);
+        let mut out = Vec::new();
+        drain_cw_monitor(&mut ready, &mut out, 8, 1.0);
+        assert_eq!(out, [1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0]);
+        assert!(ready.is_empty());
+    }
+
+    /// The operator's volume is applied to the monitor as to anything else,
+    /// and a muted receiver silences it.
+    #[test]
+    fn the_monitor_takes_the_volume_control() {
+        let mut ready: VecDeque<f32> = VecDeque::from(vec![1.0, -1.0]);
+        let mut out = Vec::new();
+        drain_cw_monitor(&mut ready, &mut out, 2, 0.25);
+        assert_eq!(out, [0.25, -0.25]);
+        let mut ready: VecDeque<f32> = VecDeque::from(vec![1.0, -1.0]);
+        drain_cw_monitor(&mut ready, &mut out, 2, 0.0);
+        assert_eq!(out, [0.0, 0.0]);
+    }
+
+    /// A speaker path that never drains cannot grow the queue without bound:
+    /// the oldest goes, so what plays when it comes back is the newest keying
+    /// rather than a minute of backlog.
+    #[test]
+    fn a_stalled_speaker_cannot_grow_the_queue_forever() {
+        let mut pending = Vec::new();
+        let mut ready: VecDeque<f32> = VecDeque::new();
+        for block in 0..400 {
+            pending.extend((0..480).map(|i| (block * 480 + i) as f32));
+            queue_cw_monitor(None, &mut pending, &mut ready);
+        }
+        assert_eq!(ready.len(), CW_MONITOR_CAP);
+        assert_eq!(*ready.back().unwrap(), (400 * 480 - 1) as f32, "the newest is kept");
     }
 }

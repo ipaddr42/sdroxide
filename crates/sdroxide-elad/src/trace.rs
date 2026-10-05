@@ -28,7 +28,7 @@ use std::time::Instant;
 use sdroxide_dsp::Complex32;
 
 /// What the settings panel tells an operator, and what the manual repeats.
-pub const FIELD_REPORT_HINT: &str = "This backend has not been verified against \
+pub const FIELD_REPORT_HINT: &str = "Only receiving on an FDM-DUO has been run on \
     real hardware. If it misbehaves, please attach the session trace \
     (Settings → Radio → Copy diagnostic report) to a bug report — it contains \
     every command exchanged with the receiver.";

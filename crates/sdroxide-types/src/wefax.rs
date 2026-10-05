@@ -369,6 +369,25 @@ impl Default for WefaxStatus {
     }
 }
 
+/// Rotate every row of a fax image horizontally by `pixels`, so a phase
+/// correction applies to the part of the chart that has already arrived rather
+/// than only to the lines still to come (issue #439).
+///
+/// A fax line wraps, so this is a rotation, not a shift with blank edges.
+/// Positive moves the picture right, matching the PHASE controls.
+pub fn shift_fax_rows(image: &mut [u8], width: usize, height: usize, pixels: i32) {
+    if width == 0 || height == 0 || pixels == 0 {
+        return;
+    }
+    let shift = (pixels as isize).rem_euclid(width as isize) as usize;
+    if shift == 0 {
+        return;
+    }
+    for row in image.chunks_mut(width).take(height) {
+        row.rotate_right(shift);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -541,5 +560,31 @@ mod tests {
         assert_eq!(s.ioc, WefaxIoc::I576);
         assert_eq!(s.lpm, WefaxLpm::L120);
         assert_eq!(s.subcarrier_hz, 1900.0);
+    }
+
+    #[test]
+    fn rows_rotate_right_for_a_positive_shift() {
+        let mut img = vec![1u8, 2, 3, 4, 5, 6, 7, 8]; // two rows of four
+        shift_fax_rows(&mut img, 4, 2, 1);
+        assert_eq!(img, vec![4, 1, 2, 3, 8, 5, 6, 7]);
+    }
+
+    #[test]
+    fn the_shift_wraps_rather_than_blanking() {
+        let mut img = vec![1u8, 2, 3, 4];
+        shift_fax_rows(&mut img, 4, 1, 100);
+        // 100 mod 4 = 0: a whole number of lines is no movement.
+        assert_eq!(img, vec![1, 2, 3, 4]);
+        shift_fax_rows(&mut img, 4, 1, -1);
+        assert_eq!(img, vec![2, 3, 4, 1], "negative moves left");
+    }
+
+    #[test]
+    fn a_zero_width_or_shift_does_nothing() {
+        let mut img = vec![1u8, 2, 3];
+        shift_fax_rows(&mut img, 0, 0, 5);
+        assert_eq!(img, vec![1, 2, 3]);
+        shift_fax_rows(&mut img, 3, 1, 0);
+        assert_eq!(img, vec![1, 2, 3]);
     }
 }

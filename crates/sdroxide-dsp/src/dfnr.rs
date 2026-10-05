@@ -1,4 +1,4 @@
-//! DeepFilterNet3 audio noise reduction — the strongest of the four engines.
+//! DeepFilterNet3 audio noise reduction — the strongest of the five engines.
 //!
 //! Two stages the others do not have: an ERB-band gain like RNNoise's, and then
 //! a learned complex *deep filter* over the low bins, which restores phase and

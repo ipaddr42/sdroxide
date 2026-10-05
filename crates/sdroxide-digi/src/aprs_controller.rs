@@ -626,6 +626,7 @@ impl AprsController {
             tx_even: false,
             transmitting: self.ch.keyed,
             tx_watchdog: false,
+            tx_refused: None,
             transcript: Vec::<TranscriptLine>::new(),
             config: self.cfg.clone(),
             text_rx: String::new(),
@@ -635,6 +636,7 @@ impl AprsController {
             rade: None,
             packet: None,
             navtex: None,
+            acars: None,
             aprs: Some(Box::new(self.aprs_status())),
             js8: None,
             atchat: None,
@@ -643,6 +645,7 @@ impl AprsController {
             clock_offset_s: None,
             cw: None,
             wspr: None,
+            pi4: None,
             qso: None,
         }
     }

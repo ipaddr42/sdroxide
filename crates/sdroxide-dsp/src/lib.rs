@@ -1,3 +1,4 @@
+pub mod acars;
 mod adc;
 pub mod afsk;
 mod agc;
@@ -14,6 +15,7 @@ mod eq;
 mod fec;
 mod fir;
 mod frame48;
+pub mod fsk441;
 mod fsq;
 mod fsq_image;
 pub mod g3ruh;
@@ -30,6 +32,7 @@ mod nnr;
 pub mod noisefloor;
 mod notch;
 mod nr;
+mod nr2;
 mod olivia;
 mod predistort;
 mod psk;
@@ -56,15 +59,23 @@ pub use agc::Agc;
 pub use binaural::Binaural;
 pub use cessb::Cessb;
 pub use ctcss::{SubToneDetect, golay23_decode, golay23_encode};
-pub use cw::{CwDecoder, CwRx, CwTx, morse_decode, morse_encode, text_duration_s};
+pub use cw::{CwDecoder, CwRx, CwSelfRx, CwTx, morse_decode, morse_encode, text_duration_s};
 pub use ddc::Ddc;
 pub use decim::{Decimator, FirDecim, HalfbandDecim, RealFirDecim, lowpass_taps};
-pub use demod::{ComplexDcBlock, DcBlock, Demodulator, channel_target, make_demod};
+pub use demod::{
+    ComplexDcBlock, DcBlock, Demodulator, channel_target, channel_target_at, hd_radio_is_am,
+    make_demod,
+};
 pub use dfnr::DeepFilterNr;
 pub use diversity::{Diversity, DiversityMode};
 pub use eq::ParametricEq;
 pub use fec::{ConvCode, viterbi_soft};
 pub use fir::{ComplexFir, RealFir, bandpass_taps};
+pub use fsk441::{
+    DEFAULT_DFTOL as FSK441_DFTOL, FSK441_BAUD, FSK441_CHARSET, FSK441_NSPD, FSK441_RATE,
+    FSK441_SHORTHAND, FSK441_TONES, Fsk441Ping, fsk441_char_to_dits, fsk441_dits_to_char,
+    fsk441_encode_tones, fsk441_find_pings, fsk441_generate_audio, fsk441_tx_tones,
+};
 pub use fsq::{FsqRx, FsqTx};
 pub use fsq_image::{FsqImageRx, FsqImageTx, IMG_H as FSQ_IMG_H, IMG_W as FSQ_IMG_W};
 pub use g3ruh::{G3RUH_TX_PEAK, G3ruhRx, G3ruhTx, Scrambler};
@@ -85,11 +96,13 @@ pub use navtex::{
 pub mod navtex_test {
     pub use crate::navtex::{encode_bits, synth};
 }
+pub use acars::{AcarsEvent, AcarsRx, CENTER_HZ as ACARS_CENTER_HZ};
 pub use nb::NoiseBlanker;
 pub use nco::Nco;
 pub use nnr::NeuralNr;
 pub use notch::AutoNotch;
 pub use nr::SpectralNr;
+pub use nr2::Nr2;
 pub use olivia::{OliviaRx, OliviaTx};
 pub use predistort::{MAX_CORRECTION as PS_MAX_CORRECTION, PureSignal};
 pub use psk::{BpskCore, PskRx, PskTx, VaricodeRx};

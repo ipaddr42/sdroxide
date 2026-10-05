@@ -247,6 +247,11 @@ pub struct Settings {
     ///
     /// Also a table, so it goes after every plain value for the reason above.
     pub speech: sdroxide_types::SpeechSettings,
+    /// Audible alerts. A client-side preference like `[speech]`: what the
+    /// operator at this screen wants heard when a decode matters.
+    ///
+    /// A table for the same reason.
+    pub alerts: sdroxide_types::AlertSettings,
     /// The sdroxide server this screen dials from Settings → Remote — the
     /// counterpart of `remote_access` above, and client-side like `[ui]` and
     /// `[speech]`: it is where *this* machine goes, not who may come here.
@@ -280,6 +285,7 @@ impl Default for Settings {
             ui: sdroxide_types::UiSettings::default(),
             remote_access: sdroxide_types::RemoteAccess::default(),
             speech: sdroxide_types::SpeechSettings::default(),
+            alerts: sdroxide_types::AlertSettings::default(),
             remote_server: sdroxide_types::RemoteServer::default(),
         }
     }
@@ -521,6 +527,19 @@ pub fn save_speech_settings(speech: &sdroxide_types::SpeechSettings) -> Result<(
     s.save()
 }
 
+/// Load just the audible-alert preferences.
+pub fn load_alerts_settings() -> sdroxide_types::AlertSettings {
+    Settings::load().alerts
+}
+
+/// Persist the audible-alert preferences, preserving every other setting
+/// (read-modify-write, like [`save_ui_settings`]).
+pub fn save_alerts_settings(alerts: &sdroxide_types::AlertSettings) -> Result<(), ConfigError> {
+    let mut s = Settings::load();
+    s.alerts = alerts.clone();
+    s.save()
+}
+
 /// A sign-in the operator asked this client to remember (`remote_login.json`).
 ///
 /// A *client*-side file, like `input.json`: it is what this machine types into
@@ -581,7 +600,7 @@ pub fn config_dir() -> Result<PathBuf, ConfigError> {
 /// migration and stays downgrade-safe.
 ///
 /// Only the files that describe *a radio* are scoped: `radio.json`,
-/// `session.json`, `scanner.json`, `tciserver.json`, `rigctld.json`,
+/// `session.json`, `scanner.json`, `modeprofiles.json`, `tciserver.json`, `rigctld.json`,
 /// `wsjtx.json`. Everything the operator shares across radios — memories,
 /// band stacks, the logbook, `config.toml` — stays on the root free functions.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -640,6 +659,20 @@ impl Store {
             Err(e) => {
                 quarantine_unreadable(&dir, file, &e);
                 (T::default(), true)
+            }
+        }
+    }
+
+    /// [`Store::load`], but `None` rather than the defaults when there is no
+    /// file to read — missing, unreadable, or quarantined for not parsing.
+    fn load_if_present<T: serde::de::DeserializeOwned>(&self, file: &str) -> Option<T> {
+        let dir = self.dir().ok()?;
+        let FileText::Text(text) = read_config_text(&dir, file) else { return None };
+        match serde_json::from_str(&text) {
+            Ok(v) => Some(v),
+            Err(e) => {
+                quarantine_unreadable(&dir, file, &e);
+                None
             }
         }
     }
@@ -706,12 +739,39 @@ impl Store {
 
     /// The remembered dial and mode, or the defaults on a first run.
     pub fn load_session(&self) -> Session {
-        let s: Session = self.load("session.json");
-        if s.is_usable() { s.sanitized() } else { Session::default() }
+        self.load_session_if_present().unwrap_or_default()
+    }
+
+    /// The remembered session, or `None` when there is not one to restore —
+    /// no `session.json`, or one that failed [`Session::is_usable`].
+    ///
+    /// The engine has to tell "a session was restored" from "this is a first
+    /// run" apart: a restored session's levels are recorded as the per-mode
+    /// values of the mode it was left in, and a first run's must not be. Those
+    /// are [`Session::default`]'s, which nobody chose, and would be recorded as
+    /// departures from a mode that starts differently — FT8's slow AGC, for
+    /// one.
+    pub fn load_session_if_present(&self) -> Option<Session> {
+        // The file has to be *there*: [`Session::default`] is itself usable, so
+        // `load` alone cannot tell a first run from a session that was saved.
+        let s: Session = self.load_if_present("session.json")?;
+        if s.is_usable() { Some(s.sanitized()) } else { None }
     }
 
     pub fn save_session(&self, session: &Session) -> Result<(), ConfigError> {
         self.save("session.json", session)
+    }
+
+    /// This station's per-mode settings overrides, or none on a first run.
+    pub fn load_mode_profiles(&self) -> sdroxide_types::ModeProfiles {
+        self.load("modeprofiles.json")
+    }
+
+    pub fn save_mode_profiles(
+        &self,
+        profiles: &sdroxide_types::ModeProfiles,
+    ) -> Result<(), ConfigError> {
+        self.save("modeprofiles.json", profiles)
     }
 
     pub fn load_scanner_config(&self) -> sdroxide_types::ScannerConfig {
@@ -1336,6 +1396,51 @@ pub fn save_session(session: &Session) -> Result<(), ConfigError> {
 pub type BandStacks =
     std::collections::HashMap<sdroxide_types::Band, Vec<sdroxide_types::BandStackEntry>>;
 
+/// One named snapshot of how the station is being worked — the whole
+/// rememberable radio state (dials, VFOs, mode, filters, gains, drive,
+/// antennas) plus the digital identity and message templates it works with
+/// and the band stacks it was put together in (issue #197).
+///
+/// A profile is a scoping of the operator's working setup, not a config
+/// backup: it deliberately does **not** carry the hardware. The backend, the
+/// audio devices and the converters are personal to a radio — profiles
+/// follow the operator across the rig they always sit at, and a "contest"
+/// profile should not drag yesterday's sound card behind it.
+///
+/// "Save" writes whatever the radio is doing right now; "apply" puts the
+/// radio back onto a saved setup without touching hardware it is not part of.
+///
+/// `#[serde(default)]`, like the [`Session`] and the digital settings inside
+/// it: a profile is kept for as long as the operator keeps it, so it will be
+/// read by builds that have grown fields since it was written. A field it
+/// lacks takes its default instead of dropping the whole profile out of the
+/// list.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Profile {
+    /// The operator's name for it — "contest", "DX", "CB", the band plan.
+    pub name: String,
+    /// The remembered radio state: dials, VFOs, mode, filters, gains, drive,
+    /// antennas.
+    pub session: Session,
+    /// The digital identity and the message templates.
+    pub digi: sdroxide_types::DigiConfig,
+    /// The band stacks — which bands this way of working the station has its
+    /// setup stored in.
+    pub stacks: BandStacks,
+}
+
+/// The named profiles defined on this station. Station scope, like the band
+/// stacks: a profile is a way of working the station, not a thing a single
+/// radio owns.
+pub fn load_profiles() -> Vec<Profile> {
+    load_json_list("profiles.json")
+}
+
+pub fn save_profiles(profiles: &Vec<Profile>) -> Result<(), ConfigError> {
+    save_json("profiles.json", profiles)
+}
+
 fn load_json<T: serde::de::DeserializeOwned + Default>(file: &str) -> T {
     let Ok(dir) = config_dir() else { return T::default() };
     let FileText::Text(text) = read_config_text(&dir, file) else { return T::default() };
@@ -1476,6 +1581,17 @@ pub fn load_memory_folders() -> Vec<sdroxide_types::MemoryFolder> {
 
 pub fn save_memory_folders(folders: &[sdroxide_types::MemoryFolder]) -> Result<(), ConfigError> {
     save_json("memory_folders.json", &folders)
+}
+
+/// The Morse trainer's progress: which Koch characters are unlocked and the
+/// running score. Its own file, like the memory list, so a version without the
+/// trainer leaves it alone rather than overwriting it.
+pub fn load_morse_progress() -> sdroxide_types::MorseProgress {
+    load_json("morse.json")
+}
+
+pub fn save_morse_progress(progress: &sdroxide_types::MorseProgress) -> Result<(), ConfigError> {
+    save_json("morse.json", progress)
 }
 
 /// Radio backend config (SoapySDR vs CAT rig; serial + sound-card settings).
@@ -2418,6 +2534,53 @@ mod tests {
         assert!(!back.tx_ham_only, "a value below a table must not become part of it");
         assert_eq!(back.server_port, 4952, "the port we listen on is not the one we dial");
         assert_eq!(back.speech, s.speech, "the table above must survive too");
+    }
+
+    /// A profile written before a field existed still loads, with that field
+    /// at its default — here one with nothing but a name and a dial.
+    #[test]
+    fn a_profile_missing_fields_still_loads() {
+        let p: Profile =
+            serde_json::from_str(r#"{"name":"DX","session":{"freq_hz":14025000.0}}"#).unwrap();
+        assert_eq!(p.name, "DX");
+        assert_eq!(p.session.freq_hz, 14_025_000.0);
+        assert!(p.stacks.is_empty());
+        assert_eq!(p.digi, sdroxide_types::DigiConfig::default());
+    }
+
+    /// The alerts table carries sub-tables of its own, so it gets the same
+    /// swallowing test: a write that scatters `[alerts.events.new-dxcc]` must
+    /// leave every scalar above it standing.
+    #[test]
+    fn alerts_settings_survive_a_write_without_swallowing_anything() {
+        let mut alerts = sdroxide_types::AlertSettings {
+            enabled: true,
+            volume: 0.4,
+            device: Some("Speakers".into()),
+            ..Default::default()
+        };
+        alerts.events.called.sound = sdroxide_types::AlertSound::Warble;
+        alerts.events.new_dxcc.enabled = true;
+
+        let s = Settings { alerts: alerts.clone(), tx_ham_only: false, ..Settings::default() };
+        let text = toml::to_string_pretty(&s).unwrap();
+        let back: Settings = toml::from_str(&text).unwrap();
+        assert_eq!(back, s);
+        assert_eq!(back.alerts, alerts);
+        assert!(back.alerts.enabled);
+        assert_eq!(back.alerts.events.called.sound, sdroxide_types::AlertSound::Warble);
+        assert_eq!(back.alerts.volume, 0.4);
+        assert!(!back.tx_ham_only, "a value below a table must not become part of it");
+        assert_eq!(back.speech, s.speech, "the table above must survive too");
+        assert_eq!(back.remote_server, s.remote_server, "the table below must survive too");
+    }
+
+    /// A `config.toml` written before this feature existed has no alerts table,
+    /// and must come up quiet rather than beeping at its owner.
+    #[test]
+    fn a_config_without_an_alerts_table_stays_quiet() {
+        let s: Settings = toml::from_str("server_port = 4950").unwrap();
+        assert!(!s.alerts.enabled);
     }
 
     /// A `config.toml` written before this feature existed has no address to

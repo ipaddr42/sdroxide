@@ -90,6 +90,14 @@ const PTT_SLAVE_ATTRS: [&str; 4] = [
     "adi,gpo2-slave-rx-enable",
     "adi,gpo3-slave-tx-enable",
 ];
+/// The device-tree properties that hand the state machine to the part's
+/// ENABLE/TXNRX pins — to whatever is wired to them — instead of SPI. An
+/// `ensm_mode` write takes that control back, so a board with either set is
+/// never written to by [`Phy::ensure_receiving`].
+const ENSM_PIN_ATTRS: [&str; 2] = [
+    "adi,ensm-enable-txnrx-control-enable",
+    "adi,frequency-division-duplex-independent-mode-enable",
+];
 
 /// AD9363 tuning range, the conservative fallback when the device publishes no
 /// `frequency_available`.
@@ -586,28 +594,143 @@ impl Phy {
         conn.read_attr(&self.phy_id, Some(RX_CHAN), "rf_port_select")
     }
 
-    /// The AD9361's enable-state-machine mode — `fdd` or `tdd`, a device-level
+    /// The AD9361's enable state machine's current *state* — `fdd`, `rx`,
+    /// `tx`, `alert`, `sleep` and a few transient ones. A device-level
     /// attribute rather than a channel one.
     ///
-    /// In FDD the part receives and transmits at once, each direction with its
-    /// own synthesiser; in TDD it does one at a time and the receiver is dead
-    /// for the length of an over whatever the link can carry. Two callers want
-    /// to know: full duplex, which collides with TDD and says so rather than
-    /// reconfiguring a board out from under its owner, and
-    /// [`Phy::setup_tr_switching`], which uses it to recognise a board an
-    /// earlier session left in TDD.
+    /// Despite the name, not the mode: the driver reads this back from the
+    /// part's state register, and it never says `tdd`. A TDD board idles in
+    /// `alert`, and so does an FDD board the driver has parked there — see
+    /// [`Phy::ensure_receiving`]. For FDD-or-TDD ask [`Phy::is_fdd`].
     pub fn ensm_mode(&self, conn: &mut Connection) -> Result<String> {
         conn.read_attr(&self.phy_id, None, "ensm_mode")
     }
 
-    /// Put the enable state machine into `mode` — `rx` or `tx` on a board this
-    /// backend has put in TDD.
+    /// Whether the part is in FDD (`Some(true)`) or TDD (`Some(false)`), or
+    /// `None` when the firmware will not say.
     ///
-    /// In FDD nobody writes this: the part is in both states at once and the
-    /// mode is a fact about the board, not a control. In TDD it is the control
-    /// — the one that decides which direction is live, and with it which of the
-    /// slaved GPO pins is high, which is to say whether the external amplifier
-    /// is keyed.
+    /// In FDD the part receives and transmits at once, each direction with its
+    /// own synthesiser; in TDD it does one at a time and the receiver is dead
+    /// for the length of an over whatever the link can carry.
+    ///
+    /// Read from `ensm_mode_available`, which the driver prints from the same
+    /// flag the FDD device-tree property sets: FDD offers `fdd`, TDD offers
+    /// `rx` and `tx` instead. The property itself is the fallback, on a
+    /// firmware that publishes the debug attributes but not the list.
+    pub fn is_fdd(&self, conn: &mut Connection) -> Option<bool> {
+        match conn.read_attr(&self.phy_id, None, "ensm_mode_available") {
+            Ok(list) => return Some(list.split_whitespace().any(|s| s == "fdd")),
+            Err(e) => tracing::debug!("PlutoSDR: could not read ensm_mode_available: {e}"),
+        }
+        if !self.has_debug_attr(FDD_ENABLE) {
+            return None;
+        }
+        conn.read_debug_attr(&self.phy_id, FDD_ENABLE).ok().map(|v| v.trim() == "1")
+    }
+
+    /// Make sure a part nobody here is driving in TDD is actually receiving —
+    /// or, where that is not this backend's to fix, say that it is not.
+    /// Answers the sentence for the operator, if there is one.
+    ///
+    /// # Why (issue #470)
+    ///
+    /// An FDD part receives in exactly one state, `fdd`. The AD9361 driver
+    /// parks it in `alert` around its own calibrations — a bandwidth change,
+    /// a transmit quadrature calibration — and afterwards restores whatever
+    /// state it found. That is `alert` again if the part was already there,
+    /// and nothing at all on the error paths of its bandwidth update, which
+    /// return before the restore: one failed quadrature calibration leaves the
+    /// part parked, and every later calibration faithfully puts it back there,
+    /// session after session, until the board is rebooted. The synthesisers
+    /// stay locked, every register still reads as configured, and the DMA
+    /// keeps delivering: one sample word repeated, faster than the sample
+    /// clock could produce it. #470's capture was exactly that — every sample
+    /// (31, 1964), 3.57 Msps out of a part set to 2.083, with the part in
+    /// `alert` before this client had written a thing. Which path put it there
+    /// is not known.
+    ///
+    /// So an FDD part found in any other state is put back to `fdd`. This runs
+    /// last in the open, after every write that calibrates, because any of
+    /// them can be the one that parks it.
+    ///
+    /// # What it will not do
+    ///
+    /// - Write `fdd` to a part in TDD. The driver refuses it, but not before
+    ///   forcing the part through `alert` and writing FORCE_TX_ON — which in
+    ///   TDD is the transmit state. So the mode is read first, and a firmware
+    ///   that will not say which mode it is in is not written to at all.
+    /// - Take over a state machine that follows its enable pins
+    ///   ([`ENSM_PIN_ATTRS`]): something wired to the board is driving it.
+    /// - Drive somebody else's TDD. That is [`Phy::setup_tr_switching`]'s rule
+    ///   and it stands; the operator is told the receiver is off, and why,
+    ///   rather than left looking at a flat line.
+    pub fn ensure_receiving(&self, conn: &mut Connection) -> Result<Option<String>> {
+        let state = match self.ensm_mode(conn) {
+            Ok(s) => s.trim().to_ascii_lowercase(),
+            Err(e) => {
+                tracing::debug!("PlutoSDR: could not read ensm_mode: {e}");
+                return Ok(None);
+            }
+        };
+        // `fdd_flush` and `rx_flush` are on their way into the state they name.
+        if state.starts_with("fdd") || state.starts_with("rx") {
+            return Ok(None);
+        }
+        let pin_driven = ENSM_PIN_ATTRS.into_iter().find(|attr| {
+            self.has_debug_attr(attr)
+                && conn.read_debug_attr(&self.phy_id, attr).is_ok_and(|v| v.trim() == "1")
+        });
+        let why = match (self.is_fdd(conn), pin_driven) {
+            (Some(true), None) => {
+                tracing::info!(
+                    "PlutoSDR: this board is in FDD but its state machine is parked in {state}, \
+                     where it receives nothing — putting it back in fdd"
+                );
+                match self.set_ensm_mode(conn, "fdd") {
+                    Ok(()) => {}
+                    Err(e @ Error::Remote { .. }) => {
+                        tracing::debug!("PlutoSDR: ensm_mode = fdd was refused: {e}")
+                    }
+                    Err(e) => return Err(e),
+                }
+                match self.ensm_mode(conn) {
+                    Ok(now) if now.trim().eq_ignore_ascii_case("fdd") => return Ok(None),
+                    Ok(now) => format!(
+                        "it is in FDD and was parked in {state}; it would not go back to fdd and \
+                         is in {} — power-cycling the Pluto clears this",
+                        now.trim()
+                    ),
+                    Err(e) => return Err(e),
+                }
+            }
+            (Some(true), Some(attr)) => format!(
+                "its state machine follows the part's enable pins ({attr}), so it is left to \
+                 whatever is wired to them"
+            ),
+            (Some(false), _) => "it is in TDD and nothing here drives its state machine, \
+                                 because the PlutoSDR settings say FDD. Choose TDD there to have \
+                                 sdroxide drive it"
+                .to_string(),
+            (None, _) => "this firmware does not say whether it is in FDD or TDD, so it is left \
+                          alone"
+                .to_string(),
+        };
+        let msg = format!(
+            "PlutoSDR: this board is not receiving — its state machine is in {state}: {why}"
+        );
+        tracing::warn!("{msg}");
+        Ok(Some(msg))
+    }
+
+    /// Put the enable state machine into `mode` — `rx` or `tx` on a board this
+    /// backend has put in TDD, `fdd` on an FDD board found anywhere else.
+    ///
+    /// In FDD this is written only to undo somebody else's `alert` (see
+    /// [`Phy::ensure_receiving`]): `fdd` is the one state an FDD part works
+    /// in. In TDD it is the control — the one that decides which direction is
+    /// live, and with it which of the slaved GPO pins is high, which is to say
+    /// whether the external amplifier is keyed. Never `fdd` to a TDD part: the
+    /// driver keys the transmitter on its way to refusing it.
     pub fn set_ensm_mode(&self, conn: &mut Connection, mode: &str) -> Result<()> {
         conn.write_attr(&self.phy_id, None, "ensm_mode", mode)
     }
@@ -685,8 +808,13 @@ impl Phy {
             // no way out but power-cycling the Pluto. So the *specific*
             // configuration this writes is recognised and undone, and a board
             // in TDD for somebody else's reasons is still left alone.
-            match self.ensm_mode(conn) {
-                Ok(mode) if !mode.to_ascii_lowercase().contains("fdd") => {
+            //
+            // The mode, not the state machine's state: an FDD board can be
+            // sitting in `alert` too, and reading that as TDD is how issue
+            // #470's board was left not receiving. That one is
+            // `ensure_receiving`'s, at the end of the open.
+            match self.is_fdd(conn) {
+                Some(false) => {
                     let mut slaved = Vec::new();
                     for attr in PTT_SLAVE_ATTRS {
                         if self.has_debug_attr(attr)
@@ -699,14 +827,13 @@ impl Phy {
                     }
                     if slaved.is_empty() {
                         tracing::info!(
-                            "PlutoSDR: this board's enable state machine is in {mode} and \
-                             no GPO pin is slaved to it — somebody put it in TDD for their \
-                             own reasons, so it is left that way"
+                            "PlutoSDR: this board is in TDD and no GPO pin is slaved to it — \
+                             somebody put it there for their own reasons, so it is left that way"
                         );
                         return Ok(out);
                     }
                     let msg = format!(
-                        "PlutoSDR: this board is in {mode} with {} slaved to the radio — \
+                        "PlutoSDR: this board is in TDD with {} slaved to the radio — \
                          the transmit-receive switching from an earlier session. Putting \
                          it back into FDD and un-slaving the pins, because with the PTT \
                          pins off nothing here drives its state machine. Choose TDD in \
@@ -716,9 +843,9 @@ impl Phy {
                     tracing::warn!("{msg}");
                     out.warnings.push(msg);
                 }
-                // In FDD, or a firmware that does not publish the mode: either
-                // way there is nothing to undo and nothing to say.
-                _ => return Ok(out),
+                // In FDD, or a firmware that does not say: either way there is
+                // nothing to undo and nothing to say.
+                Some(true) | None => return Ok(out),
             }
         }
         for attr in [FDD_ENABLE, INITIALIZE] {

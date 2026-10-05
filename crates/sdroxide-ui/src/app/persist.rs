@@ -90,6 +90,96 @@ pub(in crate::app) fn persist_speech_settings(_cfg: &sdroxide_types::SpeechSetti
     // Written by eframe's periodic `save()` into localStorage.
 }
 
+// ── Audible alerts (native: config.toml [alerts]) ────────────────────────────
+//
+// A client-side preference like `[speech]` and `[ui]`, with the same browser
+// half: the wasm build has no alarm sink yet, but remembering the settings
+// there means a later browser backend inherits them rather than starting from
+// defaults.
+
+#[cfg(not(target_arch = "wasm32"))]
+pub(in crate::app) fn load_alerts_settings(
+    _storage: Option<&dyn eframe::Storage>,
+) -> sdroxide_types::AlertSettings {
+    sdroxide_config::load_alerts_settings()
+}
+
+#[cfg(target_arch = "wasm32")]
+pub(in crate::app) fn load_alerts_settings(
+    storage: Option<&dyn eframe::Storage>,
+) -> sdroxide_types::AlertSettings {
+    storage.and_then(|s| eframe::get_value(s, "alerts_settings")).unwrap_or_default()
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub(in crate::app) fn persist_alerts_settings(cfg: &sdroxide_types::AlertSettings) {
+    if let Err(e) = sdroxide_config::save_alerts_settings(cfg) {
+        eprintln!("failed to save alerts settings: {e}");
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+pub(in crate::app) fn persist_alerts_settings(_cfg: &sdroxide_types::AlertSettings) {
+    // Written by eframe's periodic `save()` into localStorage.
+}
+
+// ── Morse trainer progress ────────────────────────────────────────────────────
+
+/// The trainer's progress is the operator's, not a radio's. Every tab holds a
+/// copy, and this is the one they all write through and read back from, so a
+/// tab's stale copy never overwrites the training done on another.
+static MORSE_PROGRESS: std::sync::Mutex<Option<sdroxide_types::MorseProgress>> =
+    std::sync::Mutex::new(None);
+
+/// The app-wide progress, once any tab has loaded or changed it.
+pub(in crate::app) fn shared_morse_progress() -> Option<sdroxide_types::MorseProgress> {
+    MORSE_PROGRESS.lock().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
+fn set_shared_morse_progress(progress: &sdroxide_types::MorseProgress) {
+    *MORSE_PROGRESS.lock().unwrap_or_else(|e| e.into_inner()) = Some(progress.clone());
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub(in crate::app) fn load_morse_progress(
+    _storage: Option<&dyn eframe::Storage>,
+) -> sdroxide_types::MorseProgress {
+    if let Some(p) = shared_morse_progress() {
+        return p;
+    }
+    let p = sdroxide_config::load_morse_progress();
+    set_shared_morse_progress(&p);
+    p
+}
+
+#[cfg(target_arch = "wasm32")]
+pub(in crate::app) fn load_morse_progress(
+    storage: Option<&dyn eframe::Storage>,
+) -> sdroxide_types::MorseProgress {
+    if let Some(p) = shared_morse_progress() {
+        return p;
+    }
+    let p: sdroxide_types::MorseProgress =
+        storage.and_then(|s| eframe::get_value(s, "morse_progress")).unwrap_or_default();
+    set_shared_morse_progress(&p);
+    p
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub(in crate::app) fn persist_morse_progress(progress: &sdroxide_types::MorseProgress) {
+    set_shared_morse_progress(progress);
+    if let Err(e) = sdroxide_config::save_morse_progress(progress) {
+        eprintln!("failed to save Morse progress: {e}");
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+pub(in crate::app) fn persist_morse_progress(progress: &sdroxide_types::MorseProgress) {
+    // Written by the station-writing tab's periodic `save()` into localStorage,
+    // from the shared copy, so training on any tab is kept.
+    set_shared_morse_progress(progress);
+}
+
 // ── Remote-access credentials (native: config.toml [remote_access]) ──────────
 //
 // Who may connect to *this* machine's server. There is no browser half: these

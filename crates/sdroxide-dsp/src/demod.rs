@@ -101,17 +101,73 @@ pub trait Demodulator: Send {
     /// `None` stops it, which is the state whenever nobody has one on screen —
     /// it is hundreds of floats several times a second.
     fn set_drm_constellation(&mut self, _channel: Option<DrmChannel>) {}
+
+    /// What the HD Radio decoder has made of the multiplex since this was last
+    /// called, or `None` from a demod that is not decoding HD Radio — and from
+    /// the HD Radio one whenever nothing has moved.
+    ///
+    /// The same arrangement as [`Self::take_drm`]: the HD Radio demodulator
+    /// lives in `sdroxide-nrsc5`, which loads a C library, so only the
+    /// snapshot type is shared and this is a trait method with a default rather
+    /// than another arm of [`make_demod`].
+    fn take_hd_radio(&mut self) -> Option<sdroxide_types::HdRadioStatus> {
+        None
+    }
+
+    /// Re-acquire the HD Radio transmission from scratch. Like
+    /// [`Self::reset_rds`], the demod cannot see a retune for itself.
+    fn reset_hd_radio(&mut self) {}
+
+    /// Decode a different programme of the HD Radio multiplex, 0-based.
+    fn set_hd_program(&mut self, _program: u8) {}
 }
 
 /// The channel rate a mode's demodulator wants from the DDC.
+///
+/// The FM figure for HD Radio: a caller that does not know where the dial is
+/// (or is not on HD Radio at all) gets the hybrid's wide stream. See
+/// [`channel_target_at`] for the dial-aware version.
 pub fn channel_target(mode: Mode) -> f64 {
+    channel_target_at(mode, 0.0)
+}
+
+/// The channel rate a mode's demodulator wants from the DDC, for a receiver
+/// tuned to `dial_hz`.
+///
+/// HD Radio is the one mode whose channel depends on where the dial is. The FM
+/// hybrid's carrier and both OFDM sidebands span roughly ±198 kHz, so it wants
+/// the wide stream; the **AM-band variant** (HD on AM, in the medium-wave
+/// broadcast band) occupies only about ±15 kHz, and feeding it the FM window
+/// would drown it in medium-wave noise — a thirteenth of the signal in thirteen
+/// times the stream (issue #489). Every other mode ignores `dial_hz`.
+pub fn channel_target_at(mode: Mode, dial_hz: f64) -> f64 {
     match mode {
         // Generous rate for WFM: the discriminator wraps when the composite
         // deviation exceeds ±fs/2, so ±128 kHz of margin keeps broadcast
         // peaks (±75 kHz nominal) well clear of click territory.
         Mode::Wfm => 256_000.0,
+        // The AM-band HD variant: ±15 kHz occupied, and 48 kHz clears it with
+        // room for the channel filter's skirts.
+        Mode::HdRadio if hd_radio_is_am(dial_hz) => 48_000.0,
+        // The FM hybrid's carrier and both OFDM sidebands span roughly
+        // ±198 kHz, and the HD Radio decoder is fed at its own fixed rate
+        // (744,187.5 S/s) by its own resampler. This only has to be wide
+        // enough that the DDC's anti-alias filter passes both sidebands, so a
+        // little over the occupied bandwidth.
+        Mode::HdRadio => 744_187.5,
         _ => 48_000.0,
     }
+}
+
+/// Whether an HD Radio channel at `hz` is the **AM-band variant** (HD on AM)
+/// rather than the FM hybrid.
+///
+/// HD-on-AM lives in the medium-wave broadcast band; everywhere else HD Radio
+/// is the FM hybrid. The span is the widest any region's MW band uses — the
+/// Americas reach about 1 710 kHz — so the narrower Regions 1 and 3 span is
+/// covered too.
+pub fn hd_radio_is_am(hz: f64) -> bool {
+    (526_500.0..=1_710_000.0).contains(&hz)
 }
 
 /// Demodulator for a mode (`None` = no audio, e.g. SPEC).
@@ -129,8 +185,14 @@ pub fn make_demod(mode: Mode, channel_rate: f64) -> Option<Box<dyn Demodulator>>
         | Mode::Ft8
         | Mode::Js8
         | Mode::Wspr
+        | Mode::Pi4
+        | Mode::Jt65
+        | Mode::Jt9
+        | Mode::Fst4
+        | Mode::Q65
         | Mode::Ft4
         | Mode::Ft2
+        | Mode::Msk144
         | Mode::Psk
         | Mode::Rtty
         | Mode::Sstv
@@ -145,7 +207,8 @@ pub fn make_demod(mode: Mode, channel_rate: f64) -> Option<Box<dyn Demodulator>>
         | Mode::PacketHf
         // AtChat COFDM: 2.7 kHz of audio on USB, tapped by the digi engine.
         | Mode::AtChat
-        | Mode::Rade => Some(Box::new(SsbDemod::new(channel_rate, lo, hi))),
+        | Mode::Rade
+        | Mode::Fsk441 => Some(Box::new(SsbDemod::new(channel_rate, lo, hi))),
         // VHF packet frequency-modulates the carrier, so like RIFP it wants a
         // discriminator — but a flat one, not the voice NFM path. APRS is the
         // same waveform on a channel of its own and takes the same path.
@@ -155,6 +218,9 @@ pub fn make_demod(mode: Mode, channel_rate: f64) -> Option<Box<dyn Demodulator>>
         // sideband filter.
         Mode::Rifp => Some(Box::new(FskDemod::new(channel_rate, lo, hi))),
         Mode::Am => Some(Box::new(AmDemod::new(channel_rate, lo, hi))),
+        // ACARS is AM: the envelope detector hands the digi engine the audio the
+        // MSK is carried in, exactly as it does for a voice channel.
+        Mode::Acars => Some(Box::new(AmDemod::new(channel_rate, lo, hi))),
         Mode::Isb => Some(Box::new(IsbDemod::new(channel_rate, lo, hi))),
         Mode::Sam => Some(Box::new(SamDemod::new(channel_rate, lo, hi))),
         // VHF SSTV takes the NFM voice path rather than the flat packet one,
@@ -176,13 +242,14 @@ pub fn make_demod(mode: Mode, channel_rate: f64) -> Option<Box<dyn Demodulator>>
         // DRM's decoder is a vendored C++ receiver, which cannot be linked from
         // this crate — see `Demodulator::take_drm`. The engine builds
         // `sdroxide_drm::DrmDemod` itself; reaching here means it forgot to,
-        // and the mode is silent rather than wrong.
-        Mode::Drm => None,
+        // and the mode is silent rather than wrong. HD Radio is the same
+        // arrangement with `sdroxide_nrsc5::HdDemod` and `take_hd_radio`.
+        Mode::Drm | Mode::HdRadio => None,
         // ADS-B produces no audio at all: it is 1 Mbit/s pulse-position
         // modulation two megahertz wide, decoded off the raw I/Q by an engine
         // lane of its own. There is nothing for this chain to demodulate, and a
         // silent receiver is the correct behaviour rather than a missing case.
-        Mode::Adsb | Mode::Vdl2 | Mode::Ais => None,
+        Mode::Adsb | Mode::Vdl2 | Mode::Ais | Mode::Hfdl => None,
         Mode::Spec => None,
     }
 }
@@ -1258,5 +1325,33 @@ impl PilotPll {
     /// Exists for the RDS decoder, whose subcarrier is this frequency tripled.
     fn tracked_hz(&self) -> Option<f64> {
         self.locked.then(|| (self.nominal + self.freq) * self.rate / std::f64::consts::TAU)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// HD Radio is the one mode whose channel follows the dial: the FM hybrid
+    /// wants its wide stream, HD-on-AM the narrow one.
+    #[test]
+    fn the_hd_channel_follows_the_dial_between_am_and_fm() {
+        // FM HD: the wide hybrid stream.
+        assert_eq!(channel_target_at(Mode::HdRadio, 98_000_000.0), 744_187.5);
+        assert!(!hd_radio_is_am(98_000_000.0));
+        // AM HD: the narrow medium-wave stream.
+        assert_eq!(channel_target_at(Mode::HdRadio, 1_650_000.0), 48_000.0);
+        assert!(hd_radio_is_am(1_650_000.0));
+        // The band's own edges, and just outside them.
+        assert!(hd_radio_is_am(526_500.0));
+        assert!(hd_radio_is_am(1_710_000.0));
+        assert!(!hd_radio_is_am(525_000.0));
+        assert!(!hd_radio_is_am(2_000_000.0));
+        // A caller with no dial gets the FM figure, which is what the function
+        // did before it took one.
+        assert_eq!(channel_target(Mode::HdRadio), 744_187.5);
+        // Every other mode ignores the dial.
+        assert_eq!(channel_target_at(Mode::Wfm, 1_650_000.0), 256_000.0);
+        assert_eq!(channel_target_at(Mode::Usb, 1_650_000.0), 48_000.0);
     }
 }

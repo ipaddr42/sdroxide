@@ -64,6 +64,39 @@ fn viewport_id(salt: u32) -> egui::ViewportId {
     }
 }
 
+/// The size and position the solar-system window opens at: the operator's last
+/// geometry if there is one, otherwise 1180×760, either way shrunk to fit the
+/// monitor it is about to open on.
+///
+/// A window wider than the screen loses the controls along its right edge, and
+/// on some Linux systems a window larger than the monitor crashes the toolkit —
+/// the same bargain [`crate::layout::fit_inner_size`] strikes for the floating
+/// windows. The frame around the drawing area is not known before the window
+/// exists, so a title bar and borders are guessed. Never grows a window: an
+/// operator who has sized theirs is not asking for it back.
+///
+/// The position comes back as it was given, only where the platform gave one
+/// (not Wayland), and is not clamped. It is in desktop coordinates, and a
+/// second monitor starts wherever the desktop puts it — often at x = 1920, or
+/// at a negative x left of the primary — while `monitor` is only a size. A
+/// clamp to `0..monitor` put a window left on the second screen back on the
+/// first; the window manager already keeps a window on some screen.
+#[cfg(not(target_arch = "wasm32"))]
+fn solar3d_geometry(
+    monitor: Option<egui::Vec2>,
+    seed: Option<sdroxide_types::Solar3dWindow>,
+) -> (egui::Vec2, Option<egui::Pos2>) {
+    let want = seed.map_or(egui::vec2(1180.0, 760.0), |s| egui::Vec2::from(s.size));
+    let Some(monitor) = monitor.filter(|m| m.x > 1.0 && m.y > 1.0) else {
+        return (want, seed.and_then(|s| s.pos).map(egui::Pos2::from));
+    };
+    let chrome = egui::vec2(16.0, 40.0);
+    let size =
+        crate::layout::fit_inner_size(monitor, want + chrome, want, egui::vec2(520.0, 340.0))
+            .unwrap_or(want);
+    (size, seed.and_then(|s| s.pos).map(egui::Pos2::from))
+}
+
 // Scene units are gigametres (10⁶ km): 1 AU ≈ 149.6, the Sun ≈ 0.696, the Earth
 // ≈ 0.0064. Everything the camera deals with then sits in [1e-3, 1e3], well
 // inside f32 range, while the ephemeris itself stays f64.
@@ -152,6 +185,18 @@ impl Solar3d {
         v
     }
 
+    /// Publish the geometry the window should open at, from the screen's
+    /// settings. Consulted only when the window is (re)built.
+    pub fn set_window_seed(&self, window: Option<sdroxide_types::Solar3dWindow>) {
+        self.lock().window_seed = window;
+    }
+
+    /// The geometry the window is actually at, for the host to keep in the
+    /// screen's settings.
+    pub fn window_now(&self) -> Option<sdroxide_types::Solar3dWindow> {
+        self.lock().window_now
+    }
+
     /// Whether the clouds are marched rather than sliced. Lives here rather than
     /// in `UiSettings` because it rides `Solar3dView`, which is the state the
     /// browser tab persists too — the same switch has to reach both.
@@ -235,23 +280,49 @@ impl Solar3d {
         }
 
         let state = Arc::clone(&self.state);
-        ctx.show_viewport_deferred(
-            viewport_id(crate::layout::radio_salt(ctx)),
-            egui::ViewportBuilder::default()
-                .with_title("sdroxide — solar system")
-                .with_inner_size([1180.0, 760.0])
-                .with_min_inner_size([520.0, 340.0]),
-            move |ui, _class| {
-                let mut st = state.lock().unwrap_or_else(|e| e.into_inner());
-                if ui.ctx().input(|i| i.viewport().close_requested()) {
-                    st.close_requested = true;
-                    // Wake the root pass so the chip un-lights promptly.
-                    ui.ctx().request_repaint_of(egui::ViewportId::ROOT);
-                    return;
+        let vid = viewport_id(crate::layout::radio_salt(ctx));
+        // The window is (re)built on the frame egui has no pass count for it —
+        // which is where the size and place come from. Every later frame leaves
+        // the geometry alone, so a live resize is not fought by our own request.
+        let mut builder = egui::ViewportBuilder::default()
+            .with_title("sdroxide — solar system")
+            .with_min_inner_size([520.0, 340.0])
+            .with_clamp_size_to_monitor_size(true);
+        if ctx.cumulative_pass_nr_for(vid) == 0 {
+            let seed = self.lock().window_seed;
+            let monitor = ctx.input(|i| i.viewport().monitor_size);
+            let (size, pos) = solar3d_geometry(monitor, seed);
+            builder = builder.with_inner_size(size);
+            if let Some(pos) = pos {
+                builder = builder.with_position(pos);
+            }
+        }
+        ctx.show_viewport_deferred(vid, builder, move |ui, _class| {
+            let mut st = state.lock().unwrap_or_else(|e| e.into_inner());
+            // Keep the geometry for the next rebuild. `content_rect` is the
+            // inner size as the toolkit reports it — the only size on Wayland,
+            // where `viewport().inner_rect` is `None` because a Wayland client
+            // is given no absolute position; `outer_rect` carries the position
+            // where the platform has one, and is `None` on Wayland too.
+            let size = ui.ctx().content_rect().size();
+            if size.x > 1.0 && size.y > 1.0 {
+                let pos = ui.ctx().input(|i| i.viewport().outer_rect).map(|r| r.min);
+                let geom = sdroxide_types::Solar3dWindow {
+                    size: [size.x.round(), size.y.round()],
+                    pos: pos.map(|p| [p.x.round(), p.y.round()]),
+                };
+                if st.window_now != Some(geom) {
+                    st.window_now = Some(geom);
                 }
-                overlay::ui(ui, &mut st);
-            },
-        );
+            }
+            if ui.ctx().input(|i| i.viewport().close_requested()) {
+                st.close_requested = true;
+                // Wake the root pass so the chip un-lights promptly.
+                ui.ctx().request_repaint_of(egui::ViewportId::ROOT);
+                return;
+            }
+            overlay::ui(ui, &mut st);
+        });
 
         // egui tears the window down when we stop emitting the viewport — do
         // *not* send `ViewportCommand::Close` as well.
@@ -371,4 +442,59 @@ impl Solar3d {
 /// everywhere, so the whole scene can be scrubbed by offsetting this.
 fn wall_clock_unix() -> f64 {
     crate::time::now_unix_f64()
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod tests {
+    use super::*;
+
+    /// The default opens on a screen with room for it, and is shrunk to fit one
+    /// that is smaller rather than hanging off the edge — the tab-switch report
+    /// was a window wider than the screen coming straight back on every rebuild.
+    #[test]
+    fn the_solar_window_opens_within_the_monitor() {
+        let default = egui::vec2(1180.0, 760.0);
+        // Room to spare: the default is left alone...
+        assert_eq!(solar3d_geometry(Some(egui::vec2(1920.0, 1080.0)), None), (default, None));
+        // ...as it is before any monitor has been reported.
+        assert_eq!(solar3d_geometry(None, None), (default, None));
+        // A small screen shrinks it instead of overflowing.
+        let (small, _) = solar3d_geometry(Some(egui::vec2(1280.0, 720.0)), None);
+        assert!(small.x <= 1280.0 && small.y <= 720.0, "{small:?} does not fit 1280x720");
+        assert!(small.x < default.x || small.y < default.y, "a small screen must shrink it");
+    }
+
+    /// A geometry the operator gave the window is honoured, but never grown
+    /// past a screen that has since become smaller.
+    #[test]
+    fn a_remembered_geometry_is_honoured_and_its_size_still_fits() {
+        let seed = sdroxide_types::Solar3dWindow { size: [900.0, 600.0], pos: Some([100.0, 80.0]) };
+        assert_eq!(
+            solar3d_geometry(Some(egui::vec2(2560.0, 1440.0)), Some(seed)),
+            (egui::vec2(900.0, 600.0), Some(egui::pos2(100.0, 80.0)))
+        );
+        // A shrunken screen shrinks the window to fit it.
+        let (size, _) = solar3d_geometry(
+            Some(egui::vec2(800.0, 600.0)),
+            Some(sdroxide_types::Solar3dWindow {
+                size: [1600.0, 1200.0],
+                pos: Some([700.0, 500.0]),
+            }),
+        );
+        assert!(size.x <= 800.0 && size.y <= 600.0, "{size:?} does not fit 800x600");
+    }
+
+    /// The position is in desktop coordinates, and `monitor` is only a size:
+    /// a window left on a second screen — right of a 1920-wide primary, or
+    /// left of it at a negative x — comes back there rather than being pulled
+    /// onto the first.
+    #[test]
+    fn a_window_on_a_second_monitor_comes_back_there() {
+        let screen = Some(egui::vec2(1920.0, 1080.0));
+        for at in [[2100.0, 120.0], [-1500.0, 200.0]] {
+            let seed = sdroxide_types::Solar3dWindow { size: [900.0, 600.0], pos: Some(at) };
+            let (_, pos) = solar3d_geometry(screen, Some(seed));
+            assert_eq!(pos, Some(egui::Pos2::from(at)), "moved off the monitor it was left on");
+        }
+    }
 }

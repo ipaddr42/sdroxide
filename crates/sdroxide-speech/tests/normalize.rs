@@ -22,6 +22,7 @@ fn meters(s_dbm: f32) -> Meters {
         stereo: false,
         tone: None,
         passband_dbfs: f32::NEG_INFINITY,
+        puresignal: None,
     }
 }
 
@@ -308,6 +309,9 @@ fn every_rule_honours_the_output_contract() {
         NrLevel::SpecLow,
         NrLevel::SpecMed,
         NrLevel::SpecHigh,
+        NrLevel::Nr2Low,
+        NrLevel::Nr2Med,
+        NrLevel::Nr2High,
         NrLevel::DfLow,
         NrLevel::DfMed,
         NrLevel::DfHigh,

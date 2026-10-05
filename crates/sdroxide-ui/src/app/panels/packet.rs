@@ -17,6 +17,59 @@ use sdroxide_types::{Command, Mode, PacketLinkOwner, PacketStatus, PacketTermKin
 use crate::app::{SdroxideApp, tx_gated};
 use crate::theme;
 
+/// The monitor's header row: the speed, the channel state, CLEAR RX, SAVE and
+/// the settings chip. Returns whether ⚙ SETUP was pressed; `setup_open` is its
+/// state and `status` the app's `digi_status`, which SAVE writes from.
+///
+/// Wrapped: on a phone the row is wider than the screen, and a plain one ran
+/// ⚙ SETUP — the only way into the packet settings — off its edge.
+pub(super) fn packet_monitor_header(
+    ui: &mut egui::Ui,
+    st: &PacketStatus,
+    status: Option<&sdroxide_types::DigiStatus>,
+    setup_open: bool,
+    cmds: &mut Vec<Command>,
+) -> bool {
+    let mut setup = false;
+    ui.horizontal_wrapped(|ui| {
+        ui.label(RichText::new("MONITOR").strong().color(theme::CYAN()));
+        ui.label(RichText::new(format!("{} baud", st.baud.label())).weak());
+        // Channel busy and bad frames are the two numbers that explain a
+        // link that is not working: one says somebody else is talking, the
+        // other says the path is marginal.
+        if st.dcd {
+            ui.label(RichText::new("BUSY").strong().color(theme::ALERT()));
+        }
+        if st.bad_frames > 0 {
+            ui.label(RichText::new(format!("{} bad", st.bad_frames)).weak().color(theme::ALERT()))
+                .on_hover_text(
+                    "Frames that arrived but failed their check sequence — a collision, a fade, \
+                     or a signal too weak to read.",
+                );
+        }
+        crate::chrome::row_tail(ui, |ui| {
+            super::clear_rx_chip_at(ui, cmds, true);
+            super::save_rx_chip_for(ui, status);
+            // The only route to the packet settings there is. Everything
+            // this mode needs before it can transmit at all — the station
+            // callsign above all — lives in that window, and until this
+            // chip existed nothing anywhere opened it: an operator told to
+            // "set a station callsign in the packet settings first" had
+            // nowhere to go and look (issue #159).
+            if crate::chrome::chip(ui, setup_open, RichText::new("⚙ SETUP").size(9.5))
+                .on_hover_text(
+                    "Station callsign, speed, TX delay, the digipeater path, the beacon and the \
+                     KISS server",
+                )
+                .clicked()
+            {
+                setup = true;
+            }
+        });
+    });
+    setup
+}
+
 impl SdroxideApp {
     pub(in crate::app) fn packet_panel(
         &mut self,
@@ -67,47 +120,9 @@ impl SdroxideApp {
         st: &PacketStatus,
         panel_h: f32,
     ) {
-        ui.horizontal(|ui| {
-            ui.label(RichText::new("MONITOR").strong().color(theme::CYAN()));
-            ui.label(RichText::new(format!("{} baud", st.baud.label())).weak());
-            // Channel busy and bad frames are the two numbers that explain a
-            // link that is not working: one says somebody else is talking, the
-            // other says the path is marginal.
-            if st.dcd {
-                ui.label(RichText::new("BUSY").strong().color(theme::ALERT()));
-            }
-            if st.bad_frames > 0 {
-                ui.label(
-                    RichText::new(format!("{} bad", st.bad_frames)).weak().color(theme::ALERT()),
-                )
-                .on_hover_text(
-                    "Frames that arrived but failed their check sequence — a collision, a fade, \
-                     or a signal too weak to read.",
-                );
-            }
-            crate::chrome::row_tail(ui, |ui| {
-                self.clear_rx_chip(ui, cmds);
-                // The only route to the packet settings there is. Everything
-                // this mode needs before it can transmit at all — the station
-                // callsign above all — lives in that window, and until this
-                // chip existed nothing anywhere opened it: an operator told to
-                // "set a station callsign in the packet settings first" had
-                // nowhere to go and look (issue #159).
-                if crate::chrome::chip(
-                    ui,
-                    self.show_digi_settings,
-                    RichText::new("⚙ SETUP").size(9.5),
-                )
-                .on_hover_text(
-                    "Station callsign, speed, TX delay, the digipeater path, the beacon and the \
-                     KISS server",
-                )
-                .clicked()
-                {
-                    self.show_digi_settings = !self.show_digi_settings;
-                }
-            });
-        });
+        if packet_monitor_header(ui, st, self.digi_status.as_ref(), self.show_digi_settings, cmds) {
+            self.show_digi_settings = !self.show_digi_settings;
+        }
 
         egui::ScrollArea::vertical()
             .id_salt("packet-monitor")

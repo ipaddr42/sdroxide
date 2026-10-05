@@ -1,11 +1,12 @@
-//! Builds the vendored Dream DRM receiver, faad2 and the C++ shim between them
-//! and Rust, then generates bindings for the shim's C API.
+//! Builds the vendored Dream DRM receiver and the C++ shim between it and Rust,
+//! then generates bindings for the shim's C API.
 //!
 //! Everything is compiled straight with `cc` rather than through Dream's qmake
-//! project or faad2's CMake. Neither upstream build system is usable here —
-//! Dream's needs Qt even for its console build, and going through a generated
-//! makefile is what broke the Windows CI job for the other vendored C in this
-//! tree (see `vendor/rade_c`). One source list and two `cc::Build`s avoid both.
+//! project (or, in `crates/sdroxide-faad2`, faad2's CMake). Neither upstream
+//! build system is usable here — Dream's needs Qt even for its console build,
+//! and going through a generated makefile is what broke the Windows CI job for
+//! the other vendored C in this tree (see `vendor/rade_c`). Source lists and
+//! `cc::Build`s avoid both.
 //!
 //! Three dependencies Dream normally takes from the system are not taken here:
 //!
@@ -14,8 +15,10 @@
 //! * **libsndfile, speexdsp, pcap, hamlib, gps, Qt** — all optional in Dream,
 //!   all left out, which is what the missing `HAVE_*` defines below select.
 //! * **faad2 at runtime** — Dream dlopens `libfaad_drm.so.2`, which most
-//!   systems do not have. It is built in from `vendor/faad2` instead, so DRM
-//!   audio decodes out of the box, which is the whole point of the feature.
+//!   systems do not have. It is linked in from `crates/sdroxide-faad2` instead,
+//!   so DRM audio decodes out of the box, which is the whole point of the
+//!   feature. That crate builds the one faad2 the binary has — stock, with
+//!   `DRM_SUPPORT` — and Dream is compiled against the headers it exports.
 
 use std::path::{Path, PathBuf};
 
@@ -156,22 +159,17 @@ fn main() {
     let manifest = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
     let out = PathBuf::from(std::env::var("OUT_DIR").unwrap());
     let dream = manifest.join("../../vendor/dream");
-    let faad2 = manifest.join("../../vendor/faad2");
+    // The faad2 headers, exported by `sdroxide-faad2`'s build script.
+    let faad2_include = PathBuf::from(
+        std::env::var("DEP_FAAD2_INCLUDE").expect("sdroxide-faad2 exports its include directory"),
+    );
 
     if !dream.join("src/DrmReceiver.h").exists() {
         panic!("vendored Dream sources are missing at {}", dream.display());
     }
-    if !faad2.join("include/neaacdec.h").exists() {
-        panic!(
-            "vendored faad2 is missing at {}\n\
-             run: git submodule update --init --recursive",
-            faad2.display()
-        );
-    }
 
-    build_faad2(&faad2);
-    build_dream(&manifest, &dream, &faad2);
-    build_shim(&manifest, &dream, &faad2);
+    build_dream(&manifest, &dream, &faad2_include);
+    build_shim(&manifest, &dream, &faad2_include);
     generate_bindings(&manifest, &out);
 
     println!("cargo:rerun-if-changed=src/drm_shim.cpp");
@@ -180,38 +178,6 @@ fn main() {
     println!("cargo:rerun-if-changed=include");
     println!("cargo:rerun-if-changed={}", dream.join("src").display());
     println!("cargo:rerun-if-changed={}", manifest.join("../../vendor/fdk-aac/include").display());
-}
-
-/// The DRM build of faad2: the same sources as the stock library with
-/// `DRM_SUPPORT` added, which is what brings in `NeAACDecInitDRM` and the DRM
-/// entry into the decoder. Upstream ships this as a second library,
-/// `libfaad_drm`, precisely because the plain one cannot decode DRM at all.
-fn build_faad2(faad2: &Path) {
-    let mut build = cc::Build::new();
-    build
-        .include(faad2.join("libfaad"))
-        .include(faad2.join("include"))
-        .define("HAVE_INTTYPES_H", "1")
-        .define("HAVE_MEMCPY", "1")
-        .define("HAVE_STRING_H", "1")
-        .define("HAVE_STRINGS_H", "1")
-        .define("HAVE_SYS_STAT_H", "1")
-        .define("HAVE_SYS_TYPES_H", "1")
-        .define("PACKAGE_VERSION", "\"2.11.2\"")
-        .define("APPLY_DRC", None)
-        .define("DRM_SUPPORT", None)
-        .opt_level(2)
-        .warnings(false);
-    if !cfg!(target_env = "msvc") {
-        build.define("HAVE_LRINTF", "1");
-    }
-    for entry in std::fs::read_dir(faad2.join("libfaad")).expect("read faad2/libfaad") {
-        let path = entry.expect("faad2 dir entry").path();
-        if path.extension().is_some_and(|e| e == "c") {
-            build.file(path);
-        }
-    }
-    build.compile("sdroxide_faad2_drm");
 }
 
 /// The `HAVE_*` set upstream's `dream.pro` defines on unix, which is really a
@@ -260,7 +226,7 @@ fn common_defines(build: &mut cc::Build) {
     build.define("EXECUTABLE_NAME", "sdroxide");
 }
 
-fn build_dream(manifest: &Path, dream: &Path, faad2: &Path) {
+fn build_dream(manifest: &Path, dream: &Path, faad2_include: &Path) {
     let src = dream.join("src");
 
     // Dream is C++ but three of the journaline files are C, and their
@@ -277,7 +243,7 @@ fn build_dream(manifest: &Path, dream: &Path, faad2: &Path) {
             // at this level shadows a header.
             .include(dream)
             .include(manifest.join("include"))
-            .include(faad2.join("include"))
+            .include(faad2_include)
             // Headers only — see `vendor/fdk-aac/PROVENANCE.md`. Nothing from
             // this directory reaches the linker.
             .include(manifest.join("../../vendor/fdk-aac/include"))
@@ -320,7 +286,7 @@ fn build_dream(manifest: &Path, dream: &Path, faad2: &Path) {
         .compile("sdroxide_fftw_compat");
 }
 
-fn build_shim(manifest: &Path, dream: &Path, faad2: &Path) {
+fn build_shim(manifest: &Path, dream: &Path, faad2_include: &Path) {
     let mut build = cc::Build::new();
     build
         .cpp(true)
@@ -328,7 +294,7 @@ fn build_shim(manifest: &Path, dream: &Path, faad2: &Path) {
         .file(manifest.join("src/drm_shim.cpp"))
         .include(dream.join("src"))
         .include(manifest.join("include"))
-        .include(faad2.join("include"))
+        .include(faad2_include)
         .opt_level(2)
         .warnings(false);
     common_defines(&mut build);

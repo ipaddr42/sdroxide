@@ -12,6 +12,7 @@
 //! That crate is the only AGPL in the tree; see its manifest for what §13 means
 //! for anything that links it.
 
+pub mod acars_controller;
 pub mod aprs_controller;
 pub mod atchat_controller;
 pub(crate) mod ax25_channel;
@@ -19,16 +20,23 @@ pub mod clock;
 pub mod controller;
 pub mod cw_controller;
 pub mod fox;
+pub mod fsk441_controller;
 pub mod fsq_controller;
+pub mod fst4_controller;
 pub mod ft2;
 pub mod ft8_eu;
 pub mod hell_controller;
 pub mod js8;
 pub mod js8_controller;
+pub mod jt_controller;
 pub mod modem;
+pub mod msk144_controller;
 pub mod navtex_controller;
 mod packet_controller;
 pub mod params;
+pub mod pi4;
+pub mod pi4_controller;
+pub mod q65_controller;
 pub mod qso;
 pub mod rade_controller;
 pub mod rf_paint_controller;
@@ -42,19 +50,29 @@ pub mod wefax_controller;
 pub mod wspr;
 pub mod wspr_controller;
 
+pub use acars_controller::AcarsController;
 pub use aprs_controller::AprsController;
 pub use atchat_controller::AtChatController;
 pub use clock::ClockMonitor;
 pub use controller::{DigiAction, DigiController};
 pub use cw_controller::CwController;
 pub use fox::Fox;
+pub use fsk441_controller::Fsk441Controller;
 pub use fsq_controller::FsqController;
+pub use fst4_controller::Fst4Controller;
 pub use hell_controller::HellController;
 pub use js8_controller::Js8Controller;
-pub use modem::{ApHints, Ft8Modem};
+pub use jt_controller::JtController;
+pub use modem::{
+    ApHints, Ft8Modem, decode_fsk441_slot, decode_fst4_slot, decode_jt_slot, decode_msk144_slot,
+    decode_q65_slot,
+};
+pub use msk144_controller::Msk144Controller;
 pub use navtex_controller::NavtexController;
 pub use packet_controller::PacketController;
 pub use params::{DECODE_RATE, DigiParams};
+pub use pi4_controller::Pi4Controller;
+pub use q65_controller::Q65Controller;
 pub use qso::QsoMachine;
 pub use rade_controller::RadeController;
 pub use rf_paint_controller::RfPaintController;
@@ -178,6 +196,16 @@ pub trait DigiEngine: Send {
     fn set_tx_text(&mut self, _text: String) {}
     /// Continuous keyboard modes: enter/leave transmit.
     fn set_tx_active(&mut self, _on: bool) {}
+    /// CW: engage (true) or drop (false) the keyboard-as-straight-key mode, and
+    /// the key up or down a PC key makes while it is engaged (issue #322).
+    ///
+    /// Text is timed and queued; a straight key is not text and has no timing
+    /// of its own — a button is held and the carrier follows the hand. The two
+    /// are one [`CwController`] here, so its manual keyer takes over the
+    /// sidetone while set and hands the key's position to it directly. Nothing
+    /// else implements either: a straight key only exists on the CW panel.
+    fn set_straight(&mut self, _on: bool) {}
+    fn key_down(&mut self, _down: bool) {}
     /// Throw away what has been copied so far, so the operator can start a
     /// fresh page. Only the received text goes: the decoder keeps running, an
     /// over in progress is untouched, and nothing already logged is lost. Inert
@@ -315,6 +343,10 @@ mod dispatch_tests {
             "sstv"
         } else if mode.is_wefax() {
             "wefax"
+        } else if mode == Mode::Navtex {
+            "navtex"
+        } else if mode == Mode::Acars {
+            "acars"
         } else if mode.is_rifp() {
             "rifp"
         } else if mode.is_aprs() {
@@ -333,6 +365,18 @@ mod dispatch_tests {
             "js8"
         } else if mode.is_wspr() {
             "wspr"
+        } else if mode.is_pi4() {
+            "pi4"
+        } else if mode == Mode::Msk144 {
+            "msk144"
+        } else if matches!(mode, Mode::Jt65 | Mode::Jt9) {
+            "jt"
+        } else if mode == Mode::Fst4 {
+            "fst4"
+        } else if mode == Mode::Q65 {
+            "q65"
+        } else if mode == Mode::Fsk441 {
+            "fsk441"
         } else {
             "ft8"
         }
@@ -348,6 +392,15 @@ mod dispatch_tests {
         // in the same passband, and a controller handed FT8's decoder would sit
         // there finding nothing for ever without a word.
         assert_eq!(pick(Mode::Wspr), "wspr");
+        // The slotted weak-signal modes are the same trap again, every one of
+        // them: slotted, in the same passband, and silent under FT8's decoder.
+        assert_eq!(pick(Mode::Pi4), "pi4");
+        assert_eq!(pick(Mode::Msk144), "msk144");
+        assert_eq!(pick(Mode::Jt65), "jt");
+        assert_eq!(pick(Mode::Jt9), "jt");
+        assert_eq!(pick(Mode::Fst4), "fst4");
+        assert_eq!(pick(Mode::Q65), "q65");
+        assert_eq!(pick(Mode::Fsk441), "fsk441");
         assert_eq!(pick(Mode::Ft8), "ft8");
         assert_eq!(pick(Mode::Ft4), "ft8");
         assert_eq!(pick(Mode::Ft2), "ft8");
@@ -359,6 +412,8 @@ mod dispatch_tests {
         // would hand it an FT8 decoder and its NET station would never join.
         assert_eq!(pick(Mode::AtChat), "atchat");
         assert_eq!(pick(Mode::Wefax), "wefax");
+        assert_eq!(pick(Mode::Navtex), "navtex");
+        assert_eq!(pick(Mode::Acars), "acars");
         // Both packet modes reach the one packet controller. HF packet is the
         // quiet trap of the pair: it is a keyboard-shaped mode on a sideband,
         // so `is_text_modem` further down would look like a plausible home and

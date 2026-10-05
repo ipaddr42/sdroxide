@@ -38,6 +38,10 @@ mod worker;
 pub use demod::{DRM_IF_OFFSET_HZ, DrmDemod};
 pub use worker::DrmWorker;
 
+// Named so its faad2 archive is linked: Dream calls `NeAACDec*` from C, which
+// Rust cannot see.
+use sdroxide_faad2 as _;
+
 use std::ffi::CStr;
 
 use sdroxide_types::{

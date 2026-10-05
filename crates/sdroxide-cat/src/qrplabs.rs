@@ -178,12 +178,19 @@ fn mode_digit(m: Mode) -> char {
     match m {
         Mode::Lsb => '1',
         Mode::Cw => '3',
-        Mode::Am | Mode::Sam | Mode::Dsb | Mode::Isb | Mode::Drm => '5',
+        Mode::Am | Mode::Sam | Mode::Dsb | Mode::Isb | Mode::Drm | Mode::Acars => '5',
         Mode::Digl => '9',
         Mode::Digu
         | Mode::Ft8
         | Mode::Js8
         | Mode::Wspr
+        | Mode::Pi4
+        | Mode::Msk144
+        | Mode::Jt65
+        | Mode::Jt9
+        | Mode::Fst4
+        | Mode::Q65
+        | Mode::Fsk441
         | Mode::Ft4
         | Mode::Ft2
         | Mode::Psk
@@ -211,7 +218,9 @@ fn mode_digit(m: Mode) -> char {
         | Mode::RttyFm
         | Mode::Adsb
         | Mode::Vdl2
-        | Mode::Ais => '2',
+        | Mode::Ais
+        | Mode::Hfdl
+        | Mode::HdRadio => '2',
         Mode::Usb | Mode::Spec | Mode::Sstv | Mode::Wefax | Mode::Navtex | Mode::RfPaint => '2',
     }
 }

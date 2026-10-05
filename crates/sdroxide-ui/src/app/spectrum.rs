@@ -970,12 +970,17 @@ const MAX_FFT: u32 = 131_072;
 /// 32768 ceiling the chips offer. It bites only on the narrow lanes, which are
 /// the ones that cannot afford it — 2048 at 24 kHz, 4096 at 48 kHz.
 fn base_fft_for_rate(chip: u32, rate_hz: f64) -> u32 {
+    // The persisted `fft_size` is not trusted here: a stale or hand-edited
+    // view can name a size the chips never offer, and an absurd one would spin
+    // this loop (the `afford * 2` overflow below wraps to zero, after which the
+    // condition stays true forever). Bound it to the ceiling the chips use.
+    let chip = chip.clamp(1024, MAX_FFT);
     if !rate_hz.is_finite() || rate_hz <= 0.0 {
-        return chip.max(1024);
+        return chip;
     }
     let mut afford = 1024u32;
-    while afford < chip && f64::from(afford * 2) / rate_hz <= MAX_FFT_WINDOW_S {
-        afford *= 2;
+    while afford < chip && f64::from(afford.saturating_mul(2)) / rate_hz <= MAX_FFT_WINDOW_S {
+        afford = afford.saturating_mul(2);
     }
     chip.min(afford).max(1024)
 }
@@ -1144,6 +1149,16 @@ mod tests {
         assert!(2048.0 / 24_000.0 <= super::MAX_FFT_WINDOW_S);
         // The CAT/Audio path, at twice the rate, affords twice the window.
         assert_eq!(base_fft_for_rate(32_768, 48_000.0), 4096);
+    }
+
+    /// A persisted `fft_size` is not trusted: an absurd one used to make the
+    /// `afford * 2` loop overflow and spin forever on the first frame. It is
+    /// bounded to the chips' ceiling, and fast whatever is asked.
+    #[test]
+    fn an_absurd_stored_fft_size_cannot_spin() {
+        assert_eq!(base_fft_for_rate(u32::MAX, 1e300), super::MAX_FFT);
+        assert_eq!(base_fft_for_rate(u32::MAX, 0.0), super::MAX_FFT);
+        assert_eq!(base_fft_for_rate(1, 48_000.0), 1024, "floored at the chip row's start");
     }
 
     #[test]

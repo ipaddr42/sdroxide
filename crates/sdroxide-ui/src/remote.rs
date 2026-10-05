@@ -34,6 +34,24 @@ pub trait AudioBridge {
     }
 }
 
+/// How long an over may run with the microphone producing nothing before the
+/// operator is told — see [`RemoteController::check_mic_is_feeding`]. Long
+/// enough to cover a browser permission prompt on the first key-down, short
+/// enough to land inside a short over.
+const MIC_SILENT_AFTER_S: f64 = 2.0;
+
+/// Whether an over has now run long enough with a microphone that has produced
+/// nothing for the operator to be told once — see
+/// [`RemoteController::check_mic_is_feeding`].
+///
+/// On [`window_elapsed`], so a clock stepping backwards cannot park the warning
+/// in the future and swallow the one report that would explain a silent
+/// transmitter — the same reasoning as the coalescing windows above, and the
+/// same nonsense-reads-as-"now" rule.
+fn mic_silence_due(now: f64, started: f64, samples: usize, already_said: bool) -> bool {
+    !already_said && samples == 0 && window_elapsed(now, started, MIC_SILENT_AFTER_S)
+}
+
 /// How many pre-open messages to hold. The window is one connect round-trip
 /// wide and the UI sends a handful of config commands in it, so this only ever
 /// bites if the socket never opens at all.
@@ -137,6 +155,16 @@ pub struct RemoteController {
     audio: Option<Box<dyn AudioBridge>>,
     pending: VecDeque<RadioEvent>,
     tx_codec: Option<AudioCodec>,
+    /// When the current over started, and how many microphone samples have
+    /// been pulled since — the two halves of the check in [`Self::pump_mic`]
+    /// that tells the operator their transmitter is sending silence.
+    mic_over_started: Option<f64>,
+    mic_over_samples: usize,
+    mic_over_reported: bool,
+    /// Whether this controller was pulling the microphone on the previous
+    /// frame — the rising edge into an over, used to drop the ring's stale
+    /// tail (see `pump_mic`).
+    mic_was_active: bool,
     transmitting: bool,
     /// The engine is recording a voice-keyer message. Its microphone is *our*
     /// microphone, so the uplink has to run for this too — otherwise a remote
@@ -252,6 +280,10 @@ impl RemoteController {
             audio,
             pending: VecDeque::new(),
             tx_codec: None,
+            mic_over_started: None,
+            mic_over_samples: 0,
+            mic_over_reported: false,
+            mic_was_active: false,
             transmitting: false,
             voice_recording: false,
             mic_buf: Vec::new(),
@@ -315,10 +347,30 @@ impl RemoteController {
             ServerMsg::Memories(m) => self.pending.push_back(RadioEvent::Memories(m)),
             ServerMsg::MemoryFolders(f) => self.pending.push_back(RadioEvent::MemoryFolders(f)),
             ServerMsg::Scanner(c) => self.pending.push_back(RadioEvent::Scanner(c)),
+            ServerMsg::Profiles(p) => self.pending.push_back(RadioEvent::Profiles(p)),
             // Dropped rather than decoded while another tab holds the page's
             // single output: the work saved is the point on a browser tab
             // holding several radios.
             ServerMsg::RxAudio { .. } if self.muted => {}
+            // …and dropped for the length of an over, which is what a radio
+            // does: the operator hears their own transmission stop the
+            // receiver, and a remote client that kept playing the band over
+            // the top of it is the one thing every report of this has led
+            // with (issue #493).
+            //
+            // Dropped here rather than asked of the server, because the audio
+            // still has a job to do at the far end — meters, decoders, the
+            // recorder — and because this is where "am I transmitting" is
+            // already known to the millisecond.
+            //
+            // In a browser it does more than that. The page plays this through
+            // the same AudioContext the microphone is captured on, and the
+            // browser's echo canceller takes whatever the page is playing as
+            // its far-end reference: receive audio running under an over is a
+            // loud, speech-shaped reference against which the operator's own
+            // voice is exactly what an AEC exists to remove. See the capture
+            // constraints in `assets/audio_bridge.js`.
+            ServerMsg::RxAudio { .. } if self.transmitting => {}
             ServerMsg::RxAudio { payload, .. } => {
                 if let Some(bridge) = self.audio.as_mut() {
                     // Only the PCM16 downlink is decoded client-side; an
@@ -338,6 +390,7 @@ impl RemoteController {
             ServerMsg::Notice(n) => self.pending.push_back(RadioEvent::Notice(n)),
             ServerMsg::Ft8Decodes(d) => self.pending.push_back(RadioEvent::Ft8Decodes(d)),
             ServerMsg::WsprSpots(s) => self.pending.push_back(RadioEvent::WsprSpots(s)),
+            ServerMsg::Pi4Spots(s) => self.pending.push_back(RadioEvent::Pi4Spots(s)),
             ServerMsg::Ft8Status(s) => self.pending.push_back(RadioEvent::Ft8Status(s)),
             ServerMsg::Ft8QsoLogged(r) => self.pending.push_back(RadioEvent::Ft8QsoLogged(r)),
             ServerMsg::SkimmerSpots(s) => self.pending.push_back(RadioEvent::SkimmerSpots(s)),
@@ -357,6 +410,7 @@ impl RemoteController {
             ServerMsg::WefaxStatus(s) => self.pending.push_back(RadioEvent::WefaxStatus(s)),
             ServerMsg::Rds(d) => self.pending.push_back(RadioEvent::Rds(d)),
             ServerMsg::Drm(d) => self.pending.push_back(RadioEvent::Drm(d)),
+            ServerMsg::Hd(d) => self.pending.push_back(RadioEvent::HdRadio(d)),
             ServerMsg::IsmReports(r) => self.pending.push_back(RadioEvent::IsmReports(r)),
             ServerMsg::IsmStatus(s) => self.pending.push_back(RadioEvent::IsmStatus(s)),
             ServerMsg::AdsbStatus(s) => self.pending.push_back(RadioEvent::AdsbStatus(s)),
@@ -488,15 +542,37 @@ impl RemoteController {
 
     fn pump_mic(&mut self) {
         let Some(bridge) = self.audio.as_mut() else { return };
-        bridge.set_mic_active(self.transmitting || self.voice_recording);
-        if !self.transmitting && !self.voice_recording {
+        let active = self.transmitting || self.voice_recording;
+        bridge.set_mic_active(active);
+        if !active {
+            // **Do not drain the capture ring here.** The page has one
+            // microphone, shared by every radio tab, and only one of those
+            // radios can be transmitting at a time. An idle tab draining the
+            // ring every frame is what emptied it out from under the tab that
+            // *was* transmitting — so with a second (receive-only) radio in the
+            // station the microphone fed nothing and the transmitter went out
+            // unmodulated, while the capture itself looked perfect
+            // (issue #493). The browser caps the ring at about a second, so
+            // leaving it alone here costs nothing but that stale tail, which
+            // the rising edge below drops.
             self.mic_buf.clear();
-            // Keep draining the capture ring so it doesn't back up.
-            let mut scratch = Vec::new();
-            bridge.pull_mic(&mut scratch);
+            self.mic_was_active = false;
+            self.mic_over_started = None;
+            self.mic_over_samples = 0;
+            self.mic_over_reported = false;
             return;
         }
+        // Rising edge into an over: drop whatever the ring accumulated before
+        // now, so the first thing sent is the operator's voice and not a
+        // syllable of room noise captured while nothing was keyed.
+        if !self.mic_was_active {
+            let mut stale = Vec::new();
+            bridge.pull_mic(&mut stale);
+            self.mic_was_active = true;
+        }
+        let before = self.mic_buf.len();
         bridge.pull_mic(&mut self.mic_buf);
+        self.mic_over_samples += self.mic_buf.len() - before;
         while self.mic_buf.len() >= 960 {
             let payload: Vec<u8> = self.mic_buf[..960]
                 .iter()
@@ -507,6 +583,42 @@ impl RemoteController {
             self.send_msg(msg);
             self.mic_buf.drain(..960);
         }
+        self.check_mic_is_feeding();
+    }
+
+    /// Say so when an over is running and the microphone has produced nothing
+    /// at all (issue #493).
+    ///
+    /// Not a level check — `sdroxide-radio` already reports an over that went
+    /// out with a silent microphone, and it does that where the audio is. This
+    /// is the case that never reaches it: *no samples whatsoever*, which on a
+    /// browser is what a capture the page never manages to read looks like, and
+    /// which is otherwise invisible from either end. The rig keys, the meters
+    /// move, nothing is modulated, and nothing anywhere says why.
+    ///
+    /// Once per over, and only after [`MIC_SILENT_AFTER_S`], because the
+    /// browser opens its microphone on the first key-down and `getUserMedia`
+    /// can take a permission prompt to answer.
+    ///
+    /// Transmitting only. A voice-keyer recording runs this same uplink and a
+    /// dead microphone would spoil it too, but that one the operator can see —
+    /// the message plays back flat — and the wording here is about air.
+    fn check_mic_is_feeding(&mut self) {
+        if !self.transmitting {
+            return;
+        }
+        let now = crate::time::now_unix_f64();
+        let started = *self.mic_over_started.get_or_insert(now);
+        if !mic_silence_due(now, started, self.mic_over_samples, self.mic_over_reported) {
+            return;
+        }
+        self.mic_over_reported = true;
+        self.pending.push_back(RadioEvent::Notice(Some(
+            "Transmitting, but this client's microphone is producing no audio at all — \
+             nothing is being modulated. In a browser, check that the page was allowed \
+             the microphone and that no other application holds it."
+                .into(),
+        )));
     }
 }
 
@@ -803,6 +915,28 @@ mod tests {
         assert!(window_elapsed(1001.0, 1000.0, 0.1));
         // Behind what was stamped — an NTP correction — is sent, not stranded.
         assert!(window_elapsed(999.0, 1000.0, 0.1));
+    }
+
+    /// A transmitter that modulates nothing at all is the one fault neither end
+    /// can see by itself, and three issues have now been spent guessing at it
+    /// (#468, #476, #493). The rule: once per over, only after the grace the
+    /// browser's permission prompt needs, and only when *nothing whatsoever*
+    /// has been captured.
+    #[test]
+    fn a_microphone_that_feeds_nothing_is_reported_once_per_over() {
+        // Inside the grace period: the browser may still be asking.
+        assert!(!mic_silence_due(100.0 + 1.9, 100.0, 0, false));
+        // Past it, with nothing captured: say so.
+        assert!(mic_silence_due(100.0 + 2.0, 100.0, 0, false));
+        assert!(mic_silence_due(100.0 + 30.0, 100.0, 0, false));
+        // Said once is said.
+        assert!(!mic_silence_due(100.0 + 30.0, 100.0, 0, true));
+        // A microphone that fed anything at all is not this fault — a quiet
+        // one is `sdroxide-radio`'s to report, where the audio actually is.
+        assert!(!mic_silence_due(100.0 + 30.0, 100.0, 1, false));
+        // A clock stepping back mid-over must not strand the warning: the
+        // over is plainly older than the grace period either way.
+        assert!(mic_silence_due(99.0, 100.0, 0, false));
     }
 
     /// What a drag costs the far end: the view still moves every frame, but the

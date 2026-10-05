@@ -26,10 +26,19 @@
 //! * [`TrSwitch::publish`] every tick, for the overs sdroxide does not drive:
 //!   a transceiver keyed at its own microphone, or a rig sending CW from its
 //!   own keyer.
+//! * [`TrSwitch::set_tx_band`] whenever its transmit dial changes band, and
+//!   the primary engine [`TrSwitch::set_rx_band`] whenever its receive dial
+//!   does, for a station whose relay bank also switches external filters or
+//!   a transverter by band (`sdroxide_types::RelayRole::BandDecoder`, issue
+//!   #442). Bands, not output words: the worker resolves them against its
+//!   own configuration and decides RX word or TX word from the station's
+//!   on-air ramp, so a band-decoder contact moves inside its lead like every
+//!   other one. The TX band that counts is the keying radio's — [`TrSwitch::key`]
+//!   sends it ahead of the key-down itself.
 
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
-use sdroxide_types::{FailSafe, RelayConfig, RelayStatus};
+use sdroxide_types::{Band, FailSafe, RelayConfig, RelayStatus};
 
 /// See the module doc.
 #[derive(Default)]
@@ -56,6 +65,22 @@ pub struct TrSwitch {
     /// transmitter out in the shack comes up, so it lives with the driver it
     /// came in with.
     sense_radio: AtomicU32,
+    /// What the band decoder has been told, kept here so a rebuilt driver can
+    /// be told it again and so the TX band sent at key-down is the keying
+    /// radio's.
+    bands: std::sync::Mutex<Bands>,
+}
+
+/// See [`TrSwitch::bands`].
+#[derive(Default)]
+struct Bands {
+    /// The primary radio's receive band.
+    rx: Option<Band>,
+    /// Each radio's transmit band, by radio id.
+    tx: std::collections::HashMap<u32, Band>,
+    /// The radio whose key-down started the current over. Its transmit band
+    /// is the one the filters follow until the last radio unkeys.
+    keyer: Option<u32>,
 }
 
 impl TrSwitch {
@@ -72,7 +97,24 @@ impl TrSwitch {
         self.configured.store(cfg.enabled(), Ordering::Release);
         self.refuse.store(cfg.fail_safe == FailSafe::RefuseTx, Ordering::Release);
         self.sense_radio.store(cfg.sense.radio, Ordering::Release);
+        // A new driver starts knowing no band. Only ever installed off the
+        // air (see `Engine::sync_relay`), so the TX band to hand it is the
+        // one a sensed over would transmit on.
+        //
+        // `bands` is held across the swap, taken before `driver` as `key`
+        // takes them: a band another engine reports meanwhile then reaches
+        // the new driver after this replay, rather than the old one on its
+        // way out.
         let old = {
+            let b = self.bands.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(h) = handle.as_ref() {
+                if let Some(rx) = b.rx {
+                    h.set_rx_band(rx);
+                }
+                if let Some(tx) = b.tx.get(&cfg.sense.radio).copied() {
+                    h.set_tx_band(tx);
+                }
+            }
             let mut slot = self.driver.lock().unwrap_or_else(|e| e.into_inner());
             std::mem::replace(&mut *slot, handle)
         };
@@ -98,11 +140,30 @@ impl TrSwitch {
     /// wait for.
     pub fn key(&self, radio: u32) -> std::time::Duration {
         let was = self.on_air.fetch_or(bit(radio), Ordering::AcqRel);
-        if was != 0 || !self.configured.load(Ordering::Acquire) {
+        if was != 0 {
+            return std::time::Duration::ZERO;
+        }
+        // This radio's transmit band, ahead of the key-down on the same
+        // channel: the worker has it before the edge, and the edge's lead is
+        // what switches the band-decoder contacts to it. `bands` is held until
+        // both are sent, so no other radio's band can land between them — see
+        // [`TrSwitch::set_tx_band`].
+        let mut b = self.bands.lock().unwrap_or_else(|e| e.into_inner());
+        b.keyer = Some(radio);
+        let tx = b.tx.get(&radio).copied();
+        if !self.configured.load(Ordering::Acquire) {
             return std::time::Duration::ZERO;
         }
         match self.driver.lock() {
-            Ok(d) => d.as_ref().map(|h| h.key()).unwrap_or_default(),
+            Ok(d) => d
+                .as_ref()
+                .map(|h| {
+                    if let Some(tx) = tx {
+                        h.set_tx_band(tx);
+                    }
+                    h.key()
+                })
+                .unwrap_or_default(),
             Err(_) => std::time::Duration::ZERO,
         }
     }
@@ -114,10 +175,15 @@ impl TrSwitch {
             // Either this radio was not on the air, or somebody else still is.
             return;
         }
+        let mut b = self.bands.lock().unwrap_or_else(|e| e.into_inner());
+        let tx = self.over_ended(&mut b);
         if let Ok(d) = self.driver.lock()
             && let Some(h) = d.as_ref()
         {
             h.unkey();
+            if let Some(tx) = tx {
+                h.set_tx_band(tx);
+            }
         }
     }
 
@@ -128,11 +194,25 @@ impl TrSwitch {
         if was & !bit(radio) != 0 {
             return; // another radio is genuinely transmitting
         }
+        let mut b = self.bands.lock().unwrap_or_else(|e| e.into_inner());
+        let tx = self.over_ended(&mut b);
         if let Ok(d) = self.driver.lock()
             && let Some(h) = d.as_ref()
         {
             h.abort();
+            if let Some(tx) = tx {
+                h.set_tx_band(tx);
+            }
         }
+    }
+
+    /// The last radio is off the air: nobody is the keyer any more, and the
+    /// band decoder's idea of "the next over" goes back to the sense radio's
+    /// band — the one over that can start without a [`TrSwitch::key`] to
+    /// bring its own. The worker holds it back until the hold is done.
+    fn over_ended(&self, b: &mut Bands) -> Option<Band> {
+        b.keyer = None;
+        b.tx.get(&self.sense_radio.load(Ordering::Acquire)).copied()
     }
 
     /// Reconcile `radio`'s bit with what it is actually doing. Called every
@@ -206,6 +286,54 @@ impl TrSwitch {
         }
         let d = self.driver.lock().ok()?;
         d.as_ref()?.take_sense_edge()
+    }
+
+    /// The band the station's receiver is on — the primary radio's, since
+    /// the bank belongs to the station. See `sdroxide_relay::Sequencer::set_rx_band`.
+    pub fn set_rx_band(&self, band: Band) {
+        self.bands.lock().unwrap_or_else(|e| e.into_inner()).rx = Some(band);
+        if let Ok(d) = self.driver.lock()
+            && let Some(h) = d.as_ref()
+        {
+            h.set_rx_band(band);
+        }
+    }
+
+    /// The band `radio` would transmit on. Every engine reports its own, so
+    /// whichever radio keys brings its band with it — see [`TrSwitch::key`].
+    ///
+    /// Passed through at once only when it is the band the filters should
+    /// already be on: the keyer's mid-over (the worker holds it back until
+    /// the over is done), or the sense radio's between overs. Anyone else's
+    /// waits for their own key-down.
+    ///
+    /// The decision and the send happen under one hold of `bands`, the same
+    /// lock [`TrSwitch::key`] sends under: otherwise another radio's key-down
+    /// could slip in between, and this band would reach the worker after that
+    /// over's edge, as if it were the keyer's.
+    pub fn set_tx_band(&self, radio: u32, band: Band) {
+        let mut b = self.bands.lock().unwrap_or_else(|e| e.into_inner());
+        b.tx.insert(radio, band);
+        let forward = match b.keyer {
+            Some(k) => k == radio,
+            None => {
+                self.on_air.load(Ordering::Acquire) == 0
+                    && radio == self.sense_radio.load(Ordering::Acquire)
+            }
+        };
+        if forward
+            && let Ok(d) = self.driver.lock()
+            && let Some(h) = d.as_ref()
+        {
+            h.set_tx_band(band);
+        }
+    }
+
+    /// Which radio's transmit band the filters follow right now — the one
+    /// whose key-down started the over, `None` off the air.
+    #[cfg(test)]
+    fn keyer(&self) -> Option<u32> {
+        self.bands.lock().unwrap_or_else(|e| e.into_inner()).keyer
     }
 
     /// Pulse one contact so the operator can check their wiring. Refused by the
@@ -297,6 +425,32 @@ mod tests {
         let s = TrSwitch::new();
         assert_eq!(s.refusal(), None);
         assert_eq!(s.status(), RelayStatus::default());
+    }
+
+    /// With no driver installed, the bands have nothing to forward to — and
+    /// must not panic finding that out.
+    #[test]
+    fn bands_with_no_driver_do_nothing() {
+        let s = TrSwitch::new();
+        s.set_rx_band(Band::M20);
+        s.set_tx_band(0, Band::M20);
+    }
+
+    /// On a multi-radio station the filters follow the radio that keyed, not
+    /// the primary, and keep following it until the last radio is off the air.
+    #[test]
+    fn the_band_decoder_follows_the_radio_that_keyed() {
+        let s = TrSwitch::new();
+        s.set_tx_band(0, Band::M20);
+        s.set_tx_band(1, Band::M40);
+        let _ = s.key(1);
+        assert_eq!(s.keyer(), Some(1));
+        let _ = s.key(0);
+        assert_eq!(s.keyer(), Some(1), "radio 0 joined an over radio 1 started");
+        s.unkey(1);
+        assert_eq!(s.keyer(), Some(1), "radio 0 is still on the air");
+        s.unkey(0);
+        assert_eq!(s.keyer(), None);
     }
 
     #[test]

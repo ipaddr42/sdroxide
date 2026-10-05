@@ -173,6 +173,10 @@ impl SdroxideApp {
                     .on_hover_text(format!("Shift the picture {px} pixels"))
                     .clicked()
                 {
+                    // The decoder moves the lines still to come; this moves the
+                    // part of the chart already on screen, so the whole picture
+                    // shifts together (issue #439).
+                    self.wefax.shift_phase(px);
                     cmds.push(Command::WefaxNudge(px));
                 }
             }

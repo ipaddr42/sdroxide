@@ -16,6 +16,62 @@ use sdroxide_types::{Command, NavtexMessage, NavtexStatus};
 use crate::app::SdroxideApp;
 use crate::theme;
 
+/// The message list's header row: the count, the sync state, what the time
+/// diversity repaired, SAVE and REV. Returns whether REV was pressed; `rev` is
+/// its state and `status` the app's `digi_status`, which SAVE writes from.
+///
+/// Wrapped: on a phone the row is wider than the screen, and a plain one ran
+/// REV off its edge.
+pub(super) fn navtex_list_header(
+    ui: &mut egui::Ui,
+    st: &NavtexStatus,
+    status: Option<&sdroxide_types::DigiStatus>,
+    rev: bool,
+) -> bool {
+    let mut flip = false;
+    ui.horizontal_wrapped(|ui| {
+        ui.label(RichText::new("MESSAGES").strong().color(theme::CYAN()));
+        ui.label(RichText::new(format!("{}", st.messages.len())).weak());
+        // The mode's own carrier detect: a constant-ratio code either
+        // frames or it does not, and there is no in-between to show.
+        if st.in_sync {
+            ui.label(RichText::new("SYNC").strong().color(theme::GREEN()))
+                .on_hover_text("The character phase is locked — a signal is being read.");
+        } else {
+            ui.label(RichText::new("hunting").weak())
+                .on_hover_text("No character phase yet: no signal, or not this one.");
+        }
+        // What the time diversity actually did, which is the only quality
+        // figure a mode with no checksum has.
+        if st.repaired > 0 || st.lost > 0 {
+            ui.label(
+                RichText::new(format!("{} repaired · {} lost", st.repaired, st.lost))
+                    .size(10.0)
+                    .color(if st.lost > 0 { theme::YELLOW() } else { theme::CYAN_DIM() }),
+            )
+            .on_hover_text(
+                "Characters whose first copy was corrupt and were taken from the repeat five \
+                 slots later, and those where both were bad. A NAVTEX character is sent \
+                 twice; that is the whole of its error correction.",
+            );
+        }
+        crate::chrome::row_tail(ui, |ui| {
+            super::save_rx_chip_for(ui, status);
+            if crate::chrome::chip(ui, rev, RichText::new("REV").size(10.5))
+                .on_hover_text(
+                    "Swap the mark and space tones, for a signal received on the other \
+                     sideband. Off is upper sideband on the channel frequency, which is what \
+                     every published tuning instruction for the service says.",
+                )
+                .clicked()
+            {
+                flip = true;
+            }
+        });
+    });
+    flip
+}
+
 impl SdroxideApp {
     pub(in crate::app) fn navtex_panel(
         &mut self,
@@ -58,49 +114,13 @@ impl SdroxideApp {
         st: &NavtexStatus,
         panel_h: f32,
     ) {
-        ui.horizontal(|ui| {
-            ui.label(RichText::new("MESSAGES").strong().color(theme::CYAN()));
-            ui.label(RichText::new(format!("{}", st.messages.len())).weak());
-            // The mode's own carrier detect: a constant-ratio code either
-            // frames or it does not, and there is no in-between to show.
-            if st.in_sync {
-                ui.label(RichText::new("SYNC").strong().color(theme::GREEN()))
-                    .on_hover_text("The character phase is locked — a signal is being read.");
-            } else {
-                ui.label(RichText::new("hunting").weak())
-                    .on_hover_text("No character phase yet: no signal, or not this one.");
+        if navtex_list_header(ui, st, self.digi_status.as_ref(), self.digi_cfg_edit.navtex_reverse)
+        {
+            self.digi_cfg_edit.navtex_reverse = !self.digi_cfg_edit.navtex_reverse;
+            if self.digi_cfg_seeded {
+                cmds.push(Command::SetDigiConfig(self.digi_cfg_edit.clone()));
             }
-            // What the time diversity actually did, which is the only quality
-            // figure a mode with no checksum has.
-            if st.repaired > 0 || st.lost > 0 {
-                ui.label(
-                    RichText::new(format!("{} repaired · {} lost", st.repaired, st.lost))
-                        .size(10.0)
-                        .color(if st.lost > 0 { theme::YELLOW() } else { theme::CYAN_DIM() }),
-                )
-                .on_hover_text(
-                    "Characters whose first copy was corrupt and were taken from the repeat five \
-                     slots later, and those where both were bad. A NAVTEX character is sent \
-                     twice; that is the whole of its error correction.",
-                );
-            }
-            crate::chrome::row_tail(ui, |ui| {
-                let rev = self.digi_cfg_edit.navtex_reverse;
-                if crate::chrome::chip(ui, rev, RichText::new("REV").size(10.5))
-                    .on_hover_text(
-                        "Swap the mark and space tones, for a signal received on the other \
-                         sideband. Off is upper sideband on the channel frequency, which is what \
-                         every published tuning instruction for the service says.",
-                    )
-                    .clicked()
-                {
-                    self.digi_cfg_edit.navtex_reverse = !rev;
-                    if self.digi_cfg_seeded {
-                        cmds.push(Command::SetDigiConfig(self.digi_cfg_edit.clone()));
-                    }
-                }
-            });
-        });
+        }
 
         egui::ScrollArea::vertical()
             .id_salt("navtex-list")
@@ -170,6 +190,19 @@ impl SdroxideApp {
                         .color(theme::CYAN_DIM()),
                 );
                 ui.label(RichText::new(m.kind_label()).size(10.5).weak());
+                // The time the message states, pulled out of the body: a
+                // warning is read against when it was issued, and finding the
+                // figure in a column of positions by eye is the tedious part.
+                // Display only — the system clock is never set from it.
+                if let Some((h, min)) = m.body_time_utc() {
+                    ui.label(
+                        RichText::new(format!("{h:02}{min:02} UTC"))
+                            .monospace()
+                            .size(10.5)
+                            .color(theme::GREEN()),
+                    )
+                    .on_hover_text("Time of day stated in the message (UTC): display only");
+                }
             }
             Some(_) => {
                 ui.label(RichText::new("RECEIVING").strong().color(theme::ALERT()));

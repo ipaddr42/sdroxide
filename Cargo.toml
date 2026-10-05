@@ -5,7 +5,7 @@ default-members = [".", "crates/sdroxide-types", "crates/sdroxide-proto", "crate
 # The vendored crates are reached through `[patch.crates-io]`, not as members:
 # they are upstream's code under upstream's licences, not ours to lint or
 # version with the rest.
-exclude = ["vendor/soapysdr", "vendor/ewebsock"]
+exclude = ["vendor/soapysdr", "vendor/ewebsock", "vendor/xng"]
 
 [patch.crates-io]
 
@@ -26,7 +26,7 @@ ewebsock = { path = "vendor/ewebsock" }
 soapysdr = { path = "vendor/soapysdr" }
 
 [workspace.package]
-version = "1.6.6"
+version = "1.6.9"
 edition = "2024"
 # The native binary links mfsk-core (GPL-3.0-or-later) for FT8/FT4 and the
 # DeepCW model (AGPL-3.0-only) for CW, so the built binary carries both. AGPL is
@@ -95,11 +95,16 @@ opt-level = 2
 
 [workspace.dependencies]
 sdroxide-types = { path = "crates/sdroxide-types" }
+# The build stamp. No dependencies and no build inputs beyond one
+# environment variable, so it builds for wasm32 alongside everything else.
+sdroxide-version = { path = "crates/sdroxide-version" }
 sdroxide-proto = { path = "crates/sdroxide-proto" }
 sdroxide-dsp = { path = "crates/sdroxide-dsp" }
 sdroxide-atchat = { path = "crates/sdroxide-atchat" }
 sdroxide-rade = { path = "crates/sdroxide-rade" }
 sdroxide-drm = { path = "crates/sdroxide-drm" }
+sdroxide-faad2 = { path = "crates/sdroxide-faad2" }
+sdroxide-nrsc5 = { path = "crates/sdroxide-nrsc5" }
 sdroxide-audio = { path = "crates/sdroxide-audio" }
 sdroxide-server = { path = "crates/sdroxide-server" }
 sdroxide-config = { path = "crates/sdroxide-config" }
@@ -140,6 +145,7 @@ sdroxide-vdl2 = { path = "crates/sdroxide-vdl2" }
 sdroxide-ais = { path = "crates/sdroxide-ais" }
 
 serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 num-complex = "0.4"
 rustfft = "6"
 thiserror = "2"
@@ -150,6 +156,24 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 postcard = { version = "1", features = ["use-std"] }
 crossbeam-channel = "0.5"
 rtrb = "0.4"
+# HFDL (ARINC 635) decode core, vendored under `vendor/xng` — a submodule pinned
+# to one commit, so the build takes no network dependency of its own. The crates
+# are not on crates.io and are reached by path (Route A, green-lit on
+# dividebysandwich/sdroxide#497). The dependency tree is modest (rustfft,
+# num-complex, chrono, serde, crc — no protobuf); `airframesio/xng` is
+# MIT/Apache-2.0 and its `PROVENANCE.md` records a clean-room derivation from
+# ICAO Annex 10 / ARINC 635.
+#
+# Note for `cargo fmt`: unlike the other vendored trees, which are reached
+# through `[patch.crates-io]`, this one is a plain path dependency — so
+# `cargo fmt --all` follows it into xng's *own* workspace and rewrites every
+# crate in it, about 800 files of upstream's code that are not ours to format.
+# Nothing is committed by that (the submodule just goes dirty), but it is
+# alarming and easy to mistake for a real diff. rustfmt's `ignore` key would
+# fix it and is nightly-only, so on stable format our own crates by name
+# instead: `cargo fmt -p sdroxide-radio -p sdroxide-ui …`, or check with
+# `cargo fmt --all --check` and read past the `vendor/xng` lines.
+xng-mode-hfdl = { path = "vendor/xng/crates/xng-mode-hfdl" }
 # Pure-Rust USB — the RTL-SDR backend's only dependency. No libusb, so it needs
 # no system library on any target and ships in every build variant.
 nusb = "0.2.7"
@@ -167,6 +191,7 @@ description = "PowerSDR/Thetis-style SDR transceiver with a native GUI, a browse
 
 [dependencies]
 sdroxide-types.workspace = true
+sdroxide-version.workspace = true
 sdroxide-proto.workspace = true
 sdroxide-dsp.workspace = true
 sdroxide-radio = { path = "crates/sdroxide-radio", default-features = false }

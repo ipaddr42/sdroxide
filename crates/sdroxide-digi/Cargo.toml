@@ -25,11 +25,13 @@ sdroxide-deepcw.workspace = true
 sdroxide-rade.workspace = true
 # The JS8 candidate loop hands complex baseband between mfsk-core primitives.
 num-complex.workspace = true
-mfsk-core = { version = "0.10.0", default-features = false, features = ["std", "ft8", "ft4", "wspr", "parallel", "fft-rustfft"] }
+mfsk-core = { version = "0.10.0", default-features = false, features = ["std", "ft8", "ft4", "wspr", "msk144", "jt65", "jt9", "fst4", "q65", "parallel", "fft-rustfft"] }
 crossbeam-channel.workspace = true
 # The WSPR candidate search is four-fifths Fano and splits cleanly across
 # candidates. Already in the tree via mfsk-core's `parallel` feature.
 rayon = "1"
+# PI4's coarse demod search: one FFT per symbol per start-time candidate.
+rustfft.workspace = true
 tracing.workspace = true
 # RIFP: the manifest is JSON, the object is verified with SHA-256, and its
 # content-encodings are ZLIB, PNG/JPEG, and CCITT Group 4 facsimile in a TIFF

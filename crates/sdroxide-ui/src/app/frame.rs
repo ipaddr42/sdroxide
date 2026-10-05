@@ -128,6 +128,9 @@ impl eframe::App for SdroxideApp {
         // two are the same rect.
         let tier = crate::layout::tier_for(ui.max_rect().size(), self.ui_settings.layout);
         crate::layout::set_tier(&ctx, tier);
+        // Whether the band selector can dock beside the waterfall, from the
+        // same column: the top bar's chip reads it before the column is drawn.
+        self.band_dock_room = super::top_bar::band_dock_room(tier, ui.max_rect().width());
         // …and the two questions the tier does not answer, published the same
         // way and for the same reason — the operator's override lives in
         // settings the context cannot see. `Small screen` asked for on a tall
@@ -216,6 +219,9 @@ impl eframe::App for SdroxideApp {
         // A channel list chosen in the memories window: parsed here and sent
         // to the engine, which owns the list and the numbering in it.
         self.poll_chirp_import(&mut cmds);
+        // A "stop after" deadline armed in the REC popup: stop the MP3
+        // recording once it passes (issue #520).
+        self.poll_recording_timer(&mut cmds);
         // The keyboard, the mouse buttons and the control surface belong to
         // the focused radio alone. In a split view every visible radio runs
         // this frame loop, and without the gate one arrow key would tune all
@@ -224,12 +230,17 @@ impl eframe::App for SdroxideApp {
             // F1 toggles the manual — handled here (not in
             // `keyboard_shortcuts`) so it works even while a text field has
             // focus.
-            if ctx.input(|i| i.key_pressed(egui::Key::F1)) {
+            // Consumed, so nothing later in the frame (the message buttons'
+            // function keys) sees the same press.
+            if ctx.input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::F1)) {
                 self.help.open = !self.help.open;
             }
             // An open manual takes the scrolling keys before the bindings run,
             // so reading it never tunes the radio at the same time.
             self.help.grab_keys(&ctx);
+            // Likewise the CW straight key takes the Space bar, so a PTT bound
+            // to it does not key the rig under the operator's hand.
+            self.swallow_straight_key(&ctx);
             self.control_inputs(&ctx, now, &mut cmds);
         }
         // (An unfocused pane's MIDI backlog is discarded in `drain_events`,
@@ -331,7 +342,7 @@ impl eframe::App for SdroxideApp {
                         ui.label(
                             RichText::new(format!(
                                 "SDRoxide {version} has been released — this is {}.",
-                                env!("CARGO_PKG_VERSION")
+                                sdroxide_version::VERSION
                             ))
                             .size(13.0)
                             .color(ink),
@@ -361,6 +372,13 @@ impl eframe::App for SdroxideApp {
         let ism_labels = self.ism_overlay();
         // Likewise the memory marks along the bottom of the waterfall.
         let mem_marks = self.memory_overlay();
+        // A docked band/mode selector takes a column off the right of the
+        // panadapter before either draws. Shown here, after the top bar and the
+        // notices, so the column sits beside the waterfall rather than under the
+        // chrome.
+        if self.band_docked && self.band_dock_visible {
+            self.band_dock_panel(ui, &mut cmds);
+        }
         // Remaining space: the panadapter (+ FT8/FT4 operating panel).
         if let Some(err) = self.error.clone() {
             let offer_retry = self.ctrl.can_reconnect();
@@ -426,9 +444,15 @@ impl eframe::App for SdroxideApp {
                 // is a view of nothing. The whole channel instead, which is
                 // also all there is on this band.
                 (dial - 1_500_000.0, dial + 1_500_000.0)
+            } else if mode.is_hfdl() {
+                // The lane is a fixed 24 kHz channel, and entering the mode
+                // put the dial on the chosen HFDL frequency; frame the channel
+                // with a little either side of it. The decoder reads the lane,
+                // not this view — the window is only so the operator can see
+                // the signal they are decoding.
+                (dial - 15_000.0, dial + 15_000.0)
             } else if mode.is_aprs() {
                 // APRS is deliberately *not* framed on its own channel.
-                //
                 // Every other digital mode is worked inside a sub-band, so
                 // framing that sub-band is a service. APRS is one channel on a
                 // band an operator has every reason to be watching — the
@@ -700,6 +724,8 @@ impl eframe::App for SdroxideApp {
                                     self.wefax_panel(ui, &mut cmds, panel_h);
                                 } else if mode == Mode::Navtex {
                                     self.navtex_panel(ui, &mut cmds, panel_h);
+                                } else if mode == Mode::Acars {
+                                    self.acars_panel(ui, &mut cmds, panel_h);
                                 } else if mode.is_image() {
                                     self.image_panel(ui, &mut cmds, mode);
                                 } else if mode.is_rf_paint() {
@@ -710,6 +736,8 @@ impl eframe::App for SdroxideApp {
                                     self.vdl2_panel(ui, &mut cmds, panel_h);
                                 } else if mode.is_ais() {
                                     self.ais_panel(ui, &mut cmds, panel_h);
+                                } else if mode.is_hfdl() {
+                                    self.hfdl_panel(ui, &mut cmds, panel_h);
                                 } else if mode.is_aprs() {
                                     self.aprs_panel(ui, &mut cmds, panel_h);
                                 } else if mode.is_packet() {
@@ -724,6 +752,18 @@ impl eframe::App for SdroxideApp {
                                     self.js8_panel(ui, &mut cmds, panel_h);
                                 } else if mode.is_wspr() {
                                     self.wspr_panel(ui, &mut cmds, panel_h);
+                                } else if mode.is_pi4() {
+                                    self.pi4_panel(ui, &mut cmds, panel_h);
+                                } else if mode == Mode::Msk144 {
+                                    self.msk144_panel(ui, &mut cmds);
+                                } else if matches!(mode, Mode::Jt65 | Mode::Jt9) {
+                                    self.jt_panel(ui, &mut cmds);
+                                } else if mode == Mode::Fst4 {
+                                    self.fst4_panel(ui, &mut cmds);
+                                } else if mode == Mode::Q65 {
+                                    self.q65_panel(ui, &mut cmds);
+                                } else if mode == Mode::Fsk441 {
+                                    self.fsk441_panel(ui, &mut cmds);
                                 } else {
                                     self.digi_panel(ui, &mut cmds);
                                 }
@@ -892,10 +932,12 @@ impl eframe::App for SdroxideApp {
         self.ism_window(&ctx, &mut cmds);
         self.adsb_setup_window(&ctx, &mut cmds);
         self.cw_macro_window(&ctx, &mut cmds);
+        self.text_macro_window(&ctx, &mut cmds);
         self.ais_setup_window(&ctx, &mut cmds);
         self.vdl2_setup_window(&ctx, &mut cmds);
         self.rds_window(&ctx);
         self.drm_window(&ctx, &mut cmds);
+        self.hd_window(&ctx, &mut cmds);
         self.voice_window(&ctx, &mut cmds);
         self.settings_window(&ctx, &mut cmds);
         self.digi_settings_window(&ctx, &mut cmds);
@@ -905,8 +947,10 @@ impl eframe::App for SdroxideApp {
         self.spots_window(&ctx, &mut cmds);
         self.public_sdrs_window(&ctx, &mut cmds);
         self.awards_window(&ctx);
+        self.grid_tracker_window(&ctx);
         self.bands_window(&ctx);
         self.sat_window(&ctx, &mut cmds);
+        self.morse_window(&ctx);
         self.help.ui(&ctx);
         // Last, so it lands on top of everything else that opened this frame.
         self.oob_tx_window(&ctx);
@@ -925,6 +969,9 @@ impl eframe::App for SdroxideApp {
             } else {
                 Default::default()
             };
+            // The geometry the window should open at, from this screen's
+            // settings. Only consulted when the window is (re)built.
+            self.solar.set_window_seed(self.ui_settings.solar3d_window);
             let lock_change = self.solar.viewport(
                 &ctx,
                 &grid,
@@ -934,6 +981,12 @@ impl eframe::App for SdroxideApp {
                 std::sync::Arc::clone(&self.sat_cfg),
                 self.sat_track.as_ref().map(|t| t.norad_id),
             );
+            // ...and keep where it actually ended up, so the next open — after a
+            // restart, or after the window is closed and reopened — returns it
+            // there.
+            if let Some(geom) = self.solar.window_now() {
+                self.ui_settings.solar3d_window = Some(geom);
+            }
             self.view.solar3d = self.solar.persisted();
             // The pass window's LOCK button lands here: the 3D window has no
             // command path of its own, so the request is drained and acted on
@@ -1078,6 +1131,11 @@ impl eframe::App for SdroxideApp {
             eframe::set_value(storage, "ui_settings", &self.ui_settings);
             // Control-input bindings: authoritative on native is input.json.
             eframe::set_value(storage, "input", &self.input.cfg);
+            // The Morse trainer's progress, so it carries to the browser build.
+            // The shared copy, which any tab may have advanced.
+            let morse = super::persist::shared_morse_progress()
+                .unwrap_or_else(|| self.morse.progress.clone());
+            eframe::set_value(storage, "morse_progress", &morse);
         }
     }
 }
@@ -1167,6 +1225,13 @@ impl SdroxideApp {
                         // keyed again the moment transmit came on. A QSY rebuilds
                         // nothing, and takes the half-typed over with it.
                         self.text_tx.clear();
+                        // The keyboard-as-straight-key toggle lives in the
+                        // panel; the keyer lives in the engine. The two are
+                        // kept in step only while the panel draws, so a
+                        // mode change drops the latch and lets a fresh
+                        // controller start unheld (issue #322).
+                        self.cw_straight = false;
+                        self.cw_key_down = false;
                     } else if qsy_clears_decodes(prev_band, self.state.band, self.state.rx[0].mode)
                     {
                         self.clear_digi_band_rx();
@@ -1220,6 +1285,12 @@ impl SdroxideApp {
                 RadioEvent::Memories(m) => self.memories = m,
                 RadioEvent::MemoryFolders(f) => self.mem_folders = f,
                 RadioEvent::Scanner(c) => self.scanner = c,
+                RadioEvent::Profiles(names) => {
+                    self.profiles = names;
+                    if std::mem::take(&mut self.profile_apply_pending) {
+                        self.digi_cfg_seeded = false;
+                    }
+                }
                 RadioEvent::ConnectionLost(e) => {
                     if self.focused {
                         self.speech.announcer.on_error(&e, now);
@@ -1248,11 +1319,75 @@ impl SdroxideApp {
                     {
                         self.speech.announcer.on_ft8(&d, st, now);
                     }
+                    // Audible alarms are the one thing that must not wait for
+                    // the window to be focused: ringing when the operator is
+                    // looking at this tab is a duplicate, not a feature.
+                    if self.alerts.enabled()
+                        && let Some(st) = self.digi_status.clone()
+                    {
+                        let dial_hz = self.state.active_freq_hz();
+                        let band =
+                            if dial_hz > 0.0 { sdroxide_types::adif_band(dial_hz) } else { "" };
+                        // A clone of the novelty index: `log_index()` borrows
+                        // the whole app, and the runtime needs `&mut self` to
+                        // arm its cooldowns.
+                        let log = self.log_index().clone();
+                        if let Some(fired) = self.alerts.on_ft8(
+                            &d,
+                            &st.config.my_call,
+                            &st.config.my_grid,
+                            &log,
+                            band,
+                        ) && fired.reply.speaks()
+                        {
+                            if self.focused {
+                                // Spoken from the alarm path rather than the
+                                // decode read-out above, which is its own
+                                // switch: an alarm is to be heard when the
+                                // operator is looking at another window.
+                                let country = sdroxide_types::entity_name(&fired.call);
+                                self.speech.announcer.on_alert(
+                                    fired.event,
+                                    &fired.call,
+                                    band,
+                                    country,
+                                    now,
+                                );
+                            } else if !fired.reply.plays_tone() {
+                                // A radio in a background tab does not speak:
+                                // its phrase would queue behind the one in
+                                // front and be read out late, as news that is
+                                // no longer so. A voice-only alert rings its
+                                // tone instead, so it is not lost.
+                                self.alerts.ring(fired.sound);
+                            }
+                        }
+                    }
                     // Prepend newest-slot decodes; keep a rolling window.
+                    let dial = self.state.rx_freq_hz();
+                    // ...and fold them into the propagation field as they
+                    // arrive, so the 3D globe's BANDS OPEN chart and the flat
+                    // maps show this station's own paths whether or not a
+                    // panel with a map is on screen — until now only
+                    // `prop_texture` folded them, and only while one was.
+                    // Under the mode's own source, the same one `prop_texture`
+                    // uses, so the store's de-duplication sees one decode
+                    // once; and not at all for meteor scatter and moonbounce.
+                    // A decode is placed by the grid in its message, so a
+                    // station that sent none is skipped.
+                    if let Some(src) = super::panels::prop_source_for(self.state.rx[0].mode) {
+                        let v = self.view.solar3d;
+                        self.prop.set_halflife_min(v.prop_halflife_min);
+                        self.prop.set_sources(crate::prop_map::PropSources(v.prop_sources));
+                        let grid = self.my_grid();
+                        self.prop.observe_decodes(&d, src, dial, &grid, crate::time::now_unix());
+                    }
                     for dec in d.into_iter().rev() {
                         self.digi_decodes.insert(0, dec);
+                        self.digi_decode_dials.insert(0, dial);
                     }
                     self.digi_decodes.truncate(200);
+                    self.digi_decode_dials.truncate(200);
                 }
                 RadioEvent::WsprSpots(s) => {
                     // Newest first, and de-duplicated against what is already
@@ -1274,6 +1409,16 @@ impl SdroxideApp {
                         self.wspr_spots.insert(0, spot);
                     }
                     self.wspr_spots.truncate(crate::app::panels::wspr::WSPR_SPOT_ROWS);
+                }
+                RadioEvent::Pi4Spots(s) => {
+                    // Newest first. No de-duplication set, unlike WSPR's:
+                    // there is no PI4 equivalent of a WSPRnet download to
+                    // double-report the same reception, and the engine only
+                    // ever reports one slot's decode once.
+                    for spot in s.into_iter().rev() {
+                        self.pi4_spots.insert(0, spot);
+                    }
+                    self.pi4_spots.truncate(crate::app::panels::pi4::PI4_SPOT_ROWS);
                 }
                 RadioEvent::Ft8Status(s) => {
                     // Seed the editable config from the engine's persisted
@@ -1335,6 +1480,7 @@ impl SdroxideApp {
                 RadioEvent::WefaxStatus(s) => self.wefax.status = s,
                 RadioEvent::Rds(d) => self.on_rds(d),
                 RadioEvent::Drm(d) => self.on_drm(d),
+                RadioEvent::HdRadio(d) => self.on_hd(d),
                 // A whole-table snapshot, so it replaces rather than merges: the
                 // engine's table is authoritative and already carries the history
                 // — first heard, times heard — that a merge here would be
@@ -1345,6 +1491,13 @@ impl SdroxideApp {
                 RadioEvent::Vdl2Status(st) => self.vdl2_status = Some(st),
                 RadioEvent::AisStatus(st) => self.ais_status = Some(st),
                 RadioEvent::Qo100Status(st) => self.qo100_status = Some(st),
+                RadioEvent::HfdlStatus(st) => {
+                    // Feed the map's plot table before the log scrolls anything
+                    // out of its rolling window: the table keeps an aircraft
+                    // until thirty minutes of silence retires it.
+                    self.hfdl_map.observe(&st.log, crate::time::now_unix());
+                    self.hfdl_status = Some(st);
+                }
                 RadioEvent::SstvStatus(s) => {
                     // Adopt a *newly* detected RX mode for the next transmit, but
                     // don't re-apply a steady detection every frame — that would
@@ -1716,8 +1869,18 @@ impl SdroxideApp {
             show_memories,
             show_voice,
             caps,
+            cw_key_down,
             ..
         } = self;
+        // The keyboard straight key is held by the operator's hand rather than
+        // by an input binding, so `release_all` knows nothing about it: without
+        // this, switching away from the tab with the key down left the carrier
+        // on until the operator came back (issue #322). The *mode* stays
+        // engaged — only the key goes up.
+        if *cw_key_down {
+            *cw_key_down = false;
+            cmds.push(Command::CwKey(false));
+        }
         let rig_squelch = caps.as_ref().is_some_and(|c| c.commands_squelch);
         let mut sink = crate::input::UiSink {
             view,

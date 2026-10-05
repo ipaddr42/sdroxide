@@ -57,12 +57,16 @@
 //! loader and from [SoapyELAD](https://github.com/DisagioDigitale/SoapyELAD),
 //! which drives an FDM-S2 on Linux and is verified against one.
 //!
-//! # Not verified against hardware
+//! # Mostly not verified against hardware
 //!
-//! This driver was written from that reference, not on a bench. Every uncertain
-//! point carries a comment saying so, and [`diagnostics`] renders a session
-//! trace built for exactly one purpose: making a first bug report from an owner
-//! actionable.
+//! This driver was written from that reference, not on a bench. Receiving on an
+//! FDM-DUO has since been run on one (hardware 2.9, firmware 4.9, at 192 kHz):
+//! the I/Q order was confirmed by retuning against broadcast carriers, and the
+//! tuning word against the calibrated clock and the dial read-back are pinned by
+//! tests built from the radio's own bytes. Transmit, the higher
+//! rates and the FDM-S1/S2 have not. Every uncertain point carries a comment
+//! saying so, and [`diagnostics`] renders a session trace built for exactly one
+//! purpose: making a first bug report from an owner actionable.
 
 pub mod convert;
 pub mod device;

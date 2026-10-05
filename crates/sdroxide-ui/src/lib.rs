@@ -26,6 +26,7 @@ mod flags;
 mod fuzzy;
 mod hell;
 mod help;
+mod hfdl_map;
 mod input;
 /// Which layout the window wears — desktop strip, tablet menus, or the compact
 /// phone strip — and the metrics that follow from it.
@@ -245,7 +246,7 @@ pub fn install_renderer_panic_note() {
                 &path,
                 format!(
                     "sdroxide {} died in the graphics driver.\n\nat {at}\n{msg}\n\n                     Delete this file to use the default renderer again.\n",
-                    env!("CARGO_PKG_VERSION"),
+                    sdroxide_version::VERSION,
                 ),
             );
         }

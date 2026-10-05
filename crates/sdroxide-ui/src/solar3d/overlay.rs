@@ -2074,8 +2074,8 @@ fn weather_panel(
 }
 
 /// Aurora: how much power is going into each oval, how far towards the equator
-/// it reaches, whether it is over your head, and what the planetary K forecast
-/// says about tonight.
+/// it reaches, whether it is over your head, and what the planetary K series
+/// did over the last day and is forecast to do over the next.
 ///
 /// The colours here mean the same thing they do everywhere else in the window —
 /// green quiet, yellow worth watching, pink a storm.
@@ -2178,9 +2178,16 @@ fn aurora_panel(
     // The forecast strip: one bar per three-hour bin over the next day. Eight
     // numbers in a column is a table nobody reads; the same eight as a shape is
     // "it picks up after midnight" at a glance.
-    let bins: Vec<_> = aurora::upcoming(&d.kp_forecast, now, 24 * 3600).take(8).collect();
-    const BAR_W: f32 = 13.0;
-    const BAR_GAP: f32 = 3.0;
+    // The trend: the observed bins behind `now` and the forecast ahead of it in
+    // one row, so the shape of the last day flows into the shape of the next.
+    // The forecast bars are filled lighter — a measurement and a prediction
+    // must never be read as the same thing.
+    let mut series: Vec<&sdroxide_solar::KpPoint> =
+        aurora::recent(&d.kp_forecast, now, 24 * 3600).collect();
+    let history_len = series.len();
+    series.extend(aurora::upcoming(&d.kp_forecast, now, 24 * 3600).take(8));
+    const BAR_W: f32 = 9.0;
+    const BAR_GAP: f32 = 2.0;
     const STRIP_H: f32 = 26.0;
 
     let font = egui::FontId::proportional(12.0);
@@ -2215,7 +2222,7 @@ fn aurora_panel(
     let title = p.layout_no_wrap("AURORA".into(), small.clone(), theme::CYAN_DIM());
     let pad = 10.0;
     let strip_w =
-        if bins.is_empty() { 0.0 } else { bins.len() as f32 * (BAR_W + BAR_GAP) - BAR_GAP };
+        if series.is_empty() { 0.0 } else { series.len() as f32 * (BAR_W + BAR_GAP) - BAR_GAP };
     let width =
         (key_w + val_w + 18.0).max(strip_w).max(footer.as_ref().map_or(0.0, |f| f.size().x))
             + pad * 2.0;
@@ -2223,7 +2230,7 @@ fn aurora_panel(
         + 5.0
         + rows.len() as f32 * row_h
         // Strip: the gap above it, the bars, and the hour stamps under them.
-        + if bins.is_empty() { 0.0 } else { STRIP_H + 18.0 }
+        + if series.is_empty() { 0.0 } else { STRIP_H + 18.0 }
         + footer.as_ref().map_or(0.0, |f| f.size().y + 4.0)
         + pad * 2.0;
 
@@ -2242,29 +2249,46 @@ fn aurora_panel(
         y += row_h;
     }
 
-    if !bins.is_empty() {
+    if !series.is_empty() {
         y += 6.0;
         let base = y + STRIP_H;
-        for (i, bin) in bins.iter().enumerate() {
+        for (i, bin) in series.iter().enumerate() {
             let x = panel.left() + pad + i as f32 * (BAR_W + BAR_GAP);
             let h = (bin.kp / 9.0) as f32 * STRIP_H;
-            // An unlit socket under every bar, so a quiet forecast still reads
+            // An unlit socket under every bar, so a quiet stretch still reads
             // as a scale rather than as missing data.
             p.rect_filled(
                 egui::Rect::from_min_max(egui::pos2(x, y), egui::pos2(x + BAR_W, base)),
                 0,
                 theme::LINE().gamma_multiply(0.55),
             );
+            // The measured half is solid, the predicted half a wash: the two
+            // must not be read as one continuous observation.
+            let fill = if bin.predicted {
+                kp_color(bin.kp).gamma_multiply(0.45)
+            } else {
+                kp_color(bin.kp)
+            };
             p.rect_filled(
                 egui::Rect::from_min_max(
                     egui::pos2(x, base - h.max(1.0)),
                     egui::pos2(x + BAR_W, base),
                 ),
                 0,
-                kp_color(bin.kp),
+                fill,
             );
         }
-        // Hours under the ends, so the strip has a time axis without eight
+        // Where measurement gives way to prediction. The first forecast bar may
+        // also be the bin containing `now`, so the line lands where the two
+        // halves meet rather than on a clock face.
+        if history_len > 0 && history_len < series.len() {
+            let x = panel.left() + pad + history_len as f32 * (BAR_W + BAR_GAP) - BAR_GAP / 2.0;
+            p.line_segment(
+                [egui::pos2(x, y - 2.0), egui::pos2(x, base)],
+                egui::Stroke::new(1.0, theme::LINE_LIT()),
+            );
+        }
+        // Hours under the ends, so the strip has a time axis without sixteen
         // labels fighting for room.
         let stamp = |unix: i64| {
             let (_, _, _, h, _, _) = sdroxide_types::utc_ymd_hms(unix);
@@ -2273,17 +2297,28 @@ fn aurora_panel(
         p.text(
             egui::pos2(panel.left() + pad, base + 2.0),
             egui::Align2::LEFT_TOP,
-            stamp(bins[0].unix),
+            stamp(series[0].unix),
             small.clone(),
             theme::LINE_LIT(),
         );
         p.text(
             egui::pos2(panel.left() + pad + strip_w, base + 2.0),
             egui::Align2::RIGHT_TOP,
-            stamp(bins[bins.len() - 1].unix),
+            stamp(series[series.len() - 1].unix),
             small.clone(),
             theme::LINE_LIT(),
         );
+        // What the two halves are, once, under the axis — only when both are
+        // actually present.
+        if history_len > 0 && history_len < series.len() {
+            p.text(
+                egui::pos2(panel.left() + pad + strip_w / 2.0, base + 2.0),
+                egui::Align2::CENTER_TOP,
+                "observed | forecast",
+                small.clone(),
+                theme::LINE_LIT(),
+            );
+        }
         y = base + 12.0;
     }
 

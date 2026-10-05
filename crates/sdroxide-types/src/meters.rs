@@ -63,6 +63,35 @@ pub struct TxTelemetry {
     pub po: Option<f32>,
 }
 
+/// What the adaptive-predistortion loop is doing, for the radios that run one
+/// (an HPSDR board correcting itself from its own receiver; a LimeSDR with its
+/// second chain given over to the job).
+///
+/// Reported in receive as well as transmit, because the question an operator
+/// asks about PureSignal is mostly asked *between* overs: did it find the
+/// feedback, and how much is it correcting. A loop that never locks is the
+/// ordinary failure — a coupler not wired, an attenuator too deep, the T/R
+/// switch taking the sample away for the length of the over — and until this
+/// reached the screen the only place it was ever said was the log, which is
+/// why a working installation and a dead one looked exactly alike
+/// (issue #441).
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct PsMeter {
+    /// The loop has found the transmission in the feedback and is correcting.
+    pub locked: bool,
+    /// How much compression the table is taking out, in dB. Zero on an
+    /// unlocked loop — and zero on a locked one that has found a transmitter
+    /// with nothing to correct, which is a perfectly good answer.
+    pub correction_db: f32,
+    /// How well the feedback matched the transmission, `0.0..=1.0`. This is
+    /// the number that says *why* an unlocked loop is unlocked: near zero is
+    /// "nothing came back", partway up is "something came back and it is not
+    /// what we sent".
+    pub score: f32,
+    /// The operator has told the loop to stop adapting and keep what it has.
+    pub frozen: bool,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct Meters {
     /// Signal level in the RX passband, dBm (after `cal_offset_db`).
@@ -134,6 +163,10 @@ pub struct Meters {
     /// front end, which has no software squelch either.
     #[serde(default = "minus_infinity")]
     pub passband_dbfs: f32,
+    /// The adaptive-predistortion loop's state, on a radio running one and
+    /// `None` on every other — see [`PsMeter`].
+    #[serde(default)]
+    pub puresignal: Option<PsMeter>,
 }
 
 fn minus_infinity() -> f32 {

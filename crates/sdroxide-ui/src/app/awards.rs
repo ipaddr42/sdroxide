@@ -62,7 +62,7 @@ fn award_cell_grid(
 impl SdroxideApp {
     /// The cached award tally for the current band filter (recomputed when the
     /// log length or the band filter changes).
-    fn ensure_awards(&mut self) {
+    pub(in crate::app) fn ensure_awards(&mut self) {
         let len = self.qso_log.len();
         let band = self.awards_band.clone();
         let stale =

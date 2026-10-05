@@ -59,6 +59,25 @@ const SCALE: f32 = 1.0 / 32768.0;
 /// acknowledgements) runs anyway.
 const CTRL_TIMEOUT: Duration = Duration::from_millis(100);
 
+/// How often a receiver that keeps overloading says so again.
+///
+/// The first one is immediate, because it is the one that tells the operator
+/// what to reach for. After that the message is a repeat of advice already
+/// given, so it is worth a line a minute at most — carrying the count, which
+/// says more about how hard the front end is being hit than any single event.
+const OVERLOAD_REPEAT: Duration = Duration::from_secs(60);
+
+/// How long the overload has to stay away before the all-clear is announced.
+///
+/// Generous, and measured rather than guessed: a receiver on the threshold
+/// does not overload steadily, it overloads in bursts with several seconds
+/// between them. At three seconds the all-clear landed between the bursts and
+/// the next burst re-announced itself a second later, which is the same flood
+/// wearing a different hat. Ten seconds of quiet is a front end that has
+/// actually settled — usually because the operator has just turned the gain
+/// down, which is the one moment the all-clear is worth reading.
+const OVERLOAD_CLEAR: Duration = Duration::from_secs(10);
+
 /// How long an announced gain must stand before it is believed without the
 /// service having flagged the block that carries it — see [`settle_gain`].
 ///
@@ -555,6 +574,7 @@ fn run(
     }));
 
     let mut pending = Pending::default();
+    let mut overload_log = OverloadLog::default();
     loop {
         match ctrl.recv_timeout(CTRL_TIMEOUT) {
             Ok(c) => {
@@ -566,6 +586,7 @@ fn run(
             Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => break,
         }
+        report_overload(&shared, &mut overload_log);
         // The overload acknowledgement the API requires, moved out of the
         // event callback so no Update ever runs on the service's thread. It
         // goes to the tuner that reported it, and to no other.
@@ -602,6 +623,72 @@ fn run(
     // Only now is the API done with the callbacks; the context can come back.
     drop(unsafe { Box::from_raw(ctx) });
     tracing::debug!("SDRplay session ended");
+}
+
+/// What the session thread remembers between overload reports.
+#[derive(Default)]
+struct OverloadLog {
+    /// When the current run of overloads was first announced.
+    began: Option<Instant>,
+    /// When the last line was printed.
+    last: Option<Instant>,
+    /// When an overload was last counted, so the all-clear can wait for quiet.
+    seen: Option<Instant>,
+    /// Entries into overload since the run began.
+    events: u32,
+}
+
+/// Say what the front end is doing, at most once a minute.
+///
+/// The first overload of a run is announced at once, with what to reach for.
+/// While it continues, a line a minute carries the count instead of the advice
+/// — an operator who has been told twice does not need telling ten times a
+/// second, and the count is the part that changes. The all-clear waits for
+/// [`OVERLOAD_CLEAR`] of quiet, because a receiver on the threshold toggles.
+fn report_overload(shared: &Shared, log: &mut OverloadLog) {
+    let now = Instant::now();
+    let events = shared.overload_events.swap(0, Ordering::Relaxed);
+    if events > 0 {
+        let tuners = shared.overload_tuners.swap(0, Ordering::Relaxed);
+        log.events += events;
+        log.seen = Some(now);
+        let due = log.last.is_none_or(|t| now.duration_since(t) >= OVERLOAD_REPEAT);
+        if due {
+            if log.began.is_none() {
+                log.began = Some(now);
+                tracing::warn!(
+                    "SDRplay: RF overload on {} — raise the LNA slider (more \
+                     attenuation), lower IF gain, or enable AGC",
+                    match tuners {
+                        0b01 => "tuner 1",
+                        0b10 => "tuner 2",
+                        _ => "the receiver",
+                    }
+                );
+            } else {
+                let secs = log.began.map_or(0.0, |t| now.duration_since(t).as_secs_f32());
+                tracing::warn!(
+                    "SDRplay: still overloading — {} times in {:.0} s, and the front end is \
+                     still set too hot for what is on the antenna",
+                    log.events,
+                    secs
+                );
+            }
+            log.last = Some(now);
+        }
+        return;
+    }
+    // Nothing counted this pass. The all-clear is only worth saying if a
+    // warning was given, and only once the receiver has been quiet for a while.
+    let quiet_for = log.seen.map(|t| now.duration_since(t));
+    if log.began.is_some()
+        && !shared.overload.load(Ordering::Relaxed)
+        && quiet_for.is_some_and(|d| d >= OVERLOAD_CLEAR)
+    {
+        let secs = log.began.map_or(0.0, |t| now.duration_since(t).as_secs_f32());
+        tracing::info!("SDRplay: overload cleared — {} times over {:.0} s", log.events, secs);
+        *log = OverloadLog::default();
+    }
 }
 
 /// Which bit of [`Shared::overload_ack_pending`] belongs to a tuner.
@@ -1099,18 +1186,14 @@ unsafe extern "C" fn event_cb(
                     _ => 0b11,
                 };
                 shared.overload_ack_pending.fetch_or(bits, Ordering::Relaxed);
+                // Counted here, reported by the session thread. A receiver
+                // sitting on the overload threshold toggles several times a
+                // second, and a line per transition drowns the log (the
+                // service's own "corrected" arrives just as fast). See
+                // `OVERLOAD_REPEAT`.
                 if over && !was {
-                    tracing::warn!(
-                        "SDRplay: RF overload on {} — raise the LNA slider (more \
-                         attenuation), lower IF gain, or enable AGC",
-                        match tuner {
-                            ffi::TUNER_A => "tuner 1",
-                            ffi::TUNER_B => "tuner 2",
-                            _ => "the receiver",
-                        }
-                    );
-                } else if !over && was {
-                    tracing::info!("SDRplay: overload corrected");
+                    shared.overload_events.fetch_add(1, Ordering::Relaxed);
+                    shared.overload_tuners.fetch_or(bits, Ordering::Relaxed);
                 }
             }
             ffi::EVENT_DEVICE_REMOVED | ffi::EVENT_DEVICE_FAILURE => {

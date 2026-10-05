@@ -125,6 +125,15 @@ impl RelayLink {
     pub fn has_numbered_channels(self) -> bool {
         matches!(self, RelayLink::Serial | RelayLink::Hid | RelayLink::Gpio)
     }
+
+    /// Whether each contact switches on its own. A sound card's one pin and
+    /// the command hook's key-down/key-up pair are a single on/off whatever
+    /// the contact table says — anything asserted is "transmit" — so a band
+    /// decoder, whose receive word is asserted while receiving, would key
+    /// them for as long as the dial sat on a band with a row.
+    pub fn switches_contacts_separately(self) -> bool {
+        !matches!(self, RelayLink::Cm108 | RelayLink::Command)
+    }
 }
 
 /// Which serial relay board. They differ only in what a "close channel 2" looks
@@ -189,6 +198,18 @@ pub enum RelayRole {
     /// Anything else the operator wants switched with the over — a preamp
     /// bypass, a receive-antenna relay, a rotator inhibit.
     Aux,
+    /// Part of a band-decoder output bank: which word from
+    /// [`RelayConfig::band_table`] it follows is decided by the band, and
+    /// whether that is the row's RX or TX word by the same on-air ramp every
+    /// other role runs on — so a contact whose two words differ moves inside
+    /// its own lead, before RF, and back only after its hold.
+    ///
+    /// The same idea as [`crate::HpsdrOcRow`]'s per-band output word,
+    /// generalised from HPSDR's fixed seven-pin OC bus to whatever relay
+    /// hardware this bank actually is — a USB relay board, GPIO header, HID
+    /// relay or external command driving an outboard band-pass/low-pass
+    /// filter bank or a transverter selector (issue #442).
+    BandDecoder,
 }
 
 impl RelayRole {
@@ -198,6 +219,7 @@ impl RelayRole {
             RelayRole::SdrAntenna => "Ground the SDR antenna",
             RelayRole::Amplifier => "Key an amplifier / T-R relay",
             RelayRole::Aux => "Auxiliary",
+            RelayRole::BandDecoder => "Band decoder (filter / transverter)",
         }
     }
 
@@ -215,6 +237,13 @@ impl RelayRole {
             // sentinel — see [`RelayChannel::lead_ms`].
             RelayRole::Amplifier => (DEFAULT_LEAD_MS / 2, 0),
             RelayRole::Aux | RelayRole::Unused => (DEFAULT_LEAD_MS, DEFAULT_HOLD_MS),
+            // The band picks the word, but the move from a row's RX word to
+            // its TX word is an on-air edge like any other — a transmit-only
+            // LPF bank switched in, a receive preamp bypassed — and must be
+            // done before RF and undone only after it. A split across bands
+            // makes that true of any band-decoder contact, not only one whose
+            // row gives it different bits, so every one gets a real ramp.
+            RelayRole::BandDecoder => (DEFAULT_LEAD_MS, DEFAULT_HOLD_MS),
         }
     }
 }
@@ -347,6 +376,30 @@ pub struct SenseConfig {
     pub radio: u32,
 }
 
+/// One row of a band-decoder output table — the same idea as
+/// [`crate::HpsdrOcRow`], generalised from HPSDR's fixed seven-pin OC bus to
+/// whatever [`RelayChannel`]s this bank has given [`RelayRole::BandDecoder`].
+///
+/// `rx_mask`/`tx_mask` read the same way the HPSDR OC table's do: bit 0 is
+/// channel 1, bit `N` is channel `N + 1` (matching `RelayChannel::index`,
+/// 1-based). A bit set in `rx_mask` means that channel is asserted while
+/// receiving on this band; `tx_mask` while transmitting. Give a channel the
+/// same bit in both for a filter that does not care which way the RF is
+/// going, and different bits for a receive preamp bypass or a transmit-only
+/// LPF bank that must not be in circuit on receive.
+///
+/// The move between the two is sequenced exactly like any other contact's:
+/// the channel's own lead before RF, its own hold after — the relay worker
+/// makes it, from the station-wide on-air state, never the engine. The RX
+/// word is the receive dial's band; the TX word is the band of the radio
+/// actually keying.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RelayBandRow {
+    pub band: crate::Band,
+    pub rx_mask: u32,
+    pub tx_mask: u32,
+}
+
 /// Everything the station's T/R switch needs to know. Persisted as
 /// `relay.json` beside the rotator's own file and announced in
 /// [`crate::StationConfig`], because it is a fact about the machine the antenna
@@ -378,6 +431,14 @@ pub struct RelayConfig {
     pub tx_cmd: String,
     pub rx_cmd: String,
     pub sense: SenseConfig,
+    /// Per-band output state for this bank's [`RelayRole::BandDecoder`]
+    /// channels — see [`RelayBandRow`]. Empty means none of this bank's
+    /// contacts switch by band; the existing on-air-driven channels are
+    /// unaffected either way, and the two kinds of channel live on the same
+    /// hardware together exactly as HPSDR's OC byte already combines a band
+    /// decoder with everything else on the bus.
+    #[serde(default)]
+    pub band_table: Vec<RelayBandRow>,
 }
 
 impl Default for RelayConfig {
@@ -403,6 +464,7 @@ impl Default for RelayConfig {
             tx_cmd: String::new(),
             rx_cmd: String::new(),
             sense: SenseConfig::default(),
+            band_table: Vec::new(),
         }
     }
 }
@@ -417,6 +479,32 @@ impl RelayConfig {
     /// operator has told us to leave alone.
     pub fn active_channels(&self) -> impl Iterator<Item = &RelayChannel> {
         self.channels.iter().filter(|c| c.role != RelayRole::Unused)
+    }
+
+    /// The [`RelayRole::BandDecoder`] channels that should be asserted right
+    /// now, given the dial's band and whether the station is transmitting —
+    /// see [`RelayBandRow`].
+    ///
+    /// Restricted to `BandDecoder`-role channels by construction: a row's
+    /// mask is intersected with the *actual* band-decoder channels on this
+    /// bank, so a stale or mis-edited table bit can never assert an
+    /// `Amplifier` or `SdrAntenna` channel it happens to share a bit position
+    /// with. An unconfigured band (no row, or a band the table has no entry
+    /// for — `Band::Gen` covers everywhere outside the amateur allocations,
+    /// the way it does for [`crate::HpsdrOcPlan`]) asserts nothing.
+    pub fn band_mask(&self, band: crate::Band, tx: bool) -> u32 {
+        let decoder: u32 = self
+            .channels
+            .iter()
+            .filter(|c| c.role == RelayRole::BandDecoder)
+            .fold(0u32, |m, c| m | (1u32 << (c.index.clamp(1, 32) - 1)));
+        let row = self
+            .band_table
+            .iter()
+            .find(|r| r.band == band)
+            .map(|r| if tx { r.tx_mask } else { r.rx_mask })
+            .unwrap_or(0);
+        row & decoder
     }
 
     /// This channel's lead. A method rather than a field access because every
@@ -468,9 +556,34 @@ impl RelayConfig {
         if self.active_channels().next().is_none() {
             return Some("no T/R switch channel has been given a job".to_string());
         }
+        if !self.link.switches_contacts_separately()
+            && self.channels.iter().any(|c| c.role == RelayRole::BandDecoder)
+        {
+            return Some(format!(
+                "a band decoder needs contacts that switch one at a time, and the \"{}\" \
+                 link is a single on/off",
+                self.link.label()
+            ));
+        }
         if let Some(c) = self.channels.iter().find(|c| c.index == 0 || c.index > MAX_CHANNEL) {
             return Some(format!(
                 "T/R switch channel number {} is out of range (1–{MAX_CHANNEL})",
+                c.index
+            ));
+        }
+        // The driver keeps one bit per contact number, so a band decoder
+        // sharing its number with the antenna relay or the amplifier line
+        // would put that contact under the band table: its receive word would
+        // key the amplifier while receiving, and the over would no longer
+        // close it.
+        if let Some(c) = self.active_channels().find(|c| {
+            c.role == RelayRole::BandDecoder
+                && self
+                    .active_channels()
+                    .any(|o| o.index == c.index && o.role != RelayRole::BandDecoder)
+        }) {
+            return Some(format!(
+                "T/R switch contact {} is a band decoder and has another job as well",
                 c.index
             ));
         }
@@ -579,6 +692,113 @@ mod tests {
         let pa_off = note.find("PA at +5").expect("{note}");
         let sdr_off = note.find("SDR at +40").expect("{note}");
         assert!(pa_off < sdr_off, "the amplifier must unkey before the antenna returns: {note}");
+    }
+
+    fn band_decoder_cfg() -> RelayConfig {
+        RelayConfig {
+            link: RelayLink::Gpio,
+            channels: vec![
+                RelayChannel { index: 1, role: RelayRole::BandDecoder, ..RelayChannel::default() },
+                RelayChannel { index: 2, role: RelayRole::BandDecoder, ..RelayChannel::default() },
+                // An ordinary on-air-driven channel sharing the same bank —
+                // the two kinds of channel must not interfere.
+                RelayChannel { index: 3, role: RelayRole::Amplifier, ..RelayChannel::default() },
+            ],
+            band_table: vec![
+                RelayBandRow { band: crate::Band::M20, rx_mask: 0b01, tx_mask: 0b01 },
+                RelayBandRow { band: crate::Band::M40, rx_mask: 0b10, tx_mask: 0b11 },
+            ],
+            ..RelayConfig::default()
+        }
+    }
+
+    #[test]
+    fn a_configured_band_asserts_its_row() {
+        let cfg = band_decoder_cfg();
+        assert_eq!(cfg.band_mask(crate::Band::M20, false), 0b01);
+        assert_eq!(cfg.band_mask(crate::Band::M20, true), 0b01);
+        assert_eq!(cfg.band_mask(crate::Band::M40, false), 0b10);
+        assert_eq!(cfg.band_mask(crate::Band::M40, true), 0b11);
+    }
+
+    #[test]
+    fn a_band_with_no_row_asserts_nothing() {
+        let cfg = band_decoder_cfg();
+        assert_eq!(cfg.band_mask(crate::Band::M15, false), 0);
+        assert_eq!(cfg.band_mask(crate::Band::M15, true), 0);
+    }
+
+    /// The safety property the whole design rests on: a band row can never
+    /// assert a channel that is not actually a band-decoder channel, however
+    /// its bits happen to line up.
+    #[test]
+    fn a_band_row_cannot_assert_a_non_decoder_channel() {
+        let mut cfg = band_decoder_cfg();
+        // Channel 3 (the amplifier) is bit index 2 — put it in a row's mask
+        // as if by a copy-paste mistake in the table.
+        cfg.band_table.push(RelayBandRow { band: crate::Band::M15, rx_mask: 0b100, tx_mask: 0 });
+        assert_eq!(cfg.band_mask(crate::Band::M15, false), 0, "the amplifier bit leaked through");
+    }
+
+    #[test]
+    fn an_empty_band_table_asserts_nothing_on_any_band() {
+        let cfg = RelayConfig {
+            channels: vec![RelayChannel {
+                index: 1,
+                role: RelayRole::BandDecoder,
+                ..RelayChannel::default()
+            }],
+            ..RelayConfig::default()
+        };
+        assert_eq!(cfg.band_mask(crate::Band::M20, false), 0);
+        assert_eq!(cfg.band_mask(crate::Band::M20, true), 0);
+    }
+
+    /// A CM108 pin or a command hook turns any asserted contact into
+    /// "transmit", so a band row's receive word would key the PTT line — or
+    /// run the transmit command — for as long as the dial sat on that band.
+    #[test]
+    fn a_band_decoder_on_a_single_on_off_link_is_refused() {
+        for link in [RelayLink::Cm108, RelayLink::Command] {
+            let cfg = RelayConfig {
+                link,
+                device: "card".into(),
+                tx_cmd: "key".into(),
+                ..band_decoder_cfg()
+            };
+            let why = cfg.refusal();
+            assert!(
+                why.as_deref().is_some_and(|w| w.contains("band decoder")),
+                "{link:?} took a band decoder: {why:?}"
+            );
+        }
+        // Each RTS/DTR line switches on its own, so two outputs work there.
+        let lines = RelayConfig {
+            link: RelayLink::SerialLines,
+            serial: SerialConfig { path: "/dev/ttyUSB0".into(), ..SerialConfig::default() },
+            ..band_decoder_cfg()
+        };
+        assert_eq!(lines.refusal(), None);
+    }
+
+    /// `band_mask` clips a row to the band-decoder contacts by number, so a
+    /// number that is also the amplifier's would let the row through to the
+    /// amplifier line — keyed on receive whenever the band's RX word has it.
+    #[test]
+    fn a_band_decoder_cannot_share_its_contact_with_another_job() {
+        let mut cfg = RelayConfig {
+            link: RelayLink::Serial,
+            serial: SerialConfig { path: "/dev/ttyUSB0".into(), ..SerialConfig::default() },
+            ..band_decoder_cfg()
+        };
+        assert_eq!(cfg.refusal(), None);
+        // The amplifier renumbered onto the first filter's contact.
+        cfg.channels[2].index = 1;
+        let why = cfg.refusal();
+        assert!(
+            why.as_deref().is_some_and(|w| w.contains("contact 1")),
+            "a shared contact was accepted: {why:?}"
+        );
     }
 
     #[test]

@@ -151,6 +151,7 @@ fn build_status(cfg: &DigiConfig, session: &AtChatSession) -> DigiStatus {
         tx_even: false,
         transmitting: atchat.keyed,
         tx_watchdog: false,
+        tx_refused: None,
         transcript: Vec::<TranscriptLine>::new(),
         config: cfg.clone(),
         text_rx: String::new(),
@@ -160,6 +161,7 @@ fn build_status(cfg: &DigiConfig, session: &AtChatSession) -> DigiStatus {
         rade: None,
         packet: None,
         navtex: None,
+        acars: None,
         aprs: None,
         js8: None,
         atchat: Some(Box::new(atchat)),
@@ -168,6 +170,7 @@ fn build_status(cfg: &DigiConfig, session: &AtChatSession) -> DigiStatus {
         clock_offset_s: None,
         cw: None,
         wspr: None,
+        pi4: None,
         qso: None,
     }
 }

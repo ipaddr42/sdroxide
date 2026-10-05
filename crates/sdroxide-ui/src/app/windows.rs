@@ -540,7 +540,6 @@ impl SdroxideApp {
         // operator who wants their local machines in here already has the file
         // (issue #234).
         ui.horizontal(|ui| {
-            #[cfg(not(target_arch = "wasm32"))]
             if crate::chrome::chip(ui, false, "IMPORT")
                 .on_hover_text(
                     "Read a channel list from a CHIRP CSV file (.csv) — a repeater \
@@ -553,7 +552,7 @@ impl SdroxideApp {
                 )
                 .clicked()
             {
-                crate::download::load_text("CHIRP CSV", "csv", self.chirp_import_inbox.clone());
+                crate::download::load_text("CHIRP CSV", &["csv"], self.chirp_import_inbox.clone());
             }
             let have = !self.memories.is_empty();
             ui.add_enabled_ui(have, |ui| {

@@ -277,6 +277,36 @@ pub struct VitaHeader {
     pub stream_id: u32,
     /// What the payload *is* (word 3, low 16 bits) — see [`pcc`].
     pub class_code: u16,
+    /// Whether word 0 declares a Class ID (bit 27), two words of it.
+    pub has_class_id: bool,
+    /// Integer-timestamp selector (bits 23–22): non-zero means one word of it.
+    pub tsi: u8,
+    /// Fractional-timestamp selector (bits 21–20): non-zero means two words.
+    pub tsf: u8,
+}
+
+impl VitaHeader {
+    /// How long this packet's header actually is, in 32-bit words, from the
+    /// indicator bits in word 0 — rather than the [`VITA_HEADER_WORDS`] a FLEX
+    /// is assumed to send.
+    ///
+    /// They agree on every packet this backend has been shown: a FLEX sends the
+    /// full shape, stream ID and class ID and both timestamps, which is seven
+    /// words. They are worth being able to compare because the cost of them
+    /// disagreeing is invisible and total — the payload would start one float
+    /// late, so every I would be read as a Q, and a mirrored spectrum is
+    /// unintelligible on both sidebands while the radio's own panadapter and
+    /// waterfall, which do not come from this stream, go on looking perfect
+    /// (issue #368).
+    #[must_use]
+    pub fn declared_header_words(&self) -> usize {
+        // Odd packet types carry a stream ID; even ones do not. A FLEX sends 3
+        // for everything it streams.
+        1 + usize::from(self.packet_type & 1 == 1)
+            + if self.has_class_id { 2 } else { 0 }
+            + usize::from(self.tsi != 0)
+            + if self.tsf != 0 { 2 } else { 0 }
+    }
 }
 
 /// Parse a VITA-49 header, or `None` if the datagram is too short to hold one.
@@ -293,6 +323,9 @@ pub fn parse_vita_header(buf: &[u8]) -> Option<VitaHeader> {
         words: (word0 & 0xFFFF) as u16,
         stream_id: w(1),
         class_code: (w(3) & 0xFFFF) as u16,
+        has_class_id: word0 & 0x0800_0000 != 0,
+        tsi: ((word0 >> 22) & 0x3) as u8,
+        tsf: ((word0 >> 20) & 0x3) as u8,
     })
 }
 
@@ -546,6 +579,37 @@ mod tests {
         assert_eq!(h.count, 5);
         assert_eq!(h.words, 11);
         assert!(!h.has_trailer);
+    }
+
+    /// The seven-word header this backend takes the payload from is what the
+    /// indicator bits in word 0 describe — stream ID, class ID and both
+    /// timestamps. A packet that says otherwise has its payload read from the
+    /// wrong offset, and one word out is one float out: I read as Q for the
+    /// whole packet, which is a mirrored spectrum (issue #368).
+    #[test]
+    fn the_header_length_the_bits_declare_is_the_one_the_payload_is_taken_from() {
+        let mut buf = Vec::new();
+        write_vita_header(&mut buf, 3, 0x2000_0000, pcc::DAX_IQ_192K, 0, 4);
+        let h = parse_vita_header(&buf).expect("header");
+        assert!(h.has_class_id);
+        assert_ne!(h.tsi, 0);
+        assert_ne!(h.tsf, 0);
+        assert_eq!(h.declared_header_words(), VITA_HEADER_WORDS);
+        assert_eq!(VITA_HEADER_WORDS * 4, VITA_HEADER_BYTES);
+
+        // And the shapes that would not be: each is shorter than the seven
+        // words assumed, so the payload would start that many words late.
+        let reparse = |mask: u32, set: u32| {
+            let mut b = buf.clone();
+            let w0 = (u32::from_be_bytes(b[..4].try_into().unwrap()) & !mask) | set;
+            b[..4].copy_from_slice(&w0.to_be_bytes());
+            parse_vita_header(&b).expect("header").declared_header_words()
+        };
+        assert_eq!(reparse(1 << 27, 0), VITA_HEADER_WORDS - 2, "no class ID");
+        assert_eq!(reparse(0x3 << 22, 0), VITA_HEADER_WORDS - 1, "no integer timestamp");
+        assert_eq!(reparse(0x3 << 20, 0), VITA_HEADER_WORDS - 2, "no fractional timestamp");
+        // An even packet type carries no stream ID at all.
+        assert_eq!(reparse(0xF << 28, 2 << 28), VITA_HEADER_WORDS - 1, "no stream ID");
     }
 
     #[test]

@@ -24,7 +24,12 @@ jobs:
     name: web client (wasm)
     runs-on: ubuntu-latest
     steps:
+      # Needed although the client builds none of it: cargo resolves the whole
+      # workspace first, and sdroxide-hfdl depends on vendor/xng by path. See
+      # the same step in release.yml.
       - uses: actions/checkout@v7
+        with:
+          submodules: recursive
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: wasm32-unknown-unknown
@@ -37,6 +42,10 @@ jobs:
           curl -sSfL https://github.com/trunk-rs/trunk/releases/download/v0.21.14/trunk-x86_64-unknown-linux-gnu.tar.gz \
             | tar -xzf - -C "$HOME/.local/bin"
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+      # Same stamp the exe gets below, so the browser client this .msi embeds
+      # does not claim to be the release while the program hosting it does not.
+      - name: Stamp the build
+        run: echo "SDROXIDE_BUILD=dev.${GITHUB_SHA::7}" >> "$GITHUB_ENV"
       - name: Build web client
         working-directory: crates/sdroxide-web
         run: trunk build --release
@@ -55,7 +64,9 @@ jobs:
         shell: bash
     steps:
       # `submodules` pulls vendor/rade_c (the RADE codec), vendor/faad2 (the AAC
-      # decoder the DRM receiver is built with) and vendor/rtl_433.
+      # decoder the DRM receiver is built with) and vendor/rtl_433. HD Radio's
+      # decoder is not among them: it is the machine's own libnrsc5, loaded at
+      # run time and never bundled (issue #488).
       - uses: actions/checkout@v7
         with:
           submodules: recursive
@@ -68,6 +79,12 @@ jobs:
             RELEASE_VERSION="dev-${GITHUB_SHA::7}"
           fi
           CARGO_VERSION=$(sed -n 's/^version *= *"\([^"]*\)".*/\1/p' Cargo.toml | head -n1)
+          # This workflow exists to hand someone a test installer, so the thing
+          # it installs has to be able to say it is not the release. Matches
+          # what release.yml's `targets` job stamps a manual run with.
+          if [[ "$GITHUB_REF_TYPE" != "tag" ]]; then
+            echo "SDROXIDE_BUILD=dev.${GITHUB_SHA::7}" >> "$GITHUB_ENV"
+          fi
           {
             echo "RELEASE_VERSION=$RELEASE_VERSION"
             echo "CARGO_VERSION=$CARGO_VERSION"

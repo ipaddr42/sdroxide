@@ -13,8 +13,12 @@
 //!   protocol most likely to be wrong in a from-scratch client, and it cannot
 //!   be checked from this side of the wire.
 //! - **The measured rate and RMS.** A plausible ksps figure with an RMS near
-//!   zero is a working link and a wrong sample layout; an implausible ksps
-//!   figure is a framing fault.
+//!   zero is a working link and a wrong sample layout. An implausible ksps
+//!   figure is a framing fault — or, when every sample is the same value, a
+//!   receiver that is not running at all (issue #470).
+//!
+//! The stream ends because this program releases the radio after two seconds,
+//! not because anything failed.
 
 use std::time::{Duration, Instant};
 
@@ -97,6 +101,8 @@ fn main() {
     let mut pairs = 0u64;
     let mut sum_sq = 0f64;
     let mut peak = 0f32;
+    let mut first: Option<(f32, f32)> = None;
+    let mut varied = false;
     let started = Instant::now();
     while started.elapsed() < Duration::from_secs(2) {
         let n = handle.rx_read(&mut buf);
@@ -109,15 +115,32 @@ fn main() {
             sum_sq += (v as f64) * (v as f64);
             peak = peak.max(v.abs());
         }
+        for &[i, q] in buf[..n].as_chunks::<2>().0 {
+            varied |= *first.get_or_insert((i, q)) != (i, q);
+        }
     }
     let dt = started.elapsed().as_secs_f64();
     let rms = if pairs > 0 { (sum_sq / (pairs as f64 * 2.0)).sqrt() } else { 0.0 };
-    println!("  {pairs} samples in {dt:.2} s = {:.1} ksps", pairs as f64 / dt / 1000.0);
+    let ksps = pairs as f64 / dt / 1000.0;
+    println!("  {pairs} samples in {dt:.2} s = {ksps:.1} ksps");
     println!("  RMS {rms:.6} ({:.1} dBFS), peak {peak:.6}", 20.0 * rms.max(1e-12).log10());
     if pairs == 0 {
         println!("  NOTHING ARRIVED — the trace below is what to send in a bug report.");
     } else if rms < 1e-6 {
         println!("  The link works but every sample is zero: check the scan format above.");
+    } else if !varied {
+        // Issue #470: an AD9361 whose state machine is not receiving still
+        // streams, and what it streams is one frozen word, over and over.
+        println!(
+            "  Every sample is the same value — the receiver is not running, however well the \
+             link is carrying it. Look for `ensm_mode` in the trace below."
+        );
+    } else if ksps * 1e3 > handle.sample_rate_hz * 1.1 {
+        println!(
+            "  That is faster than the {:.1} ksps the radio is set to — no running receiver \
+             produces that, so these are not samples from one.",
+            handle.sample_rate_hz / 1e3
+        );
     } else if peak >= 0.999 {
         println!("  Clipping. Lower the RX gain or switch the AGC out of manual.");
     }

@@ -433,14 +433,13 @@ impl SdroxideApp {
                                 crate::download::save("sdroxide-log.adi", adif.as_bytes());
                             }
                         });
-                        #[cfg(not(target_arch = "wasm32"))]
                         if crate::chrome::chip(ui, false, "IMPORT")
-                            .on_hover_text("Import QSOs from an ADIF (.adi) file")
+                            .on_hover_text("Import QSOs from an ADIF (.adi or .adif) file")
                             .clicked()
                         {
                             crate::download::load_text(
                                 "ADIF",
-                                "adi",
+                                &["adi", "adif"],
                                 self.adif_import_inbox.clone(),
                             );
                         }

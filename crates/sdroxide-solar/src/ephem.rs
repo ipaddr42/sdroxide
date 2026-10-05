@@ -537,6 +537,73 @@ pub fn is_daylight_at(lat_deg: f64, lon_deg: f64, unix_s: i64) -> bool {
     solar_elevation_deg(lat_deg, lon_deg, unix_s as f64) > 0.0
 }
 
+/// Solar elevation above which the flat map carries no night shade, in degrees.
+/// A little above the horizon, so the shade sits on the shadow rather than
+/// through the middle of the terminator.
+const NIGHT_DAY_TOP_DEG: f64 = 2.0;
+/// Solar elevation at which the shade reaches full strength, in degrees —
+/// between the end of nautical twilight (−12°) and of astronomical (−18°), where
+/// the sky is dark to the eye. The band between this and [`NIGHT_DAY_TOP_DEG`]
+/// is the twilight the grey line is drawn in.
+const NIGHT_FULL_DEG: f64 = -14.0;
+/// Alpha of the darkest shade, as a fraction. Strong enough that the terminator
+/// reads across land as well as sea, but not opaque: the coastlines, borders and
+/// any propagation heat stay readable under it. This is what the texture
+/// carries; a light map paints it weaker — see the UI's `MapPalette::night_max`.
+pub const NIGHT_MAX_ALPHA: f32 = 0.78;
+/// Night ink — a deep dusk blue rather than black, so the map is shaded rather
+/// than erased.
+const NIGHT_INK: [u8; 3] = [8, 12, 28];
+
+/// How dark the grey-line overlay is at a solar elevation: `0.0` in daylight,
+/// rising through twilight to `1.0` at full night.
+///
+/// Pure and monotonic, which is what the tests pin. The eye can check the
+/// boundary that matters — the subsolar point is unshaded, its antipode is
+/// not — without a graphics context.
+pub fn night_shade(elev_deg: f64) -> f32 {
+    if elev_deg >= NIGHT_DAY_TOP_DEG {
+        0.0
+    } else if elev_deg <= NIGHT_FULL_DEG {
+        1.0
+    } else {
+        ((NIGHT_DAY_TOP_DEG - elev_deg) / (NIGHT_DAY_TOP_DEG - NIGHT_FULL_DEG)) as f32
+    }
+}
+
+/// The grey-line overlay for an equirectangular world image: straight RGBA8,
+/// row-major from the north pole, `width` cells across 360° of longitude and
+/// `height` down 180° of latitude.
+///
+/// The same Sun the band-conditions table is taken at ([`solar_elevation_deg`])
+/// and the same frame the flat maps project, so the shade and the "day"/"night"
+/// a verdict calls a band cannot disagree. Pure arithmetic — no textures, no
+/// I/O — so it compiles for the browser and can be unit-tested.
+pub fn night_shade_rgba(width: usize, height: usize, unix_s: i64) -> Vec<u8> {
+    let mut px = vec![0u8; width * height * 4];
+    if width == 0 || height == 0 {
+        return px;
+    }
+    // The subsolar point once, not once per cell: the elevation of every cell is
+    // the angle to that same unit vector.
+    let (sub_lat, sub_lon) = subsolar_point(julian_day(unix_s as f64));
+    let sun = geodetic_to_body(sub_lat, sub_lon);
+    let alpha_full = (NIGHT_MAX_ALPHA * 255.0).round() as u8;
+    for y in 0..height {
+        let lat = 90.0 - (y as f64 + 0.5) * 180.0 / height as f64;
+        for x in 0..width {
+            let lon = -180.0 + (x as f64 + 0.5) * 360.0 / width as f64;
+            let here = geodetic_to_body(lat, lon);
+            let elev = 90.0 - here.dot(sun).clamp(-1.0, 1.0).acos().to_degrees();
+            let a = (night_shade(elev) * alpha_full as f32).round() as u8;
+            let i = (y * width + x) * 4;
+            px[i..i + 3].copy_from_slice(&NIGHT_INK);
+            px[i + 3] = a;
+        }
+    }
+    px
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -894,5 +961,45 @@ mod tests {
         assert!((geodetic_to_body(0.0, 0.0) - vec3(1.0, 0.0, 0.0)).len() < 1e-12);
         assert!((geodetic_to_body(0.0, 90.0) - vec3(0.0, 1.0, 0.0)).len() < 1e-12);
         assert!((geodetic_to_body(90.0, 0.0) - vec3(0.0, 0.0, 1.0)).len() < 1e-12);
+    }
+
+    /// The shade is a ramp, not a step: daylight at the top, night at the
+    /// bottom, and monotonic all the way with nothing out of range.
+    #[test]
+    fn the_shade_ramps_from_day_to_night() {
+        assert_eq!(night_shade(45.0), 0.0);
+        assert_eq!(night_shade(-45.0), 1.0);
+        let twilight = night_shade(0.0);
+        assert!(twilight > 0.0 && twilight < 1.0, "the horizon is not a step: {twilight}");
+        let mut prev = 1.0;
+        for k in -90..=90 {
+            let a = night_shade(k as f64);
+            assert!((0.0..=1.0).contains(&a), "shade {a} out of range at {k}");
+            // Shade only ever lightens as the Sun climbs; never darkens.
+            assert!(a <= prev, "the shade darkened as the Sun rose at {k}: {prev} then {a}");
+            prev = a;
+        }
+    }
+
+    /// The picture has to agree with the ephemeris it was drawn from: the cell
+    /// under the Sun is in daylight, and the one opposite it is in full night.
+    #[test]
+    fn the_subsolar_cell_is_lit_and_its_antipode_is_not() {
+        let (w, h) = (360usize, 180usize);
+        let unix = 1_800_000_000i64;
+        let px = night_shade_rgba(w, h, unix);
+        assert_eq!(px.len(), w * h * 4);
+        let (sub_lat, sub_lon) = subsolar_point(julian_day(unix as f64));
+        let alpha_at = |lat: f64, lon: f64| {
+            let y = (((90.0 - lat) / 180.0) * h as f64) as usize;
+            let x = ((((lon + 180.0) % 360.0 + 360.0) % 360.0) / 360.0 * w as f64) as usize;
+            px[(y.min(h - 1) * w + x.min(w - 1)) * 4 + 3]
+        };
+        assert_eq!(alpha_at(sub_lat, sub_lon), 0, "the cell under the Sun is shaded");
+        assert_eq!(
+            alpha_at(-sub_lat, sub_lon + 180.0),
+            (NIGHT_MAX_ALPHA * 255.0).round() as u8,
+            "the antipode is not in full night"
+        );
     }
 }

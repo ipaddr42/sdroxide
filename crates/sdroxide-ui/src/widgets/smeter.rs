@@ -239,6 +239,27 @@ pub fn hover_text(meters: Option<&Meters>) -> String {
     if let Some(t) = m.pa_temp_c {
         out.push_str(&format!("\n\nThe radio reports {t:.0} °C."));
     }
+    if let Some(ps) = m.puresignal {
+        if ps.locked {
+            out.push_str(&format!(
+                "\n\nPS — PureSignal is correcting {:.1} dB of compression{} (the feedback \
+                 matched the transmission at {:.2}).",
+                ps.correction_db,
+                if ps.frozen { ", table held" } else { "" },
+                ps.score,
+            ));
+        } else {
+            out.push_str(&format!(
+                "\n\nPS −− — PureSignal is switched on but has not found the transmission in \
+                 the feedback path (best match {:.2}), so the transmitter is going out \
+                 uncorrected. Check that a sample of the amplifier's output really reaches a \
+                 receive input the T/R switch does not take away on transmit, and that its \
+                 attenuator is not swallowing it. The loop listens on this receiver only — a \
+                 coupler wired to a second receiver (RX2, ADC2) is never read as the feedback.",
+                ps.score,
+            ));
+        }
+    }
     out
 }
 
@@ -784,6 +805,37 @@ fn temperature(p: &Painter, rect: Rect, meters: Option<&Meters>, k: f32) {
     );
 }
 
+/// The predistortion loop's state, in the face's bottom-**right** corner,
+/// opposite the temperature (issue #441).
+///
+/// PureSignal fails silently by nature: a loop that never finds its feedback
+/// leaves the transmitter exactly as it would have been with the feature off,
+/// and nothing about the transmission says which of the two happened. Until
+/// this reached the screen, the only place the answer was ever written was the
+/// log. So the indicator's job is not to report a number — it is to separate
+/// "correcting" from "on but blind", which is why the unlocked state is drawn
+/// in the warning colour rather than left subdued like the temperature beside
+/// it.
+///
+/// Says nothing at all on a radio with no loop, which is nearly all of them.
+fn puresignal(p: &Painter, rect: Rect, meters: Option<&Meters>, k: f32) {
+    let Some(ps) = meters.and_then(|m| m.puresignal) else { return };
+    let (text, ink) = if !ps.locked {
+        // Blind: the feature is on and doing nothing.
+        ("PS --".to_string(), hot(c(0xffc03a), c(0xc88a00), c(0xffff00)))
+    } else {
+        let held = if ps.frozen { "*" } else { "" };
+        (format!("PS {:.0}dB{held}", ps.correction_db), SUBDUED())
+    };
+    p.text(
+        pos2(rect.right() - 6.0 * k, rect.bottom() - 3.0 * k),
+        Align2::RIGHT_BOTTOM,
+        text,
+        FontId::monospace(9.0 * k.max(0.85)),
+        ink,
+    );
+}
+
 /// Draw the box border on top of the finished meter (the meter face already
 /// covers the whole rect, so the frame's own border would be hidden).
 fn border(ui: &Ui, rect: Rect) {
@@ -1014,6 +1066,7 @@ fn show_bar(ui: &mut Ui, meters: Option<&Meters>, size: Vec2) -> Response {
     let right = rect.right() - 6.0 * k;
     header(&p, rect, &r, k);
     temperature(&p, rect, meters, k);
+    puresignal(&p, rect, meters, k);
 
     if let Some(tx) = tx {
         // Two stacked rows: the engine's drive on top, and below it whichever
@@ -1208,6 +1261,7 @@ fn show_needle(ui: &mut Ui, meters: Option<&Meters>, size: Vec2) -> Response {
     // Readouts along the top edge, where the arc has dipped out of the way.
     header(&p, rect, &r, k);
     temperature(&p, rect, meters, k);
+    puresignal(&p, rect, meters, k);
     border(ui, rect);
     resp
 }
@@ -1363,6 +1417,7 @@ fn show_trace(ui: &mut Ui, meters: Option<&Meters>, size: Vec2) -> Response {
     );
     header(&p, rect, &r, k);
     temperature(&p, rect, meters, k);
+    puresignal(&p, rect, meters, k);
     border(ui, rect);
     resp
 }

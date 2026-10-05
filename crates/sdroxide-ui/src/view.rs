@@ -146,6 +146,15 @@ pub struct ViewState {
     /// `Band::ALL`.
     #[serde(default = "prop_map_band_default")]
     pub prop_map_band: u8,
+    /// Shade the night side of the flat map, with the twilight either side of
+    /// it — the grey line.
+    ///
+    /// Here and not in [`Solar3dView`] for the same reason [`Self::prop_on_map`]
+    /// is: that struct belongs to the globe window and is republished wholesale
+    /// every frame. Off by default, like the propagation heat — scenery rather
+    /// than something to leave switched on over a decode list.
+    #[serde(default)]
+    pub map_night: bool,
     /// Which spot kinds are shown in the SPOTS list, on the panadapter and on
     /// the world map — indexed by `SpotKind::index`, so the chip order in the
     /// SPOTS window and this array have to stay in lockstep.
@@ -179,6 +188,10 @@ pub struct ViewState {
     /// ...and of its height given to the detail card, while one is open.
     #[serde(default = "ais_card_default")]
     pub ais_card_fraction: f32,
+    /// Fraction of the HFDL window's width given to the decode log; the rest is
+    /// the aircraft map. User-draggable.
+    #[serde(default = "hfdl_split_default")]
+    pub hfdl_split_fraction: f32,
     /// Fraction of the QSO area's height given to the world map; the rest is the
     /// station card + transcript + buttons. User-draggable.
     ///
@@ -553,6 +566,7 @@ impl Default for ViewState {
             prop_on_map: false,
             prop_map_mode: prop_map_mode_default(),
             prop_map_band: prop_map_band_default(),
+            map_night: false,
             spot_kinds_shown: spot_kinds_default(),
             digi_panel_fraction: 0.46,
             digi_split_fraction: 0.52,
@@ -561,6 +575,7 @@ impl Default for ViewState {
             adsb_card_fraction: adsb_card_default(),
             ais_split_fraction: ais_split_default(),
             ais_card_fraction: ais_card_default(),
+            hfdl_split_fraction: hfdl_split_default(),
             digi_map_fraction: 0.6,
             digi_pane: 0,
             sstv_tx_fraction: 0.38,
@@ -708,9 +723,14 @@ fn auto_fit_default() -> bool {
 /// list itself so the two cannot drift apart.
 pub const SPOT_KINDS: usize = sdroxide_types::SpotKind::COUNT;
 
-/// Default for [`ViewState::center_on_vfo`]: on.
+/// Default for [`ViewState::center_on_vfo`]: off, so a new station pans and
+/// zooms where it is put. Lit, the window follows the dial *and* a zoom brings
+/// it back to the middle, which is what the mode promises — but on a front end
+/// with a full-band lane that also means a zoom onto a signal away from the
+/// dial is pulled home again rather than being followed, so the mode is one to
+/// ask for rather than one to arrive in.
 fn center_on_vfo_default() -> bool {
-    true
+    false
 }
 
 /// Default for [`ViewState::spot_kinds_shown`] — every kind shown, so enabling
@@ -755,6 +775,13 @@ fn ais_split_default() -> f32 {
 /// sign, an IMO number, dimensions, a draught, a destination and an ETA.
 fn ais_card_default() -> f32 {
     0.45
+}
+
+/// Default for [`ViewState::hfdl_split_fraction`]. The decode log has the room
+/// on the left: a row carries a timestamp, a kind, a ground station and the
+/// payload, where the map holds only a square and a flight number per aircraft.
+fn hfdl_split_default() -> f32 {
+    0.5
 }
 
 /// Default for [`ViewState::js8_split_fraction`].

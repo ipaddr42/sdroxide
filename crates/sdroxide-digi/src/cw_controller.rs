@@ -36,7 +36,7 @@ use std::collections::VecDeque;
 use std::time::SystemTime;
 
 use sdroxide_deepcw::{Tuner, Worker};
-use sdroxide_dsp::{CwRx, CwTx, MonoResampler};
+use sdroxide_dsp::{CwRx, CwSelfRx, CwTx, MonoResampler};
 use sdroxide_types::{CwEngine, CwStatus, DigiConfig, DigiStatus, Mode, QsoStep, TranscriptLine};
 
 use crate::DigiEngine;
@@ -49,15 +49,19 @@ const CW_RATE: f64 = 8000.0;
 const OUT_RATE: f64 = 48_000.0;
 /// Cap on the rolling receive text.
 const RX_TEXT_CAP: usize = 8000;
+/// Cap on the straight key's own decoded text, so a long session's keying
+/// cannot grow without bound. Long enough to read back a whole exchange.
+const SENT_TEXT_CAP: usize = 2000;
 /// Sidetone samples generated per fill iteration.
 const TX_CHUNK: usize = 400;
-/// Drop out of transmit after this long with nothing left to send.
+/// The longest a straight key may be held without a key-up (issue #322).
 ///
-/// Holding the key down between characters is what makes typing feel like
-/// sending, but "between characters" has to end somewhere: a transmitter left
-/// keyed on an empty buffer holds the frequency, and the operator who wandered
-/// off is exactly the one not watching for it.
-const TX_IDLE_S: f32 = 5.0;
+/// A hand does not hold a key for half a minute, so a key still down after
+/// this is a lost key-up — a stuck Space bar, a client that went away — and the
+/// carrier stops rather than staying on until somebody notices. The over is
+/// ended and the status carries `tx_watchdog`, the same flag the automatic
+/// modes set when they stand down on their own.
+const STRAIGHT_MAX_HOLD_S: f32 = 30.0;
 /// How long a part-typed word waits for the rest of itself before it is handed
 /// to the rig anyway.
 ///
@@ -221,6 +225,15 @@ pub struct CwController {
     deep_failed: bool,
     tuner: Tuner,
     deep_scratch: Vec<f32>,
+    /// A second decoder, fed our *own* sidetone so the operator can read back
+    /// what the straight key sends — the receive decoder deliberately ignores
+    /// our sending, so this is the only way the hand gets a character readout
+    /// the way the text keyer's box gives the typist one. Speed-locked to our
+    /// own WPM, which is known, so it copies a clean self-made tone with no
+    /// hunt.
+    sent_rx: CwSelfRx,
+    sent_rs: Option<MonoResampler>,
+    sent_text: String,
 
     // TX
     tx: CwTx,
@@ -230,6 +243,19 @@ pub struct CwController {
     tx_pushed: usize,
     tx_active: bool,
     keyed: bool,
+    /// The keyboard-as-straight-key mode (issue #322): the PC keyboard's
+    /// Space bar pressed as a straight key.
+    ///
+    /// Only on the sidetone route — a rig that keys itself from text has no
+    /// way to hear a hand keyed into its sound card, and can only send the
+    /// timed text a message commits to. Such a radio never enters the mode.
+    straight: bool,
+    /// Output samples the straight key has been continuously down for, so a
+    /// lost key-up can be capped (see [`STRAIGHT_MAX_HOLD_S`]).
+    straight_held_samples: usize,
+    /// Set when the straight key was dropped by that cap rather than let go of,
+    /// so the panel can say why the carrier stopped.
+    tx_watchdog: bool,
     last_sent: usize,
     /// Something has actually been sent since transmit was switched on.
     ///
@@ -261,6 +287,13 @@ impl CwController {
         let pitch = cfg.cw_pitch_hz;
         let mut rx = CwRx::new(CW_RATE, pitch);
         rx.set_speed_lock(cfg.cw_speed_lock.then_some(cfg.cw_wpm));
+        // The straight key's read-back decoder. It reads the tone we are
+        // generating ourselves, so it does not need the classic decoder's
+        // six-second window and three-second catch-up — those make the read-back
+        // lag the hand and swallow characters — but a small, immediate decoder
+        // that measures each element as it goes out and prints a character the
+        // moment its gap shows (issue #495 follow-up).
+        let sent_rx = CwSelfRx::new(CW_RATE, cfg.cw_wpm);
         // Built only when it is the engine the operator asked for: it is a
         // neural model to load and hold, and a station set to the timing
         // decoder should not be paying for one it will never run.
@@ -284,6 +317,9 @@ impl CwController {
             deep_failed,
             tuner: Tuner::new(tap_rate, pitch as f64),
             deep_scratch: Vec::new(),
+            sent_rx,
+            sent_rs: MonoResampler::new(OUT_RATE, CW_RATE),
+            sent_text: String::new(),
             tx: CwTx::new(CW_RATE, pitch as f64, cfg.cw_wpm),
             tx_rs: MonoResampler::new(CW_RATE, OUT_RATE),
             tx48: VecDeque::new(),
@@ -291,6 +327,9 @@ impl CwController {
             tx_pushed: 0,
             tx_active: false,
             keyed: false,
+            straight: false,
+            straight_held_samples: 0,
+            tx_watchdog: false,
             last_sent: 0,
             over_had_text: false,
             idle_samples: 0,
@@ -439,10 +478,11 @@ impl CwController {
         // the rig has finished keying it, rather than waiting out a typist who
         // was never going to type.
         let committed_over_done = self.cfg.send_on_enter && self.over_had_text;
+        let idle_s = self.cfg.cw_tx_idle_s.max(0.0);
         let waited = self.cat.as_ref().is_some_and(|c| {
             c.last_input
                 .and_then(|t| now.duration_since(t).ok())
-                .is_some_and(|d| d.as_secs_f32() >= TX_IDLE_S)
+                .is_some_and(|d| idle_s == 0.0 || d.as_secs_f32() >= idle_s)
         });
         if self.tx_active && empty && (committed_over_done || waited) {
             self.over_had_text = false;
@@ -457,6 +497,11 @@ impl CwController {
             wpm: self.rx.wpm(),
             snr_db: self.rx.snr_db(),
             tone_hz: self.rx.tone_hz(),
+            // What [`Self::set_straight`] refuses on, said out loud so the
+            // panel can grey the key out with a reason rather than let it be
+            // switched on and do nothing (issue #495).
+            rig_keys_itself: self.cat.is_some(),
+            sent_text: self.sent_text.clone(),
         }
     }
 
@@ -498,7 +543,8 @@ impl CwController {
             audio_hz: self.cfg.cw_pitch_hz,
             tx_even: false,
             transmitting: self.on_air(now),
-            tx_watchdog: false,
+            tx_watchdog: self.tx_watchdog,
+            tx_refused: None,
             transcript: Vec::<TranscriptLine>::new(),
             config: self.cfg.clone(),
             text_rx: self.rx_display(),
@@ -508,6 +554,7 @@ impl CwController {
             rade: None,
             packet: None,
             navtex: None,
+            acars: None,
             aprs: None,
             js8: None,
             atchat: None,
@@ -516,7 +563,34 @@ impl CwController {
             clock_offset_s: None,
             cw: Some(self.cw_status()),
             wspr: None,
+            pi4: None,
             qso: None,
+        }
+    }
+
+    /// Decode the tone the straight key is putting out, so its operator sees
+    /// the characters they sent where a typist sees the text box. Fed the
+    /// transmit block itself rather than the receive tap: the tap is the
+    /// receiver's audio and never carries the sidetone we only play locally —
+    /// which is why the first cut of this read back nothing on a real rig
+    /// (issue #495 follow-up).
+    fn feed_sent_decode(&mut self, block: &[f32]) {
+        if !self.straight {
+            return;
+        }
+        self.scratch.clear();
+        match &mut self.sent_rs {
+            Some(r) => r.push(block, &mut self.scratch),
+            None => self.scratch.extend_from_slice(block),
+        }
+        let text = self.sent_rx.process(&self.scratch);
+        if !text.is_empty() {
+            self.sent_text.push_str(&text);
+            if self.sent_text.len() > SENT_TEXT_CAP {
+                let cut = self.sent_text.len() - SENT_TEXT_CAP;
+                self.sent_text.drain(..cut);
+            }
+            self.status_dirty = true;
         }
     }
 }
@@ -527,12 +601,18 @@ impl DigiEngine for CwController {
     }
 
     fn on_rx_audio(&mut self, tap: &[f32]) {
-        // Our own sidetone is not a signal to copy. Full break-in would let the
-        // decoder read the other station between our own elements, but the tap
-        // carries what we are sending, not what they are, so reading it would
-        // only echo us back onto the panel. A rig keying itself from text we
+        // Our own sidetone is not a signal for the *receive* decoder to copy:
+        // full break-in would let it read the other station between our own
+        // elements, but the tap carries what we are sending, so reading it
+        // would only echo us onto the panel. A rig keying itself from text we
         // handed it is doing exactly that too, and its sidetone comes back down
         // the same audio path.
+        //
+        // The straight key's read-back does not read here. The tap is the
+        // *receiver's* audio, and our sidetone never appears on it — the
+        // engine hands the keyed tone to the speakers, not back down the
+        // receive path — so the read-back is fed the transmit block itself in
+        // `fill_tx_block` (issue #495 follow-up).
         if self.on_air(SystemTime::now()) {
             return;
         }
@@ -611,13 +691,19 @@ impl DigiEngine for CwController {
             // out, not five seconds later. The hang below exists to bridge the
             // gaps between typed characters, and under `send_on_enter` there
             // are no gaps to bridge — only a carrier nobody is using.
-            if self.cfg.send_on_enter && self.over_had_text {
+            //
+            // A straight key is not a committed line: an element or a pause in
+            // an element is not a finished over, and the operator still holding
+            // the frequency between elements must keep it through the idle
+            // hang rather than getting a PTT cycle per character.
+            if !self.straight && self.cfg.send_on_enter && self.over_had_text {
                 self.over_had_text = false;
                 self.tx_active = false;
                 self.status_dirty = true;
             }
             self.idle_samples += out.len();
-            if self.idle_samples as f32 > TX_IDLE_S * OUT_RATE as f32 {
+            let idle_s = self.cfg.cw_tx_idle_s.max(0.0);
+            if idle_s == 0.0 || self.idle_samples as f32 > idle_s * OUT_RATE as f32 {
                 self.tx_active = false;
                 self.status_dirty = true;
             }
@@ -625,19 +711,41 @@ impl DigiEngine for CwController {
             self.idle_samples = 0;
             self.over_had_text = true;
         }
-        while self.tx48.len() < out.len() && self.producing() {
-            self.scratch.clear();
-            self.scratch.resize(TX_CHUNK, 0.0);
-            self.tx.next_block(&mut self.scratch);
-            self.scratch48.clear();
-            match &mut self.tx_rs {
-                Some(r) => r.push(&self.scratch, &mut self.scratch48),
-                None => self.scratch48.extend_from_slice(&self.scratch),
+        if self.straight {
+            // The operator's hand is the timing, so the sidetone is rendered
+            // straight at the output rate instead of in `TX_CHUNK` pieces of
+            // 8 kHz — a chunk is 50 ms, and reading the key once per chunk
+            // would quantise every element to it (issue #322).
+            if self.tx.held() {
+                self.straight_held_samples += out.len();
+                if self.straight_held_samples as f32 > STRAIGHT_MAX_HOLD_S * OUT_RATE as f32 {
+                    // A lost key-up, not a hand: drop the key and end the over,
+                    // and say so through the watchdog flag.
+                    self.tx.set_held(false);
+                    self.tx_active = false;
+                    self.tx_watchdog = true;
+                    self.status_dirty = true;
+                }
+            } else {
+                self.straight_held_samples = 0;
             }
-            self.tx48.extend(self.scratch48.iter().copied());
-        }
-        for s in out.iter_mut() {
-            *s = self.tx48.pop_front().unwrap_or(0.0);
+            self.tx.next_manual_block(out, OUT_RATE);
+            self.feed_sent_decode(out);
+        } else {
+            while self.tx48.len() < out.len() && self.producing() {
+                self.scratch.clear();
+                self.scratch.resize(TX_CHUNK, 0.0);
+                self.tx.next_block(&mut self.scratch);
+                self.scratch48.clear();
+                match &mut self.tx_rs {
+                    Some(r) => r.push(&self.scratch, &mut self.scratch48),
+                    None => self.scratch48.extend_from_slice(&self.scratch),
+                }
+                self.tx48.extend(self.scratch48.iter().copied());
+            }
+            for s in out.iter_mut() {
+                *s = self.tx48.pop_front().unwrap_or(0.0);
+            }
         }
         if self.tx.sent_chars() != self.last_sent {
             self.last_sent = self.tx.sent_chars();
@@ -656,6 +764,7 @@ impl DigiEngine for CwController {
     fn on_burst_done(&mut self) {
         self.keyed = false;
         self.idle_samples = 0;
+        self.straight_held_samples = 0;
         // The decoder heard nothing but our own sending for the length of that
         // over; its window is stale and its speed fit is ours, not theirs.
         self.rx.reset();
@@ -688,6 +797,17 @@ impl DigiEngine for CwController {
         self.last_sent = 0;
         self.idle_samples = 0;
         self.over_had_text = false;
+        // An abort also lifts a key that was mid-character: the operator is
+        // stopping, not pausing between dits. The *mode* stays engaged. The
+        // panel's KEY chip is the only switch for it and cannot see in here,
+        // and the engine aborts on its own when it refuses a key-down (out of
+        // band, another radio on the air) — leaving the mode there left the
+        // chip lit, the transmit box locked, and a Space bar that did nothing.
+        if self.straight {
+            self.tx.set_held(false);
+            self.straight_held_samples = 0;
+            self.tx_watchdog = false;
+        }
         if let Some(cat) = self.cat.as_mut() {
             let sending = cat.sending_since.is_some();
             cat.clear();
@@ -786,11 +906,67 @@ impl DigiEngine for CwController {
         self.status_dirty = true;
     }
 
+    /// The keyboard as a straight key (issue #322): enter or leave the mode.
+    ///
+    /// Engaged, the keyer drops whatever timed text it was holding — the
+    /// operator has just taken the frequency into their own hand — and the
+    /// keyboard becomes the key, down while a key is held, up on release (a
+    /// straight key is drawn, not timed, so it cannot live in the timed queue).
+    ///
+    /// Only the sidetone route has it: a rig that keys itself from text
+    /// ([`Self::cat`]) has its own keyer between here and the air and nothing
+    /// can be hand-keyed through it.
+    fn set_straight(&mut self, on: bool) {
+        if self.cat.is_some() || on == self.straight {
+            return;
+        }
+        self.straight = on;
+        self.straight_held_samples = 0;
+        self.tx_watchdog = false;
+        self.tx.set_manual(on);
+        self.tx.set_held(false);
+        // A fresh key session starts its read-back blank, so what is on screen
+        // is what this hand has sent rather than the last session's.
+        if on {
+            self.sent_text.clear();
+            self.sent_rx.reset(self.cfg.cw_wpm);
+        }
+        self.status_dirty = true;
+    }
+
+    /// Where the straight key sits this instant, while [`Self::straight`] is
+    /// engaged. A key-down over an off transmitter starts the over — keying is
+    /// itself the instruction to transmit, exactly as typing in the box is.
+    fn key_down(&mut self, down: bool) {
+        if !self.straight || self.cat.is_some() {
+            return;
+        }
+        if down && !self.tx_active {
+            self.set_tx_active(true);
+        }
+        self.tx.set_held(down);
+        if down {
+            self.idle_samples = 0;
+            self.straight_held_samples = 0;
+            // A fresh press is the operator keying again, so the watchdog flag
+            // from a key that was dropped before goes with it.
+            self.tx_watchdog = false;
+        } else {
+            self.straight_held_samples = 0;
+        }
+        self.status_dirty = true;
+    }
+
     /// The unsettled tail goes with the settled text: it is on the same page,
     /// and leaving it behind would clear the window to a stray half-word.
+    /// A straight key's read-back is on the same page too, and it is the same
+    /// gesture — the CLEAR RX chip says "the decode windows are clean", so the
+    /// read-back goes with them rather than lingering from the last over.
     fn clear_rx(&mut self) {
         self.rx_text.clear();
         self.rx_pending.clear();
+        self.sent_text.clear();
+        self.sent_rx.reset(self.cfg.cw_wpm);
         self.status_dirty = true;
     }
 }
@@ -798,6 +974,10 @@ impl DigiEngine for CwController {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The default idle hang — `DigiConfig::cw_tx_idle_s`'s default — which the
+    /// timing tests below are written against.
+    const TX_IDLE_S: f32 = 5.0;
 
     fn cfg() -> DigiConfig {
         DigiConfig { my_call: "W1AW".into(), cw_wpm: 25.0, ..Default::default() }
@@ -983,6 +1163,102 @@ mod tests {
         assert!((TX_IDLE_S..TX_IDLE_S + 1.0).contains(&held_s), "held the key for {held_s:.1} s");
     }
 
+    /// The refusal in `set_straight` has to reach the panel, or the operator
+    /// gets a KEY button that lights and keys nothing — the whole of issue
+    /// #495, reported against an IC-7610 over its LAN port.
+    #[test]
+    fn a_rig_that_keys_itself_says_so_and_refuses_the_hand_key() {
+        // Sending over the control port: the rig times the elements.
+        let mut rig = CwController::new(cfg(), 48_000.0, Some(28));
+        assert!(rig.status().cw.expect("CW status").rig_keys_itself);
+        rig.set_straight(true);
+        assert!(!rig.straight, "the hand key engaged on a rig that keys itself");
+        rig.key_down(true);
+        assert!(!rig.tx.held(), "the rig was keyed by hand through its own keyer");
+        assert!(!rig.tx_active, "a refused key asked for transmit anyway");
+
+        // The sidetone route — an SDR, or a rig on sound-card keying — is the
+        // one a hand can drive, and it must still say so.
+        let mut sdr = CwController::new(cfg(), 48_000.0, None);
+        assert!(!sdr.status().cw.expect("CW status").rig_keys_itself);
+        sdr.set_straight(true);
+        assert!(sdr.straight, "the hand key was refused on the route built for it");
+    }
+
+    /// The straight key is read at the engine's block, not once per 50 ms CW
+    /// chunk: a 15 ms element is a dit at 40 WPM, and quantising it to a chunk
+    /// would put 50 ms of carrier on the air instead (issue #322).
+    #[test]
+    fn a_short_element_is_not_rounded_up_to_a_cw_chunk() {
+        let mut c = CwController::new(cfg(), 48_000.0, None);
+        c.set_straight(true);
+        c.key_down(true);
+
+        // 15 ms down, handed over in 10 ms engine blocks, counting the samples
+        // that carry tone as they come (the drain below reuses the buffer).
+        let mut keyed = 0usize;
+        let mut blk = [0.0f32; 480];
+        let mut left = (0.015 * OUT_RATE) as usize;
+        while left > 0 {
+            let n = left.min(blk.len());
+            c.fill_tx_block(&mut blk[..n]);
+            keyed += blk[..n].iter().filter(|s| s.abs() > 1e-3).count();
+            left -= n;
+        }
+        c.key_down(false);
+
+        // …then the envelope's tail.
+        for _ in 0..20 {
+            c.fill_tx_block(&mut blk);
+            keyed += blk.iter().filter(|s| s.abs() > 1e-3).count();
+        }
+        let keyed_ms = keyed as f32 * 1000.0 / OUT_RATE as f32;
+        assert!((8.0..35.0).contains(&keyed_ms), "a 15 ms element lasted {keyed_ms:.0} ms");
+    }
+
+    /// A key held down for half a minute is a lost key-up, not a hand: the
+    /// carrier is dropped and the status says why (issue #322).
+    #[test]
+    fn a_key_held_past_the_cap_is_dropped_and_says_so() {
+        let mut c = CwController::new(cfg(), 48_000.0, None);
+        c.set_straight(true);
+        c.key_down(true);
+
+        let mut blk = [0.0f32; 480];
+        let blocks = (STRAIGHT_MAX_HOLD_S * OUT_RATE as f32 / blk.len() as f32) as usize + 3;
+        for _ in 0..blocks {
+            c.fill_tx_block(&mut blk);
+        }
+        assert!(!c.tx.held(), "the key was never let go of");
+        assert!(!c.tx_active, "transmit was left on after the cap");
+        assert!(c.status().tx_watchdog, "the drop was not reported");
+
+        // Keying again clears it.
+        c.key_down(true);
+        c.key_down(false);
+        assert!(!c.status().tx_watchdog, "the flag outlived the next press");
+    }
+
+    /// A refused or aborted over lifts the key and leaves the mode engaged: the
+    /// panel's chip is still lit, so the next press has to key again rather
+    /// than land on a keyer that quietly left the mode (issue #322).
+    #[test]
+    fn an_abort_lifts_the_key_and_keeps_the_mode() {
+        let mut c = CwController::new(cfg(), 48_000.0, None);
+        c.set_straight(true);
+        c.key_down(true);
+        assert!(c.tx.held() && c.tx_active);
+
+        c.abort_tx();
+        assert!(!c.tx.held(), "the key stayed down through the abort");
+        assert!(!c.tx_active, "transmit stayed on through the abort");
+        assert!(c.straight, "the abort took the straight key away from the chip");
+
+        c.key_down(true);
+        assert!(c.tx.held(), "the next press was ignored");
+        assert!(c.tx_active, "the next press did not ask for transmit");
+    }
+
     /// Transmit must not decode itself. The tap carries our own sidetone while
     /// we key, and copying it would fill the receive pane with our own callsign.
     #[test]
@@ -1004,8 +1280,118 @@ mod tests {
         assert!(c.rx_text.is_empty(), "copied itself: {:?}", c.rx_text);
     }
 
-    // ── sending from a radio that keys itself ───────────────────────────────
+    /// The straight key *does* decode its own sending — the read-back the text
+    /// keyer gives a typist (issue #495 follow-up). The receive pane still must
+    /// not fill with it, so the two decoders are separate.
+    #[test]
+    fn the_straight_key_decodes_its_own_sending() {
+        let mut c = CwController::new(cfg(), 48_000.0, None);
+        c.set_straight(true);
+        c.poll(SystemTime::now(), 14_030_000.0);
 
+        // One unit of keying at the configured speed: a dit is 1 unit, the
+        // inter-character gap 3.
+        let unit_ms = 1200.0 / c.cfg.cw_wpm;
+        c.key_down(true);
+        // The engine's next poll is what marks us on the air.
+        c.poll(SystemTime::now(), 14_030_000.0);
+        let mut peak = 0.0f32;
+        let feed = |c: &mut CwController, ms: f32, peak: &mut f32| {
+            let mut blk = [0.0f32; 480];
+            for _ in 0..(ms / 10.0).round().max(0.0) as usize {
+                c.fill_tx_block(&mut blk);
+                for s in blk {
+                    *peak = peak.max(s.abs());
+                }
+                // The engine plays the keyed sidetone to the speakers; the
+                // receive tap carries the receiver, not us. Feed it anyway so
+                // the assertion below still pins that the read-back does not
+                // leak into the receive pane.
+                c.on_rx_audio(&blk);
+            }
+        };
+        // Key T E S T by hand — T(3) gap3 E(1) gap3 S(1 gap1 1 gap1 1) gap3
+        // T(3) — then a settling gap. The decoder's window is 1.2 s before it
+        // says anything at all, so the feed is longer than that. The read-back
+        // need not be letter-perfect: this is hand-approximated timing, and the
+        // assertion below only claims the character readout is working, not
+        // that a synthetic fist is a good one.
+        for (on, off) in [(3u32, 3u32), (1, 3), (1, 1), (1, 1), (1, 3), (3, 30)] {
+            c.key_down(true);
+            feed(&mut c, unit_ms * on as f32, &mut peak);
+            c.key_down(false);
+            feed(&mut c, unit_ms * off as f32, &mut peak);
+        }
+        let got = c.sent_text.replace(' ', "");
+        assert!(
+            got.len() >= 3 && got.contains('T') && got.contains('E'),
+            "read back {:?}",
+            c.sent_text
+        );
+        assert!(c.rx_text.is_empty(), "the receive pane copied our keying: {:?}", c.rx_text);
+        // A fresh key session starts the read-back blank.
+        c.set_straight(false);
+        c.set_straight(true);
+        assert!(c.sent_text.is_empty());
+    }
+
+    /// The read-back follows the operator's fist, not the panel's decode
+    /// speed: keyed here at 18 WPM with element jitter while the panel's speed
+    /// is its default, and every character still comes back. This is what the
+    /// classic decoder could not do — its six-second window and three-second
+    /// catch-up swallowed all but a stray space (issue #495 follow-up).
+    #[test]
+    fn the_read_back_follows_the_operator_s_fist() {
+        let mut c = CwController::new(cfg(), 48_000.0, None);
+        c.set_straight(true);
+        c.poll(SystemTime::now(), 14_030_000.0);
+        let unit_ms = 1200.0 / 18.0;
+        let jit = [0.85f32, 1.1, 0.95, 1.05, 0.9, 1.15, 1.0, 0.8, 1.2, 0.92, 1.08, 0.97];
+        // One line per letter, which is the only way to read it: each pair is
+        // (mark, gap) in units, and the gaps that end a letter are the 3s.
+        #[rustfmt::skip]
+        let seq: &[(u32, u32)] = &[
+            (1, 1), (3, 1), (3, 1), (1, 3), // P .--.
+            (1, 1), (3, 3),                 // A .-
+            (1, 1), (3, 1), (1, 3),         // R .-.
+            (1, 1), (1, 3),                 // I ..
+            (1, 1), (1, 1), (1, 20),        // S ...
+        ];
+        let mut ji = 0usize;
+        let mut peak = 0.0f32;
+        let feed = |c: &mut CwController, ms: f32, peak: &mut f32| {
+            let mut blk = [0.0f32; 480];
+            for _ in 0..(ms / 10.0).round().max(0.0) as usize {
+                c.fill_tx_block(&mut blk);
+                for s in blk {
+                    *peak = peak.max(s.abs());
+                }
+                c.on_rx_audio(&blk);
+            }
+        };
+        for &(on, off) in seq {
+            c.key_down(true);
+            feed(&mut c, unit_ms * on as f32 * jit[ji % jit.len()], &mut peak);
+            ji += 1;
+            c.key_down(false);
+            feed(&mut c, unit_ms * off as f32 * jit[ji % jit.len()], &mut peak);
+            ji += 1;
+        }
+        let got = c.sent_text.replace(' ', "");
+        assert_eq!(got, "PARIS", "read back {:?}", c.sent_text);
+        assert!(c.rx_text.is_empty(), "the receive pane copied our keying: {:?}", c.rx_text);
+
+        // CLEAR RX clears the read-back with the receive window, and the wipe
+        // sticks: no tail is still cached in the decoder to trickle out while
+        // the operator is not keying.
+        c.clear_rx();
+        assert!(c.sent_text.is_empty(), "read-back not cleared: {:?}", c.sent_text);
+        assert!(c.status().cw.as_ref().unwrap().sent_text.is_empty());
+        feed(&mut c, unit_ms * 30.0, &mut peak);
+        assert!(c.sent_text.is_empty(), "read-back came back on its own: {:?}", c.sent_text);
+    }
+
+    // ── sending from a radio that keys itself ───────────────────────────────
     use std::time::Duration;
 
     /// The text handed to the radio by a round of polling.
@@ -1210,6 +1596,33 @@ mod tests {
         }
         let held_s = blocks as f32 * 480.0 / OUT_RATE as f32;
         assert!(held_s < TX_IDLE_S * 0.5, "held the key for {held_s:.1} s after one dit");
+        assert!(!c.status().tx_next);
+    }
+
+    /// The transmit-hold after the last character is the operator's to set
+    /// (issue #495): five seconds on an empty frequency is a long time.
+    #[test]
+    fn the_transmit_hold_is_configurable() {
+        let mut c = CwController::new(
+            DigiConfig { send_on_enter: false, cw_tx_idle_s: 1.0, ..cfg() },
+            48_000.0,
+            None,
+        );
+        c.set_tx_text("E".into());
+        c.set_tx_active(true);
+        c.poll(SystemTime::now(), 14_030_000.0);
+
+        let mut blk = [0.0f32; 480];
+        let mut blocks = 0;
+        while !c.fill_tx_block(&mut blk) {
+            blocks += 1;
+            assert!(blocks < 2000, "transmit never released the key");
+        }
+        let held_s = blocks as f32 * 480.0 / OUT_RATE as f32;
+        assert!(
+            held_s < TX_IDLE_S * 0.5,
+            "a 1 s hold should release well before the 5 s default, held {held_s:.1} s"
+        );
         assert!(!c.status().tx_next);
     }
 

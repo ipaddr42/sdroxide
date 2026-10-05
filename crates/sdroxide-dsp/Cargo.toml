@@ -35,3 +35,8 @@ df = { package = "deep_filter", git = "https://github.com/Rikorose/DeepFilterNet
 # and the view types would not interoperate.
 ndarray = "0.15"
 
+
+[dev-dependencies]
+# The off-air ACARS fixture test reads a WAV; the other crates that do this
+# (DRM, digi, RADE) use the same crate.
+hound = "3"

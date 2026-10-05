@@ -1185,6 +1185,201 @@ impl CwRx {
     }
 }
 
+// ─── self-monitor decoder ────────────────────────────────────────────────────
+
+/// Rectifier smoothing of the self-monitor's envelope, in Hz. Wide enough to
+/// pass a dit's keying, narrow enough to leave the rectified tone's 2× pitch
+/// ripple behind — this reads a tone we are generating, so it has no fading or
+/// QRM to be tolerant of and can afford to be narrow.
+const SELFRX_ENV_HZ: f32 = 120.0;
+/// Peak-follower decay, in seconds. Long enough to hold a mark's level across
+/// the gap between elements, short enough to forget a signal that has stopped.
+const SELFRX_PEAK_S: f32 = 0.25;
+/// Fractions of the peak at which a mark is entered and left. The band between
+/// them is the hysteresis that stops a clean tone chattering on its own shaping
+/// edges.
+const SELFRX_ON: f32 = 0.5;
+const SELFRX_OFF: f32 = 0.35;
+/// Runs whose length feeds the unit estimate, and how far down the sorted
+/// history the estimate reads. The dot (and the gap between elements) is the
+/// shortest thing on the air, so the low end of the distribution is the unit;
+/// reading it from a whole word rather than one run is what makes a hand fist's
+/// jitter harmless.
+const SELFRX_HIST: usize = 32;
+/// A character is taken as finished once its gap reaches this many units, so
+/// the read-back keeps pace with the hand instead of waiting for the next
+/// element to prove the gap was a character break.
+const SELFRX_CHAR_UNITS: f32 = 2.0;
+/// A gap this wide ends a word.
+const SELFRX_WORD_UNITS: f32 = 5.0;
+
+/// A low-latency decoder for our own keyed sidetone.
+///
+/// The classic [`CwRx`] is built for the off-air channel: a six-second window,
+/// a speed fit that has to agree hop to hop, and a three-second catch-up before
+/// a character is committed. That is a copy decoder's trade — it will not be
+/// hurried and it will not print a run it might have to take back. A straight
+/// key's operator wants the opposite: the read-back must keep up with the hand
+/// and never swallow a character, and the tone is our own — clean, un-faded, no
+/// QRM — so none of the robustness that costs that latency is wanted. This is a
+/// much smaller thing: an envelope, a hysteretic threshold, run lengths against
+/// a unit read from the low end of recent runs, and a character the moment its
+/// gap says it has ended.
+pub struct CwSelfRx {
+    rate: f32,
+    /// One-pole envelope smoothing, two cascaded stages.
+    a: f32,
+    lp1: f32,
+    lp2: f32,
+    peak: f32,
+    decay: f32,
+    /// Whether the key is currently held, and how long the present run is.
+    on: bool,
+    run: f32,
+    /// Recent completed run lengths (marks and gaps), for the unit estimate.
+    hist: Vec<f32>,
+    /// Unit from the panel speed, until the history can speak for itself.
+    seed: f32,
+    /// The character being accumulated, and whether this gap has already
+    /// flushed it (and then a following space).
+    sym: String,
+    flushed: bool,
+    spaced: bool,
+    /// Whether anything at all has been decoded — so the silence before the
+    /// first element cannot spray leading spaces.
+    emitted: bool,
+}
+
+impl CwSelfRx {
+    /// `rate` is the audio rate; `wpm` seeds the unit estimate, which then
+    /// follows the operator's own fist.
+    pub fn new(rate: f64, wpm: f32) -> Self {
+        let rate = rate as f32;
+        let a = 1.0 - (-std::f32::consts::TAU * SELFRX_ENV_HZ / rate).exp();
+        Self {
+            rate,
+            a,
+            lp1: 0.0,
+            lp2: 0.0,
+            peak: 0.0,
+            decay: (-1.0 / (SELFRX_PEAK_S * rate)).exp(),
+            on: false,
+            run: 0.0,
+            hist: Vec::with_capacity(SELFRX_HIST),
+            seed: 1.2 * rate / wpm.max(1.0),
+            sym: String::new(),
+            flushed: false,
+            spaced: false,
+            emitted: false,
+        }
+    }
+
+    /// Restart for a new key session: drop the envelope, the run in progress
+    /// and everything decoded.
+    pub fn reset(&mut self, wpm: f32) {
+        self.lp1 = 0.0;
+        self.lp2 = 0.0;
+        self.peak = 0.0;
+        self.on = false;
+        self.run = 0.0;
+        self.hist.clear();
+        self.seed = 1.2 * self.rate / wpm.max(1.0);
+        self.sym.clear();
+        self.flushed = false;
+        self.spaced = false;
+        self.emitted = false;
+    }
+
+    /// The element unit, in samples: the low end of the recent run lengths, or
+    /// the panel's speed until there are enough runs to read.
+    fn unit(&self) -> f32 {
+        if self.hist.len() < 3 {
+            return self.seed;
+        }
+        let mut sorted = self.hist.clone();
+        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        // Read the low end, not a fixed `max(1, …)` rank: with only a few runs
+        // in the history a skewed rank lands on a dah or a word gap, the unit
+        // inflates, and the early characters all read as dits.
+        let k = (sorted.len() / 8).min(sorted.len() - 1);
+        sorted[k].max(self.rate / 70.0)
+    }
+
+    fn observe(&mut self, len: f32) {
+        if self.hist.len() >= SELFRX_HIST {
+            self.hist.remove(0);
+        }
+        self.hist.push(len);
+    }
+
+    /// Feed audio; returns whatever characters completed.
+    pub fn process(&mut self, audio: &[f32]) -> String {
+        let mut out = String::new();
+        for &x in audio {
+            let e = x.abs();
+            self.lp1 += self.a * (e - self.lp1);
+            self.lp2 += self.a * (self.lp1 - self.lp2);
+            let env = self.lp2;
+            self.peak = (self.peak * self.decay).max(env);
+            self.run += 1.0;
+
+            if self.on {
+                if env <= SELFRX_OFF * self.peak {
+                    self.on = false;
+                    let mark = self.run - 1.0;
+                    self.end_mark(mark);
+                    self.run = 1.0;
+                }
+            } else if self.peak > 1e-4 && env >= SELFRX_ON * self.peak {
+                self.on = true;
+                // The gap is over; it was never observed until now, since its
+                // length is only known once the next mark begins.
+                if self.flushed || !self.sym.is_empty() {
+                    self.observe(self.run - 1.0);
+                }
+                self.flushed = false;
+                self.spaced = false;
+                self.run = 1.0;
+            } else {
+                // Still in the gap. The read-back must not wait for the next
+                // element to say a character ended, so a character (and then a
+                // word space) is flushed as the gap crosses its threshold.
+                let u = self.unit();
+                if !self.flushed && !self.sym.is_empty() && self.run >= SELFRX_CHAR_UNITS * u {
+                    // An element run with no case in the table is shown as the
+                    // replacement glyph, not as `?`: this is a read-back of the
+                    // operator's own hand, and `?` is a character they can send
+                    // (`..--..`). Printing it for a run that did not decode
+                    // would tell them they had keyed one.
+                    out.push(morse_decode(&self.sym).unwrap_or(char::REPLACEMENT_CHARACTER));
+                    self.sym.clear();
+                    self.flushed = true;
+                    self.emitted = true;
+                }
+                if self.flushed && self.emitted && !self.spaced && self.run >= SELFRX_WORD_UNITS * u
+                {
+                    out.push(' ');
+                    self.spaced = true;
+                }
+            }
+        }
+        out
+    }
+
+    fn end_mark(&mut self, len: f32) {
+        self.observe(len);
+        let u = self.unit();
+        if len < 2.0 * u {
+            self.sym.push('.');
+        } else {
+            self.sym.push('-');
+        }
+        if self.sym.chars().count() > MAX_ELEMENTS {
+            self.sym.clear();
+        }
+    }
+}
+
 // ─── keyed sidetone transmitter ──────────────────────────────────────────────
 
 /// Rise and fall time of the keying envelope, in milliseconds. Long enough to
@@ -1226,6 +1421,15 @@ pub struct CwTx {
     /// True once anything has been queued, so the first character does not get
     /// an inter-character gap in front of it.
     started: bool,
+    /// Manual keying (issue #322): a pc keyboard held down as a straight key.
+    ///
+    /// In manual mode the queue of timed elements is ignored — nothing from it
+    /// may cut across the operator's hand — and `next_block` becomes a switch:
+    /// tone while [`Self::held`] is down, silence while it is up, both through
+    /// the same raised-cosine envelope.
+    manual: bool,
+    /// The straight key's present position while manual keying is engaged.
+    held: bool,
 }
 
 impl CwTx {
@@ -1245,6 +1449,8 @@ impl CwTx {
             shape: 0.0,
             shape_step: 1.0 / (SHAPE_MS * 1e-3 * rate as f32).max(1.0),
             started: false,
+            manual: false,
+            held: false,
         }
     }
 
@@ -1334,6 +1540,55 @@ impl CwTx {
         self.sent_chars
     }
 
+    /// Turn manual keying on or off (issue #322). Coming in, everything the
+    /// timed keyer had queued or partially sent is dropped: the keyer is about
+    /// to hand the operator the frequency, and a half-typed automatic message
+    /// surfacing between dits would be the last thing they expected to hear.
+    pub fn set_manual(&mut self, manual: bool) {
+        self.clear();
+        self.manual = manual;
+        if !manual {
+            self.held = false;
+        }
+    }
+
+    /// The straight key up or down, while manual keying is engaged.
+    pub fn set_held(&mut self, down: bool) {
+        self.held = down && self.manual;
+    }
+
+    /// Whether the straight key is down.
+    pub fn held(&self) -> bool {
+        self.held
+    }
+
+    /// A block of straight-key sidetone, rendered straight at `out_rate`.
+    ///
+    /// The timed keyer runs at the CW rate in `TX_CHUNK`-sized pieces and is
+    /// resampled, so reading the key once per piece quantises every element to
+    /// that piece — 50 ms at 400 samples of 8 kHz, longer than a dit at any
+    /// speed worth sending. Manual keying has no queue to protect, so it
+    /// renders at the rate its caller asked for and reads the key once per
+    /// sample instead, leaving the resolution at the engine's own block.
+    pub fn next_manual_block(&mut self, out: &mut [f32], out_rate: f64) {
+        let inc = std::f64::consts::TAU * self.pitch / out_rate;
+        let step = 1.0 / (SHAPE_MS * 1e-3 * out_rate as f32).max(1.0);
+        for s in out.iter_mut() {
+            let target = if self.held { 1.0 } else { 0.0 };
+            self.shape = if self.shape < target {
+                (self.shape + step).min(target)
+            } else {
+                (self.shape - step).max(target)
+            };
+            let amp = 0.5 - 0.5 * (std::f32::consts::PI * self.shape).cos();
+            self.ph += inc;
+            if self.ph > std::f64::consts::TAU {
+                self.ph -= std::f64::consts::TAU;
+            }
+            *s = amp * self.ph.sin() as f32;
+        }
+    }
+
     /// Samples of keying still to go out, the element in progress included.
     pub fn queued_samples(&self) -> usize {
         self.q.iter().map(|k| k.samples).sum::<usize>() + self.cur_left
@@ -1344,7 +1599,14 @@ impl CwTx {
     }
 
     /// True once every queued element has gone out and the envelope has closed.
+    ///
+    /// Manual keying settles the moment the straight key is up again and the
+    /// envelope has closed — after that the keyer is just a switch neither
+    /// closed nor opening.
     pub fn drained(&self) -> bool {
+        if self.manual {
+            return !self.held && self.shape <= 0.0;
+        }
         self.q.is_empty() && self.cur_left == 0 && self.shape <= 0.0
     }
 
@@ -1360,6 +1622,13 @@ impl CwTx {
 
     /// Fill `out` with the next block of sidetone.
     pub fn next_block(&mut self, out: &mut [f32]) {
+        // Manual keying: the operator's hand is the timing, and nothing from
+        // the timed queue may surface between their elements. Rendered by the
+        // straight-key path, at this keyer's own rate.
+        if self.manual {
+            self.next_manual_block(out, self.rate);
+            return;
+        }
         let inc = std::f64::consts::TAU * self.pitch / self.rate;
         for s in out.iter_mut() {
             if self.cur_left == 0 {

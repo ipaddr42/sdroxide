@@ -624,6 +624,12 @@ impl IqSource for PanadapterSource {
         self.rx.adc_overload()
     }
 
+    /// The *transceiver's*: predistortion corrects a transmitter, and the
+    /// receiver lending its spectrum here has none.
+    fn puresignal(&mut self) -> Option<sdroxide_types::PsMeter> {
+        self.ctrl.puresignal()
+    }
+
     // ── Transmit: the transceiver ───────────────────────────────────────────
 
     /// `center_hz` arrives on the dial's scale; the transmitter goes where the

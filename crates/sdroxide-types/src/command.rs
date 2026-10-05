@@ -804,11 +804,32 @@ pub enum Command {
     SetAdsbConfig(crate::AdsbSettings),
 
     /// Whether the QO-100 beacon decoder runs, and how wide it searches
-    /// around [`crate::QO100_BEACON_HZ`]. The engine persists this and
-    /// echoes it back in [`crate::RadioState`], so there is no apply step —
-    /// the same convention [`Command::SetIsmConfig`] follows. Appended for
-    /// the usual reason: postcard numbers variants by position.
+    /// around [`crate::QO100_BEACON_HZ`]. The engine echoes it back in
+    /// [`crate::RadioState`], so there is no apply step and no way for the
+    /// panel's copy and the engine's to drift apart — the same convention
+    /// [`Command::SetIsmConfig`] follows.
+    ///
+    /// It is *not* written to disk, which is where the resemblance to
+    /// `SetIsmConfig` stops: that one is kept in `ism.json` and comes back
+    /// next run, while this is session-scoped and the decoder starts off
+    /// again. Deliberately — the lane costs a downconversion and a worker
+    /// thread, and a station that switched it on once should not find it
+    /// running on its own. [`Command::SetHfdlConfig`] is the other lane that
+    /// works this way.
+    ///
+    /// Appended for the usual reason: postcard numbers variants by position.
     SetQo100Config(crate::Qo100Settings),
+
+    /// Whether the HFDL (ARINC 635) decoder runs, and which channel it
+    /// centres on. The engine echoes it back in [`crate::RadioState`], so
+    /// there is no apply step and no way for the panel's copy and the
+    /// engine's to drift apart — but it is held for the session only and
+    /// never written to disk, so the decoder starts off again next run. That
+    /// is deliberate: the lane costs a downconversion and a worker thread,
+    /// and a station that switched it on once should not find it running on
+    /// its own. Appended for the usual reason: postcard numbers variants by
+    /// position.
+    SetHfdlConfig(crate::HfdlSettings),
 
     /// Start (`true`) or stop (`false`) recording the receiver's raw I/Q to a
     /// WAV file (issue #217).
@@ -1053,4 +1074,76 @@ pub enum Command {
     ///
     /// Appended for the usual reason — postcard numbers variants by position.
     AtChatReconnect,
+
+    /// Decode a different programme of the HD Radio multiplex, 0-based.
+    ///
+    /// Most digital FM broadcasts carry one programme and this never comes up;
+    /// those that carry two (HD-1 and an HD-2 subchannel) need it, because the
+    /// receiver is stuck on whichever the transmission lists first otherwise.
+    /// Out-of-range values are ignored rather than clamped: the number of
+    /// programmes is a property of the transmission, and a stale click from a
+    /// client that has not seen the multiplex change should do nothing rather
+    /// than land somewhere else.
+    ///
+    /// Appended for the usual reason — postcard numbers variants by position.
+    SetHdProgram {
+        program: u8,
+    },
+
+    /// CW: use the PC keyboard as a straight key (issue #322) — engage (true)
+    /// or leave (false) the mode. Typed text is keyed to its timing queue; a
+    /// straight key cannot be a queue, so this hands the whole keyer over to
+    /// [`Command::CwKey`]. Refused (harmlessly) where the rig keys itself from
+    /// text and a hand keyed into its sound card would go nowhere.
+    ///
+    /// Appended for the usual reason — postcard numbers variants by position.
+    CwStraight(bool),
+
+    /// CW, with the straight key engaged: the key's position — down (true)
+    /// while a key is held, up (false) when it is released. Sent on each
+    /// change, never per frame: a held key is one press, and a repeat of down
+    /// from a stale frame would be a dit inside whatever the operator is
+    /// sending.
+    ///
+    /// Appended for the usual reason too.
+    CwKey(bool),
+
+    /// Save the state of the station — dials and VFOs, mode and filters,
+    /// gains and drive, antennas, the digital identity and templates, and the
+    /// band stacks (issue #197) — under a name the operator chooses, so it can
+    /// be put back on in one click later. The hardware (backend, audio
+    /// devices, converters) is deliberately not part of it.
+    ///
+    /// A name already in use is overwritten. The engine answers with the
+    /// profile list and a notice.
+    ///
+    /// Appended for the usual reason — postcard numbers variants by position.
+    ProfileSave(String),
+
+    /// Put the station back onto a saved profile: the dials, VFOs, mode and
+    /// filters, the gains, drive and antennas, the digital identity and
+    /// message templates, and the band stacks it was saved with. Whatever a
+    /// profile deliberately scoped out — the backend, the audio devices, the
+    /// converters — is left exactly as it is.
+    ///
+    /// Appended for the usual reason — postcard numbers variants by position.
+    ProfileApply(String),
+
+    /// Drop a saved profile by name. The radio stays exactly where it is; only
+    /// the named snapshot goes.
+    ///
+    /// Appended for the usual reason — postcard numbers variants by position.
+    ProfileDelete(String),
+    /// Forget the operator's per-mode settings overrides — for one mode, or
+    /// (`None`) for every mode — and put the defaults back on any receiver
+    /// sitting in a mode that was cleared.
+    ///
+    /// The counterpart of the overrides the engine records when a setting is
+    /// changed while a mode is selected. This is the "put it back the way the
+    /// mode ships" an operator reaches for after fiddling; the values it
+    /// restores are [`Mode::default_profile`]'s. Appended for the usual reason
+    /// too.
+    ResetModeDefaults {
+        mode: Option<Mode>,
+    },
 }

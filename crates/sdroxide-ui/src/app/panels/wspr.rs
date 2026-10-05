@@ -162,6 +162,7 @@ impl SdroxideApp {
         self.digi_stations.observe_wspr(&self.wspr_spots, now_t, now);
         let stations = self.digi_stations.stations(now_t);
         let heat = self.prop_texture(ui.ctx(), self.state.rx_freq_hz());
+        let night = self.night_texture(ui.ctx());
         crate::widgets::worldmap::show(
             ui,
             &mut self.map_view,
@@ -172,6 +173,7 @@ impl SdroxideApp {
             &stations,
             &[],
             heat,
+            night,
             self.digi_status.as_ref().map(|s| s.transmitting).unwrap_or(false),
             map_budget,
         );
@@ -204,6 +206,13 @@ impl SdroxideApp {
                     format!("{} rx", self.wspr_spots.len())
                 };
                 ui.label(RichText::new(label).size(10.0).color(crate::theme::gray(120)));
+                crate::app::panels::save_text_chip(
+                    ui,
+                    !self.wspr_spots.is_empty(),
+                    "sdroxide-wspr-spots.csv",
+                    "Save the WSPR reception list as CSV",
+                    || crate::app::save_text::wspr_spots_csv(&self.wspr_spots),
+                );
             });
         });
 

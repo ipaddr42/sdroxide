@@ -8,7 +8,10 @@
 use sdroxide_dsp::{IqCorrect, MonoResampler, Nco};
 use sdroxide_radio::rtrb;
 use sdroxide_radio::{Complex32, ControlUpdate, DC_BLOCK_HZ, IqSource, Result};
-use sdroxide_types::{CatConfig, Mode, SoundFormat, TxTelemetry};
+use sdroxide_types::{
+    CatConfig, CatFamily, Mode, SoundFormat, TRUSDX_RX_RATE_HZ, TRUSDX_TX_RATE_HZ, TrUsdxAudio,
+    TxTelemetry,
+};
 
 use crate::dial::Dial;
 
@@ -54,6 +57,9 @@ pub struct AudioCatSource {
     out: Option<(sdroxide_audio::AudioOutput, rtrb::Producer<f32>)>,
     tx_resampler: Option<MonoResampler>,
     tx_scratch: Vec<f32>,
+    /// Scratch for draining the in-band receive ring, on a rig at
+    /// [`IqSource::streams_audio`] — the (tr)uSDX.
+    stream_scratch: Vec<f32>,
 
     cat: sdroxide_cat::CatHandle,
     /// Top of the `27 00` amplitude scale on the rig the model list names —
@@ -111,6 +117,13 @@ impl AudioCatSource {
         audio_in: Option<&str>,
         audio_out: Option<&str>,
     ) -> anyhow::Result<Self> {
+        // The (tr)uSDX has no sound card: its audio is inside the CAT link,
+        // and there is nothing for `audio_in`/`audio_out` to name. Everything
+        // about the transport differs, so it is built separately rather than
+        // threaded through this one's sound-card setup.
+        if cfg.family == CatFamily::TrUsdx && cfg.trusdx_audio == TrUsdxAudio::OneCable {
+            return Self::open_streamed(cfg);
+        }
         // Adopt the rig's current dial/mode before we start commanding it.
         // Whether anything answered at all is kept too: it is the only evidence
         // there is that there *is* a control link, and the whole shape of
@@ -129,7 +142,7 @@ impl AudioCatSource {
             tracing::warn!(
                 "no sound card chosen for the {} rig on {} ({}) — falling back to the system \
                  default, which is not this radio unless it happens to be the default. Pick its \
-                 card under Settings → General → Radio audio.",
+                 card under Settings → Radio → Radio audio.",
                 cfg.family.label(),
                 sdroxide_cat::link_label(&cfg),
                 match (audio_in.is_none(), audio_out.is_none()) {
@@ -256,7 +269,7 @@ impl AudioCatSource {
         let signal_max_age = sdroxide_cat::signal_max_age(&cfg);
         // Either sound format: even an IQ-format rig transmits what arrives at
         // its sound card, so MCW rides a sideband there too.
-        let cw_mcw = cfg.cw_keying == sdroxide_types::CwKeying::Audio;
+        let cw_mcw = sdroxide_cat::effective_cw_keying(&cfg) == sdroxide_types::CwKeying::Audio;
         // The scope, asked for on a link its sweeps do not fit down, is
         // declined rather than allowed to bury the polls and the PTT — and
         // that has to be said on screen, because nothing else explains a
@@ -322,6 +335,7 @@ impl AudioCatSource {
             out,
             tx_resampler,
             tx_scratch: Vec::new(),
+            stream_scratch: Vec::new(),
             cat,
             scope_full_scale,
             cw_mcw,
@@ -337,10 +351,97 @@ impl AudioCatSource {
         })
     }
 
+    /// Open the (tr)uSDX: control *and* audio over its one USB serial port.
+    ///
+    /// No sound card is opened, because there is none to open. Receive audio
+    /// arrives in the CAT byte stream at [`TRUSDX_RX_RATE_HZ`] and is read from
+    /// the control thread's ring; transmit audio is pushed to that thread's
+    /// other ring, which paces it out at [`TRUSDX_TX_RATE_HZ`] while the radio
+    /// is keyed.
+    ///
+    /// The startup query the sound-card path opens with is deliberately
+    /// skipped. Opening the port resets the radio on the common board — the
+    /// CH340's DTR is wired to its reset — and a radio part way through boot
+    /// answers nothing, so the query would only ever report a dead link for a
+    /// perfectly good one.
+    ///
+    /// Nothing adopts the radio's own dial afterwards either: this mode reads
+    /// nothing at all, because a CAT frame written into the running stream
+    /// kills it (see `trusdx::TrUsdx::poll_requests`). So the dial below is
+    /// where the band starts rather than where the radio is, and the first
+    /// tune from here is what puts the two in step. The settings note says as
+    /// much: in this mode the radio is driven from sdroxide, not followed.
+    fn open_streamed(cfg: CatConfig) -> anyhow::Result<Self> {
+        let cat = sdroxide_cat::spawn(cfg.clone());
+        let signal_max_age = sdroxide_cat::signal_max_age(&cfg);
+        let label = format!("(tr)uSDX on {}", sdroxide_cat::link_label(&cfg));
+        let status = Some(
+            "Audio and control share the USB cable — no sound card is used. The radio \
+             reboots when the port opens, so the first second or two after connecting is \
+             quiet while it comes up."
+                .to_string(),
+        );
+        // A ring nobody writes to, for the fields the sound-card path shares.
+        let (_p, in_consumer) = rtrb::RingBuffer::<f32>::new(1);
+        Ok(AudioCatSource {
+            in_stream: None,
+            in_consumer,
+            in_rate: f64::from(TRUSDX_RX_RATE_HZ),
+            drops: DropWatch::started(std::time::Instant::now()),
+            quad: QuadratureWatch::default(),
+            // The radio demodulates; what arrives is audio, not I/Q.
+            format: SoundFormat::DemodAudio,
+            q_sign: 1.0,
+            iq_shift: None,
+            iq_correct: None,
+            audio_bw: cfg.audio_bw_hz,
+            out: None,
+            tx_resampler: None,
+            tx_scratch: Vec::new(),
+            stream_scratch: Vec::new(),
+            cat,
+            scope_full_scale: 160.0,
+            cw_mcw: sdroxide_cat::effective_cw_keying(&cfg) == sdroxide_types::CwKeying::Audio,
+            // Where the band starts, not where the radio is — nothing reads
+            // the radio's dial in this mode. The first tune commands it.
+            dial: Dial::at(14_074_000.0),
+            // The dial is commandable: `FA` is one of the commands this
+            // firmware answers. Treated as reachable from the start rather than
+            // waiting for an answer that a booting radio cannot give.
+            dial_reachable: true,
+            label,
+            status,
+            last_telem: None,
+            last_signal: None,
+            signal_max_age,
+            antenna: String::new(),
+            released: false,
+        })
+    }
+
     /// The antenna sockets this rig can put its receiver on, for
     /// `DeviceCaps::antennas_rx`. Empty on every family but ELAD.
     pub fn antennas(&self) -> &'static [&'static str] {
         self.cat.antennas()
+    }
+
+    /// Pull in-band receive audio into `buf` as a real signal, for a rig whose
+    /// audio arrives down the CAT link. Returns how many samples were read; a
+    /// nap on an empty ring is what keeps the engine loop from spinning while
+    /// the radio is between blocks.
+    fn read_stream(&mut self, buf: &mut [Complex32]) -> usize {
+        self.stream_scratch.clear();
+        // Bounded by the caller's block so nothing is drained into a scratch
+        // the copy below cannot take; the ring keeps the rest for next time.
+        self.cat.poll_stream_audio(&mut self.stream_scratch, buf.len());
+        let n = self.stream_scratch.len().min(buf.len());
+        for (slot, &s) in buf.iter_mut().zip(self.stream_scratch[..n].iter()) {
+            *slot = Complex32::new(s, 0.0);
+        }
+        if n == 0 {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        n
     }
 
     /// Report capture frames the sound card dropped since the last look.
@@ -402,7 +503,10 @@ impl AudioCatSource {
 /// arithmetic about wall-clock time and a monotonic total, which is exactly
 /// where it went wrong before and exactly what should be checkable without a
 /// radio plugged in.
-struct DropWatch {
+///
+/// Shared with [`crate::usb_audio_source`], whose capture card is watched the
+/// same way.
+pub(crate) struct DropWatch {
     /// The card's lifetime drop total as of the last look.
     seen: u64,
     /// When that look happened — the time it *did*, not the time the next one
@@ -414,13 +518,17 @@ struct DropWatch {
 }
 
 impl DropWatch {
-    fn started(now: std::time::Instant) -> Self {
+    pub(crate) fn started(now: std::time::Instant) -> Self {
         DropWatch { seen: 0, last_check: now }
     }
 
     /// Frames lost since the last look and the window they were lost in, or
     /// `None` when it is not yet time to look or nothing was lost.
-    fn check(&mut self, now: std::time::Instant, total: u64) -> Option<(u64, std::time::Duration)> {
+    pub(crate) fn check(
+        &mut self,
+        now: std::time::Instant,
+        total: u64,
+    ) -> Option<(u64, std::time::Duration)> {
         let window = now.duration_since(self.last_check);
         if window < DROP_CHECK_INTERVAL {
             return None;
@@ -437,7 +545,7 @@ impl DropWatch {
     /// Forget what the counter accumulated and start the window again from
     /// `now` — for drops that happened while nobody was reading the stream and
     /// so say nothing about whether this machine can keep up with it.
-    fn rebase(&mut self, now: std::time::Instant, total: u64) {
+    pub(crate) fn rebase(&mut self, now: std::time::Instant, total: u64) {
         self.seen = total;
         self.last_check = now;
     }
@@ -766,6 +874,9 @@ impl IqSource for AudioCatSource {
     }
 
     fn read(&mut self, buf: &mut [Complex32]) -> Result<usize> {
+        if self.cat.streams_audio() {
+            return Ok(self.read_stream(buf));
+        }
         self.check_dropped();
         match self.format {
             SoundFormat::DemodAudio => {
@@ -810,6 +921,9 @@ impl IqSource for AudioCatSource {
     /// rig's audio once per I/Q block, and a sleep there would pace the whole
     /// receiver off a sound card that is not driving it.
     fn read_available(&mut self, buf: &mut [Complex32]) -> Result<usize> {
+        if self.cat.streams_audio() {
+            return Ok(self.read_stream(buf));
+        }
         // Checked on this path too, not only in `read`: a rig lent out as
         // another radio's panadapter is drained exclusively through here, and
         // that is the arrangement where a card the machine cannot keep up with
@@ -1120,6 +1234,12 @@ impl IqSource for AudioCatSource {
             self.cat.set_freq(f);
         }
         self.cat.set_ptt(true);
+        if self.cat.streams_audio() {
+            // The radio takes transmit audio at its own rate, and the engine
+            // rate-matches the modem to whatever this returns. There is no
+            // sound card to ask.
+            return Ok(f64::from(TRUSDX_TX_RATE_HZ));
+        }
         Ok(self.out.as_ref().map(|(o, _)| o.sample_rate).unwrap_or(self.in_rate))
     }
 
@@ -1135,6 +1255,15 @@ impl IqSource for AudioCatSource {
     }
 
     fn discard_pending_rx(&mut self) {
+        if self.cat.streams_audio() {
+            // The audio ring kept filling from whatever the radio was sending
+            // before the over; none of it is the station we are about to hear
+            // when the key comes up.
+            self.stream_scratch.clear();
+            self.cat.poll_stream_audio(&mut self.stream_scratch, usize::MAX);
+            self.stream_scratch.clear();
+            return;
+        }
         // The capture callback keeps filling this ring during TX too.
         while self.in_consumer.pop().is_ok() {}
         // And it overflowed it long before the over was out. The engine stops
@@ -1181,61 +1310,116 @@ impl IqSource for AudioCatSource {
     }
 
     fn tx_write_audio(&mut self, audio: &[f32]) -> Result<()> {
+        if self.cat.streams_audio() {
+            // The control thread paces these out at the radio's own rate. If
+            // its ring is full the over is ahead of the radio, so wait for room
+            // rather than drop — dropping silence into a digital mode is worse
+            // than a stutter. Bounded so a thread that has died cannot hang the
+            // transmit loop forever.
+            let mut off = 0;
+            let mut spins = 0u32;
+            while off < audio.len() {
+                let n = self.cat.push_stream_audio(&audio[off..]);
+                if n == 0 {
+                    spins += 1;
+                    if spins > 500 {
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                    continue;
+                }
+                off += n;
+                spins = 0;
+            }
+            return Ok(());
+        }
         let Some((_, producer)) = self.out.as_mut() else {
             return Ok(()); // no TX audio device — PTT still keyed the rig
         };
-        // Resample 48 kHz → card rate, then interleave to stereo.
-        //
-        // A *pair* per sample, whatever the card's own channel count is: the
-        // ring `start_output` hands back is interleaved stereo by definition,
-        // and the playback callback takes two out of it for every frame it
-        // fills and mixes them down itself where the device opened mono. One
-        // per sample on such a card is therefore not a quieter over — the
-        // callback consumes the ring twice as fast as it is filled, so the
-        // audio goes out at double speed with every pair averaged together and
-        // silence spliced in wherever it ran dry. On a virtual cable, which is
-        // where a mono output turns up (VB-Audio's CABLE-B opens as one
-        // channel), that is an FT8 burst arriving as a smear across the whole
-        // passband (issue #247).
-        self.tx_scratch.clear();
-        match self.tx_resampler.as_mut() {
-            Some(rs) => rs.push(audio, &mut self.tx_scratch),
-            None => self.tx_scratch.extend_from_slice(audio),
-        }
-        // Block until the card drains room, applying backpressure so the engine's
-        // TX loop is paced to real time. Without this a long continuous burst
-        // (e.g. a 110 s SSTV image) is generated at CPU speed and mostly dropped
-        // on a full ring, so the radio only transmits the first buffer-full.
-        for &s in &self.tx_scratch {
-            for _ in 0..2 {
-                let mut v = s;
-                let mut tries = 0u32;
-                while let Err(rtrb::PushError::Full(x)) = producer.push(v) {
-                    v = x;
-                    tries += 1;
-                    if tries > 200 {
-                        break; // output device stalled — drop rather than hang TX
-                    }
-                    std::thread::sleep(std::time::Duration::from_millis(1));
-                }
-            }
-        }
+        write_tx_audio(producer, self.tx_resampler.as_mut(), &mut self.tx_scratch, audio);
         Ok(())
     }
 
     fn tx_drain(&mut self) {
-        // The output ring holds ~1 s; wait for it to play out before PTT is
-        // released so the tail of a burst (critical for FT8 decode) isn't cut.
-        if let Some((_, producer)) = self.out.as_ref() {
-            let cap = producer.buffer().capacity();
+        if self.cat.streams_audio() {
+            // Hold the unkey until the radio has actually been fed the tail of
+            // the burst — an FT8 over cut short does not decode. Bounded so a
+            // stalled link cannot hold the transmitter on forever.
             for _ in 0..1000 {
-                let buffered = cap.saturating_sub(producer.slots());
-                if buffered <= cap / 40 {
+                if self.cat.stream_tx_pending() == 0 {
                     break;
                 }
                 std::thread::sleep(std::time::Duration::from_millis(2));
             }
+            return;
         }
+        // The output ring holds ~1 s; wait for it to play out before PTT is
+        // released so the tail of a burst (critical for FT8 decode) isn't cut.
+        if let Some((_, producer)) = self.out.as_ref() {
+            drain_tx_audio(producer);
+        }
+    }
+}
+
+/// Send 48 kHz transmit audio to a sound card's playback ring: resampled to the
+/// card's rate, then interleaved to stereo.
+///
+/// A *pair* per sample, whatever the card's own channel count is: the ring
+/// `start_output` hands back is interleaved stereo by definition, and the
+/// playback callback takes two out of it for every frame it fills and mixes
+/// them down itself where the device opened mono. One per sample on such a card
+/// is therefore not a quieter over — the callback consumes the ring twice as
+/// fast as it is filled, so the audio goes out at double speed with every pair
+/// averaged together and silence spliced in wherever it ran dry. On a virtual
+/// cable, which is where a mono output turns up (VB-Audio's CABLE-B opens as
+/// one channel), that is an FT8 burst arriving as a smear across the whole
+/// passband (issue #247).
+///
+/// Blocks until the card drains room, applying backpressure so the engine's TX
+/// loop is paced to real time. Without this a long continuous burst (e.g. a
+/// 110 s SSTV image) is generated at CPU speed and mostly dropped on a full
+/// ring, so the radio only transmits the first buffer-full — and on a VOX-keyed
+/// radio the gap that follows is a key that drops out mid-sentence.
+///
+/// Shared with [`crate::usb_audio_source`], which drives its card the same way.
+pub(crate) fn write_tx_audio(
+    producer: &mut rtrb::Producer<f32>,
+    resampler: Option<&mut MonoResampler>,
+    scratch: &mut Vec<f32>,
+    audio: &[f32],
+) {
+    scratch.clear();
+    match resampler {
+        Some(rs) => rs.push(audio, scratch),
+        None => scratch.extend_from_slice(audio),
+    }
+    for &s in scratch.iter() {
+        for _ in 0..2 {
+            let mut v = s;
+            let mut tries = 0u32;
+            while let Err(rtrb::PushError::Full(x)) = producer.push(v) {
+                v = x;
+                tries += 1;
+                if tries > 200 {
+                    break; // output device stalled — drop rather than hang TX
+                }
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        }
+    }
+}
+
+/// Wait for a playback ring (~1 s deep) to play out, so the tail of a burst —
+/// critical for FT8 decode — is not cut when the radio unkeys. Gives up after
+/// about two seconds rather than hang an unkey on a stalled device.
+pub(crate) fn drain_tx_audio(producer: &rtrb::Producer<f32>) {
+    let cap = producer.buffer().capacity();
+    for _ in 0..1000 {
+        let buffered = cap.saturating_sub(producer.slots());
+        if buffered <= cap / 40 {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(2));
     }
 }
 

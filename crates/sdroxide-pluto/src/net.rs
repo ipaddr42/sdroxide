@@ -540,23 +540,22 @@ impl PlutoRig {
             // was on — and the one check that can be made from here. The link
             // itself cannot be measured before anything has streamed; the
             // throughput warnings in `stream::Stats` cover that once it has.
-            match phy.ensm_mode(&mut control) {
-                Ok(mode) if mode.eq_ignore_ascii_case("fdd") => {
+            match phy.is_fdd(&mut control) {
+                Some(true) => {
                     tracing::info!("PlutoSDR: full duplex — receive stays up through an over");
                 }
-                Ok(mode) => {
-                    let msg = format!(
-                        "PlutoSDR: full duplex is on, but this board's enable state machine is \
-                         in {mode}, not FDD — it can only receive or transmit at one time, so \
-                         receive will still stop for the length of an over"
-                    );
+                Some(false) => {
+                    let msg = "PlutoSDR: full duplex is on, but this board is in TDD, not FDD — \
+                               it can only receive or transmit at one time, so receive will \
+                               still stop for the length of an over"
+                        .to_string();
                     tracing::warn!("{msg}");
                     warnings.push(msg);
                 }
                 // Not fatal, and not worth a warning on screen: a firmware
-                // that does not publish `ensm_mode` is one this check cannot
-                // be made on, not one that is known to be wrong.
-                Err(e) => tracing::debug!("PlutoSDR: could not read ensm_mode: {e}"),
+                // that will not say is one this check cannot be made on, not
+                // one that is known to be wrong.
+                None => tracing::debug!("PlutoSDR: could not tell whether this board is in FDD"),
             }
         }
         // A dial left outside this board's range — a restored session from a
@@ -607,6 +606,11 @@ impl PlutoRig {
                      PlutoSDR settings to run it in FDD"
                 ))
             })?;
+        } else if let Some(msg) = phy.ensure_receiving(&mut control)? {
+            // Last for the same reason: in FDD it is the driver's own
+            // calibrations, run by the writes above, that can leave the part
+            // parked with its receiver off (issue #470).
+            warnings.push(msg);
         }
 
         if phy.rx_pairs_available() > 1 {
@@ -1482,6 +1486,11 @@ fn control_thread(
 /// connection — the server-side device timeout — is set by
 /// [`Connection::connect`].
 fn redial_ctrl(shared: &Shared, cause: &Error, conn: &mut Connection) -> bool {
+    // A socket `release` shut down under a command in flight is the session
+    // ending, not the link failing — see `stream::rx_thread` (issue #470).
+    if !shared.alive.load(Ordering::Relaxed) {
+        return false;
+    }
     tracing::warn!("PlutoSDR: the control socket failed ({cause}) — replacing it");
     shared.trace.note(format!("~~ control socket failed ({cause}); redialling"));
     // Shut the old one down at both ends before dialling, so `iiod` starts

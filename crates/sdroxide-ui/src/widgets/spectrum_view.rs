@@ -342,6 +342,29 @@ fn center_on_dial(
     if over.abs() >= column { over } else { 0.0 }
 }
 
+/// How much the span has to change before a zoom counts as one, as a fraction
+/// of it. A wheel notch is a couple of per cent and a pinch frame rather less;
+/// this is far below either and far above the drift a clamp leaves behind.
+const ZOOM_EPS: f64 = 1e-3;
+
+/// Whether centring is due this frame: nothing centred yet, the dial has moved,
+/// or the view has been zoomed.
+///
+/// `was` is the dial and span the window was last centred for. Zoom counts
+/// because the operator asked for the dial to stay in the middle and a
+/// zoom-about-the-cursor walks it out of there — CTR then had to be clicked
+/// again to bring it back (issue #535). A *pan* deliberately does not count:
+/// it changes neither, so dragging the window still goes where it was put.
+fn centring_due(was: Option<(f64, f64)>, vfo: f64, span: f64) -> bool {
+    match was {
+        None => true,
+        Some((prev_vfo, prev_span)) => {
+            (prev_vfo - vfo).abs() > 0.5
+                || (prev_span - span).abs() > prev_span.abs().max(span.abs()) * ZOOM_EPS
+        }
+    }
+}
+
 /// The sub receiver's colour, on the panadapter and on its control module.
 /// Deliberately nothing like the main receiver's red, the amber VFO/RTTY
 /// markers, or the cyan the digital modes use: two receivers on one waterfall
@@ -1996,10 +2019,13 @@ pub fn show_ext(
 
     // Centre tuning (issue #174): keep the dial in the middle of the window.
     //
-    // Edge-triggered on the dial *moving*, not held every frame, so a pan or a
-    // zoom-about-the-cursor still goes where it was put and only the next tune
-    // brings the marker home. The memo is dropped while the mode is off, which
-    // is what makes switching it on centre at once — that click is also the
+    // Edge-triggered on the dial moving or the view being zoomed, not held
+    // every frame, so a *pan* still goes where it was put. Zoom used to be left
+    // alone too, but zooming is anchored on the cursor ([`zoom_about`]), which
+    // walks the dial out of the middle while the mode that promises to keep it
+    // there is lit — and CTR had to be clicked again to bring it back
+    // (issue #535). The memo is dropped while the mode is off, which is what
+    // makes switching it on centre at once — that click is also the
     // "centre the display now" button the issue asked for.
     //
     // Zoomed in this costs nothing: the window slides inside the captured span
@@ -2010,7 +2036,7 @@ pub fn show_ext(
     // waterfall remap and, on some front ends, a skimmer restart, and nobody
     // can see a sub-pixel slide.
     let centring_id = ui.id().with("centre-on-vfo");
-    let centred_at: Option<f64> = ui.data(|d| d.get_temp(centring_id)).unwrap_or(None);
+    let centred_at: Option<(f64, f64)> = ui.data(|d| d.get_temp(centring_id)).unwrap_or(None);
     if view.center_on_vfo {
         // The cursor rather than the dial in the modes that hold their tones
         // off it — see [`AudioCursor::center_on_cursor`]. Memoised on the
@@ -2018,13 +2044,16 @@ pub fn show_ext(
         // brings the window along exactly as turning the dial does.
         let vfo = state.active_freq_hz()
             + cursor.filter(|c| c.center_on_cursor).map_or(0.0, |c| f64::from(c.hz));
-        if centred_at.is_none_or(|was| (was - vfo).abs() > 0.5) {
+        if centring_due(centred_at, vfo, view.span()) {
             let over = center_on_dial(view, vfo, zoom_center, zoom_span, rect.width());
             pan_center(&mut dev_center, state, over, pan, cmds);
+            // Recorded only when it actually centred, so a gesture that moves
+            // the span in steps below `ZOOM_EPS` accumulates towards one rather
+            // than resetting the comparison every frame and never arriving.
+            ui.data_mut(|d| d.insert_temp(centring_id, Some((vfo, view.span()))));
         }
-        ui.data_mut(|d| d.insert_temp(centring_id, Some(vfo)));
     } else if centred_at.is_some() {
-        ui.data_mut(|d| d.insert_temp(centring_id, None::<f64>));
+        ui.data_mut(|d| d.insert_temp(centring_id, None::<(f64, f64)>));
     }
 
     let view_log_id = ui.id().with("view-log");
@@ -3400,6 +3429,65 @@ mod tests {
     fn wheel(view: &mut ViewState, factor: f64, dev_span: f64) {
         let rect = Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(1000.0, 400.0));
         zoom_about(view, 500.0, &rect, factor, dev_span);
+    }
+
+    /// CTR promises the dial stays in the middle, and zoom is anchored on the
+    /// cursor — so a wheel notch walked the dial out of the middle and the chip
+    /// had to be clicked again (issue #535). Zoom now brings it home.
+    #[test]
+    fn zooming_brings_the_dial_back_to_the_middle() {
+        let (dial, span) = (14_100_000.0, 200_000.0);
+        assert!(!centring_due(Some((dial, span)), dial, span), "nothing moved");
+
+        // A wheel notch in: the dial has not moved, the span has.
+        let mut v = view_spanning(dial - span / 2.0, dial + span / 2.0);
+        wheel(&mut v, 0.8, 2_000_000.0);
+        assert!(
+            centring_due(Some((dial, span)), dial, v.span()),
+            "a zoom left the dial off centre and did not ask to be re-centred"
+        );
+        // ...and out again.
+        let mut v = view_spanning(dial - span / 2.0, dial + span / 2.0);
+        wheel(&mut v, 1.25, 2_000_000.0);
+        assert!(centring_due(Some((dial, span)), dial, v.span()), "zooming out did not re-centre");
+    }
+
+    /// A pan must still go where it was put: that is the whole reason the
+    /// centring is edge-triggered rather than held every frame.
+    #[test]
+    fn panning_does_not_drag_the_window_back() {
+        let (dial, span) = (14_100_000.0, 200_000.0);
+        let mut v = view_spanning(dial - span / 2.0, dial + span / 2.0);
+        pan_view(&mut v, 60_000.0, 14_100_000.0, 2_000_000.0);
+        assert!((v.span() - span).abs() < 1.0, "a pan changed the span: this is not testing a pan");
+        assert!(!centring_due(Some((dial, span)), dial, v.span()), "a pan was undone");
+    }
+
+    /// The dial moving still brings the window along, zoom or no zoom.
+    #[test]
+    fn tuning_still_centres_the_window() {
+        let span = 200_000.0;
+        assert!(centring_due(Some((14_100_000.0, span)), 14_101_000.0, span), "a tune was ignored");
+        // Sub-hertz wobble is not a tune, and must not retune the front end.
+        assert!(!centring_due(Some((14_100_000.0, span)), 14_100_000.4, span));
+        // Nothing centred yet: switching the mode on centres at once.
+        assert!(centring_due(None, 14_100_000.0, span));
+    }
+
+    /// Steps below the threshold accumulate rather than being lost, because the
+    /// memo is only rewritten when the window is actually centred. A slow pinch
+    /// has to arrive, not stall.
+    #[test]
+    fn a_slow_pinch_still_arrives() {
+        let (dial, span) = (14_100_000.0, 200_000.0);
+        let mut v = view_spanning(dial - span / 2.0, dial + span / 2.0);
+        let mut steps = 0;
+        while !centring_due(Some((dial, span)), dial, v.span()) {
+            wheel(&mut v, 0.9995, 2_000_000.0);
+            steps += 1;
+            assert!(steps < 500, "a pinch of 0.05% a frame never accumulated to a re-centre");
+        }
+        assert!(steps > 1, "the threshold let a single sub-notch step through");
     }
 
     fn view_spanning(lo: f64, hi: f64) -> ViewState {

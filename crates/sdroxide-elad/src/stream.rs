@@ -34,6 +34,27 @@ use crate::trace::{self, Trace};
 /// idle loop costs nothing.
 const COMPLETE_TIMEOUT: Duration = Duration::from_millis(5);
 
+/// How often an FDM-DUO is asked where its VFO now is.
+///
+/// The window rides on that VFO, so a hand on the knob moves the samples and
+/// nothing else says so when there is no CAT serial port. Four times a second
+/// keeps a spun dial from being visibly behind, and costs one short control
+/// transfer between blocks — the same endpoint a retune already uses, and far
+/// less traffic than one retune's busy-wait.
+const TUNE_POLL: Duration = Duration::from_millis(250);
+
+/// How many times [`TUNE_POLL`] doubles while the read keeps failing: up to
+/// 32×, one attempt every eight seconds.
+///
+/// A control transfer that is refused outright costs nothing, but one that
+/// times out holds this thread for a whole second — and this thread is the one
+/// keeping the sample queue fed, which at 192 kHz is 128 ms deep. Retried at
+/// the full rate, a firmware that never answers would have the stream dropping
+/// samples for most of every second, while still delivering enough that the
+/// silence watchdog never steps in. Backed off, it costs one second in eight
+/// at worst, and an answer puts the rate straight back.
+const TUNE_POLL_BACKOFF_MAX: u32 = 5;
+
 /// How long a stream may deliver nothing at all before it is said out loud.
 ///
 /// This is the one failure this backend can produce with no error anywhere in
@@ -187,6 +208,11 @@ fn pump(
     let mut samples: Vec<f32> = Vec::with_capacity(TRANSFER_BYTES / 2);
     let mut logged_first = false;
     let mut said_silent = false;
+    // Far enough back that the first pass asks straight away.
+    let mut last_tune_poll = Instant::now() - TUNE_POLL;
+    let mut tune_poll_failures = 0u32;
+    let mut said_tune_poll_failed = false;
+    let mut said_tune_answered = false;
 
     for _ in 0..IN_FLIGHT {
         ep.submit(ep.allocate(TRANSFER_BYTES));
@@ -222,6 +248,46 @@ fn pump(
             // The front-end switches move the calibrated scale, so it is
             // re-read rather than tracked field by field.
             deconstruct.set_scale(dev.scale());
+        }
+
+        // 1b. Ask the radio where it is, on a timer — when the owner wants it
+        //     (`EladHandle::follow_radio_dial`). Only an FDM-DUO answers, and
+        //     only its own front panel can make the answer differ from what we
+        //     last commanded.
+        let tune_poll_every = TUNE_POLL * (1 << tune_poll_failures.min(TUNE_POLL_BACKOFF_MAX));
+        if shared.read_dial.load(Ordering::Relaxed) && last_tune_poll.elapsed() >= tune_poll_every {
+            last_tune_poll = Instant::now();
+            match dev.read_tuned() {
+                Ok(Some(t)) => {
+                    shared.duo_tuned_hz.store(t.hz as u64, Ordering::Relaxed);
+                    // The answers themselves are not traced (see
+                    // `UsbDev::control_in_polled`), so the report says once that
+                    // the read works, and again if it comes back after failing.
+                    if !said_tune_answered || tune_poll_failures > 0 {
+                        said_tune_answered = true;
+                        trace.note(format!(
+                            "dial read-back answering: {:.0} Hz, word 0x{:08X}, status 0x{:02x}",
+                            t.hz, t.word, t.status
+                        ));
+                    }
+                    tune_poll_failures = 0;
+                }
+                Ok(None) => {}
+                // Not fatal and not worth a line per failure: the samples are
+                // still arriving, and the frequency axis simply stays where it
+                // was until an answer comes back. Asked less often meanwhile —
+                // see `TUNE_POLL_BACKOFF_MAX`.
+                Err(e) => {
+                    tune_poll_failures = tune_poll_failures.saturating_add(1);
+                    if !said_tune_poll_failed {
+                        said_tune_poll_failed = true;
+                        tracing::debug!("ELAD: reading the radio's dial failed: {e}");
+                        trace.note(format!(
+                            "dial read-back failed: {e} — asking less often until it answers"
+                        ));
+                    }
+                }
+            }
         }
 
         // 2. Refill before draining, so the queue is never empty while the

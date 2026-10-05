@@ -38,6 +38,9 @@ pub struct SstvController {
     /// The callsign the last station sent in its FSK ID, held until another one
     /// does. It arrives after the picture, so it cannot travel with it.
     rx_id: Option<String>,
+    /// The last header for a mode this build cannot draw — see
+    /// [`sdroxide_types::SstvStatus::unsupported`].
+    unsupported: Option<String>,
     image_id: u32,
 
     // TX
@@ -83,6 +86,7 @@ impl SstvController {
             rx_active: false,
             detected: None,
             rx_id: None,
+            unsupported: None,
             image_id: 0,
             tx: None,
             tx_mode: SstvMode::Martin1,
@@ -110,6 +114,7 @@ impl SstvController {
             detected: self.detected,
             progress,
             signal: self.rx.level(),
+            unsupported: self.unsupported.clone(),
             rx_id: self.rx_id.clone(),
         }
     }
@@ -127,6 +132,7 @@ impl SstvController {
             tx_even: false,
             transmitting: self.keyed,
             tx_watchdog: false,
+            tx_refused: None,
             transcript: Vec::<TranscriptLine>::new(),
             config: self.cfg.clone(),
             text_rx: String::new(),
@@ -136,6 +142,7 @@ impl SstvController {
             rade: None,
             packet: None,
             navtex: None,
+            acars: None,
             aprs: None,
             js8: None,
             atchat: None,
@@ -144,6 +151,7 @@ impl SstvController {
             clock_offset_s: None,
             cw: None,
             wspr: None,
+            pi4: None,
             qso: None,
         }
     }
@@ -169,6 +177,9 @@ impl DigiEngine for SstvController {
                     self.rx_image = vec![0u8; w as usize * h as usize * 3];
                     self.rx_active = true;
                     self.detected = Some(mode);
+                    // A picture is starting, so whatever could not be drawn
+                    // last time is no longer what is on the air.
+                    self.unsupported = None;
                     // RX mode determines the next transmit mode. In Auto, keep the
                     // RX auto-detecting; otherwise pin free-run to this mode.
                     self.tx_mode = mode;
@@ -192,6 +203,21 @@ impl DigiEngine for SstvController {
                     // transmission gets no VIS and no whole frame, and the
                     // callsign at the end is then the only thing that arrives.
                     self.rx_id = Some(id);
+                    self.status_dirty = true;
+                }
+                SstvEvent::UnsupportedMode { code, name } => {
+                    // The receiver read the header and knows exactly what it
+                    // cannot draw. Naming it is the difference between "the
+                    // SSTV decoder is broken" and "that station is sending
+                    // Pasokon P3" (issue #421).
+                    let label = match name {
+                        Some(n) => n.to_string(),
+                        None => format!("VIS ${code:02X}"),
+                    };
+                    tracing::info!(
+                        "SSTV: a header arrived for {label}, which this build does not decode"
+                    );
+                    self.unsupported = Some(label);
                     self.status_dirty = true;
                 }
                 SstvEvent::ImageComplete => {

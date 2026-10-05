@@ -1,0 +1,4 @@
+[package]
+name = "sdroxide-version"
+version.workspace = true
+edition.workspace = true

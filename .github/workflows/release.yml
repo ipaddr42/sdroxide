@@ -6,6 +6,16 @@ on:
   # Manual runs build all artifacts (downloadable from the run page) without
   # creating a release — useful for testing the pipeline.
   workflow_dispatch:
+  # Nightly build, 03:17 UTC. Same deal as a manual run — `release` is gated on
+  # a tag, so nothing is published — but it builds the four platforms listed in
+  # `targets` rather than all fourteen, and the result is downloaded from the
+  # run's Artifacts section. Note that GitHub runs a schedule on the default
+  # branch only, and disables it after 60 days with no commits to the
+  # repository; a push re-enables it. The odd minute is deliberate: GitHub
+  # delays scheduled runs at the top of the hour, when load peaks, and drops
+  # some outright, which is most likely what became of the first 03:00 nightly.
+  schedule:
+    - cron: '17 3 * * *'
 
 permissions:
   contents: write
@@ -18,12 +28,108 @@ env:
   CMAKE_POLICY_VERSION_MINIMUM: "3.5"
 
 jobs:
+  # Which build combinations this run wants. A tag or a manual run builds all
+  # fourteen; the nightly builds four — the standard (non-SoapySDR) variant of
+  # the platforms most people run. A scheduled run publishes nothing (`release`
+  # below is gated on a tag), so its artifacts on the run page are the whole
+  # product of the run and the releases page never hears about it.
+  #
+  # The platform table lives in this job rather than in `build`'s own
+  # `strategy.matrix` because a matrix written in YAML cannot be narrowed per
+  # event. Shrinking the `label` list would leave the `include:` entries that
+  # map a label to its runner with nothing to attach to, and GitHub turns an
+  # unattached `include:` entry into an extra job rather than dropping it — so
+  # the three platforms the nightly means to skip would come back as three
+  # more builds.
+  targets:
+    name: pick targets
+    runs-on: ubuntu-latest
+    outputs:
+      combos: ${{ steps.pick.outputs.combos }}
+      stamp: ${{ steps.pick.outputs.stamp }}
+    steps:
+      - id: pick
+        run: |
+          # The -compat builds are the same two Linux builds compiled inside an
+          # Ubuntu 22.04 container, so the binaries link glibc 2.35 and run on
+          # stable/LTS distributions (Ubuntu 22.04, Mint 21, Debian 12,
+          # Raspberry Pi OS bookworm) that the regular builds refuse with
+          # "version `GLIBC_2.39' not found" (issue report 2026-08). A
+          # container rather than `runs-on: ubuntu-22.04` because GitHub
+          # retires that runner image on 2027-04-17 with brownouts from
+          # 2026-09-17, while a container image keeps working on any runner.
+          # Every other entry carries no `container` key, which `build` reads
+          # as the empty string and GitHub as "no container".
+          platforms='[
+            {"label": "linux-x86_64",         "os": "ubuntu-latest"},
+            {"label": "linux-aarch64",        "os": "ubuntu-24.04-arm"},
+            {"label": "linux-x86_64-compat",  "os": "ubuntu-latest",    "container": "ubuntu:22.04"},
+            {"label": "linux-aarch64-compat", "os": "ubuntu-24.04-arm", "container": "ubuntu:22.04"},
+            {"label": "windows-x86_64",       "os": "windows-latest"},
+            {"label": "macos-aarch64",        "os": "macos-latest"},
+            {"label": "macos-x86_64",         "os": "macos-15-intel"}
+          ]'
+          # Every platform is built twice: `soapy` (dynamically links SoapySDR)
+          # and `cat` (--no-default-features: no SoapySDR, runs without
+          # libSoapySDR installed; drive a CAT rig over serial + a sound card
+          # instead). The nightly builds `cat` only — it is what the installers
+          # ship and the one a tester can run without installing PothosSDR
+          # first.
+          if [[ "$GITHUB_EVENT_NAME" == "schedule" ]]; then
+            wanted='["linux-x86_64-compat", "linux-aarch64-compat", "windows-x86_64", "macos-aarch64"]'
+            variants='["cat"]'
+          else
+            wanted='null'
+            variants='["soapy", "cat"]'
+          fi
+          # An include-only matrix: one job per entry, and no cross product to
+          # filter down afterwards.
+          combos=$(jq -cn \
+            --argjson platforms "$platforms" \
+            --argjson wanted "$wanted" \
+            --argjson variants "$variants" \
+            '{include: [ $platforms[] as $p
+                         | select($wanted == null or ($wanted | index($p.label)) != null)
+                         | $variants[]
+                         | $p + {variant: .} ]}')
+          echo "combos=$combos" >> "$GITHUB_OUTPUT"
+          echo "$combos" | jq .
+
+          # What this build should call itself. A tag is a release and keeps the
+          # bare crate version; anything else says which build it is and which
+          # commit it came from, so `sdroxide --version`, the About box and a
+          # crash report name the build rather than the release it was cut
+          # from. `sdroxide-version`'s build script reads this; unset (a local
+          # `cargo build`) means the plain version. Both the wasm client and
+          # every native build take it from here so they agree.
+          if [[ "$GITHUB_REF_TYPE" == "tag" ]]; then
+            stamp=""
+          elif [[ "$GITHUB_EVENT_NAME" == "schedule" ]]; then
+            stamp="nightly.$(date -u +%Y%m%d).${GITHUB_SHA::7}"
+          else
+            stamp="dev.${GITHUB_SHA::7}"
+          fi
+          echo "stamp=$stamp" >> "$GITHUB_OUTPUT"
+          echo "build stamp: ${stamp:-<none, release>}"
+
   # Build the wasm web client once; every native build embeds the same dist.
   web:
     name: web client (wasm)
+    needs: targets
     runs-on: ubuntu-latest
+    # So the About box in a browser client agrees with the server that served
+    # it, rather than naming the release the nightly was cut from.
+    env:
+      SDROXIDE_BUILD: ${{ needs.targets.outputs.stamp }}
     steps:
+      # The client compiles none of the vendored code, but cargo reads every
+      # workspace member's manifest before building any of them, and
+      # sdroxide-hfdl reaches xng by path into the vendor/xng submodule.
+      # Without it cargo stops at "failed to get `xng-mode-hfdl`", which is
+      # what failed every nightly from 2026-09-24 on.
       - uses: actions/checkout@v7
+        with:
+          submodules: recursive
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: wasm32-unknown-unknown
@@ -44,46 +150,22 @@ jobs:
           name: web-dist
           path: crates/sdroxide-web/dist
           if-no-files-found: error
+          # A nightly is superseded the next night, so it need not sit on the
+          # run page for the repository's default 90 days. 0 means "use the
+          # default", which is what a tagged or manual run keeps.
+          retention-days: ${{ github.event_name == 'schedule' && 14 || 0 }}
 
   build:
     name: ${{ matrix.label }} (${{ matrix.variant }})
-    needs: web
+    needs: [web, targets]
     runs-on: ${{ matrix.os }}
     # Empty for every non-compat entry, which means "no container".
     container: ${{ matrix.container }}
+    env:
+      SDROXIDE_BUILD: ${{ needs.targets.outputs.stamp }}
     strategy:
       fail-fast: false
-      matrix:
-        # Build every platform twice: `soapy` (dynamically links SoapySDR) and
-        # `cat` (--no-default-features: no SoapySDR, runs without libSoapySDR
-        # installed; drive a CAT rig over serial + a sound card instead).
-        variant: [soapy, cat]
-        label: [linux-x86_64, linux-aarch64, linux-x86_64-compat, linux-aarch64-compat, windows-x86_64, macos-aarch64, macos-x86_64]
-        include:
-          - label: linux-x86_64
-            os: ubuntu-latest
-          - label: linux-aarch64
-            os: ubuntu-24.04-arm
-          # The -compat builds are the same two Linux builds compiled inside an
-          # Ubuntu 22.04 container, so the binaries link glibc 2.35 and run on
-          # stable/LTS distributions (Ubuntu 22.04, Mint 21, Debian 12,
-          # Raspberry Pi OS bookworm) that the regular builds refuse with
-          # "version `GLIBC_2.39' not found" (issue report 2026-08). A
-          # container rather than `runs-on: ubuntu-22.04` because GitHub
-          # retires that runner image on 2027-04-17 with brownouts from
-          # 2026-09-17, while a container image keeps working on any runner.
-          - label: linux-x86_64-compat
-            os: ubuntu-latest
-            container: ubuntu:22.04
-          - label: linux-aarch64-compat
-            os: ubuntu-24.04-arm
-            container: ubuntu:22.04
-          - label: windows-x86_64
-            os: windows-latest
-          - label: macos-aarch64
-            os: macos-latest
-          - label: macos-x86_64
-            os: macos-15-intel
+      matrix: ${{ fromJSON(needs.targets.outputs.combos) }}
     defaults:
       run:
         shell: bash
@@ -113,7 +195,10 @@ jobs:
           fi
 
       # `submodules` pulls vendor/rade_c (the RADE codec), vendor/faad2 (the AAC
-      # decoder the DRM receiver is built with) and vendor/rtl_433.
+      # decoder the DRM receiver is built with), vendor/rtl_433 and vendor/xng
+      # (the HFDL decode core). HD Radio's
+      # decoder is not among them: it is the machine's own libnrsc5, loaded at
+      # run time and never bundled (issue #488).
       - uses: actions/checkout@v7
         with:
           submodules: recursive
@@ -324,6 +409,13 @@ jobs:
           fi
           cat >> stage/sdroxide/README.txt <<'EOF'
 
+          HD Radio (the digital sidecar of North American FM stations) needs
+          nrsc5's decoder library, libnrsc5.so, which is not bundled: sdroxide
+          loads it at startup when it is there. Install nrsc5 from
+          https://github.com/theori-io/nrsc5 (on Arch, the nrsc5-git AUR
+          package), or put libnrsc5.so beside the sdroxide executable. Without
+          it the HD RADIO mode is shown greyed out, and hovering it says why.
+
           To add sdroxide to your desktop menu, run ./install-desktop-entry.sh
           (per-user, no root needed; --uninstall removes it again). The .deb
           package registers the menu entry automatically.
@@ -510,6 +602,13 @@ jobs:
           # note. Zadig is the only Windows-side setup either receiver needs.
           cat >> stage/sdroxide/README.txt <<'EOF'
 
+          HD Radio (the digital sidecar of North American FM stations) needs
+          nrsc5's decoder library, libnrsc5.dll, which is not bundled: put it,
+          and the DLLs it depends on, beside sdroxide.exe. nrsc5 publishes no
+          Windows download; it builds with MSYS2 (see
+          https://github.com/theori-io/nrsc5). Without it the HD RADIO mode is
+          shown greyed out, and hovering it says why.
+
           USB receivers: Windows has no driver bound to an RTL-SDR or RX-888
           out of the box. Use Zadig (https://zadig.akeo.ie/) to bind the device
           to WinUSB — for the RX-888 do this for BOTH of its USB ids,
@@ -610,6 +709,12 @@ jobs:
           fi
           cat >> stage/sdroxide/README.txt <<'EOF'
 
+          HD Radio (the digital sidecar of North American FM stations) needs
+          nrsc5's decoder library, libnrsc5.dylib, which is not bundled: build
+          and install nrsc5 from https://github.com/theori-io/nrsc5, which puts
+          it in /usr/local/lib, where sdroxide looks. Without it the HD RADIO
+          mode is shown greyed out, and hovering it says why.
+
           LICENSE-rx888-firmware.txt covers the RX-888 FX3 firmware image that
           is bundled in the binary and uploaded to the receiver; it is MIT
           licensed and separate from sdroxide's own LICENSE.
@@ -699,6 +804,9 @@ jobs:
           name: pkg-${{ matrix.label }}-${{ matrix.variant }}
           path: out/*
           if-no-files-found: error
+          # As above: a nightly's artifacts expire in a fortnight, a tagged
+          # build's become the release assets and keep the default retention.
+          retention-days: ${{ github.event_name == 'schedule' && 14 || 0 }}
 
   release:
     name: create release
@@ -814,6 +922,28 @@ jobs:
           to the receiver at open time. It is MIT licensed (© 2017-2020 Oscar
           Steila IK1XPV and the rx888-firmware contributors) and its notice
           ships as `LICENSE-rx888-firmware.txt` in every package.
+
+          ### HD Radio — all builds
+
+          HD Radio (the digital sidecar of North American FM stations) is
+          decoded by **libnrsc5** from the [nrsc5](https://github.com/theori-io/nrsc5)
+          project, which is **not bundled**: sdroxide looks for it at startup
+          and uses it if it is there. Without it the **HD RADIO** mode is shown
+          greyed out, and hovering it says why. With a remote client, it is the
+          station's machine that needs it, not the client's.
+
+          - **Linux**: on Arch, the `nrsc5-git` AUR package. Elsewhere, build
+            nrsc5 from source: `sudo make install` puts `libnrsc5.so` in
+            `/usr/local/lib`, where sdroxide looks. A `libnrsc5.so` beside the
+            executable works too.
+          - **Windows**: put `libnrsc5.dll` and the DLLs it depends on beside
+            `sdroxide.exe`. nrsc5 publishes no Windows download; it builds with
+            MSYS2.
+          - **macOS**: build and install nrsc5 from source, which puts
+            `libnrsc5.dylib` in `/usr/local/lib`.
+
+          Restart sdroxide after installing it: the library is looked for once,
+          at startup.
 
           ### Spoken announcements
 

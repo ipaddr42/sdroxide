@@ -60,7 +60,10 @@ const CONTEXT_XML: &str = r#"<?xml version="1.0" encoding="utf-8"?>
       <attribute name="frequency_available" filename="out_altvoltage1_TX_LO_frequency_available" />
     </channel>
     <attribute name="ensm_mode" filename="ensm_mode" />
+    <attribute name="ensm_mode_available" filename="ensm_mode_available" />
     <debug-attribute name="adi,frequency-division-duplex-mode-enable" />
+    <debug-attribute name="adi,frequency-division-duplex-independent-mode-enable" />
+    <debug-attribute name="adi,ensm-enable-txnrx-control-enable" />
     <debug-attribute name="adi,gpo0-slave-rx-enable" />
     <debug-attribute name="adi,gpo0-slave-tx-enable" />
     <debug-attribute name="adi,gpo1-slave-rx-enable" />
@@ -167,11 +170,23 @@ struct DeviceState {
     rx_open_masks: Vec<String>,
     /// … and on the transmit buffer.
     tx_open_masks: Vec<String>,
-    /// Pause this long in the middle of the next `READBUF` payload, once.
-    /// Models the intermittent gap a Pluto on a USB gadget produces every few
-    /// minutes. How long it lasts decides which of the client's two answers is
-    /// under test — see [`HICCUP`] and [`STALL`].
-    stall_next_readbuf: Option<Duration>,
+    /// Go quiet in the middle of the next `READBUF` payload, once — one socket
+    /// or the whole board, for how long. Which of the two, and how long it
+    /// lasts, decides which of the client's answers is under test: see
+    /// [`Stall`], [`HICCUP`], [`PAUSE`] and [`STALL`].
+    stall_next_readbuf: Option<Stall>,
+    /// Until when the whole board is quiet: every connection's next command,
+    /// a fresh one's included, waits for this to pass. Set by a
+    /// [`Stall::Board`].
+    paused_until: Option<Instant>,
+    /// Connections that asked `VERSION` without ever sending `TIMEOUT` — the
+    /// client's probe of whether the board is still answering, which is not
+    /// one of its sessions and is not counted in [`Fake::connections`].
+    probes: usize,
+    /// Never answer the next `READBUF` at all, while answering everything else:
+    /// a socket stuck before its reply began, the shape the #377 control-drop
+    /// started with ("read reply failed").
+    swallow_next_readbuf: bool,
     /// Answer every `READBUF` with `-EAGAIN` until the buffer is reopened.
     /// Models a wedged DMA: the connection is fine, the server is answering,
     /// and no amount of further reading will ever produce a sample.
@@ -215,10 +230,28 @@ impl DeviceState {
     }
 }
 
+/// The two ways a `READBUF` goes quiet mid-payload, which look the same from
+/// inside the socket and want opposite treatment.
+#[derive(Clone, Copy)]
+enum Stall {
+    /// This one socket stops while the board carries on answering everything
+    /// else — issues #377 and #418: a fresh connection got `VERSION` back in
+    /// milliseconds while the stuck one had been silent for seconds, and every
+    /// redial worked at once.
+    Socket(Duration),
+    /// The whole board stops, fresh connections included, as a Pluto does
+    /// when its own processor is too busy to feed the network — issue #288.
+    /// The bytes come when it recovers.
+    Board(Duration),
+}
+
 struct Fake {
     addr: std::net::SocketAddr,
     state: Arc<Mutex<DeviceState>>,
     stop: Arc<AtomicBool>,
+    /// The client's sessions: connections that sent `TIMEOUT`, which every
+    /// one of its connections does first. Its probes of whether the board is
+    /// answering do not, and are in [`DeviceState::probes`] instead.
     connections: Arc<AtomicUsize>,
 }
 
@@ -227,20 +260,26 @@ impl Fake {
         Fake::start_with(DeviceState::default(), CONTEXT_XML.to_string())
     }
 
-    /// A device that goes quiet in the middle of one buffer for longer than the
-    /// client will wait, and then carries on.
+    /// One socket that goes quiet in the middle of a buffer for longer than
+    /// anyone should wait, while the board goes on answering everything else.
     fn start_that_stalls_mid_buffer() -> Fake {
         Fake::start_with(
-            DeviceState { stall_next_readbuf: Some(STALL), ..DeviceState::default() },
+            DeviceState {
+                stall_next_readbuf: Some(Stall::Socket(STALL)),
+                ..DeviceState::default()
+            },
             CONTEXT_XML.to_string(),
         )
     }
 
-    /// The same fault, briefly enough that the client should ride it out on the
-    /// socket it already has — see [`HICCUP`].
+    /// The whole board going quiet mid-buffer, briefly enough that the client
+    /// should ride it out on the socket it already has — see [`HICCUP`].
     fn start_that_hiccups_mid_buffer() -> Fake {
         Fake::start_with(
-            DeviceState { stall_next_readbuf: Some(HICCUP), ..DeviceState::default() },
+            DeviceState {
+                stall_next_readbuf: Some(Stall::Board(HICCUP)),
+                ..DeviceState::default()
+            },
             CONTEXT_XML.to_string(),
         )
     }
@@ -249,7 +288,7 @@ impl Fake {
     /// deadline, and with the transfer still on its way — see [`PAUSE`].
     fn start_that_pauses_mid_buffer() -> Fake {
         Fake::start_with(
-            DeviceState { stall_next_readbuf: Some(PAUSE), ..DeviceState::default() },
+            DeviceState { stall_next_readbuf: Some(Stall::Board(PAUSE)), ..DeviceState::default() },
             CONTEXT_XML.to_string(),
         )
     }
@@ -285,11 +324,11 @@ impl Fake {
                         break;
                     }
                     let Ok(sock) = sock else { break };
-                    connections.fetch_add(1, Ordering::Relaxed);
                     let state = Arc::clone(&state);
                     let stop = Arc::clone(&stop);
                     let xml = Arc::clone(&xml);
-                    std::thread::spawn(move || serve(sock, state, stop, xml));
+                    let connections = Arc::clone(&connections);
+                    std::thread::spawn(move || serve(sock, state, stop, xml, connections));
                 }
             });
         }
@@ -348,8 +387,47 @@ fn default_attr(key: &str) -> &'static str {
         // How a Pluto boots: transmit and receive enabled together, which is
         // what makes full duplex a question about the link rather than about
         // the part.
+        //
+        // This is the state machine's *state*, as the driver reads it back
+        // from the part — `fdd`, `rx`, `tx`, `alert`, `sleep` — and never the
+        // word `tdd`, which this fixture used to serve and which no AD9361 can
+        // say. The *mode* is `FDD_PROPERTY`, and `ensm_mode_available` below.
         "ad9361-phy/ensm_mode" => "fdd",
+        FDD_PROPERTY => "1",
         _ => "0",
+    }
+}
+
+/// The device-tree property that decides whether the part is in FDD or TDD.
+const FDD_PROPERTY: &str = "ad9361-phy/DEBUG/adi,frequency-division-duplex-mode-enable";
+
+/// Whether the fake part is in FDD — the property's latest value, or a stock
+/// Pluto's.
+///
+/// The real driver only takes the property at `initialize`; this takes it at
+/// once. The client always commits straight after writing it, so nothing it
+/// does can see the difference.
+fn fake_is_fdd(g: &DeviceState) -> bool {
+    g.get(FDD_PROPERTY).unwrap_or_else(|| default_attr(FDD_PROPERTY)) == "1"
+}
+
+/// What a `READ` of `key` answers: the last value written, or the device's own.
+/// Shared by both fake servers so the two cannot drift.
+fn read_value(g: &DeviceState, key: &str) -> String {
+    if key == "ad9361-phy/ensm_mode_available" {
+        return ensm_modes_available(g).to_string();
+    }
+    g.get(key).unwrap_or_else(|| default_attr(key)).to_string()
+}
+
+/// What the AD9361 driver prints for `ensm_mode_available`: the states the
+/// part can be asked for, which is the one place its duplex mode is readable
+/// without the debug attributes.
+fn ensm_modes_available(g: &DeviceState) -> &'static str {
+    if fake_is_fdd(g) {
+        "sleep wait alert fdd pinctrl pinctrl_fdd_indep"
+    } else {
+        "sleep wait alert rx tx pinctrl"
     }
 }
 
@@ -375,11 +453,18 @@ const SAMPLE2_Q: i16 = -1024;
 /// +1024 = `0x400`; -1024 in 12-bit two's complement = `0xC00`.
 const SAMPLE2_BYTES: [u8; 4] = [0x00, 0x04, 0x00, 0x0C];
 
-fn serve(sock: TcpStream, state: Arc<Mutex<DeviceState>>, stop: Arc<AtomicBool>, xml: Arc<String>) {
+fn serve(
+    sock: TcpStream,
+    state: Arc<Mutex<DeviceState>>,
+    stop: Arc<AtomicBool>,
+    xml: Arc<String>,
+    connections: Arc<AtomicUsize>,
+) {
     let _ = sock.set_read_timeout(Some(Duration::from_millis(100)));
     let mut writer = sock.try_clone().expect("clone");
     let mut reader = BufReader::new(sock);
     let mut line = String::new();
+    let mut session = false;
     while !stop.load(Ordering::Relaxed) {
         line.clear();
         match reader.read_line(&mut line) {
@@ -394,17 +479,30 @@ fn serve(sock: TcpStream, state: Arc<Mutex<DeviceState>>, stop: Arc<AtomicBool>,
             continue;
         }
         let words: Vec<&str> = cmd.split_whitespace().collect();
+        // Counted on arrival rather than on answer, so a probe the board is
+        // too busy to answer is on the books by the time its pause is over.
+        if !session && words.first() == Some(&"VERSION") {
+            state.lock().expect("lock").probes += 1;
+        }
+        // A board that has paused answers nobody until it recovers — a fresh
+        // connection included, which is what tells its pause apart from one
+        // stuck socket.
+        let paused_until = state.lock().expect("lock").paused_until;
+        if let Some(until) = paused_until {
+            std::thread::sleep(until.saturating_duration_since(Instant::now()));
+        }
         let ok = match words.first().copied() {
             Some("VERSION") => writer.write_all(b"0.25 (git tag:v0.25)\n").is_ok(),
-            Some("TIMEOUT") => writer.write_all(b"0\n").is_ok(),
+            Some("TIMEOUT") => {
+                if !std::mem::replace(&mut session, true) {
+                    connections.fetch_add(1, Ordering::Relaxed);
+                }
+                writer.write_all(b"0\n").is_ok()
+            }
             Some("PRINT") => writer.write_all(format!("{}\n{xml}\n", xml.len()).as_bytes()).is_ok(),
             Some("READ") => {
                 let key = attr_key(&words[1..]);
-                let value = {
-                    let g = state.lock().expect("lock");
-                    g.get(&key).map(str::to_string)
-                }
-                .unwrap_or_else(|| default_attr(&key).to_string());
+                let value = read_value(&state.lock().expect("lock"), &key);
                 let mut payload = value.into_bytes();
                 payload.push(0);
                 writer
@@ -425,6 +523,35 @@ fn serve(sock: TcpStream, state: Arc<Mutex<DeviceState>>, stop: Arc<AtomicBool>,
                 let value =
                     String::from_utf8_lossy(&payload).trim_end_matches('\0').trim().to_string();
                 if refuses_carrier(&state, &key, &value) {
+                    let _ = writer.write_all(b"-22\n");
+                    if writer.flush().is_err() {
+                        break;
+                    }
+                    continue;
+                }
+                // The state machine checks the state asked for against the
+                // mode the part is in: `rx` and `tx` are TDD states, `fdd` is
+                // FDD's. And `fdd` asked of a TDD part is not merely refused —
+                // from anywhere but `alert`, the driver forces the part
+                // through `alert` and then writes FORCE_TX_ON, which in TDD is
+                // *transmit*, before it answers -EINVAL. Modelled, because it
+                // is the one wrong write here that keys the radio.
+                if key == "ad9361-phy/ensm_mode" && {
+                    let mut g = state.lock().expect("lock");
+                    let fdd = fake_is_fdd(&g);
+                    let refused = match value.as_str() {
+                        "rx" | "tx" => fdd,
+                        "fdd" => !fdd,
+                        _ => false,
+                    };
+                    if refused
+                        && !fdd
+                        && g.get(&key).unwrap_or_else(|| default_attr(&key)) != "alert"
+                    {
+                        g.attrs.push((key.clone(), "tx".to_string()));
+                    }
+                    refused
+                } {
                     let _ = writer.write_all(b"-22\n");
                     if writer.flush().is_err() {
                         break;
@@ -530,6 +657,9 @@ fn serve(sock: TcpStream, state: Arc<Mutex<DeviceState>>, stop: Arc<AtomicBool>,
                 writer.write_all(b"0\n").is_ok()
             }
             Some("READBUF") => {
+                if std::mem::take(&mut state.lock().expect("lock").swallow_next_readbuf) {
+                    continue;
+                }
                 // A dual-pair mask gets four-element sample sets, the second
                 // pair carrying its own pattern; anything else gets the stock
                 // two-element sets.
@@ -572,12 +702,19 @@ fn serve(sock: TcpStream, state: Arc<Mutex<DeviceState>>, stop: Arc<AtomicBool>,
                     let mut g = state.lock().expect("lock");
                     std::mem::take(&mut g.stall_next_readbuf)
                 };
-                let ok = if let Some(how_long) = stall {
+                let ok = if let Some(stall) = stall {
                     // The same bytes in the same order — only the timing
                     // differs. The pause falls *inside* the first chunk's
                     // payload, which is the position that matters: a read that
                     // gives up there has consumed an unknown number of bytes
                     // and cannot simply be retried from the top.
+                    let how_long = match stall {
+                        Stall::Socket(d) => d,
+                        Stall::Board(d) => {
+                            state.lock().expect("lock").paused_until = Some(Instant::now() + d);
+                            d
+                        }
+                    };
                     stalled_chunk(&mut writer, &data[..split], &mask, how_long)
                         && write_chunk(&mut writer, &data[split..], &mask)
                 } else {
@@ -672,12 +809,13 @@ fn attr_key(words: &[&str]) -> String {
     parts.join("/")
 }
 
-/// A mid-buffer gap short enough that the client should wait it out on the
-/// socket it already has.
+/// A mid-buffer pause of the whole board short enough that the client should
+/// wait it out on the socket it already has.
 ///
-/// Over the one-second socket poll, so the read genuinely comes back empty and
-/// the retry loop is what carries it; under the payload deadline, so the answer
-/// under test is patience rather than the reconnect below.
+/// Several socket polls long, so the read genuinely comes back empty and the
+/// retry loop is what carries it, and long enough that the client asks the
+/// board — twice — and gets no answer; under the payload deadline, so the
+/// answer under test is patience rather than the reconnect below.
 const HICCUP: Duration = Duration::from_millis(1_200);
 
 /// A mid-buffer gap longer than one payload deadline, on a transfer that then
@@ -687,13 +825,14 @@ const HICCUP: Duration = Duration::from_millis(1_200);
 /// that the bytes were always going to arrive.
 const PAUSE: Duration = Duration::from_millis(3_000);
 
-/// A mid-buffer gap long enough that the client should stop waiting and replace
-/// the receive socket.
+/// A mid-buffer silence on one socket, long enough that the client has no
+/// business waiting it out — and, the board answering meanwhile, no reason to.
 ///
-/// Six seconds is chosen against the field report: a LibreSDR over a saturated
-/// link went quiet mid-payload while `iiod` on the same board answered a fresh
-/// connection in six milliseconds. Waiting it out was eight seconds of dead
-/// audio for a fault a reconnect clears in fifty milliseconds.
+/// Six seconds is chosen against the field reports: a LibreSDR went quiet
+/// mid-payload for eight seconds while `iiod` on the same board answered a
+/// fresh connection in six milliseconds, and the #377 stalls ran out a
+/// six-second deadline time after time. A reconnect clears it in tens of
+/// milliseconds.
 const STALL: Duration = Duration::from_secs(6);
 
 fn wait_for(what: &str, cond: impl FnMut() -> bool) {
@@ -904,6 +1043,9 @@ fn a_gap_in_the_middle_of_a_buffer_does_not_end_the_stream() {
         3,
         "a gap shorter than the payload deadline must be waited out, not redialled around"
     );
+    // And waited out because the board was asked and said nothing — it was the
+    // board that had gone quiet, not this socket.
+    assert!(fake.state.lock().expect("lock").probes >= 1, "the board was never asked");
     // The samples either side of the gap are still the ones the device sent,
     // in the right order — a retry that lost its place would interleave I and Q.
     assert!((buf[0] - (SAMPLE_I as f32 / 2048.0)).abs() < 1e-6, "I was {}", buf[0]);
@@ -941,6 +1083,10 @@ fn a_pause_the_transfer_recovers_from_costs_no_socket() {
         "a pause the transfer recovered from must not have cost a socket"
     );
     assert_eq!(fake.state.lock().expect("lock").rx_buffer_opens, 1, "...nor a buffer reopen");
+    assert!(
+        fake.state.lock().expect("lock").probes >= 1,
+        "the board should have been asked, and its silence is why the socket was kept"
+    );
     // And the two halves are still the samples the device sent, in order — a
     // resumed read that lost its place would interleave I and Q.
     assert!((buf[0] - (SAMPLE_I as f32 / 2048.0)).abs() < 1e-6, "I was {}", buf[0]);
@@ -948,21 +1094,23 @@ fn a_pause_the_transfer_recovers_from_costs_no_socket() {
     handle.release();
 }
 
-/// A gap too long to wait out costs one socket, not the whole radio.
+/// A socket stuck while the board answers costs one socket, not the whole
+/// radio — and not seconds of waiting either (issues #377, #418).
 ///
-/// The fault this is drawn from wedged a single TCP connection mid-payload for
-/// eight seconds while `iiod` on the same board answered a fresh connection in
-/// six milliseconds — so the board was never gone, and taking the rig down to
-/// redial it from scratch (context XML, whole front end, source swap) added a
-/// second of dead audio to a stall that was already the complaint. Replacing
-/// the one socket that failed is tens of milliseconds, and it leaves the dial,
-/// the gains and any transmission in progress alone.
+/// The faults this is drawn from wedged a single TCP connection mid-payload for
+/// six to eight seconds at a time while `iiod` on the same board answered a
+/// fresh connection in six milliseconds. Taking the rig down to redial it from
+/// scratch (context XML, whole front end, source swap) added a second of dead
+/// audio to a stall that was already the complaint; waiting the deadline out
+/// first, as the client later did, was the rest of it, every time. The board
+/// is asked once the socket has been quiet for half a second, and the socket
+/// replaced as soon as it answers.
 #[test]
-fn a_gap_too_long_to_wait_out_replaces_the_socket_and_keeps_the_radio() {
+fn a_socket_stuck_while_the_board_answers_is_replaced_at_once_and_keeps_the_radio() {
     let fake = Fake::start_that_stalls_mid_buffer();
     let mut handle =
         PlutoHandle::open(&fake.address(), &config(), 435_000_000.0).expect("open the fake Pluto");
-    wait_for("the receive buffer", || fake.state.lock().unwrap().rx_buffer_open);
+    let opened = Instant::now();
 
     let mut buf = vec![0f32; 4096];
     let mut got = 0;
@@ -970,7 +1118,15 @@ fn a_gap_too_long_to_wait_out_replaces_the_socket_and_keeps_the_radio() {
         got = handle.rx_read(&mut buf);
         got > 0
     });
+    let took = opened.elapsed();
+    assert!(
+        took < Duration::from_millis(1_500),
+        "the stuck socket cost {took:?} of silence — waiting out the payload deadline on a \
+         socket the board has stopped sending on is the dead air this exists to remove"
+    );
     assert!(handle.is_alive(), "the board was never gone, and the connection must survive");
+    let trace = handle.trace().dump();
+    assert!(trace.contains("the socket is stuck"), "the verdict belongs in the trace:\n{trace}");
     let connections = fake.connections.load(Ordering::Relaxed);
     assert!(
         connections >= 4,
@@ -988,6 +1144,37 @@ fn a_gap_too_long_to_wait_out_replaces_the_socket_and_keeps_the_radio() {
         fake.state.lock().unwrap().get("ad9361-phy/OUTPUT/altvoltage0/frequency")
             == Some("144200000")
     });
+    handle.release();
+}
+
+/// The same stuck socket, caught before its reply began: a `READBUF` that is
+/// never answered while the board answers everything else. How the #377
+/// control-connection drop started ("read reply failed").
+///
+/// Later than a stuck payload, because a healthy daemon may sit on a request
+/// for its whole device timeout before saying `-ETIMEDOUT` — but not the
+/// eight seconds the reply wait used to take to give up.
+#[test]
+fn a_readbuf_never_answered_while_the_board_answers_is_replaced() {
+    let fake = Fake::start_with(
+        DeviceState { swallow_next_readbuf: true, ..DeviceState::default() },
+        CONTEXT_XML.to_string(),
+    );
+    let mut handle =
+        PlutoHandle::open(&fake.address(), &config(), 435_000_000.0).expect("open the fake Pluto");
+    let opened = Instant::now();
+
+    let mut buf = vec![0f32; 4096];
+    let mut got = 0;
+    wait_up_to(Duration::from_secs(12), "samples after the socket was replaced", || {
+        got = handle.rx_read(&mut buf);
+        got > 0
+    });
+    let took = opened.elapsed();
+    assert!(took < Duration::from_secs(6), "an unanswered READBUF cost {took:?} of silence");
+    assert!(handle.is_alive(), "the board was never gone, and the connection must survive");
+    assert_eq!(fake.connections.load(Ordering::Relaxed), 4, "one socket replaced, no more");
+    assert!(fake.state.lock().expect("lock").probes >= 1, "the board was never asked");
     handle.release();
 }
 
@@ -1047,6 +1234,32 @@ fn releasing_does_not_wait_out_a_stalled_read() {
         took < STALL / 2,
         "release waited {took:?} for a read stalled {STALL:?} — it must break the read, \
          not outlive it"
+    );
+}
+
+/// Breaking that read is our own doing, and has to be understood as such.
+///
+/// From the receive thread's side a socket shut down by `release` is
+/// indistinguishable from the far end hanging up: "the server closed the
+/// connection with N bytes still due". It used to be reported exactly so, as a
+/// warning, followed by a redial — which is what every run of the `probe`
+/// example ends with, since it releases the radio after two seconds of
+/// streaming. Issue #470 was read as `iiod` crashing two seconds in.
+#[test]
+fn releasing_mid_read_is_not_reported_as_a_failed_socket() {
+    let fake = Fake::start_that_stalls_mid_buffer();
+    let mut handle =
+        PlutoHandle::open(&fake.address(), &config(), 435_000_000.0).expect("open the fake Pluto");
+    // Inside the stalled read, which is where the probe's release lands — and
+    // well before the half-second of silence after which the board would be
+    // asked about the socket, which here would rightly condemn it.
+    std::thread::sleep(Duration::from_millis(150));
+    handle.release();
+
+    let trace = handle.trace().dump();
+    assert!(
+        !trace.contains("socket failed"),
+        "a socket this client shut down was reported as a failure:\n{trace}"
     );
 }
 
@@ -1321,18 +1534,122 @@ fn full_duplex_receives_through_an_over() {
 /// sentence on screen rather than a silent half-duplex over.
 #[test]
 fn full_duplex_on_a_tdd_board_says_so() {
+    let fake = Fake::start_with(somebody_elses_tdd_board(), CONTEXT_XML.to_string());
+    let cfg = PlutoConfig { full_duplex: true, ..config() };
+    let handle = PlutoHandle::open(&fake.address(), &cfg, 145_500_000.0).expect("it still opens");
+    let status = handle.open_status().unwrap_or_default();
+    assert!(status.contains("TDD"), "the mode should be named, got {status:?}");
+    assert!(status.contains("full duplex"), "and what it collides with, got {status:?}");
+}
+
+/// A board in TDD with no GPO pin slaved — somebody else's arrangement, and
+/// idle, which in TDD is `alert`: nobody is driving the state machine.
+fn somebody_elses_tdd_board() -> DeviceState {
+    DeviceState {
+        attrs: vec![
+            (FDD_PROPERTY.to_string(), "0".to_string()),
+            ("ad9361-phy/ensm_mode".to_string(), "alert".to_string()),
+        ],
+        ..DeviceState::default()
+    }
+}
+
+/// Issue #470: a Pluto in FDD whose state machine sat in `alert`. The radio
+/// opened, every register read back as configured, and the capture was one
+/// sample word repeated for two seconds — a receiver that was never on.
+///
+/// `alert` is a state both modes have, and the driver parks an FDD part there
+/// around its own calibrations — and leaves it there when one fails, since its
+/// bandwidth update returns before restoring. The client used to read "not
+/// `fdd`" as "somebody's TDD" and leave the board alone. On an FDD part there
+/// is nothing to respect: `fdd` is the only state that receives.
+///
+/// Put back last, after every write that can calibrate — any of them can be
+/// the one that parks it again.
+#[test]
+fn an_fdd_board_parked_in_alert_is_put_back_to_receiving() {
     let fake = Fake::start_with(
         DeviceState {
-            attrs: vec![("ad9361-phy/ensm_mode".to_string(), "tdd".to_string())],
+            attrs: vec![("ad9361-phy/ensm_mode".to_string(), "alert".to_string())],
             ..DeviceState::default()
         },
         CONTEXT_XML.to_string(),
     );
-    let cfg = PlutoConfig { full_duplex: true, ..config() };
-    let handle = PlutoHandle::open(&fake.address(), &cfg, 145_500_000.0).expect("it still opens");
+    let handle =
+        PlutoHandle::open(&fake.address(), &config(), 100_000_000.0).expect("open the fake Pluto");
+    wait_for("the receive buffer", || fake.state.lock().unwrap().rx_buffer_open);
+
+    let g = fake.state.lock().expect("lock");
+    assert_eq!(g.get("ad9361-phy/ensm_mode"), Some("fdd"), "the receiver has to be switched on");
+    // The fixture's own `alert`, then the one write.
+    assert_eq!(g.writes_of("ad9361-phy/ensm_mode"), vec!["alert", "fdd"]);
+    // Not by reinitialising the part: the state is all that was wrong.
+    let touched: Vec<&str> =
+        g.attrs.iter().map(|(k, _)| k.as_str()).filter(|k| k.contains("/DEBUG/")).collect();
+    assert!(touched.is_empty(), "the device tree was rewritten: {touched:?}");
+    let last = |key: &str| g.attrs.iter().rposition(|(k, _)| k == key);
+    let fdd_at = last("ad9361-phy/ensm_mode").expect("written");
+    for key in [
+        "ad9361-phy/INPUT/voltage0/sampling_frequency",
+        "ad9361-phy/INPUT/voltage0/rf_bandwidth",
+        "ad9361-phy/OUTPUT/altvoltage0/frequency",
+        "ad9361-phy/OUTPUT/altvoltage1/frequency",
+    ] {
+        let at = last(key).unwrap_or_else(|| panic!("{key} was never written"));
+        assert!(at < fdd_at, "{key} was written after the state machine was put back");
+    }
+    drop(g);
+    drop(handle);
+}
+
+/// …and the other side of that line. A TDD board nobody here is driving stays
+/// as it is — but a receiver that is off is said out loud, rather than shown
+/// as a flat line. And `fdd` is never written to it: on a TDD part the driver
+/// answers that by switching the transmitter on.
+#[test]
+fn somebody_elses_idle_tdd_board_is_left_alone_and_says_it_is_not_receiving() {
+    let fake = Fake::start_with(somebody_elses_tdd_board(), CONTEXT_XML.to_string());
+    let handle =
+        PlutoHandle::open(&fake.address(), &config(), 145_500_000.0).expect("open the fake Pluto");
     let status = handle.open_status().unwrap_or_default();
-    assert!(status.contains("tdd"), "the mode should be named, got {status:?}");
-    assert!(status.contains("full duplex"), "and what it collides with, got {status:?}");
+    assert!(status.contains("not receiving"), "the dead receiver should be named, got {status:?}");
+    assert!(status.contains("TDD"), "and why, got {status:?}");
+    wait_for("the receive buffer", || fake.state.lock().unwrap().rx_buffer_open);
+
+    let g = fake.state.lock().expect("lock");
+    assert_eq!(g.writes_of("ad9361-phy/ensm_mode"), vec!["alert"], "the state machine was driven");
+    assert_eq!(g.writes_of(FDD_PROPERTY), vec!["0"], "the board was reconfigured");
+    drop(g);
+    drop(handle);
+}
+
+/// An FDD board whose state machine follows its ENABLE/TXNRX pins is being
+/// driven by whatever is wired to them. An `ensm_mode` write would hand
+/// control back to SPI, so a board like that is left as it is — and told.
+#[test]
+fn a_state_machine_on_its_enable_pins_is_not_taken_over() {
+    let fake = Fake::start_with(
+        DeviceState {
+            attrs: vec![
+                ("ad9361-phy/ensm_mode".to_string(), "alert".to_string()),
+                (
+                    "ad9361-phy/DEBUG/adi,ensm-enable-txnrx-control-enable".to_string(),
+                    "1".to_string(),
+                ),
+            ],
+            ..DeviceState::default()
+        },
+        CONTEXT_XML.to_string(),
+    );
+    let handle =
+        PlutoHandle::open(&fake.address(), &config(), 145_500_000.0).expect("open the fake Pluto");
+    let status = handle.open_status().unwrap_or_default();
+    assert!(status.contains("not receiving"), "the dead receiver should be named, got {status:?}");
+    assert!(status.contains("pins"), "and why, got {status:?}");
+    let g = fake.state.lock().expect("lock");
+    assert_eq!(g.writes_of("ad9361-phy/ensm_mode"), vec!["alert"], "the state machine was driven");
+    drop(g);
+    drop(handle);
 }
 
 /// The GPO transmit-receive switching, end to end: the device-tree properties
@@ -1468,7 +1785,9 @@ fn a_board_this_left_in_tdd_is_put_back_when_the_pins_are_turned_off() {
     let fake = Fake::start_with(
         DeviceState {
             attrs: vec![
-                ("ad9361-phy/ensm_mode".to_string(), "tdd".to_string()),
+                // TDD, and receiving: the last session's key-down left it in `rx`.
+                (FDD_PROPERTY.to_string(), "0".to_string()),
+                ("ad9361-phy/ensm_mode".to_string(), "rx".to_string()),
                 ("ad9361-phy/DEBUG/adi,gpo2-slave-rx-enable".to_string(), "1".to_string()),
                 ("ad9361-phy/DEBUG/adi,gpo3-slave-tx-enable".to_string(), "1".to_string()),
             ],
@@ -1695,11 +2014,7 @@ fn serve_with_xml(
             Some("TIMEOUT") => writer.write_all(b"0\n").is_ok(),
             Some("READ") => {
                 let key = attr_key(&words[1..]);
-                let value = {
-                    let g = state.lock().expect("lock");
-                    g.get(&key).map(str::to_string)
-                }
-                .unwrap_or_else(|| default_attr(&key).to_string());
+                let value = read_value(&state.lock().expect("lock"), &key);
                 let mut payload = value.into_bytes();
                 payload.push(0);
                 writer

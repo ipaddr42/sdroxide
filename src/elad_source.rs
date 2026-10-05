@@ -62,21 +62,27 @@
 //! [issue #146]: https://github.com/dividebysandwich/sdroxide/issues/146
 //! [issue #170]: https://github.com/dividebysandwich/sdroxide/issues/170
 //!
-//! # Not verified against hardware
+//! # What has met hardware
 //!
-//! Almost nothing here has been run against a radio. One of the two assumptions
-//! this file was written on has now been settled the hard way, by an operator
-//! with an FDM-DUO: the DDC feeding this USB interface is emphatically *not*
-//! independent of the receiver the transceiver tunes for its own audio. The
-//! other still wants checking — whether the stream survives a transmit cycle.
-//! It is assumed *not* to (the interface is declared half duplex), which is the
-//! safe way to be wrong.
+//! Receiving over the USB interface, driven through the gateway with no serial
+//! cable, has been run on an FDM-DUO (hardware 2.9, firmware 4.9) at 192 kHz:
+//! the I/Q order, the tuning word with the EEPROM clock correction applied, the
+//! dial read-back that follows the radio's own knob, and the radio's VFO A/B
+//! (PRs #462 and #467). Before that, one of the two assumptions this file was
+//! written on had been settled the hard way by an operator: the DDC feeding
+//! this USB interface is emphatically *not* independent of the receiver the
+//! transceiver tunes for its own audio.
+//!
+//! Transmit has not been run, nor has the serial path on a bench, any rate above
+//! 192 kHz, or an FDM-S1/S2. The open question on transmit is whether the
+//! stream survives a transmit cycle. It is assumed *not* to (the interface is
+//! declared half duplex), which is the safe way to be wrong.
 
 use std::time::Duration;
 
 use sdroxide_elad::{EladHandle, Model};
 use sdroxide_radio::{Complex32, ControlUpdate, IqSource, Result};
-use sdroxide_types::{CatConfig, CatFamily, EladAntenna, EladConfig, Mode, TxTelemetry};
+use sdroxide_types::{CatConfig, CatFamily, EladAntenna, EladConfig, Mode, TxTelemetry, Vfo};
 
 /// How long the device may deliver nothing before the connection counts as
 /// dead. Same three seconds as the other native USB backends: this is a local
@@ -107,17 +113,19 @@ const FREQ_SETTLE: Duration = Duration::from_millis(1200);
 /// Three cases and they are genuinely different, which is why this is an enum
 /// rather than an `Option`. The serial port is the full link — it reads as well
 /// as writes, so the meters, the mode and the operator's own knob all come
-/// back. The USB gateway writes only. Nothing at all is an FDM-S.
+/// back. The USB gateway writes commands and reads back only the dial. Nothing
+/// at all is an FDM-S.
 enum Control {
     /// The rig's CAT serial port.
     Serial(Box<sdroxide_cat::CatHandle>),
     /// The FDM-DUO's CAT gateway on the streaming USB interface.
     ///
-    /// A write-only path, and the reason it exists is worth stating: it works
-    /// with **no serial cable plugged in**. A DUO on one USB lead can still be
-    /// tuned, put in a mode and keyed. What is given up is everything that
-    /// needs an answer — the S-meter, the SWR, the transmit power, and any
-    /// notice that the operator has touched the front panel.
+    /// The reason it exists is worth stating: it works with **no serial cable
+    /// plugged in**. A DUO on one USB lead can still be tuned, put in a mode
+    /// and keyed, and the radio's own dial is read back on the same interface
+    /// (`EladHandle::tuned_hz`), so a turn of its knob is followed. What is
+    /// given up is every other answer — the S-meter, the SWR, the transmit
+    /// power, and a mode or a VFO changed on the front panel.
     Gateway,
     /// An FDM-S1 or FDM-S2: a receiver, with nothing to control.
     None,
@@ -166,6 +174,19 @@ pub struct EladSource {
     /// on its way there — leaves genuine front-panel movements getting through,
     /// which is the whole point of reading the rig at all.
     expect_freq: Option<(f64, std::time::Instant)>,
+    /// Which of the radio's own VFOs sdroxide is driving.
+    ///
+    /// Only ever anything but [`Vfo::A`] on the gateway path — see
+    /// [`IqSource::select_vfo`] on this type for why the serial path stays on
+    /// VFO A.
+    rig_vfo: Vfo,
+    /// A VFO taken up while the rig was keyed, waiting for [`Self::tx_end`].
+    ///
+    /// Selecting a VFO moves the radio onto its frequency, and mid-over that is
+    /// the transmitter moving — to a frequency the transmit checks at key-down
+    /// never saw. So the choice is held and made at the unkey, where the
+    /// receive dial goes back anyway.
+    pending_vfo: Option<Vfo>,
     /// Whether the transceiver's VFO is something this end can move at all,
     /// and so whether the window centre is the dial ([`IqSource::center_is_dial`]).
     ///
@@ -239,12 +260,16 @@ impl EladSource {
         } else if cat.serial.path.trim().is_empty() {
             status.push(
                 "no CAT serial port is set, so the FDM-DUO is being driven through its \
-                 USB interface — it can be tuned and keyed, but its S-meter, SWR and \
-                 front-panel knob cannot be read. Set the port under Settings → Radio."
+                 USB interface — it can be tuned and keyed, and its own dial is followed, \
+                 but its S-meter and SWR cannot be read. Set the port under Settings → \
+                 Radio."
                     .to_string(),
             );
-            // Write-only, but it is the interface the samples are arriving on,
-            // so there is no question of whether it is there.
+            // Not quite write-only: commands go out through the gateway, and
+            // the radio's own dial comes back from it (`EladHandle::tuned_hz`),
+            // which is what the VFO being reachable means here. It is also the
+            // interface the samples are arriving on, so there is no question of
+            // whether it is there.
             dial_reachable = true;
             Control::Gateway
         } else {
@@ -302,7 +327,7 @@ impl EladSource {
             if audio_out.is_none() {
                 status.push(
                     "no sound card is set for transmit audio — the FDM-DUO's own USB \
-                     Audio port should be chosen under Settings → General → Radio audio, \
+                     Audio port should be chosen under Settings → Radio → Radio audio, \
                      or transmit will go out through whatever the system default is"
                         .to_string(),
                 );
@@ -338,6 +363,8 @@ impl EladSource {
             preselector: cfg.preselector,
             antenna: EladAntenna::default(),
             expect_freq: None,
+            rig_vfo: Vfo::A,
+            pending_vfo: None,
             dial_reachable,
             keyed: false,
             last_telem: None,
@@ -346,6 +373,19 @@ impl EladSource {
             status,
             late: std::sync::Mutex::new(Vec::new()),
         };
+        // Which of the radio's own VFOs this session is driving, asserted
+        // rather than assumed: a DUO left on VFO B by the last session — or by
+        // its own A/B button — would otherwise receive on B while every command
+        // from here went to A, and the frequency axis would be wrong by
+        // whatever B happens to hold. The serial path sends this already, in
+        // `Protocol::clear_offsets`; this is the gateway's copy of it.
+        if matches!(src.control, Control::Gateway) {
+            src.handle.send_cat(sdroxide_cat::elad::vfo_frame(Vfo::A));
+            // And its dial is read back, which is the only way this path sees
+            // the knob turned. Not on the serial path, where the CAT poll
+            // already reports it.
+            src.handle.follow_radio_dial(true);
+        }
         // Put the transceiver's VFO on the window centre before the first
         // sample is looked at. On a DUO that is where the window *is*, so the
         // two agreeing is what makes the frequency axis true; the device was
@@ -371,11 +411,88 @@ impl EladSource {
         matches!(self.control, Control::Serial(_))
     }
 
+    /// What to make of a frequency the radio has just reported — over its CAT
+    /// port, or read back off the streaming interface.
+    ///
+    /// Not simply believed, because four different things arrive here looking
+    /// the same, and only the last of them is the operator's hand:
+    ///
+    /// * nothing the rig says about its frequency means anything while we are
+    ///   keying it. The VFO is the transmit frequency for the length of the
+    ///   over, and reading that as the window having moved would slide the
+    ///   panadapter sideways on every key-down. [`Self::tx_end`] puts it back,
+    ///   and the report that follows is the honest one;
+    /// * the rig arriving where we sent it is not news. Retire the expectation
+    ///   and say nothing: the centre is already the number we commanded;
+    /// * anything else with a command of ours still in flight is the rig on its
+    ///   way, or an answer that crossed our command on the wire. See
+    ///   [`FREQ_SETTLE`];
+    /// * a report of the frequency we are already on is not a move either —
+    ///   the gateway re-reads the same number four times a second.
+    ///
+    /// What is left is the knob. On this radio the VFO carries the window and
+    /// the dial together, so that is both: the centre moves here (the engine
+    /// reads it straight back out of `center_hz` when it takes the `Freq`, and
+    /// the axis has to be relabelled against the same number the samples are
+    /// now arriving on), and the dial goes up as `Freq` so the readout follows
+    /// the radio instead of sitting where it was left.
+    ///
+    /// Nothing goes back at the VFO: the only write here is the DDC's own
+    /// tuning word, which keeps the device's record of the centre in step with
+    /// ours. So the operator's hand and this end cannot fight over the knob —
+    /// which matters most on the gateway path, where this runs four times a
+    /// second against a dial that may still be turning.
+    fn adopt_dial(&mut self, hz: f64) -> Option<ControlUpdate> {
+        if self.keyed {
+            return None;
+        }
+        match self.expect_freq {
+            // The rig arriving where we sent it. Over serial that retires the
+            // expectation at once: the CAT thread reports a frequency only when
+            // it changes, so this is the one report there will be.
+            //
+            // The gateway re-reads four times a second, and there a match can
+            // be *stale* — the radio still on the number a tune started from.
+            // Wheel up a channel and straight back and the first read matches
+            // the channel returned to before the radio has even left it; retire
+            // the expectation on that and the next read, catching the radio on
+            // its way through the channel in between, is taken for the knob.
+            // So there the expectation stands out its settle time, and the
+            // answers after it are judged on their own; the same number keeps
+            // arriving, so waiting loses nothing.
+            Some((want, at)) if (want - hz).abs() < 1.0 => {
+                if !matches!(self.control, Control::Gateway) || at.elapsed() >= FREQ_SETTLE {
+                    self.expect_freq = None;
+                }
+                None
+            }
+            Some((_, at)) if at.elapsed() < FREQ_SETTLE => None,
+            // A report of where we already are is not a move. Worth its own
+            // line on the gateway path, which re-reads the same number four
+            // times a second and would otherwise announce every one of them.
+            _ if (self.center - hz).abs() < 1.0 => {
+                self.expect_freq = None;
+                None
+            }
+            _ => {
+                self.expect_freq = None;
+                self.center = hz;
+                self.handle.set_center_hz(hz);
+                Some(ControlUpdate::Freq(hz))
+            }
+        }
+    }
+
     /// Put the rig's own VFO on `hz`, by whichever path is available.
     fn command_freq(&mut self, hz: f64) {
         match &self.control {
+            // Always VFO A here: the dial is read back with `FA;`, which
+            // answers VFO A whichever one the radio is on, so this path keeps
+            // the radio there. See `select_vfo`.
             Control::Serial(cat) => cat.set_freq(hz),
-            Control::Gateway => self.handle.send_cat(sdroxide_cat::elad::freq_frame(hz)),
+            Control::Gateway => {
+                self.handle.send_cat(sdroxide_cat::elad::freq_frame_on(self.rig_vfo, hz))
+            }
             Control::None => return,
         }
         self.expect_freq = Some((hz, std::time::Instant::now()));
@@ -592,9 +709,64 @@ impl IqSource for EladSource {
 
     // ── Rig control ──────────────────────────────────────────────────────────
 
+    /// Take up the radio's own VFO B when the operator takes up sdroxide's,
+    /// so the radio's display, its knob and its A/B button are on the same
+    /// dial as the panadapter.
+    ///
+    /// The window rides on whichever VFO is selected, measured on an FDM-DUO:
+    /// `FR1` moves the I/Q stream to VFO B's frequency, `FR0` brings it back,
+    /// and writing `FB` while on A moves nothing. So the pair is sent together
+    /// — select, then the dial on the VFO now selected — which keeps the radio
+    /// on a stale number for one command rather than until the next retune.
+    ///
+    /// **Only on the gateway path.** With a CAT serial port the dial is read
+    /// back by polling `FA;`, and that answers VFO A's frequency whichever VFO
+    /// the radio is on: mirroring there would report the wrong dial for
+    /// everything sdroxide does with B. The USB read-back has no such problem
+    /// — it reports the frequency the receiver is actually on — so the two
+    /// paths differ, and the serial one keeps the radio on VFO A as it always
+    /// has. Lifting that means teaching the CAT layer to ask for the dial it
+    /// is actually on, which is a change in another crate and needs a serial
+    /// cable to test.
+    ///
+    /// Never while keyed: see [`Self::pending_vfo`]. The frequency needs no
+    /// holding with it — the engine re-centres through `set_center_hz`, which
+    /// records the centre that [`Self::tx_end`] puts the radio back on.
+    ///
+    /// Sent even when it names the VFO this end already believes the radio is
+    /// on. A press of A/B at the radio cannot be seen from here (the read-back
+    /// reports a frequency, not a VFO), and after one every command goes to the
+    /// VFO the radio is no longer on; re-selecting the VFO in sdroxide is the
+    /// way back into step, and it would do nothing if a no-change were skipped.
+    fn select_vfo(&mut self, vfo: Vfo, hz: f64) {
+        if !matches!(self.control, Control::Gateway) {
+            return;
+        }
+        if self.keyed {
+            self.pending_vfo = Some(vfo);
+            return;
+        }
+        self.rig_vfo = vfo;
+        self.handle.send_cat(sdroxide_cat::elad::vfo_frame(vfo));
+        self.command_freq(hz);
+    }
+
     fn poll_control(&mut self) -> Vec<ControlUpdate> {
-        let Control::Serial(cat) = &self.control else {
-            return Vec::new();
+        let cat = match &self.control {
+            Control::Serial(cat) => cat,
+            // No serial port, but the radio is still answering on the cable the
+            // samples arrive on, and its own dial can be read there.
+            Control::Gateway => {
+                let Some(hz) = self.handle.tuned_hz() else { return Vec::new() };
+                let out = self.adopt_dial(hz);
+                // Only the moves, not the four answers a second that say the
+                // radio is where it was.
+                if out.is_some() {
+                    tracing::debug!(hz, "the FDM-DUO's own dial moved");
+                }
+                return out.into_iter().collect();
+            }
+            Control::None => return Vec::new(),
         };
         let updates = cat.poll();
         // A radio that has said anything at all is a radio whose VFO this end
@@ -604,47 +776,7 @@ impl IqSource for EladSource {
         let mut out = Vec::new();
         for u in updates {
             match u {
-                sdroxide_cat::CatUpdate::Freq(hz) => {
-                    // Nothing the rig says about its frequency means anything
-                    // while we are keying it: the VFO is the transmit frequency
-                    // for the length of the over, and reading that as the
-                    // window having moved would slide the panadapter sideways
-                    // on every key-down. `tx_end` puts it back, and the report
-                    // that follows is the honest one.
-                    if self.keyed {
-                        continue;
-                    }
-                    match self.expect_freq {
-                        // The rig arriving where we sent it. Retire the
-                        // expectation and say nothing: the centre is already
-                        // the number we commanded.
-                        Some((want, _)) if (want - hz).abs() < 1.0 => self.expect_freq = None,
-                        // Something else, with a command of ours still in
-                        // flight — the rig on its way, or an answer that
-                        // crossed our command on the wire. See `FREQ_SETTLE`.
-                        Some((_, at)) if at.elapsed() < FREQ_SETTLE => {}
-                        // The operator's knob, turned by hand. On this radio
-                        // the VFO carries the window and the dial together, so
-                        // this is both: the centre moves here (the engine reads
-                        // it straight back out of `center_hz` when it takes the
-                        // `Freq`, and the axis has to be relabelled against the
-                        // same number the samples are now arriving on), and the
-                        // dial goes up as `Freq` so the readout follows the
-                        // radio instead of sitting where it was left.
-                        //
-                        // Nothing goes back at the VFO over the control link:
-                        // the only write here is the DDC's own tuning word,
-                        // which keeps the device's record of the centre in step
-                        // with ours. So the operator's hand and this end cannot
-                        // fight over the knob.
-                        _ => {
-                            self.expect_freq = None;
-                            self.center = hz;
-                            self.handle.set_center_hz(hz);
-                            out.push(ControlUpdate::Freq(hz));
-                        }
-                    }
-                }
+                sdroxide_cat::CatUpdate::Freq(hz) => out.extend(self.adopt_dial(hz)),
                 sdroxide_cat::CatUpdate::Mode(m) => out.push(ControlUpdate::Mode(m)),
                 // Which socket the rig came up on, read once as the port
                 // opened. Adopted rather than overridden: it is the operator's
@@ -773,6 +905,12 @@ impl IqSource for EladSource {
         // this the panadapter would spend the rest of the session looking at
         // wherever the last over went out.
         self.keyed = false;
+        // A VFO taken up during the over is selected now, with the transmitter
+        // off, and the centre below lands on it.
+        if let Some(vfo) = self.pending_vfo.take() {
+            self.rig_vfo = vfo;
+            self.handle.send_cat(sdroxide_cat::elad::vfo_frame(vfo));
+        }
         self.command_freq(self.center);
         self.last_telem = None; // drop the stale SWR reading on unkey
         Ok(())
@@ -877,8 +1015,9 @@ impl IqSource for EladSource {
         let mut parts = self.status.clone();
         parts.extend(late.iter().cloned());
         parts.push(
-            "ELAD support is new and has not been verified against real hardware. \
-             If it misbehaves, Settings → Radio has a Copy diagnostic report button."
+            "ELAD support is new, and only receiving on an FDM-DUO has been run on a \
+             real radio. If it misbehaves, Settings → Radio has a Copy diagnostic \
+             report button."
                 .to_string(),
         );
         Some(parts.join(" — "))

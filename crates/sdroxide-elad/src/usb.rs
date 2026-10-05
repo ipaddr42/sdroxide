@@ -304,6 +304,36 @@ impl UsbDev {
         index: u16,
         len: u16,
     ) -> Result<Vec<u8>> {
+        self.control_in_traced(req, name, value, index, len, true)
+    }
+
+    /// [`Self::control_in`] for a request asked on a timer: a failure is
+    /// traced like any other, an answer is not.
+    ///
+    /// The trace is a bounded ring, and a read four times a second fills it
+    /// with identical lines — pushing the open sequence and the EEPROM
+    /// calibration, the part of a report a developer reads first, out of it
+    /// inside a quarter of an hour of an idle radio.
+    pub fn control_in_polled(
+        &self,
+        req: Request,
+        name: &str,
+        value: u16,
+        index: u16,
+        len: u16,
+    ) -> Result<Vec<u8>> {
+        self.control_in_traced(req, name, value, index, len, false)
+    }
+
+    fn control_in_traced(
+        &self,
+        req: Request,
+        name: &str,
+        value: u16,
+        index: u16,
+        len: u16,
+        trace_ok: bool,
+    ) -> Result<Vec<u8>> {
         let r = self
             .iface
             .control_in(
@@ -319,6 +349,7 @@ impl UsbDev {
             )
             .wait();
         match r {
+            Ok(data) if !trace_ok => Ok(data),
             Ok(data) => {
                 self.trace.ctrl(
                     req.code(),

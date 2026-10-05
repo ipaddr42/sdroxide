@@ -179,6 +179,21 @@ impl Default for WefaxUi {
 }
 
 impl WefaxUi {
+    /// Rotate the chart already received, so the PHASE nudge corrects the whole
+    /// picture rather than only the lines still to come (issue #439).
+    pub fn shift_phase(&mut self, pixels: i32) {
+        if self.live_w == 0 || self.live_h == 0 {
+            return;
+        }
+        sdroxide_types::shift_fax_rows(
+            &mut self.live,
+            self.live_w as usize,
+            self.live_h as usize,
+            pixels,
+        );
+        self.dirty = true;
+    }
+
     /// Adopt a freshly decoded scan line.
     pub fn push_line(&mut self, image_id: u32, y: u16, gray: &[u8]) {
         if gray.is_empty() || gray.len() > MAX_W {

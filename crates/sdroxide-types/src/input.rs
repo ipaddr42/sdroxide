@@ -75,6 +75,12 @@ pub enum Action {
     MemoryRecall(u32),
     RecordToggle,
     AbortTx,
+    /// Hold the bound key as a CW straight key (issue #322). The *key* is the
+    /// binding; the CW panel reads it held rather than the input runtime
+    /// dispatching it, because a straight key is a held state and not a
+    /// press/release pair the runtime can see through the panel's own focus
+    /// rules. Only takes effect while the CW panel's KEY toggle is armed.
+    CwStraight,
     /// Transmit voice-keyer slot `n` (0-based). Does nothing when the slot is
     /// empty, which is what makes the shipped numpad bindings safe.
     VoicePlay(u8),
@@ -146,7 +152,7 @@ impl Action {
             | Mute | NoiseBlanker | NoiseReductionCycle | AutoNotch | Binaural | AgcCycle
             | SubRx | ModeNext | ModePrev | ModeSelect(_) | RecordToggle => "Receive",
             Ptt | TuneCarrier | TxDrive | TuneDrive | MicGain | DigiAudioFreq | AbortTx
-            | VoicePlay(_) | VoiceStop | ToneBurst => "Transmit",
+            | CwStraight | VoicePlay(_) | VoiceStop | ToneBurst => "Transmit",
             SpectrumZoom | SpectrumPan | SpectrumFloorDb | SpectrumCeilDb | FitSpan | ZoomIn
             | ZoomOut | PeakHold | SpectrumCollapse | WaterfallCollapse | WaterfallFlip => {
                 "Display"
@@ -201,6 +207,7 @@ impl Action {
             ModePrev => "Mode previous",
             RecordToggle => "Record on/off",
             AbortTx => "Abort transmit",
+            CwStraight => "CW straight key",
             VoiceStop => "Voice keyer stop",
             ToneBurst => "1750 Hz tone burst",
             FitSpan => "Fit span",
@@ -293,7 +300,7 @@ impl Action {
         v.extend(Band::ALL.iter().map(|b| BandSelect(*b)));
         v.extend([ModeNext, ModePrev]);
         v.extend(Mode::ALL.iter().map(|m| ModeSelect(*m)));
-        v.extend([RecordToggle, AbortTx, VoiceStop, ToneBurst]);
+        v.extend([RecordToggle, AbortTx, CwStraight, VoiceStop, ToneBurst]);
         v.extend((0..crate::VOICE_SLOTS as u8).map(VoicePlay));
         v.extend([
             FitSpan,
@@ -495,6 +502,20 @@ impl KeyBinding {
         }
     }
 
+    /// A momentary binding — hold to act, release to stop. Used by the CW
+    /// straight key, which is the one binding whose *held* state matters rather
+    /// than its edges.
+    fn momentary(chord: KeyChord, action: Action) -> Self {
+        KeyBinding {
+            chord,
+            action,
+            value: 1.0,
+            tuning: BindingTuning::with_step(action.default_step()),
+            button: ButtonMode::Momentary,
+            enabled: true,
+        }
+    }
+
     /// The shipped defaults. These reproduce the shortcuts sdroxide had before
     /// bindings were configurable, so an operator who never opens the editor
     /// sees no change.
@@ -521,6 +542,11 @@ impl KeyBinding {
             KeyBinding::toggle(KeyChord::plain("N"), Action::NoiseBlanker),
             KeyBinding::toggle(KeyChord::plain("F"), Action::FitSpan),
             KeyBinding::toggle(KeyChord::plain("V"), Action::WaterfallFlip),
+            // The CW straight key keeps its historical Space bar, now as a
+            // binding so any key can be chosen instead (the space bar's travel
+            // is long for keying). Only armed by the CW panel's KEY toggle, so
+            // it types a space everywhere else.
+            KeyBinding::momentary(KeyChord::plain("Space"), Action::CwStraight),
         ];
         // Numpad 1–9 then 0 play slots 1–10; numpad "−" stops a message early.
         for slot in 0..crate::VOICE_SLOTS as u8 {
@@ -859,6 +885,22 @@ pub struct InputSettings {
     /// stuck-controller backstop. 0 disables the timeout.
     pub ptt_hold_timeout_s: f32,
     pub midi: MidiSettings,
+    /// Which set of shipped defaults this file has already seen. See
+    /// [`InputSettings::SCHEMA`] and [`InputSettings::migrate`].
+    ///
+    /// The field default is spelled out rather than left to the struct's
+    /// `#[serde(default)]`: that one fills a missing field from
+    /// [`InputSettings::default`], which carries the *current* schema — so a
+    /// file written before the stamp existed would read as already migrated
+    /// and the migration would never run on the only files that need it.
+    #[serde(default = "schema_before_stamps")]
+    pub schema: u32,
+}
+
+/// What [`InputSettings::schema`] reads as in a file written before the field
+/// existed: nothing has been migrated into it yet.
+fn schema_before_stamps() -> u32 {
+    0
 }
 
 impl Default for InputSettings {
@@ -869,7 +911,53 @@ impl Default for InputSettings {
             mouse_buttons: Vec::new(),
             ptt_hold_timeout_s: 300.0,
             midi: MidiSettings::default(),
+            schema: InputSettings::SCHEMA,
         }
+    }
+}
+
+impl InputSettings {
+    /// The current shipped-defaults generation. Bumped whenever a release adds
+    /// a *new* default binding — see [`Self::migrate`] for why that is not
+    /// free.
+    pub const SCHEMA: u32 = 1;
+
+    /// Bindings introduced at each schema step, so a saved file picks up a new
+    /// action's default instead of silently losing the key.
+    ///
+    /// The keys are stored as a plain list, so a new entry in
+    /// [`KeyBinding::defaults`] simply does not exist in a file written before
+    /// it was added — and the feature it drives is then dead with nothing on
+    /// screen to say why. That is what happened to the CW straight key: it had
+    /// been hard-wired to the space bar, became [`Action::CwStraight`] so any
+    /// key could drive it, and every operator who had ever opened the Controls
+    /// tab found the space bar doing nothing.
+    ///
+    /// Only ever *adds*, and only where the operator has no binding for that
+    /// action at all — a binding they moved, disabled or deleted after the
+    /// migration ran is theirs, and the stamped `schema` is what stops this
+    /// putting it back.
+    const ADDED: &'static [(u32, Action)] = &[(1, Action::CwStraight)];
+
+    /// Bring a loaded file up to [`Self::SCHEMA`], reporting whether it had to
+    /// be touched — and so whether it is worth writing back. The stamp is
+    /// written even when no binding was added, because it is the stamp that
+    /// keeps a later deletion deleted.
+    pub fn migrate(&mut self) -> bool {
+        if self.schema >= Self::SCHEMA {
+            return false;
+        }
+        let shipped = KeyBinding::defaults();
+        for &(at, action) in Self::ADDED {
+            if self.schema >= at || self.keys.iter().any(|b| b.action == action) {
+                continue;
+            }
+            if let Some(b) = shipped.iter().find(|b| b.action == action) {
+                self.keys.push(b.clone());
+            }
+        }
+        self.schema = Self::SCHEMA;
+        true
     }
 }
 
@@ -880,6 +968,64 @@ mod tests {
     #[test]
     fn absolute_has_no_detents() {
         assert_eq!(RelativeMode::Absolute.decode(64), None);
+    }
+
+    /// A settings file saved before `CwStraight` existed picks the binding up,
+    /// so the space bar still keys a straight key after the upgrade instead of
+    /// quietly doing nothing (issue #495 follow-up).
+    #[test]
+    fn an_old_file_gains_the_bindings_added_since() {
+        let mut old = InputSettings {
+            keys: KeyBinding::defaults()
+                .into_iter()
+                .filter(|b| b.action != Action::CwStraight)
+                .collect(),
+            schema: 0,
+            ..InputSettings::default()
+        };
+        assert!(old.migrate(), "an old file has to be written back");
+        let straight: Vec<_> = old.keys.iter().filter(|b| b.action == Action::CwStraight).collect();
+        assert_eq!(straight.len(), 1, "exactly one straight-key binding");
+        assert_eq!(straight[0].chord, KeyChord::plain("Space"));
+        assert!(straight[0].enabled);
+        assert_eq!(old.schema, InputSettings::SCHEMA);
+    }
+
+    /// The real path: a file on disk with no `schema` key at all.
+    #[test]
+    fn a_file_written_before_the_stamp_existed_reads_as_schema_zero() {
+        let mut cfg = InputSettings::default();
+        cfg.keys.retain(|b| b.action != Action::CwStraight);
+        let mut v: serde_json::Value = serde_json::to_value(&cfg).unwrap();
+        v.as_object_mut().unwrap().remove("schema");
+        let mut back: InputSettings = serde_json::from_value(v).unwrap();
+        assert_eq!(back.schema, 0, "a file with no stamp must read as 0, not as current");
+        assert!(back.migrate());
+        assert!(back.keys.iter().any(|b| b.action == Action::CwStraight));
+    }
+
+    /// ...and only once. An operator who deletes the binding afterwards keeps
+    /// it deleted: the stamp says this file has already seen that default.
+    #[test]
+    fn a_migrated_file_does_not_get_it_back() {
+        let mut cfg = InputSettings::default();
+        cfg.keys.retain(|b| b.action != Action::CwStraight);
+        assert!(!cfg.migrate(), "a current file needs no write-back");
+        assert!(!cfg.keys.iter().any(|b| b.action == Action::CwStraight));
+    }
+
+    /// A binding the operator moved to another key is theirs, and is left
+    /// alone rather than joined by a second one on the shipped default.
+    #[test]
+    fn a_rebound_action_is_not_given_the_default_as_well() {
+        let mut old = InputSettings { schema: 0, ..InputSettings::default() };
+        for b in old.keys.iter_mut().filter(|b| b.action == Action::CwStraight) {
+            b.chord = KeyChord::plain("Z");
+        }
+        old.migrate();
+        let straight: Vec<_> = old.keys.iter().filter(|b| b.action == Action::CwStraight).collect();
+        assert_eq!(straight.len(), 1);
+        assert_eq!(straight[0].chord, KeyChord::plain("Z"));
     }
 
     #[test]

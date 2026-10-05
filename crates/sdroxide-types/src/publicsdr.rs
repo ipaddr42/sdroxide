@@ -33,15 +33,20 @@ use crate::radio::{Backend, RadioConfig, RxSite, SpyServerConfig};
 pub enum PublicSdrNetwork {
     SpyServer,
     KiwiSdr,
+    /// The receivers listed by `sdr-list.xyz` — PhantomSDR-Plus, UberSDR,
+    /// NovaSDR and VertexSDR, the RX-888-class web receivers (issue #482).
+    SdrList,
 }
 
 impl PublicSdrNetwork {
-    pub const ALL: [PublicSdrNetwork; 2] = [PublicSdrNetwork::SpyServer, PublicSdrNetwork::KiwiSdr];
+    pub const ALL: [PublicSdrNetwork; 3] =
+        [PublicSdrNetwork::SpyServer, PublicSdrNetwork::KiwiSdr, PublicSdrNetwork::SdrList];
 
     pub fn label(self) -> &'static str {
         match self {
             PublicSdrNetwork::SpyServer => "SpyServer",
             PublicSdrNetwork::KiwiSdr => "KiwiSDR",
+            PublicSdrNetwork::SdrList => "sdr-list.xyz",
         }
     }
 }
@@ -112,6 +117,10 @@ impl PublicSdrEntry {
             PublicSdrNetwork::SpyServer => Backend::SpyServer,
             // A Kiwi has only the one shape.
             PublicSdrNetwork::KiwiSdr => Backend::KiwiSdr,
+            // Nothing drives these yet — see `PublicSdrEntry::blocked_reason`.
+            // Named rather than left to a catch-all so that adding a client
+            // for one of them is a compile error here until this is answered.
+            PublicSdrNetwork::SdrList => Backend::KiwiSdr,
         }
     }
 
@@ -141,6 +150,15 @@ impl PublicSdrEntry {
                 block.iq_decimation = SpyServerConfig::AUTO_DECIMATION;
             }
             PublicSdrNetwork::KiwiSdr => {
+                cfg.kiwi.address = self.address.clone();
+                cfg.kiwi.password.clear();
+            }
+            // Unreachable in practice: `blocked_reason` refuses every one of
+            // these and the panel does not offer a blocked row. The address
+            // still goes into the KiwiSDR block, because that is the interface
+            // a client for these would grow out of — see `blocked_reason` for
+            // what is actually in the way.
+            PublicSdrNetwork::SdrList => {
                 cfg.kiwi.address = self.address.clone();
                 cfg.kiwi.password.clear();
             }
@@ -193,6 +211,31 @@ impl PublicSdrEntry {
     /// for a receiver in a particular part of the world is better served by
     /// "there is one there, and it is full" than by an empty list.
     pub fn blocked_reason(&self) -> Option<String> {
+        if self.network == PublicSdrNetwork::SdrList {
+            // Measured against a live PhantomSDR-Plus 4.1.0, not assumed: its
+            // Kiwi bridge answers `/kiwi/<id>/SND` and `/kiwi/<id>/W/F`, takes
+            // `SET mod=… freq=…` and really does retune — but what comes back
+            // is **demodulated mono audio**, 512 big-endian `i16` a frame at
+            // 12 kHz with the stereo flag clear, not the I/Q that
+            // `Backend::KiwiSdr` decodes. The bridge's own source says so:
+            // *"KiwiSndEncoder — packs demodulated PCM into the Kiwi SND frame
+            // format"*. The others on this list — UberSDR, NovaSDR, VertexSDR —
+            // answer 404 on those paths and speak protocols of their own.
+            //
+            // So the directory is here and the receivers are not reachable
+            // yet. Saying which, and why, is the point: an operator can see
+            // what is on the air and where, and nobody has to re-discover this
+            // by trying it.
+            return Some(match self.device.as_str() {
+                d if d.starts_with("PhantomSDR") => {
+                    "PhantomSDR's KiwiSDR bridge sends demodulated audio, not I/Q — sdroxide \
+                     has no client for it yet"
+                        .into()
+                }
+                "" => "no client for this receiver's protocol yet".to_string(),
+                d => format!("no client for {d}'s protocol yet"),
+            });
+        }
         if self.api_channels == Some(0) {
             return Some("operator has not enabled connections from non-browser apps".into());
         }
@@ -464,6 +507,134 @@ pub fn parse_kiwisdr_directory(js: &str) -> Result<Vec<PublicSdrEntry>, String> 
                     .as_deref()
                     .and_then(|s| s.split(',').next())
                     .and_then(|s| s.trim().parse::<u8>().ok()),
+            })
+        })
+        .collect())
+}
+
+// -------------------------------------------------------------------------
+// sdr-list.xyz
+// -------------------------------------------------------------------------
+
+/// One row of `sdr-list.xyz/api/v1/receivers`.
+///
+/// A proper JSON API, unlike the other two: one flat array, real numbers, and
+/// a coordinate that is already split out. Every field is optional anyway —
+/// about a fifth of the rows are receivers the crawler has seen once and can
+/// say little about, and those carry `null` for everything but the address.
+#[derive(Deserialize)]
+struct SdrListRow {
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    hostname: Option<String>,
+    #[serde(default)]
+    port: Option<u16>,
+    #[serde(default)]
+    users: Option<u32>,
+    #[serde(default)]
+    max_users: Option<u32>,
+    #[serde(default)]
+    grid_locator: Option<String>,
+    #[serde(default)]
+    lat: Option<f64>,
+    #[serde(default)]
+    lon: Option<f64>,
+    /// The web-receiver software: `PhantomSDR+`, `UberSDR`, `NovaSDR`,
+    /// `VertexSDR`, or empty where the crawler could not tell.
+    #[serde(default)]
+    software: Option<String>,
+    #[serde(default)]
+    version: Option<String>,
+    #[serde(default)]
+    range_start_hz: Option<f64>,
+    #[serde(default)]
+    range_end_hz: Option<f64>,
+    /// Width of the receiver's whole window, which is *not* the tuning range:
+    /// an RX-888 direct-sampling 0–30 MHz reports 30 MHz here and a VHF one
+    /// reports its 2 MHz span around 434 MHz.
+    #[serde(default)]
+    bandwidth: Option<f64>,
+    #[serde(default)]
+    center_frequency: Option<f64>,
+    #[serde(default)]
+    location_city: Option<String>,
+    #[serde(default)]
+    location_country: Option<String>,
+}
+
+/// Parse `sdr-list.xyz`'s receiver list (issue #482).
+///
+/// The list is what it says it is and needs none of the unwrapping the other
+/// two do. What it does *not* say is which of these sdroxide can drive — see
+/// [`PublicSdrEntry::blocked_reason`], which is where that lives so the answer
+/// is in one place and can be softened one family at a time.
+///
+/// A row with no host is dropped; anything else is kept, including the ones
+/// the crawler knows nothing else about. A receiver with no stated range is
+/// given the window its `center_frequency` and `bandwidth` describe, which is
+/// what the listing itself draws its coverage bar from.
+pub fn parse_sdr_list_directory(json: &str) -> Result<Vec<PublicSdrEntry>, String> {
+    let rows: Vec<SdrListRow> = serde_json::from_str(json).map_err(|e| e.to_string())?;
+    Ok(rows
+        .into_iter()
+        .filter_map(|r| {
+            let host = r.hostname?;
+            let host = host.trim();
+            if host.is_empty() {
+                return None;
+            }
+            // Always an explicit port, for the reason the KiwiSDR parser gives:
+            // more than half of these answer on 80 and a default of anything
+            // else would miss them.
+            let address = format!("{host}:{}", r.port.unwrap_or(80));
+            // "City, Country", with whichever halves there are.
+            let location = [r.location_city.as_deref(), r.location_country.as_deref()]
+                .into_iter()
+                .flatten()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let (min_hz, max_hz) = match (r.range_start_hz, r.range_end_hz) {
+                (Some(lo), Some(hi)) if hi > lo => (lo, hi),
+                // Fall back to the window the receiver is looking at.
+                _ => match (r.center_frequency, r.bandwidth) {
+                    (Some(c), Some(bw)) if bw > 0.0 => ((c - bw / 2.0).max(0.0), c + bw / 2.0),
+                    _ => (0.0, 0.0),
+                },
+            };
+            let software = r.software.unwrap_or_default().trim().to_string();
+            // The version rides with the software name, because which build a
+            // PhantomSDR is running is exactly what decides whether its Kiwi
+            // bridge is there at all.
+            let device = match r.version.as_deref().map(str::trim).filter(|v| !v.is_empty()) {
+                Some(v) if !software.is_empty() => format!("{software} {v}"),
+                _ => software,
+            };
+            let coord = |v: Option<f64>| v.filter(|f| *f != 0.0).map(|f| f as f32);
+            Some(PublicSdrEntry {
+                network: PublicSdrNetwork::SdrList,
+                name: r.name.unwrap_or_default().trim().to_string(),
+                location,
+                // The listing carries no antenna description at all.
+                antenna: String::new(),
+                device,
+                address,
+                lat: coord(r.lat),
+                lon: coord(r.lon),
+                grid: r.grid_locator.unwrap_or_default().trim().to_string(),
+                min_hz,
+                max_hz,
+                users: r.users.unwrap_or(0),
+                max_users: r.max_users.unwrap_or(0),
+                // No equivalent of the Kiwi's `ext_api`: these receivers make
+                // no distinction between a browser and anything else.
+                api_channels: None,
+                max_iq_rate: 0.0,
+                full_control: true,
+                session_limit_min: 0,
+                snr_db: None,
             })
         })
         .collect())
@@ -884,6 +1055,105 @@ var kiwisdr_com =
         assert_eq!(describe_place("none"), "");
         assert_eq!(describe_place(""), "");
         assert_eq!(describe_place("Ottawa wideband"), "Ottawa wideband");
+    }
+
+    /// Five rows copied out of a live `sdr-list.xyz/api/v1/receivers`: one of
+    /// each software family it lists, plus the shape a row takes when the
+    /// crawler has seen a receiver and knows nothing else about it (`null`
+    /// everywhere but the address).
+    const SDR_LIST_SAMPLE: &str = r#"[
+      {"id":78212,"name":"K3FEF - Radio Ranch in Milford PA","hostname":"ubersdr.k3fef.com",
+       "port":80,"bandwidth":30000000,"users":46,"max_users":200,
+       "center_frequency":15000000,"grid_locator":"FN21mh","lat":41.3125,"lon":-74.95833333,
+       "software":"UberSDR","backend":"ka9q-radio","version":"0.1.66","receiver_count":1,
+       "range_start_hz":10000,"range_end_hz":30000000,"location_city":"Dingman Township",
+       "location_country":"United States","last_seen":"2026-09-17T23:17:44Z"},
+      {"id":67,"name":"SV1BTL PhantomSDR+","hostname":"phantomsdr.no-ip.org","port":8900,
+       "bandwidth":30000000,"users":5,"max_users":100,"center_frequency":15000000,
+       "grid_locator":"KM17VX","lat":37.97916666,"lon":23.79166666,"software":"PhantomSDR+",
+       "backend":null,"version":"v.4.1.0","receiver_count":null,"range_start_hz":null,
+       "range_end_hz":null,"location_city":"Municipal Unit of Papagou",
+       "location_country":"Greece","last_seen":"2026-09-17T23:18:07Z"},
+      {"id":58889,"name":"WebSDR.ru","hostname":"websdr.ru","port":80,"bandwidth":30000000,
+       "users":5,"max_users":1000,"center_frequency":15000000,"grid_locator":"KO89XC",
+       "lat":59.10416666,"lon":37.95833333,"software":"","backend":null,"version":null,
+       "receiver_count":null,"range_start_hz":null,"range_end_hz":null,
+       "location_city":"Cherepovets","location_country":"Russia",
+       "last_seen":"2026-05-14T18:08:25Z"},
+      {"id":18810721,"name":"22dx.ru WebSDR in Barnaul","hostname":"sdr.22dx.ru","port":8901,
+       "bandwidth":2048000,"users":1,"max_users":100,"center_frequency":434000000,
+       "grid_locator":"NO13TH","lat":53.3125,"lon":83.625,"software":"VertexSDR",
+       "backend":"fftw","version":"20260916201653-64","receiver_count":6,
+       "range_start_hz":432976000,"range_end_hz":435024000,"location_city":"Barnaul",
+       "location_country":"Russia","last_seen":"2026-09-17T23:18:04Z"},
+      {"id":9,"name":null,"hostname":"bare.example","port":null,"bandwidth":null,
+       "users":null,"max_users":null,"center_frequency":null,"grid_locator":null,
+       "lat":null,"lon":null,"software":null,"backend":null,"version":null,
+       "receiver_count":null,"range_start_hz":null,"range_end_hz":null,
+       "location_city":null,"location_country":null,"last_seen":null}
+    ]"#;
+
+    #[test]
+    fn the_sdr_list_directory_parses() {
+        let e = parse_sdr_list_directory(SDR_LIST_SAMPLE).expect("parses");
+        assert_eq!(e.len(), 5);
+        assert!(e.iter().all(|r| r.network == PublicSdrNetwork::SdrList));
+
+        let uber = &e[0];
+        assert_eq!(uber.address, "ubersdr.k3fef.com:80");
+        assert_eq!(uber.location, "Dingman Township, United States");
+        assert_eq!(uber.device, "UberSDR 0.1.66");
+        assert_eq!(uber.grid, "FN21mh");
+        assert_eq!((uber.min_hz, uber.max_hz), (10_000.0, 30_000_000.0));
+        assert_eq!((uber.users, uber.max_users), (46, 200));
+
+        // A row with no stated range falls back to the window its centre and
+        // bandwidth describe, which is what the listing's own coverage bar
+        // draws. 15 MHz ± 15 is the whole of HF, and that is the truth about
+        // an RX-888 looking at all of it.
+        let phantom = &e[1];
+        assert_eq!(phantom.address, "phantomsdr.no-ip.org:8900");
+        assert_eq!((phantom.min_hz, phantom.max_hz), (0.0, 30_000_000.0));
+        assert_eq!(phantom.device, "PhantomSDR+ v.4.1.0");
+
+        // A VHF receiver: the stated range wins over the 2 MHz window.
+        let vertex = &e[3];
+        assert_eq!((vertex.min_hz, vertex.max_hz), (432_976_000.0, 435_024_000.0));
+        assert!(vertex.covers(434_000_000.0));
+        assert!(!vertex.covers(14_100_000.0));
+
+        // Nothing but a hostname: still a row, with the default port.
+        let bare = &e[4];
+        assert_eq!(bare.address, "bare.example:80");
+        assert_eq!(bare.location, "");
+        assert_eq!((bare.min_hz, bare.max_hz), (0.0, 0.0));
+        assert_eq!(bare.range_label(), "—");
+    }
+
+    /// None of these can be opened yet, and each row says why in its own
+    /// words — which is the whole value of listing them (issue #482).
+    #[test]
+    fn every_sdr_list_receiver_says_why_it_cannot_be_opened() {
+        let e = parse_sdr_list_directory(SDR_LIST_SAMPLE).expect("parses");
+        let why: Vec<String> = e.iter().map(|r| r.blocked_reason().expect("blocked")).collect();
+        assert!(why[0].contains("UberSDR"), "{}", why[0]);
+        assert!(why[1].contains("demodulated audio"), "{}", why[1]);
+        // A receiver whose software the crawler could not name still explains
+        // itself rather than naming an empty string.
+        assert_eq!(why[2], "no client for this receiver's protocol yet");
+        assert!(why[3].contains("VertexSDR"), "{}", why[3]);
+    }
+
+    /// A row's position is used for the map pin and — more importantly — for
+    /// `rx_site`, so a spot heard through somebody else's antenna is reported
+    /// from their square (issue #284).
+    #[test]
+    fn an_sdr_list_row_reports_from_its_own_square() {
+        let e = parse_sdr_list_directory(SDR_LIST_SAMPLE).expect("parses");
+        assert_eq!(e[1].locator(), "KM17VX");
+        // No locator and no position: the honest answer is "somewhere else",
+        // not the station's own square.
+        assert_eq!(e[4].locator(), "");
     }
 
     #[test]

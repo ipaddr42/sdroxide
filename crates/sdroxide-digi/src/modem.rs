@@ -6,7 +6,7 @@
 use mfsk_core::msg::decode_request::DecodeRequest;
 use mfsk_core::msg::hash_table::CallsignHashTable;
 use mfsk_core::msg::wsjt77;
-use sdroxide_types::{Decode, Mode};
+use sdroxide_types::{Decode, Ft8Depth, Mode};
 
 use crate::params::{AUDIO_MAX_HZ, AUDIO_MIN_HZ};
 
@@ -144,15 +144,33 @@ pub struct Ft8Modem {
     /// The same callsigns again, hashed the way the EU VHF contest layout
     /// needs them — see [`eu_vhf::Hashes`].
     eu_hashes: eu_vhf::Hashes,
+    /// How hard the FT8 decoder works for weak signals — see
+    /// [`Ft8Depth`]. Only the FT8 path reads it.
+    ft8_depth: Ft8Depth,
 }
 
 impl Ft8Modem {
     pub fn new(mode: Mode) -> Self {
-        Ft8Modem { mode, hashes: CallsignHashTable::new(), eu_hashes: eu_vhf::Hashes::default() }
+        Ft8Modem {
+            mode,
+            hashes: CallsignHashTable::new(),
+            eu_hashes: eu_vhf::Hashes::default(),
+            ft8_depth: Ft8Depth::default(),
+        }
     }
 
     pub fn mode(&self) -> Mode {
         self.mode
+    }
+
+    /// How hard the FT8 decoder works — see [`Ft8Depth`]. Set from
+    /// [`crate::DigiConfig::ft8_depth`] on every config change.
+    pub fn set_ft8_depth(&mut self, depth: Ft8Depth) {
+        self.ft8_depth = depth;
+    }
+
+    pub fn ft8_depth(&self) -> Ft8Depth {
+        self.ft8_depth
     }
 
     /// Register callsigns we already know (ours, and the station we're
@@ -187,10 +205,80 @@ impl Ft8Modem {
         ap: &ApHints,
         listening_hz: f32,
     ) -> Vec<Decode> {
+        let (quick, extras) = self.decode_slot_staged(audio_12k, slot_utc, ap, listening_hz);
+        let mut all = quick;
+        all.extend(extras);
+        all
+    }
+
+    /// Decode a slot in two stages for FT8, for a caller that must act on the
+    /// quick result before the slow one lands.
+    ///
+    /// The problem: `.sic_early()` is one call that does the whole
+    /// checkpointed multi-pass and returns only at the end — about 1.15 s on a
+    /// busy slot against FT8's 0.5 s transmit offset — so an auto-sequenced
+    /// reply decided from its result goes out a cycle late. So the plain
+    /// single-pass decode runs first and is returned as `quick` immediately;
+    /// the SIC pass then runs and returns as `extras` (only the decodes it
+    /// found that the quick pass did not, deduplicated by message and offset).
+    ///
+    /// For every other mode `extras` is empty and `quick` is the whole decode.
+    pub fn decode_slot_staged(
+        &mut self,
+        audio_12k: &[i16],
+        slot_utc: i64,
+        ap: &ApHints,
+        listening_hz: f32,
+    ) -> (Vec<Decode>, Vec<Decode>) {
         let mode = self.mode;
         let ht = &self.hashes;
         let eu = &self.eu_hashes;
+        // For FT8 the quick single-pass result is emitted first and the SIC
+        // extras held back; every other mode has empty `extras`.
+        let mut extras: Vec<Decode> = Vec::new();
         let mut decodes: Vec<Decode> = match mode {
+            Mode::Ft8 => {
+                let hint = ap.ft8();
+                // The operator's chosen depth — see `Ft8Depth` — governs only
+                // the extras: `Fast` skips them, `Normal` runs flat multi-pass
+                // SIC, `Deep` the checkpointed pass (~1.2 s on a busy slot).
+                let run = |depth: Ft8Depth| -> Vec<Decode> {
+                    let req = DecodeRequest::<mfsk_core::Ft8>::new(
+                        audio_12k,
+                        AUDIO_MIN_HZ,
+                        AUDIO_MAX_HZ,
+                        SYNC_MIN,
+                        MAX_CAND,
+                    )
+                    .osd(true);
+                    let req = match depth {
+                        Ft8Depth::Fast => req,
+                        Ft8Depth::Normal => req.sic_rounds(2),
+                        Ft8Depth::Deep => req.sic_early(),
+                    };
+                    let req = match hint.as_ref() {
+                        Some(h) => req.ap_hint(h),
+                        None => req,
+                    };
+                    req.decode()
+                        .results
+                        .into_iter()
+                        .filter_map(|r| {
+                            let bits: [u8; 77] = r.message77().try_into().ok()?;
+                            build_decode(&bits, r.snr_db, r.dt_sec, r.freq_hz, slot_utc, ht, eu)
+                        })
+                        .collect()
+                };
+                let quick = run(Ft8Depth::Fast);
+                // The SIC pass supersedes the quick one; keep what it adds.
+                if self.ft8_depth != Ft8Depth::Fast {
+                    extras = run(self.ft8_depth)
+                        .into_iter()
+                        .filter(|d| !quick.iter().any(|q| same_signal(q, d)))
+                        .collect();
+                }
+                quick
+            }
             Mode::Ft4 => DecodeRequest::<mfsk_core::Ft4>::new(
                 audio_12k,
                 AUDIO_MIN_HZ,
@@ -199,6 +287,16 @@ impl Ft8Modem {
                 MAX_CAND,
             )
             .osd(true)
+            // Subtraction, so a weak signal inside a stronger neighbour's
+            // occupied bandwidth is still decoded — FT4's whole reason for
+            // multi-pass SIC, and what WSJT-X/WSJT-CB run by default. The
+            // default strategy is single-pass: without this a busy slot
+            // reports only the strongest signal at each audio offset, which
+            // is the "they don't stack" report against WSJT-X. Two rounds are
+            // the measured choice (mfsk-core's FT4 WSJT-X sample: 11/14
+            // without, 14/14 with `.sic_rounds(2)`, nothing more from a
+            // third; 5 ms → 71 ms against a 7.5 s slot).
+            .sic_rounds(2)
             .decode()
             .results
             .into_iter()
@@ -226,9 +324,9 @@ impl Ft8Modem {
             })
             .collect(),
             _ => {
-                // With no hint this is bit-for-bit the plain wide-band decode;
-                // with one, every candidate that fails an ordinary decode gets a
-                // second attempt with our two callsigns' bits locked.
+                // FT8 is handled in `decode_slot_staged` above, in two stages;
+                // this arm is the plain single-pass fallback for any other
+                // protocol that reaches here.
                 let hint = ap.ft8();
                 let req = DecodeRequest::<mfsk_core::Ft8>::new(
                     audio_12k,
@@ -301,19 +399,23 @@ impl Ft8Modem {
                 if let Some(d) =
                     build_decode(&r.msg77, r.snr_db, r.dt_sec, r.freq_hz, slot_utc, ht, eu)
                     && !decodes.iter().any(|o| same_signal(o, &d))
+                    && !extras.iter().any(|o| same_signal(o, &d))
                 {
-                    decodes.push(d);
+                    // The contest rescue is part of the slower work, so it
+                    // rides the extras batch and does not hold up the quick one.
+                    extras.push(d);
                 }
             }
         }
-        // Remember who we heard, for the next slot's hashed messages.
-        for d in &decodes {
+        // Remember who we heard, for the next slot's hashed messages. Both
+        // batches, so an extras-only station is still remembered.
+        for d in decodes.iter().chain(extras.iter()) {
             for call in [d.to.as_deref(), d.from.as_deref()].into_iter().flatten() {
                 self.hashes.insert(call);
                 self.eu_hashes.insert(call);
             }
         }
-        decodes
+        (decodes, extras)
     }
 
     /// Synthesize a message into 12 kHz mono f32 burst audio at tone offset
@@ -344,6 +446,112 @@ impl Ft8Modem {
         };
         Some((audio, sent))
     }
+}
+
+/// Decode one full 60-second JT65 or JT9 slot of 12 kHz mono i16 audio.
+///
+/// The two JT modes share the 72-bit JT message and the 60-second slot, so
+/// they share this mapping; only the call into mfsk-core differs. It is a free
+/// function rather than a [`Ft8Modem`] method because JT keeps no hash table —
+/// its 72-bit message has no hashed-callsign layout — and the JT sound card is
+/// the i16 the slotted engine already carries, which mfsk-core wants as f32.
+///
+/// A JT decode carries **no CRC** (72 bits, no checksum), so what stands
+/// between noise and an invented message is the decoder itself: JT65's
+/// Reed–Solomon decode is hard-decision with no erasures, which almost never
+/// converges on noise, and JT9 gates each candidate on its sync and its soft
+/// symbol quality and accepts only the standard `<to> <from> <grid|report>`
+/// layout. Both scans collapse duplicates. Every row they return is shown.
+///
+/// The scan is centred on the one-second transmit offset both modes use, and
+/// `dt` is reported from there, as WSJT-X's DT column is: an on-time station
+/// reads about 0.
+pub fn decode_jt_slot(audio_12k: &[i16], mode: Mode, slot_utc: i64) -> Vec<Decode> {
+    let audio: Vec<f32> = audio_12k.iter().map(|&s| f32::from(s) / 28_000.0).collect();
+    let nominal_s = JT_TX_OFFSET_SAMPLES as f32 / DECODE_RATE_U32 as f32;
+    match mode {
+        Mode::Jt65 => {
+            let params = mfsk_core::jt65::search::SearchParams {
+                // mfsk-core's default window is 1000–2000 Hz; a JT65 signal
+                // can sit anywhere a receiver passes, and its 65 tones run
+                // ~180 Hz up from the sync tone the search places.
+                freq_min_hz: JT_FREQ_MIN_HZ,
+                freq_max_hz: AUDIO_MAX_HZ - JT65_WIDTH_HZ,
+                // Every candidate costs a full decode attempt; over the whole
+                // passband the default eight would cap a busy slot at eight
+                // stations.
+                max_candidates: 20,
+                ..Default::default()
+            };
+            mfsk_core::jt65::decode_scan(&audio, DECODE_RATE_U32, JT_TX_OFFSET_SAMPLES, &params)
+                .into_iter()
+                .filter_map(|r| {
+                    jt_decode(r.message, r.snr_db, r.dt_sec - nominal_s, r.freq_hz, slot_utc)
+                })
+                .collect()
+        }
+        Mode::Jt9 => mfsk_core::jt9::decode_scan(
+            &audio,
+            DECODE_RATE_U32,
+            JT_TX_OFFSET_SAMPLES,
+            // JT9's default window is already jt9's own 200–4000 Hz.
+            &mfsk_core::jt9::search::SearchParams::default(),
+        )
+        .into_iter()
+        .filter_map(|r| {
+            // JT9 exposes only the start index, from the start of the buffer.
+            let dt = r.start_sample as f32 / DECODE_RATE_U32 as f32 - nominal_s;
+            jt_decode(r.message, r.snr_db, dt, r.freq_hz, slot_utc)
+        })
+        .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// JT65 and JT9 key one second into their 60-second slot, as WSJT-X does.
+const JT_TX_OFFSET_SAMPLES: usize = 12_000;
+/// The lowest sync tone the JT65 scan looks for, Hz.
+const JT_FREQ_MIN_HZ: f32 = 200.0;
+/// A JT65A signal's width above its sync tone: 65 tones at 2.69 Hz.
+const JT65_WIDTH_HZ: f32 = 180.0;
+
+/// mfsk-core's JT and Q65 entry points take a `u32` rate; the workspace's is
+/// `f64`.
+const DECODE_RATE_U32: u32 = 12_000;
+
+/// Map one mfsk-core JT message onto the stable [`Decode`].
+///
+/// The 72-bit message has two shapes: the everyday `<to> <from> <grid|report>`
+/// and an `Unsupported` catch-all for compound callsigns and free text, which
+/// this build does not unpack — it is skipped rather than shown as a row of
+/// hex, because a decode list a listener cannot read is worse than a shorter
+/// one.
+fn jt_decode(
+    message: mfsk_core::msg::Jt72Message,
+    snr_db: f32,
+    dt_sec: f32,
+    freq_hz: f32,
+    slot_utc: i64,
+) -> Option<Decode> {
+    let mfsk_core::msg::Jt72Message::Standard { call1, call2, grid_or_report } = message else {
+        return None;
+    };
+    let text = format!("{call1} {call2} {grid_or_report}");
+    let p = parse_message(&text, MsgKind::Standard);
+    Some(Decode {
+        slot_utc,
+        snr_db: snr_db.round() as i16,
+        dt: dt_sec,
+        audio_hz: freq_hz,
+        message: text,
+        to: p.to,
+        from: p.from,
+        grid: p.grid,
+        is_cq: p.is_cq,
+        cq_to: p.cq_to,
+        free_text: false,
+        rr73_to: None,
+    })
 }
 
 /// Pack `text` into a 77-bit message, degrading to the nearest layout FT8 can
@@ -788,6 +996,215 @@ fn join3(a: &str, b: &str, c: &str) -> String {
     [a, b, c].iter().filter(|t| !t.is_empty()).copied().collect::<Vec<_>>().join(" ")
 }
 
+/// How far either side of the audio cursor the MSK144 decoder searches, in Hz.
+///
+/// MSK144's tones sit 500 Hz either side of its centre, and the short-ping
+/// search looks `2 × tolerance` either side of each tone line in the squared
+/// signal's spectrum — so a tolerance of 500 Hz or more makes the high- and
+/// low-tone windows overlap, and the frequency-error estimate the short-ping
+/// path depends on can lock to the wrong line. The long-ping search's cost also
+/// grows with it. 200 Hz covers a station a little off the cursor.
+pub const MSK144_TOLERANCE_HZ: f32 = 200.0;
+
+/// Decode one 15-second MSK144 slot of 12 kHz mono i16 audio, searching
+/// [`MSK144_TOLERANCE_HZ`] either side of `audio_hz`.
+///
+/// MSK144 is not a frame at a fixed offset: the operator transmits through the
+/// whole period and the decoder slides a window across the slot looking for
+/// meteor-trail bursts, so it is handed the centre and half-width to search
+/// rather than a start time — and each result carries the time *into* the
+/// slot (`.tsec`) the burst was found at, which becomes the [`Decode`]'s `dt`.
+/// The centre is the operator's audio cursor, as WSJT-X's is: 1500 Hz is the
+/// convention everyone transmits on.
+///
+/// Unlike every other mode here, mfsk-core resolves the message text inside
+/// the decode call, so there are no raw 77 bits for us to unpack: the text is
+/// already a `String`, and [`parse_text_decode`] reads it.
+pub fn decode_msk144_slot(audio_12k: &[i16], audio_hz: f32, slot_utc: i64) -> Vec<Decode> {
+    use mfsk_core::msk144::decode::{Depth, decode_slot};
+    decode_slot(audio_12k, audio_hz, MSK144_TOLERANCE_HZ, Depth::Deep)
+        .into_iter()
+        .map(|r| {
+            let p = parse_text_decode(&r.message);
+            Decode {
+                slot_utc,
+                snr_db: r.snr_db as i16,
+                dt: r.tsec,
+                audio_hz: r.freq_hz,
+                message: r.message,
+                to: p.to,
+                from: p.from,
+                grid: p.grid,
+                is_cq: p.is_cq,
+                cq_to: p.cq_to,
+                free_text: p.free_text,
+                rr73_to: None,
+            }
+        })
+        .collect()
+}
+
+/// Decode one full FST4 slot of 12 kHz mono i16 audio at the chosen period.
+///
+/// FST4 goes through the same generic [`DecodeRequest`] as FT4 and shares its
+/// 77-bit message, so the mapping to [`Decode`] is FT4's; only the protocol
+/// type parameter differs, and the five periods are five types rather than a
+/// runtime width. The slot length is the period the operator chose — the
+/// caller must hand in that many seconds of audio, which is what
+/// [`sdroxide_types::Fst4Period`]'s timing gives the controller.
+pub fn decode_fst4_slot(
+    audio_12k: &[i16],
+    period: sdroxide_types::Fst4Period,
+    slot_utc: i64,
+) -> Vec<Decode> {
+    use mfsk_core::msg::decode_request::DecodeRequest;
+    // FST4's own example uses a sync floor of 0.8 and a small candidate cap:
+    // it is a deep, sparse mode, so there are few signals and a lower bar is
+    // safe. The FT8 family's 1.5 would hide the weak ones this mode exists
+    // for.
+    const FST4_SYNC_MIN: f32 = 0.8;
+    const FST4_MAX_CAND: usize = 30;
+    // The five periods are five protocol types rather than a runtime width, so
+    // the request cannot be built once behind a generic closure; the macro
+    // writes the arms out instead, exactly as the crate's own example does.
+    macro_rules! run {
+        ($p:ty) => {
+            DecodeRequest::<$p>::new(
+                audio_12k,
+                AUDIO_MIN_HZ,
+                AUDIO_MAX_HZ,
+                FST4_SYNC_MIN,
+                FST4_MAX_CAND,
+            )
+            .decode()
+            .results
+            .into_iter()
+            .filter_map(|r| {
+                let bits: [u8; 77] = r.message77().try_into().ok()?;
+                // FST4 carries the same 77-bit message as FT8, hashed-callsign
+                // layouts included. No session hash table is kept for it, so a
+                // hashed callsign reads as `<...>` rather than being resolved.
+                build_decode(
+                    &bits,
+                    r.snr_db,
+                    r.dt_sec,
+                    r.freq_hz,
+                    slot_utc,
+                    &CallsignHashTable::new(),
+                    &eu_vhf::Hashes::default(),
+                )
+            })
+            .collect()
+        };
+    }
+    match period {
+        sdroxide_types::Fst4Period::P15 => run!(mfsk_core::fst4::Fst4s15),
+        sdroxide_types::Fst4Period::P30 => run!(mfsk_core::fst4::Fst4s30),
+        sdroxide_types::Fst4Period::P60 => run!(mfsk_core::fst4::Fst4s60),
+        sdroxide_types::Fst4Period::P120 => run!(mfsk_core::fst4::Fst4s120),
+        sdroxide_types::Fst4Period::P300 => run!(mfsk_core::fst4::Fst4s300),
+    }
+}
+
+/// Decode one full Q65 slot of 12 kHz mono i16 audio at the chosen sub-mode.
+///
+/// Q65 goes through mfsk-core's `q65::DecodeRequest`, which takes f32 audio
+/// and a `SearchParams`; the ten sub-modes are ten protocol types, so the
+/// request is built per sub-mode. The result carries the message text already
+/// unpacked, so it maps through the same parser every other mode uses.
+pub fn decode_q65_slot(
+    audio_12k: &[i16],
+    mode: sdroxide_types::Q65Mode,
+    slot_utc: i64,
+) -> Vec<Decode> {
+    use mfsk_core::q65::DecodeRequest;
+    use mfsk_core::q65::search::SearchParams;
+
+    let audio: Vec<f32> = audio_12k.iter().map(|&s| f32::from(s) / 28_000.0).collect();
+    // The scan searches around where this sub-mode keys — half a second in for
+    // 15A and 30A, one second for the rest — and its own asymmetric
+    // `SearchParams` window carries the tolerance. mfsk-core reports each
+    // frame's start from the start of the buffer, so the nominal start comes
+    // off it to give WSJT-X's DT.
+    let nominal_start = (mode.start_delay_s() * f64::from(DECODE_RATE_U32)).round() as usize;
+    let nominal_s = mode.start_delay_s() as f32;
+    let params = SearchParams::default();
+
+    macro_rules! run {
+        ($p:ty) => {
+            DecodeRequest::<$p>::new(&audio, DECODE_RATE_U32, nominal_start, params)
+                .decode()
+                .into_iter()
+                .map(|r| {
+                    let p = parse_text_decode(&r.message);
+                    Decode {
+                        slot_utc,
+                        snr_db: r.snr_db.round() as i16,
+                        dt: r.dt_sec - nominal_s,
+                        audio_hz: r.freq_hz,
+                        message: r.message,
+                        to: p.to,
+                        from: p.from,
+                        grid: p.grid,
+                        is_cq: p.is_cq,
+                        cq_to: p.cq_to,
+                        free_text: p.free_text,
+                        rr73_to: None,
+                    }
+                })
+                .collect()
+        };
+    }
+    match mode {
+        sdroxide_types::Q65Mode::A15 => run!(mfsk_core::q65::Q65a15),
+        sdroxide_types::Q65Mode::A30 => run!(mfsk_core::q65::Q65a30),
+        sdroxide_types::Q65Mode::A60 => run!(mfsk_core::q65::Q65a60),
+        sdroxide_types::Q65Mode::B60 => run!(mfsk_core::q65::Q65b60),
+        sdroxide_types::Q65Mode::C60 => run!(mfsk_core::q65::Q65c60),
+        sdroxide_types::Q65Mode::D60 => run!(mfsk_core::q65::Q65d60),
+        sdroxide_types::Q65Mode::E60 => run!(mfsk_core::q65::Q65e60),
+        sdroxide_types::Q65Mode::D120 => run!(mfsk_core::q65::Q65d120),
+        sdroxide_types::Q65Mode::E120 => run!(mfsk_core::q65::Q65e120),
+        sdroxide_types::Q65Mode::A300 => run!(mfsk_core::q65::Q65a300),
+    }
+}
+
+/// Decode one FSK441 slot of mono f32 audio at
+/// [`sdroxide_dsp::FSK441_RATE`](sdroxide_dsp::FSK441_RATE).
+///
+/// FSK441 is a meteor-scatter mode: the operator transmits the message over and
+/// over through the whole period and the receiver hears only the short
+/// reflections off ionised trails, so the decoder hunts the slot for pings.
+/// Each [`sdroxide_dsp::Fsk441Ping`] carries the time into the slot it was
+/// found at, which becomes the [`Decode`]'s `dt`.
+///
+/// The audio is at the decoder's own rate — 441 baud × 25 samples — and not the
+/// 12 kHz the other modes use: the controller resamples to it before this sees
+/// a sample, because those constants are the mode and do not re-derive at
+/// another rate.
+pub fn decode_fsk441_slot(audio: &[f32], slot_utc: i64) -> Vec<Decode> {
+    sdroxide_dsp::fsk441_find_pings(audio)
+        .into_iter()
+        .map(|p| {
+            let parsed = parse_text_decode(&p.text);
+            Decode {
+                slot_utc,
+                snr_db: p.snr_db.round() as i16,
+                dt: p.start_s,
+                audio_hz: p.audio_hz,
+                message: p.text,
+                to: parsed.to,
+                from: parsed.from,
+                grid: parsed.grid,
+                is_cq: parsed.is_cq,
+                cq_to: parsed.cq_to,
+                free_text: parsed.free_text,
+                rr73_to: parsed.rr73_to,
+            }
+        })
+        .collect()
+}
+
 /// Unpack 77 message bits and build a [`Decode`], or `None` if unpacking fails.
 /// `hashes` resolves the `<...>` placeholders of hashed callsigns, and
 /// `eu_hashes` the ones the EU VHF contest layout uses — see [`eu_vhf::Hashes`]
@@ -843,6 +1260,26 @@ struct Parsed {
 /// decorations are stripped, so the shared tail handles them all; the kind
 /// (from the type bits, never guessed from the text) decides which decorations
 /// to strip and whether there is any addressing at all.
+/// Addressing for a decode that arrives as text alone.
+///
+/// MSK144 and Q65 come back from mfsk-core already unpacked, and FSK441 is
+/// plain text by design, so there are no message-type bits to say whether a
+/// row is a standard `<to> <from> <grid|report>` or free text. It is read as a
+/// standard message and kept as one only when the calls it names look like
+/// callsigns; anything else is free text and names nobody. Without that,
+/// `TNX 73 GL` reads as a message from "73", which goes on the map and to PSK
+/// Reporter as a station heard.
+fn parse_text_decode(text: &str) -> Parsed {
+    let p = parse_message(text, MsgKind::Standard);
+    // An unresolved hashed call (`<...>`) is already `None` here.
+    let names_a_station = |c: &Option<String>| c.as_deref().is_none_or(is_callish);
+    if names_a_station(&p.to) && names_a_station(&p.from) {
+        p
+    } else {
+        Parsed { free_text: true, ..Default::default() }
+    }
+}
+
 fn parse_message(text: &str, kind: MsgKind) -> Parsed {
     // Free text carries no addressing, however much it may look like it does.
     if kind == MsgKind::FreeText {
@@ -1062,6 +1499,371 @@ mod tests {
         (sent, modem.decode_slot(&i16buf, 0, &ApHints::default(), 1500.0))
     }
 
+    /// A synthesized MSK144 frame decodes back to its message — the round trip
+    /// the controller makes. The waveform is the reference binary-FSK one
+    /// mfsk-core's own sweep uses (`msk144sim`'s), not our TX path, so a decode
+    /// here is the decoder working and not the modulator agreeing with itself.
+    #[test]
+    fn msk144_frame_round_trips() {
+        use mfsk_core::FecCodec;
+        use mfsk_core::msg::wsjt77::pack77;
+
+        const FS: f32 = 12_000.0;
+        // A single frame, continuous phase, 2000 baud, tone spacing = baud.
+        fn frame_itone(call1: &str, call2: &str, report: &str) -> [u8; 144] {
+            let msg = pack77(call1, call2, report).expect("pack77");
+            let mut info = [0u8; 90];
+            info[..77].copy_from_slice(&msg);
+            let mut bytes = [0u8; 12];
+            for (i, &b) in info[..77].iter().enumerate() {
+                bytes[i / 8] |= (b & 1) << (7 - (i % 8));
+            }
+            let crc = mfsk_core::fec::ldpc_128_90::crc13(&bytes);
+            for i in 0..13 {
+                info[77 + i] = ((crc >> (12 - i)) & 1) as u8;
+            }
+            let mut codeword = [0u8; 128];
+            mfsk_core::fec::Ldpc128_90.encode(&info, &mut codeword);
+            // OQPSK frame -> the tone sequence the reference synth plays,
+            // through the same differential transform mfsk-core's own sweep
+            // uses (`build_i4tone`), so a decode here is not our modulator
+            // agreeing with our demodulator.
+            let bitseq = mfsk_core::engine::dsp::msk::build_bitseq(&codeword);
+            let mut bp = [0i8; 144];
+            for i in 0..144 {
+                bp[i] = 2 * bitseq[i] as i8 - 1;
+            }
+            let mut i4 = [0i8; 144];
+            for i in 1..=72usize {
+                i4[2 * i - 2] = (bp[2 * i - 1] * bp[2 * i - 2] + 1) / 2;
+                i4[2 * i - 1] = -((bp[2 * i - 1] * bp[(2 * i) % 144] - 1) / 2);
+            }
+            let mut t = [0u8; 144];
+            for i in 0..144 {
+                t[i] = (-i4[i] + 1) as u8;
+            }
+            t
+        }
+        fn wave(itone: &[u8; 144], freq: f32) -> Vec<i16> {
+            let twopi = 2.0 * std::f32::consts::PI;
+            let baud = 2000.0f32;
+            let d0 = twopi * (freq - 0.25 * baud) / FS;
+            let d1 = twopi * (freq + 0.25 * baud) / FS;
+            let mut phi = 0.0f32;
+            let mut out = Vec::with_capacity(144 * 6);
+            for &tone in itone {
+                let d = if tone == 0 { d0 } else { d1 };
+                for _ in 0..6 {
+                    out.push((phi.cos() * 12_000.0) as i16);
+                    phi += d;
+                    if phi >= twopi {
+                        phi -= twopi;
+                    }
+                }
+            }
+            out
+        }
+
+        let itone = frame_itone("K1ABC", "W9XYZ", "EN37");
+        // A meteor ping per second through a 15 s slot: the frame plays
+        // continuously but is enveloped by the ionised trail's decay
+        // (`2.718*t*exp(-t)`, the shape mfsk-core's own sweep uses). MSK144's
+        // decoder hunts these bursts, so a bare continuous carrier is not a
+        // signal it is built to find.
+        let one = wave(&itone, 1500.0);
+        let npts = 15 * FS as usize;
+        let mut carrier = Vec::with_capacity(npts);
+        while carrier.len() < npts {
+            carrier.extend_from_slice(&one);
+        }
+        carrier.truncate(npts);
+        let mut slot = Vec::with_capacity(npts);
+        for (i, &s) in carrier.iter().enumerate() {
+            let iping = (i / FS as usize).clamp(1, 14);
+            let t = (i as f32 / FS - iping as f32) / 0.2;
+            let env =
+                if (0.0..=10.0).contains(&t) { std::f32::consts::E * t * (-t).exp() } else { 0.0 };
+            slot.push((s as f32 * env) as i16);
+        }
+        let decodes = decode_msk144_slot(&slot, 1500.0, 0);
+        assert!(
+            decodes.iter().any(|d| d.message == "K1ABC W9XYZ EN37"),
+            "MSK144 did not round-trip: {decodes:?}"
+        );
+        // A station a little off the cursor is still inside the search...
+        let decodes = decode_msk144_slot(&slot, 1650.0, 0);
+        assert!(
+            decodes.iter().any(|d| d.message == "K1ABC W9XYZ EN37"),
+            "150 Hz off the cursor was not found: {decodes:?}"
+        );
+        // ...and one well outside it is not searched for.
+        let decodes = decode_msk144_slot(&slot, 2100.0, 0);
+        assert!(decodes.is_empty(), "600 Hz off the cursor still decoded: {decodes:?}");
+    }
+
+    /// A synthesized JT65 and JT9 message decodes back to the same
+    /// `<to> <from> <grid>` — the round trip the JT controller makes — with the
+    /// DT an on-time station has in WSJT-X's column, about zero. JT65 is also
+    /// placed low in the passband, where mfsk-core's default 1000–2000 Hz
+    /// window would never have looked.
+    #[test]
+    fn jt_messages_round_trip() {
+        for (mode, hz) in [(Mode::Jt65, 1000.0), (Mode::Jt65, 600.0), (Mode::Jt9, 1000.0)] {
+            let synth = match mode {
+                Mode::Jt65 => {
+                    mfsk_core::jt65::tx::synthesize_standard("CQ", "K1ABC", "FN42", 12_000, hz, 0.3)
+                }
+                _ => {
+                    mfsk_core::jt9::tx::synthesize_standard("CQ", "K1ABC", "FN42", 12_000, hz, 0.3)
+                }
+            }
+            .expect("synthesize");
+            // The scan wants a whole 60-second slot; pad the burst into one.
+            let mut slot = vec![0.0f32; 12_000]; // the one-second TX offset
+            slot.extend_from_slice(&synth);
+            slot.resize(60 * 12_000, 0.0);
+            let i16buf: Vec<i16> = slot.iter().map(|&s| (s * 20_000.0) as i16).collect();
+
+            let decodes = decode_jt_slot(&i16buf, mode, 0);
+            let best =
+                decodes.first().unwrap_or_else(|| panic!("{mode:?} at {hz} Hz: nothing decoded"));
+            assert_eq!(best.from.as_deref(), Some("K1ABC"), "{mode:?}: {decodes:?}");
+            assert!(best.is_cq, "{mode:?}: {decodes:?}");
+            assert_eq!(best.grid.as_deref(), Some("FN42"), "{mode:?}: {decodes:?}");
+            assert!(best.dt.abs() < 0.3, "{mode:?}: an on-time signal read DT {}", best.dt);
+        }
+    }
+
+    /// Noise alone decodes to nothing in either JT mode. The 72-bit message
+    /// has no CRC, so this is the decoder's own gates being tested — several
+    /// deterministic seeds, so a marginal gate shows up here rather than as an
+    /// invented callsign on an empty band.
+    #[test]
+    fn jt_noise_alone_decodes_nothing() {
+        for mode in [Mode::Jt65, Mode::Jt9] {
+            for seed in 1..=3u32 {
+                let mut rng = seed.wrapping_mul(0x9e37_79b9);
+                let noise: Vec<i16> = (0..60 * 12_000)
+                    .map(|_| {
+                        rng ^= rng << 13;
+                        rng ^= rng >> 17;
+                        rng ^= rng << 5;
+                        ((rng as i32 as f32 / i32::MAX as f32) * 6_000.0) as i16
+                    })
+                    .collect();
+                let decodes = decode_jt_slot(&noise, mode, 0);
+                assert!(decodes.is_empty(), "{mode:?} seed {seed}: noise decoded as {decodes:?}");
+            }
+        }
+    }
+
+    /// A text-only decode (MSK144, Q65, FSK441) is addressed only when its
+    /// calls look like callsigns: free text names nobody, so it never reaches
+    /// the map or PSK Reporter as a station heard.
+    #[test]
+    fn free_text_names_no_station() {
+        for text in ["TNX 73 GL", "PSE QSL", "RRR", "73", "K1ABC TNX"] {
+            let p = parse_text_decode(text);
+            assert!(p.free_text && p.from.is_none() && p.to.is_none(), "{text}: {p:?}");
+        }
+        let p = parse_text_decode("K1ABC W9XYZ EN37");
+        assert!(!p.free_text);
+        assert_eq!((p.to.as_deref(), p.from.as_deref()), (Some("K1ABC"), Some("W9XYZ")));
+        let p = parse_text_decode("CQ K1ABC FN42");
+        assert!(p.is_cq && !p.free_text);
+        assert_eq!(p.from.as_deref(), Some("K1ABC"));
+        // An unresolved hashed call is not a reason to call the row free text.
+        let p = parse_text_decode("<...> W9XYZ R-05");
+        assert!(!p.free_text);
+        assert_eq!(p.from.as_deref(), Some("W9XYZ"));
+    }
+
+    /// `Fst4Period` states FST4's geometry in `sdroxide-types`, which cannot
+    /// depend on mfsk-core; this is where the two are held to agree — the slot,
+    /// the symbol length and the transmit offset every decode's DT is measured
+    /// from. FST4-15 alone keys half a second in.
+    #[test]
+    fn fst4_periods_match_mfsk_cores_geometry() {
+        use mfsk_core::engine::{FrameLayout, ModulationParams};
+        use sdroxide_types::Fst4Period;
+        fn check<P: FrameLayout + ModulationParams>(p: Fst4Period) {
+            assert_eq!(p.nsps(), P::NSPS as usize, "FST4-{} NSPS", p.label());
+            assert_eq!(p.slot_s(), f64::from(P::T_SLOT_S), "FST4-{} slot", p.label());
+            assert_eq!(
+                p.start_delay_s(),
+                f64::from(P::TX_START_OFFSET_S),
+                "FST4-{} transmit offset",
+                p.label()
+            );
+        }
+        check::<mfsk_core::fst4::Fst4s15>(Fst4Period::P15);
+        check::<mfsk_core::fst4::Fst4s30>(Fst4Period::P30);
+        check::<mfsk_core::fst4::Fst4s60>(Fst4Period::P60);
+        check::<mfsk_core::fst4::Fst4s120>(Fst4Period::P120);
+        check::<mfsk_core::fst4::Fst4s300>(Fst4Period::P300);
+    }
+
+    /// A synthesized FST4 message decodes back at every period. FST4 shares
+    /// FT8's 77-bit message with no CRC-free ambiguity, so exactly one decode
+    /// of the right message is expected; the period decides the slot the audio
+    /// has to be padded into.
+    #[test]
+    fn fst4_messages_round_trip_at_every_period() {
+        use sdroxide_types::Fst4Period;
+        for period in Fst4Period::ALL {
+            let msg77 = mfsk_core::msg::wsjt77::pack77("CQ", "K1ABC", "FN42").expect("pack77");
+            let itone = mfsk_core::fst4::encode::message_to_tones(&msg77);
+            let cfg = match period {
+                Fst4Period::P15 => &mfsk_core::fst4::encode::FST4_15_GFSK,
+                Fst4Period::P30 => &mfsk_core::fst4::encode::FST4_30_GFSK,
+                Fst4Period::P60 => &mfsk_core::fst4::encode::FST4_60A_GFSK,
+                Fst4Period::P120 => &mfsk_core::fst4::encode::FST4_120_GFSK,
+                Fst4Period::P300 => &mfsk_core::fst4::encode::FST4_300_GFSK,
+            };
+            let burst = mfsk_core::fst4::encode::tones_to_f32_with_gfsk(&itone, 1000.0, 0.3, cfg);
+            // Pad into a whole slot at the period's TX offset.
+            let mut slot = vec![0.0f32; (period.start_delay_s() * 12_000.0).round() as usize];
+            slot.extend_from_slice(&burst);
+            slot.resize((period.slot_s() * 12_000.0) as usize, 0.0);
+            let i16buf: Vec<i16> = slot.iter().map(|&s| (s * 20_000.0) as i16).collect();
+
+            let decodes = decode_fst4_slot(&i16buf, period, 0);
+            let best = decodes
+                .iter()
+                .find(|d| d.from.as_deref() == Some("K1ABC"))
+                .unwrap_or_else(|| panic!("FST4-{}: nothing decoded: {decodes:?}", period.label()));
+            assert!(best.is_cq, "FST4-{}: {decodes:?}", period.label());
+            assert_eq!(best.grid.as_deref(), Some("FN42"), "FST4-{}", period.label());
+            // Keyed at the period's own offset, it is on time.
+            assert!(best.dt.abs() < 0.3, "FST4-{}: DT {}", period.label(), best.dt);
+        }
+    }
+
+    /// A synthesized Q65 message decodes back at every sub-mode — the round trip
+    /// the controller makes. Q65 shares FT8's 77-bit message, so the message is
+    /// expected whole; the sub-mode decides both the slot the audio is padded
+    /// into and the protocol type the decode is run as.
+    ///
+    /// `#[ignore]`d because the ten scans take about 20 s in a test build,
+    /// most of it the long sub-modes; run it with
+    /// `cargo test -p sdroxide-digi --lib -- --ignored q65`. The cheapest
+    /// sub-mode has its own unignored smoke test below, and
+    /// `q65_sub_modes_match_mfsk_cores_geometry` checks every sub-mode's
+    /// mapping on every run.
+    #[test]
+    #[ignore = "Q65 scans take ~20 s; run with -- --ignored"]
+    fn q65_messages_round_trip_at_every_sub_mode() {
+        use sdroxide_types::Q65Mode;
+
+        q65_round_trip::<mfsk_core::q65::Q65a15>(Q65Mode::A15);
+        q65_round_trip::<mfsk_core::q65::Q65a30>(Q65Mode::A30);
+        q65_round_trip::<mfsk_core::q65::Q65a60>(Q65Mode::A60);
+        q65_round_trip::<mfsk_core::q65::Q65b60>(Q65Mode::B60);
+        q65_round_trip::<mfsk_core::q65::Q65c60>(Q65Mode::C60);
+        q65_round_trip::<mfsk_core::q65::Q65d60>(Q65Mode::D60);
+        q65_round_trip::<mfsk_core::q65::Q65e60>(Q65Mode::E60);
+        q65_round_trip::<mfsk_core::q65::Q65d120>(Q65Mode::D120);
+        q65_round_trip::<mfsk_core::q65::Q65e120>(Q65Mode::E120);
+        q65_round_trip::<mfsk_core::q65::Q65a300>(Q65Mode::A300);
+    }
+
+    /// The Q65 round trip at the cheapest sub-mode, so an ordinary test run
+    /// still exercises the decoder. The full sweep is `#[ignore]`d above.
+    #[test]
+    fn q65_message_round_trips() {
+        q65_round_trip::<mfsk_core::q65::Q65a15>(sdroxide_types::Q65Mode::A15);
+    }
+
+    /// Synthesize a `CQ K1ABC FN42` at sub-mode `m`, pad it into a whole slot at
+    /// the sub-mode's own TX offset, and assert it decodes back on time.
+    fn q65_round_trip<P: mfsk_core::engine::ModulationParams>(m: sdroxide_types::Q65Mode) {
+        let burst = mfsk_core::q65::tx::synthesize_standard_for::<P>(
+            "CQ", "K1ABC", "FN42", 12_000, 1000.0, 0.3,
+        )
+        .expect("synthesize");
+        let mut slot = vec![0.0f32; (m.start_delay_s() * 12_000.0).round() as usize];
+        slot.extend_from_slice(&burst);
+        slot.resize((m.slot_s() * 12_000.0) as usize, 0.0);
+        let i16buf: Vec<i16> = slot.iter().map(|&s| (s * 20_000.0) as i16).collect();
+
+        let decodes = decode_q65_slot(&i16buf, m, 0);
+        let best = decodes
+            .iter()
+            .find(|d| d.from.as_deref() == Some("K1ABC"))
+            .unwrap_or_else(|| panic!("Q65-{}: nothing decoded: {decodes:?}", m.label()));
+        assert!(best.is_cq, "Q65-{}: {decodes:?}", m.label());
+        assert_eq!(best.grid.as_deref(), Some("FN42"), "Q65-{}", m.label());
+        // mfsk-core places a frame to a fraction of a symbol, and the long
+        // sub-modes' symbols are long: 120D reads a third of a second early and
+        // 300A (3.5 s symbols) a whole second. "On time" is to half a symbol
+        // there; the short sub-modes are held to 0.3 s.
+        let half_symbol = m.nsps() as f32 / 12_000.0 / 2.0;
+        assert!(best.dt.abs() <= 0.3f32.max(half_symbol), "Q65-{}: DT {}", m.label(), best.dt);
+    }
+
+    /// `Q65Mode` states each sub-mode's geometry in `sdroxide-types`, which
+    /// cannot depend on mfsk-core; this holds the two together — the slot and
+    /// the symbol length that decide the burst, and so which protocol type a
+    /// sub-mode is decoded as. (The transmit offset is WSJT-X's rather than
+    /// mfsk-core's, which says one second for all of them.)
+    #[test]
+    fn q65_sub_modes_match_mfsk_cores_geometry() {
+        use mfsk_core::engine::{FrameLayout, ModulationParams};
+        use sdroxide_types::Q65Mode;
+        fn check<P: FrameLayout + ModulationParams>(m: Q65Mode) {
+            assert_eq!(m.nsps(), P::NSPS as usize, "Q65-{} NSPS", m.label());
+            assert_eq!(m.slot_s(), f64::from(P::T_SLOT_S), "Q65-{} slot", m.label());
+        }
+        check::<mfsk_core::q65::Q65a15>(Q65Mode::A15);
+        check::<mfsk_core::q65::Q65a30>(Q65Mode::A30);
+        check::<mfsk_core::q65::Q65a60>(Q65Mode::A60);
+        check::<mfsk_core::q65::Q65b60>(Q65Mode::B60);
+        check::<mfsk_core::q65::Q65c60>(Q65Mode::C60);
+        check::<mfsk_core::q65::Q65d60>(Q65Mode::D60);
+        check::<mfsk_core::q65::Q65e60>(Q65Mode::E60);
+        check::<mfsk_core::q65::Q65d120>(Q65Mode::D120);
+        check::<mfsk_core::q65::Q65e120>(Q65Mode::E120);
+        check::<mfsk_core::q65::Q65a300>(Q65Mode::A300);
+    }
+
+    /// A synthesized FSK441 ping decodes through the modem adapter into a
+    /// [`Decode`] with the text and its parsed addressing. The waveform is the
+    /// fork's own generator at the decoder's 11 025 Hz, with noise and a small
+    /// amplitude behind it, so this exercises the adapter and the parser rather
+    /// than a bare round trip of the generator against itself.
+    #[test]
+    fn fsk441_ping_round_trips_through_the_adapter() {
+        use sdroxide_dsp::{FSK441_RATE, fsk441_encode_tones, fsk441_generate_audio};
+
+        let msg = "W1ABC W9XYZ FN42";
+        let audio = fsk441_generate_audio(&fsk441_encode_tones(msg));
+        let npts = FSK441_RATE as usize * 2;
+        let start = npts / 3;
+        // Deterministic noise, so the test cannot flake.
+        let mut slot = vec![0.0f32; npts];
+        let mut state = 0x9e37_79b9u32;
+        for s in slot.iter_mut() {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            *s = ((state >> 8) as f32 / 8_388_608.0 - 1.0) * 0.15;
+        }
+        for (i, &s) in audio.iter().enumerate() {
+            if start + i < npts {
+                slot[start + i] += s * 0.7;
+            }
+        }
+
+        let decodes = decode_fsk441_slot(&slot, 0);
+        let d = decodes
+            .iter()
+            .find(|d| d.message == msg)
+            .unwrap_or_else(|| panic!("FSK441 did not round-trip: {decodes:?}"));
+        assert_eq!(d.to.as_deref(), Some("W1ABC"));
+        assert_eq!(d.from.as_deref(), Some("W9XYZ"));
+        assert_eq!(d.grid.as_deref(), Some("FN42"));
+        // The ping is reported where it was keyed.
+        assert!((d.dt - start as f32 / FSK441_RATE as f32).abs() < 0.06, "dt {}", d.dt);
+    }
+
     #[test]
     fn parse_cq_and_qso_messages() {
         let p = parse_message("CQ AB1CD FN42", MsgKind::Standard);
@@ -1230,6 +2032,84 @@ mod tests {
             "got {:?}",
             decodes.iter().map(|d| &d.message).collect::<Vec<_>>()
         );
+    }
+
+    /// A weak FT4 signal buried under a strong one at the same audio offset
+    /// must still decode. This is what multi-pass SIC buys and what the
+    /// single-pass default cannot do: the strong signal's own occupied
+    /// bandwidth (90 Hz) covers the weak one, and only subtraction of the
+    /// strong decode exposes it in the residual. WSJT-X and WSJT-CB subtract
+    /// by default, so without this a busy FT4 slot reports only the strongest
+    /// signal at each offset — the "they don't stack" report.
+    ///
+    /// The two decodes are co-channel on purpose: at any wider separation the
+    /// single-pass default would already find both, and the test would stop
+    /// pinning subtraction at all. Noise is deterministic, so this cannot
+    /// flake between runs.
+    #[test]
+    fn a_masked_ft4_signal_is_recovered_by_subtraction() {
+        let modem = Ft8Modem::new(Mode::Ft4);
+        let strong = "CQ AB1CD FN42";
+        let weak = "CQ EF2GH JO22";
+        let pad = (0.5 * 12_000.0) as usize;
+        let (sb, _) = modem.encode_burst_12k(strong, 1500.0, 0.5).expect("encode strong");
+        let (wb, _) = modem.encode_burst_12k(weak, 1500.0, 0.03).expect("encode weak");
+        let mut slot = vec![0.0f32; (7.5 * 12_000.0) as usize - pad];
+        for (i, &s) in sb.iter().enumerate() {
+            if i < slot.len() {
+                slot[i] += s;
+            }
+        }
+        for (i, &s) in wb.iter().enumerate() {
+            if i < slot.len() {
+                slot[i] += s;
+            }
+        }
+        let mut rng: u32 = 0x9e37_79b9;
+        for s in slot.iter_mut() {
+            rng ^= rng << 13;
+            rng ^= rng >> 17;
+            rng ^= rng << 5;
+            *s += (rng as i32 as f32 / i32::MAX as f32) * 0.005;
+        }
+        let mut padded = vec![0.0f32; pad];
+        padded.extend_from_slice(&slot);
+        let buf: Vec<i16> = padded.iter().map(|&s| (s * 20_000.0) as i16).collect();
+
+        let mut rx = Ft8Modem::new(Mode::Ft4);
+        let got = rx.decode_slot(&buf, 0, &ApHints::default(), 1500.0);
+        let messages: Vec<&str> = got.iter().map(|d| d.message.as_str()).collect();
+        assert!(messages.contains(&strong), "the strong signal decoded: {messages:?}");
+        assert!(
+            messages.contains(&weak),
+            "the weak signal under it did not survive subtraction: {messages:?}",
+        );
+    }
+
+    /// Noise alone must not decode, now that the wide-band pass subtracts:
+    /// mfsk-core runs the second round at three quarters of the sync floor
+    /// even when the first found nothing, so a slot of plain noise is searched
+    /// deeper than it used to be and CRC-14 is all that stands between that
+    /// search and an invented callsign. Several deterministic seeds, so a
+    /// marginal floor shows up here rather than on the air.
+    #[test]
+    fn ft4_noise_alone_decodes_nothing() {
+        let n = (7.5 * 12_000.0) as usize;
+        for seed in 1..=8u32 {
+            let mut rng = seed.wrapping_mul(0x9e37_79b9);
+            let buf: Vec<i16> = (0..n)
+                .map(|_| {
+                    rng ^= rng << 13;
+                    rng ^= rng >> 17;
+                    rng ^= rng << 5;
+                    ((rng as i32 as f32 / i32::MAX as f32) * 6_000.0) as i16
+                })
+                .collect();
+            let mut rx = Ft8Modem::new(Mode::Ft4);
+            let got = rx.decode_slot(&buf, 0, &ApHints::default(), 1500.0);
+            let messages: Vec<&str> = got.iter().map(|d| d.message.as_str()).collect();
+            assert!(messages.is_empty(), "seed {seed}: noise decoded as {messages:?}");
+        }
     }
 
     #[test]
@@ -1531,5 +2411,92 @@ mod tests {
         let d = decodes.iter().find(|d| d.message.contains("DL/W1AW")).expect("decoded");
         assert!(d.is_cq);
         assert_eq!(d.from.as_deref(), Some("DL/W1AW"));
+    }
+
+    /// A weak FT8 signal buried *inside* a strong neighbour's occupied
+    /// bandwidth still decodes — the whole reason FT8 runs signal subtraction.
+    ///
+    /// This is the one thing a one-signal sensitivity test cannot show: put a
+    /// strong CQ at 2310 Hz and a weak one 10–30 Hz away and, without the
+    /// checkpointed subtraction on the FT8 request (mfsk-core's default is a
+    /// bare single pass), only the strong signal comes back. Deterministic, so
+    /// it is a real gate rather than a measurement.
+    #[test]
+    fn a_weak_signal_under_a_strong_neighbour_is_recovered() {
+        let slot = |weak_hz: f32| {
+            let modem = Ft8Modem::new(Mode::Ft8);
+            let (strong, _) = modem.encode_burst_12k("CQ AB1CD FN42", 2310.0, 0.5).unwrap();
+            let weak_amp = 0.5 * 10f32.powf(-14.0 / 20.0);
+            let (weak, _) = modem.encode_burst_12k("CQ W9XYZ EN52", weak_hz, weak_amp).unwrap();
+            let mut out = vec![0.0f32; 180_000];
+            for (i, &x) in strong.iter().enumerate() {
+                out[6_000 + i] += x;
+            }
+            for (i, &x) in weak.iter().enumerate() {
+                out[6_000 + i] += x;
+            }
+            out.iter().map(|&x| (x * 12_000.0) as i16).collect::<Vec<i16>>()
+        };
+        let decode = |buf: &[i16]| {
+            Ft8Modem::new(Mode::Ft8)
+                .decode_slot(buf, 0, &ApHints::default(), 2310.0)
+                .into_iter()
+                .map(|d| d.message)
+                .collect::<Vec<_>>()
+        };
+
+        // Weak inside the strong signal's bandwidth: both must come back.
+        for weak_hz in [2300.0f32, 2320.0] {
+            let got = decode(&slot(weak_hz));
+            assert!(
+                got.iter().any(|m| m == "CQ AB1CD FN42"),
+                "the strong signal must decode at {weak_hz} Hz: {got:?}"
+            );
+            assert!(
+                got.iter().any(|m| m == "CQ W9XYZ EN52"),
+                "signal subtraction must recover the weak signal under the strong \
+                 one at {weak_hz} Hz: {got:?}"
+            );
+        }
+    }
+
+    /// The two-stage split that lets an auto-sequenced reply be decided in
+    /// time: the quick single-pass result comes back on its own, and the SIC
+    /// extras (plus the contest rescue) follow as a second batch. The quick
+    /// batch must already hold the strong signal; the extras hold the weak one
+    /// subtraction recovers.
+    #[test]
+    fn ft8_decodes_in_two_stages_for_an_on_time_reply() {
+        let modem = Ft8Modem::new(Mode::Ft8);
+        let (strong, _) = modem.encode_burst_12k("CQ AB1CD FN42", 2310.0, 0.5).unwrap();
+        let weak_amp = 0.5f32 * 10f32.powf(-14.0 / 20.0);
+        let (weak, _) = modem.encode_burst_12k("CQ W9XYZ EN52", 2320.0, weak_amp).unwrap();
+        let mut out = vec![0.0f32; 180_000];
+        for (i, &x) in strong.iter().enumerate() {
+            out[6_000 + i] += x;
+        }
+        for (i, &x) in weak.iter().enumerate() {
+            out[6_000 + i] += x;
+        }
+        let buf: Vec<i16> = out.iter().map(|&x| (x * 12_000.0) as i16).collect();
+
+        let (quick, extras) =
+            Ft8Modem::new(Mode::Ft8).decode_slot_staged(&buf, 0, &ApHints::default(), 2310.0);
+        let q: Vec<&str> = quick.iter().map(|d| d.message.as_str()).collect();
+        let e: Vec<&str> = extras.iter().map(|d| d.message.as_str()).collect();
+        assert!(q.contains(&"CQ AB1CD FN42"), "the quick pass must hold the strong signal: {q:?}");
+        assert!(
+            e.contains(&"CQ W9XYZ EN52"),
+            "the extras must hold the weak signal subtraction recovers: {e:?}"
+        );
+        // The quick pass alone is what a reply can act on within the offset.
+        assert!(!q.contains(&"CQ W9XYZ EN52"), "the weak one is the slow pass's job: {q:?}");
+
+        // `Fast` is the quick pass alone: no subtraction batch at all.
+        let mut fast = Ft8Modem::new(Mode::Ft8);
+        fast.set_ft8_depth(Ft8Depth::Fast);
+        let (quick, extras) = fast.decode_slot_staged(&buf, 0, &ApHints::default(), 2310.0);
+        assert!(quick.iter().any(|d| d.message == "CQ AB1CD FN42"));
+        assert!(extras.is_empty(), "Fast must skip the subtraction pass: {extras:?}");
     }
 }

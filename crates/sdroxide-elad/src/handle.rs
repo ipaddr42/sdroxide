@@ -372,6 +372,21 @@ pub(crate) struct Shared {
     /// every block so a ring that fills during an over is accounted for as the
     /// cost of transmitting rather than as an overrun.
     pub rx_paused: AtomicBool,
+    /// What an FDM-DUO last said it was tuned to, in whole Hz, or zero before
+    /// the first answer and on every other model.
+    ///
+    /// The radio's own knob moves this window, so it is read back rather than
+    /// assumed — see `Device::read_tuned`. Whole Hz because the radio reports
+    /// whole Hz, which also makes an atomic the whole of the plumbing.
+    pub duo_tuned_hz: AtomicU64,
+    /// Whether the stream thread asks the radio for its dial at all.
+    ///
+    /// Off until the owner turns it on, because only one owner needs it: a
+    /// DUO driven through its USB gateway, which has no other way to see the
+    /// knob. With a CAT serial port the dial already comes back over serial,
+    /// and four control transfers a second on the streaming interface would
+    /// buy nothing but a chance to stall it.
+    pub read_dial: AtomicBool,
 }
 
 impl Shared {
@@ -380,6 +395,8 @@ impl Shared {
             alive: AtomicBool::new(true),
             last_rx_ms: AtomicU64::new(0),
             rx_paused: AtomicBool::new(false),
+            duo_tuned_hz: AtomicU64::new(0),
+            read_dial: AtomicBool::new(false),
         }
     }
 }
@@ -483,6 +500,29 @@ impl EladHandle {
         // A closed channel means the thread has exited; `needs_reopen` will
         // pick that up from `is_alive`, so there is nothing useful to do here.
         let _ = self.ctrl.send(c);
+    }
+
+    /// Where the radio itself says the window is, if it has said.
+    ///
+    /// Only an FDM-DUO answers: its receive window is its VFO, so the
+    /// front-panel knob moves it and this is how that becomes visible without a
+    /// CAT serial port. `None` until the first read comes back, and on every
+    /// model that has no VFO to turn.
+    ///
+    /// Nothing is asked until [`Self::follow_radio_dial`] turns the read on.
+    pub fn tuned_hz(&self) -> Option<f64> {
+        match self.shared.duo_tuned_hz.load(Ordering::Relaxed) {
+            0 => None,
+            hz => Some(hz as f64),
+        }
+    }
+
+    /// Have the stream thread read the radio's own dial back (see
+    /// [`Self::tuned_hz`]), or stop it. For a DUO with no CAT serial port,
+    /// which has no other way to see its knob turned; everywhere else the read
+    /// is traffic on the streaming interface that nothing uses.
+    pub fn follow_radio_dial(&self, on: bool) {
+        self.shared.read_dial.store(on, Ordering::Relaxed);
     }
 
     pub fn set_center_hz(&self, hz: f64) {

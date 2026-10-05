@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{Sample, SampleFormat};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 #[derive(Debug, thiserror::Error)]
 pub enum AudioError {
@@ -184,46 +184,101 @@ impl Glitches {
     }
 
     /// Record one and log it, at most once per [`GLITCH_REPORT_EVERY`] after
-    /// the first.
+    /// the first — and only as loudly as it deserves; see [`Say`].
     fn on_glitch(&self, what: &str, device: &str) {
         let total = self.n.fetch_add(1, Ordering::Relaxed) + 1;
         let Ok(mut said) = self.said.lock() else { return };
         let (last_total, at) = *said;
-        if total > 1 && at.elapsed() < GLITCH_REPORT_EVERY {
+        let elapsed = at.elapsed();
+        let say = Say::decide(self.costs_a_decode, total, elapsed);
+        if say == Say::Nothing {
             return;
         }
         *said = (total, Instant::now());
-        if !self.costs_a_decode {
-            // Recorded and reported, but not as a fault: nothing is listening
-            // to this stream unless the transmitter is keyed by voice, and then
-            // the hole is a millisecond of speech rather than a lost period.
-            info!(
-                "{what}: the audio stream from \"{device}\" glitched ({total} so far) — the \
-                 host lost samples between two callbacks. On the microphone this only matters \
-                 during a voice over, where it is a millisecond of speech; while receiving, \
-                 nothing reads this stream at all and it costs nothing. It is not why a \
-                 digital mode is failing to decode — look at the receiver's own audio stream \
-                 for that."
-            );
-            return;
+        match say {
+            Say::Nothing => unreachable!("returned above"),
+            Say::FirstHarmless => {
+                // Recorded and said once, but not as a fault: nothing is
+                // listening to this stream unless the transmitter is keyed by
+                // voice, and then the hole is a millisecond of speech rather
+                // than a lost period.
+                info!(
+                    "{what}: the audio stream from \"{device}\" glitched ({total} so far) — the \
+                     host lost samples between two callbacks. On the microphone this only \
+                     matters during a voice over, where it is a millisecond of speech; while \
+                     receiving, nothing reads this stream at all and it costs nothing. It is \
+                     not why a digital mode is failing to decode — look at the receiver's own \
+                     audio stream for that. Further glitches on this stream are counted but \
+                     not reported again."
+                );
+            }
+            Say::MoreHarmless => {
+                debug!(
+                    "{what}: {} more harmless audio glitch(es) from \"{device}\" in the last \
+                     {:.0} s ({total} since the stream opened)",
+                    total - last_total,
+                    elapsed.as_secs_f64()
+                );
+            }
+            Say::FirstFault => {
+                warn!(
+                    "{what}: the audio stream from \"{device}\" glitched — the host says \
+                     samples were lost between two callbacks, so what reaches the decoders has \
+                     a hole in it spliced out of it. A virtual audio cable (VB-Audio, VAC, \
+                     Flex DAX) does this routinely when the program feeding it is not keeping \
+                     exact pace; a real sound card doing it means this machine is not keeping \
+                     up. Further glitches on this stream are counted and summarised rather \
+                     than logged one by one."
+                );
+            }
+            Say::MoreFaults => {
+                warn!(
+                    "{what}: {} more audio glitch(es) from \"{device}\" in the last {:.0} s \
+                     ({total} since the stream opened)",
+                    total - last_total,
+                    elapsed.as_secs_f64()
+                );
+            }
         }
-        if total == 1 {
-            warn!(
-                "{what}: the audio stream from \"{device}\" glitched — the host says samples \
-                 were lost between two callbacks, so what reaches the decoders has a hole in \
-                 it spliced out of it. A virtual audio cable (VB-Audio, VAC, Flex DAX) does \
-                 this routinely when the program feeding it is not keeping exact pace; a real \
-                 sound card doing it means this machine is not keeping up. Further glitches on \
-                 this stream are counted and summarised rather than logged one by one."
-            );
-        } else {
-            let since = total - last_total;
-            warn!(
-                "{what}: {since} more audio glitch(es) from \"{device}\" in the last {:.0} s \
-                 ({total} since the stream opened)",
-                at.elapsed().as_secs_f64()
-            );
+    }
+}
+
+/// What one glitch is worth saying, which is not the same question as whether
+/// one happened.
+///
+/// Split out from the logging so the decision can be tested, because getting it
+/// wrong is not a cosmetic matter: a stream that reports a harmless glitch once
+/// a minute for as long as the program runs reads, to the operator scrolling
+/// the diagnostics window, exactly like a fault. Two of them filed it as one
+/// (issues #487 and #506) against a microphone the receiving station was not
+/// even reading — and the line they were reading says in its own text that it
+/// costs nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Say {
+    /// Nothing: inside the quiet period since the last report.
+    Nothing,
+    /// The first hole in a stream something is listening to.
+    FirstFault,
+    /// How many more there have been since the last summary.
+    MoreFaults,
+    /// The first hole in a stream nothing reads. Worth saying once, with why
+    /// it is not a fault, so an operator who goes looking has the answer.
+    FirstHarmless,
+    /// A later one of those: counted, and said only to a debug log. The count
+    /// is still there for anyone diagnosing; what is gone is the standing
+    /// alarm about a stream that costs nothing when it glitches.
+    MoreHarmless,
+}
+
+impl Say {
+    fn decide(costs_a_decode: bool, total: u64, since_last: Duration) -> Say {
+        if total <= 1 {
+            return if costs_a_decode { Say::FirstFault } else { Say::FirstHarmless };
         }
+        if since_last < GLITCH_REPORT_EVERY {
+            return Say::Nothing;
+        }
+        if costs_a_decode { Say::MoreFaults } else { Say::MoreHarmless }
     }
 }
 
@@ -460,6 +515,18 @@ fn alsa_card_id(pcm_id: &str) -> Option<String> {
     (!id.is_empty()).then(|| id.to_string())
 }
 
+/// The ALSA PCM *device* index (`DEV=n`) a cpal pcm id opens. `None` when the
+/// name leaves it to the default (`sysdefault:CARD=X`) or is not an ALSA PCM.
+/// One USB card can expose several devices — a mono demod and a stereo I/Q —
+/// and each has its own `/proc/asound/cardN/streamM`, so this is what selects
+/// the right one.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn alsa_dev_index(pcm_id: &str) -> Option<u32> {
+    let rest = pcm_id.split("DEV=").nth(1)?;
+    let end = rest.find([',', ':']).unwrap_or(rest.len());
+    rest[..end].trim().parse().ok()
+}
+
 /// Trim the "at usb-…, full speed" tail off an ALSA longname, leaving the
 /// readable "manufacturer model" part.
 fn prettify_longname(long: &str) -> String {
@@ -536,37 +603,49 @@ fn device_card_id(device: &cpal::Device) -> Option<String> {
     alsa_card_id(device.description().ok()?.driver()?)
 }
 
+/// Highest capture channel count in the text of an ALSA `streamN` file. Zero
+/// when the file has no capture section at all.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn capture_channels_in(text: &str) -> u16 {
+    let mut in_capture = false;
+    let mut max = 0u16;
+    for line in text.lines() {
+        let t = line.trim();
+        match t {
+            "Capture:" => in_capture = true,
+            "Playback:" => in_capture = false,
+            _ if in_capture => {
+                let channels =
+                    t.strip_prefix("Channels:").and_then(|r| r.trim().parse::<u16>().ok());
+                if let Some(n) = channels {
+                    max = max.max(n);
+                }
+            }
+            _ => {}
+        }
+    }
+    max
+}
+
 /// Linux: the true maximum hardware capture channel count for a card, read from
-/// `/proc/asound/cardN/stream0`. This sees past ALSA's plug/dmix layer, which
+/// `/proc/asound/cardN/streamM`. This sees past ALSA's plug/dmix layer, which
 /// upmixes a mono microphone to a fake stereo config — so it's the only
 /// reliable way to tell that a "stereo" capture is really mono (no good for
-/// I/Q). `None` off-Linux or when the file is absent.
-fn hw_capture_channels(index: &str) -> Option<u16> {
+/// I/Q). `pcm_id` picks the stream: a USB card can carry several, a mono demod
+/// on stream0 and a stereo I/Q on stream1, and reading stream0 regardless
+/// called the stereo input mono (issue #582). `None` off-Linux or when the
+/// file is absent.
+fn hw_capture_channels(index: &str, pcm_id: &str) -> Option<u16> {
     #[cfg(target_os = "linux")]
     {
-        let text = std::fs::read_to_string(format!("/proc/asound/card{index}/stream0")).ok()?;
-        let mut in_capture = false;
-        let mut max = 0u16;
-        for line in text.lines() {
-            let t = line.trim();
-            match t {
-                "Capture:" => in_capture = true,
-                "Playback:" => in_capture = false,
-                _ if in_capture => {
-                    if let Some(rest) = t.strip_prefix("Channels:") {
-                        if let Ok(n) = rest.trim().parse::<u16>() {
-                            max = max.max(n);
-                        }
-                    }
-                }
-                _ => {}
-            }
-        }
-        return (max > 0).then_some(max);
+        let dev = alsa_dev_index(pcm_id).unwrap_or(0);
+        let text = std::fs::read_to_string(format!("/proc/asound/card{index}/stream{dev}")).ok()?;
+        let n = capture_channels_in(&text);
+        (n > 0).then_some(n)
     }
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = index;
+        let _ = (index, pcm_id);
         None
     }
 }
@@ -997,11 +1076,15 @@ pub fn start_input_stereo(
         });
     // Report the TRUE hardware channel count, not cpal's — the ALSA plug layer
     // upmixes a mono mic to a fake 2-channel config, which would otherwise slip
-    // past the caller's mono-for-IQ guard. Fall back to cpal's count when the
-    // hardware count is unknown (non-Linux, or a virtual device).
-    let hw_channels = alsa_cards()
-        .get(&device_card_id(&device).unwrap_or_default())
-        .and_then(|c| hw_capture_channels(&c.index));
+    // past the caller's mono-for-IQ guard. The PCM's own device index picks the
+    // stream file, so a card's stereo I/Q is not judged by its mono demod.
+    // Fall back to cpal's count when the hardware count is unknown (non-Linux,
+    // or a virtual device).
+    let pcm_id = device.description().ok().and_then(|d| d.driver().map(str::to_string));
+    let hw_channels = pcm_id.as_deref().and_then(|p| {
+        let card = alsa_cards().get(alsa_card_id(p)?.as_str()).cloned()?;
+        hw_capture_channels(&card.index, p)
+    });
     let mut last = AudioError::NoConfig;
     for (config, fmt) in config_candidates(picked, device.default_input_config()) {
         let rate = config.sample_rate;
@@ -1122,7 +1205,8 @@ pub fn start_output(
 #[cfg(test)]
 mod tests {
     use super::{
-        CAPTURE_BUFFER_MS, NameAssigner, PendingInput, capture_period_frames, config_candidates,
+        CAPTURE_BUFFER_MS, GLITCH_REPORT_EVERY, NameAssigner, PendingInput, Say, alsa_dev_index,
+        capture_channels_in, capture_period_frames, config_candidates,
     };
     use std::time::{Duration, Instant};
 
@@ -1211,6 +1295,25 @@ mod tests {
         eprintln!("inputs:  {ins:?}");
     }
 
+    /// One USB card can carry two PCM devices — a mono demod on stream0 and a
+    /// stereo I/Q on stream1 (issue #582). Reading stream0 regardless called
+    /// the stereo input mono and refused it for I/Q, so the PCM's own `DEV=`
+    /// has to pick the stream file.
+    #[test]
+    fn the_iq_channel_probe_reads_the_pcm_devices_own_stream() {
+        assert_eq!(alsa_dev_index("hw:CARD=reciever,DEV=1"), Some(1));
+        assert_eq!(alsa_dev_index("plughw:CARD=reciever,DEV=0"), Some(0));
+        assert_eq!(alsa_dev_index("sysdefault:CARD=reciever"), None);
+
+        let demod = "Playback:\n  Interface 4\n    Channels: 1\n\
+                     Capture:\n  Interface 5\n    Channels: 1\n";
+        let iq = "Capture:\n  Interface 5\n    Channels: 2\n";
+        assert_eq!(capture_channels_in(demod), 1);
+        assert_eq!(capture_channels_in(iq), 2);
+        // A playback-only stream is not a capture device at all.
+        assert_eq!(capture_channels_in("Playback:\n    Channels: 2\n"), 0);
+    }
+
     /// ALSA reaches one card through several PCMs. They are one device and have
     /// to stay one entry, or the operator picks between doors instead of radios
     /// and the opener loses the fallback to whichever PCM will actually run.
@@ -1259,5 +1362,31 @@ mod tests {
         // B named second in both runs, so B keeps its suffix whichever order
         // the two were seen in.
         assert_eq!(name("dev:aaaa", "dev:bbbb"), name("dev:cccc", "dev:bbbb"));
+    }
+
+    /// A microphone nothing is reading must not report a fault once a minute
+    /// for the length of the session. Two operators read exactly that as
+    /// broken audio — issues #487 and #506 — off a stream whose own message
+    /// says it costs nothing.
+    #[test]
+    fn a_harmless_stream_says_its_piece_once_and_then_keeps_the_count_quietly() {
+        let quiet = GLITCH_REPORT_EVERY / 2;
+        let due = GLITCH_REPORT_EVERY + Duration::from_secs(1);
+
+        // The first one is news either way, and carries the explanation.
+        assert_eq!(Say::decide(false, 1, quiet), Say::FirstHarmless);
+        assert_eq!(Say::decide(true, 1, quiet), Say::FirstFault);
+
+        // Inside the quiet period nothing is said about either.
+        assert_eq!(Say::decide(false, 2, quiet), Say::Nothing);
+        assert_eq!(Say::decide(true, 2, quiet), Say::Nothing);
+
+        // After it, a stream that costs a decode is still warned about — and
+        // one that costs nothing is counted where only a debug log will see
+        // it, however many there have been.
+        assert_eq!(Say::decide(true, 2, due), Say::MoreFaults);
+        assert_eq!(Say::decide(true, 45, due), Say::MoreFaults);
+        assert_eq!(Say::decide(false, 2, due), Say::MoreHarmless);
+        assert_eq!(Say::decide(false, 45, due), Say::MoreHarmless);
     }
 }

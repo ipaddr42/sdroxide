@@ -9,7 +9,7 @@ use eframe::egui::{self, Color32, ComboBox, DragValue, RichText, Slider};
 use sdroxide_types::{Command, Direction};
 
 use crate::app::SdroxideApp;
-use crate::app::settings::enum_combo;
+use crate::app::settings::{device_combo, enum_combo};
 use crate::chrome::StyledCombo;
 
 /// Why a discovery or test control is greyed out.
@@ -170,14 +170,18 @@ pub(in crate::app) fn settings_cat_tab(
     // antenna, where it has one, is in the receive path.
     antenna_rx: &str,
     rx_antenna: bool,
+    // The sound cards on the machine the *rig* is plugged into, once that
+    // machine has answered. `None` until it has.
+    radio_audio: Option<(&[String], &[String])>,
     can_probe: bool,
+    apply: &mut bool,
     cmds: &mut Vec<Command>,
 ) {
     use sdroxide_types::{
         CAT_SCOPE_MIN_BAUD, CatFamily, CwKeying, DigiMode, Direction, ELAD_CAT_BAUDS,
         ELAD_DEFAULT_CAT_BAUD, EladAntenna, EladTxInput, IcomModel, IcomScopeSpan, KenwoodSend,
         LineState, ModeControl, Parity, PttMethod, QMX_IQ_OFFSET_HZ, QMX_IQ_RATE_HZ,
-        RS_HFIQ_CAT_BAUD, SoundFormat, StopBits,
+        RS_HFIQ_CAT_BAUD, SoundFormat, StopBits, TrUsdxAudio,
     };
     let Some(cfg) = radio_edit.as_mut() else {
         ui.label("Waiting for the configuration of the machine the radio is attached to.");
@@ -357,6 +361,22 @@ pub(in crate::app) fn settings_cat_tab(
             cfg.cat.iq_offset_hz = 0.0;
         }
 
+        // A (tr)uSDX is a USB serial adapter and nothing else: no sound card,
+        // so the sound format is demod audio coming down the CAT link, and PTT
+        // is a CAT command. The rate is 115200 on firmware 2.00t and up (the
+        // older 38400 is still offered below). DTR is the radio's reset line on
+        // the common board and the driver holds it high whatever is configured
+        // here, so a key-down on DTR is not offered by the profile.
+        if cfg.cat.family == CatFamily::TrUsdx && cfg.cat.family != family_before {
+            cfg.cat.format = SoundFormat::DemodAudio;
+            cfg.cat.ptt = PttMethod::Cat;
+            cfg.cat.serial.baud = 115_200;
+            cfg.cat.serial.data_bits = 8;
+            cfg.cat.serial.parity = Parity::None;
+            cfg.cat.serial.stop_bits = StopBits::One;
+            cfg.cat.serial.force_dtr = LineState::High;
+        }
+
         // A network family reaches the radio over a socket, so every serial
         // setting below is about a port nothing will open. Drawing them would
         // invite an operator to fix a connection problem by changing a baud
@@ -442,6 +462,10 @@ pub(in crate::app) fn settings_cat_tab(
             // offering a link that cannot work. See `sdroxide_cat::spawn`.
             let bauds: &[u32] = if cfg.cat.family == CatFamily::Elad {
                 &ELAD_CAT_BAUDS
+            } else if cfg.cat.family == CatFamily::TrUsdx {
+                // "38400 / 115200 (2.00t and above)" — the firmware's own two
+                // rates, and nothing else it has a setting for.
+                &[38_400, 115_200]
             } else {
                 &[4800, 9600, 19200, 38400, 57600, 115200]
             };
@@ -800,6 +824,52 @@ pub(in crate::app) fn settings_cat_tab(
             ui.end_row();
         }
 
+        if cfg.cat.family == CatFamily::TrUsdx {
+            ui.label("Radio");
+            ui.label(RichText::new("(tr)uSDX · open uSDX").weak()).on_hover_text(
+                "DL2MAN/PE1NNZ's pocket QRP transceiver and the open uSDX firmware \
+                 it grew from. It emulates a Kenwood TS-480, but the subset is \
+                 thin: the dial, the mode, PTT and RIT/XIT clear are all it \
+                 answers. No S-meter, no SWR, no power control, no VFO B, no \
+                 split and no CAT keyer, so the Drive slider and the meters do \
+                 nothing over CAT — the audio level is the only transmit control \
+                 there is.\n\n\
+                 CW is keyed as audio (MCW) through the sideband, or with the \
+                 key or paddle at the radio; there is no command that takes text.",
+            );
+            ui.end_row();
+
+            ui.label("Audio").on_hover_text(
+                "A (tr)uSDX has no sound card of its own and two ways to be heard, \
+                 and which is right is a fact about your shack rather than the radio.\n\n\
+                 \"One cable\" takes the audio inside the CAT serial link itself — the \
+                 radio's own 8-bit stream, over the same USB cable as the control, with \
+                 nothing else to plug in. The catch is the firmware: it cannot take a \
+                 CAT command while its stream is running (a command sent into the stream \
+                 does not pause it, it kills it), so this mode never polls. Tuning and \
+                 mode changes are sent as you make them, each pausing the stream for a \
+                 moment and starting it again, so expect a brief gap on each change; \
+                 nothing is sent while you are simply listening. The radio's own dial \
+                 and mode are not followed either — there is no read to follow them \
+                 with — so drive it from here.\n\n\
+                 \"USB sound card\" takes the audio from an external sound card wired to \
+                 the radio's 3.5 mm speaker/mic jack, and behaves as any other CAT rig: \
+                 the dial poll runs, so the radio's own knob and mode are followed. Pick \
+                 the card under Radio audio below.\n\n\
+                 Both modes open the port with DTR held high: the serial adapter's DTR \
+                 is wired to the radio's reset, so opening the port reboots it and the \
+                 first second or two is quiet while it comes up. DTR is never used to key.",
+            );
+            enum_combo(
+                ui,
+                "trusdx_audio",
+                &mut cfg.cat.trusdx_audio,
+                &TrUsdxAudio::ALL,
+                TrUsdxAudio::label,
+            );
+            ui.end_row();
+        }
+
         if cfg.cat.family == CatFamily::Icom {
             ui.label("Radio model").on_hover_text(
                 "Which Icom, for the two things CI-V does not do the same way \
@@ -887,8 +957,146 @@ pub(in crate::app) fn settings_cat_tab(
             }
         }
     });
+    cat_radio_audio(ui, cfg, radio_audio, can_probe, apply);
     ui.add_space(6.0);
     ui.label(RichText::new("Press \"Apply / reconnect\" to switch without a restart.").weak());
+}
+
+/// The rig's own sound card, and how loud what comes back off it is.
+///
+/// On this tab rather than under General, where it used to live: a sound card
+/// belongs to a radio, not to the program. A station running two rigs at once
+/// runs two interfaces at once, and one pair of card pickers on a shared page
+/// could only ever describe one of them (issue #474). The `UsbAudio` backend's
+/// identical pickers have always been on this tab; these are now beside them.
+///
+/// Only the CAT interface has this: every other backend carries its audio in
+/// the same stream as its I/Q.
+///
+/// The cards offered are the ones on the machine the *radio* is plugged into,
+/// asked for by name rather than taken from the audio-device list — that list
+/// is this screen's own speaker and microphone, and offering a laptop's
+/// built-in mic as the shack transceiver's transmit path would be worse than
+/// offering nothing at all.
+fn cat_radio_audio(
+    ui: &mut egui::Ui,
+    cfg: &mut sdroxide_types::RadioConfig,
+    devices: Option<(&[String], &[String])>,
+    can_probe: bool,
+    apply: &mut bool,
+) {
+    ui.add_space(10.0);
+    ui.separator();
+    ui.add_space(6.0);
+    ui.label(RichText::new("Radio audio (sound card)").strong());
+    let Some((inputs, outputs)) = devices else {
+        ui.label(
+            RichText::new("Waiting for the sound cards on the machine the radio is plugged into.")
+                .weak(),
+        );
+        return;
+    };
+    let (ci, co) = (cfg.radio_audio_in.clone(), cfg.radio_audio_out.clone());
+    egui::Grid::new("radio-audio").num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
+        ui.label("From radio (RX)");
+        probe_only(ui, can_probe, |ui| {
+            device_combo(ui, "r-in", inputs, &ci, |n| cfg.radio_audio_in = n)
+        });
+        ui.end_row();
+        ui.label("To radio (TX)");
+        probe_only(ui, can_probe, |ui| {
+            device_combo(ui, "r-out", outputs, &co, |n| cfg.radio_audio_out = n)
+        });
+        ui.end_row();
+    });
+    ui.add_space(4.0);
+    ui.horizontal(|ui| {
+        if ui
+            .button("Apply / reconnect")
+            .on_hover_text("Reopen the CAT rig with these sound cards — no restart")
+            .clicked()
+        {
+            *apply = true;
+        }
+        ui.add(
+            egui::Label::new(RichText::new("Reconnects the radio without restarting.").weak())
+                .wrap(),
+        );
+    });
+    crate::app::settings::general::settings_rx_audio_gain(ui, cfg);
+}
+
+/// The sound-card radio: no control cable, so the whole tab is the two card
+/// choices (receive in, transmit out) and the reminder that the rig keys itself
+/// off VOX. Drawn after the CAT tab so the two sink-holes for audio devices
+/// sit together in the file.
+pub(in crate::app) fn settings_usb_audio_tab(
+    ui: &mut egui::Ui,
+    devices: Option<(&[String], &[String])>,
+    radio_edit: &mut Option<sdroxide_types::RadioConfig>,
+    apply: &mut bool,
+    can_probe: bool,
+) {
+    let Some(cfg) = radio_edit.as_mut() else {
+        ui.label("Waiting for the configuration of the machine the radio is attached to.");
+        return;
+    };
+    // The two lists are the cards on the machine the radio is plugged into,
+    // and they arrive as an answer. Until then the combos would offer nothing
+    // but "System default", which reads as a machine with no sound cards.
+    let Some((inputs, outputs)) = devices else {
+        ui.label(
+            RichText::new("Waiting for the sound cards on the machine the radio is plugged into.")
+                .weak(),
+        );
+        return;
+    };
+    // Read out before the combos, which hand the fields to their editors.
+    let (ci, co) = (cfg.radio_audio_in.clone(), cfg.radio_audio_out.clone());
+    egui::Grid::new("usb-audio-grid").num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
+        // Only the combos are greyed: wrapping whole rows would put both of
+        // them, `end_row` and all, inside a single cell of the grid.
+        ui.label("Receive (radio → PC)").on_hover_text(
+            "The sound card the radio's own audio comes in on — its headphone \
+             socket into the computer's line or mic input. Everything on the \
+             panadapter and in the decoders arrives here.",
+        );
+        probe_only(ui, can_probe, |ui| {
+            device_combo(ui, "ua-in", inputs, &ci, |n| cfg.radio_audio_in = n)
+        });
+        ui.end_row();
+        ui.label("Transmit (PC → radio mic)").on_hover_text(
+            "The sound card that carries the audio the radio must broadcast — \
+             the computer's output into the radio's mic socket. The radio keys \
+             itself, by VOX, the moment audio arrives here, so this device is \
+             silent unless the radio is being transmitted through.",
+        );
+        probe_only(ui, can_probe, |ui| {
+            device_combo(ui, "ua-out", outputs, &co, |n| cfg.radio_audio_out = n)
+        });
+        ui.end_row();
+    });
+    ui.add_space(4.0);
+    ui.label(
+        RichText::new(
+            "This radio has no control cable — it keys itself off VOX, so there is no PTT to \
+             command. Transmit is audio into the radio's microphone.",
+        )
+        .weak(),
+    );
+    ui.horizontal(|ui| {
+        if ui
+            .button("Apply / reconnect")
+            .on_hover_text("Reopen the radio with these sound cards — no restart")
+            .clicked()
+        {
+            *apply = true;
+        }
+        ui.add(
+            egui::Label::new(RichText::new("Reconnects the radio without restarting.").weak())
+                .wrap(),
+        );
+    });
 }
 
 /// HPSDR interface: network device discovery / manual IP / sample rate (the
@@ -1218,7 +1426,10 @@ pub(in crate::app) fn settings_hpsdr_tab(
              directional coupler and an attenuator have to put a sample of the amplifier's \
              output into an input the T/R switch does not take away on transmit. On a \
              Hermes-Lite 2 that means the IO board's PureSignal jack, and the receive input \
-             above set to match. With nothing coupled in, the loop never locks and the \
+             above set to match; on a board without one, an ANAN's RX port or an external relay \
+             that switches the coupler in for the length of the over. It is this receiver that \
+             is read — a board with a second ADC cannot use RX2 as the feedback tap, however \
+             its own firmware routes it. With nothing coupled in, the loop never locks and the \
              transmitter is left exactly as it would have been. Applies on Apply / reconnect, \
              and only on the radio that owns the transmitter (DDC1).",
         );
@@ -4809,8 +5020,8 @@ pub(in crate::app) fn settings_elad_tab(
     ui.add_space(4.0);
     ui.label(
         RichText::new(
-            "ELAD support has not been verified against real hardware. If it \
-             misbehaves, please attach the diagnostic report to a bug report.",
+            "Only receiving on an FDM-DUO has been run on real hardware so far. If \
+             anything misbehaves, please attach the diagnostic report to a bug report.",
         )
         .color(crate::theme::YELLOW()),
     );
@@ -7344,8 +7555,15 @@ pub(in crate::app) fn settings_lime_tab(
         ui.label("Sample rate");
         ui.horizontal(|ui| {
             let text = format!("{:.3} Msps", cfg.lime.sample_rate_hz / 1e6);
+            // The Mini's USB link underruns at 1 Msps on transmit (issue #609),
+            // so it gets a lower-rate list; every other board gets the full one.
+            let rates = devices
+                .iter()
+                .find(|d| d.matches(&cfg.lime.device))
+                .map(|d| LimeConfig::rates_for(&d.name))
+                .unwrap_or(&LimeConfig::SAMPLE_RATES);
             egui::ComboBox::from_id_salt("lime-rate").selected_text(text).show_styled(ui, |ui| {
-                for r in LimeConfig::SAMPLE_RATES {
+                for &r in rates {
                     let label = match LimeConfig::rate_note(r) {
                         Some(note) => format!("{:.3} Msps — {note}", r / 1e6),
                         None => format!("{:.3} Msps", r / 1e6),
